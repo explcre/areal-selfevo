@@ -3005,6 +3005,44 @@ class SchedulerConfig:
 
 
 @dataclass
+class DatasetSourceConfig:
+    """One dataset source in a routed MOPD dataset mixture."""
+
+    path: str = field(
+        default=MISSING,
+        metadata={"help": "Local path or HuggingFace name for this dataset source."},
+    )
+    type: str = field(
+        default=MISSING,
+        metadata={"help": "Training data type, for example 'rl'."},
+    )
+    route: str = field(
+        default=MISSING,
+        metadata={
+            "help": "Required MOPD route applied to every sample from this source."
+        },
+    )
+    split: str | None = field(
+        default=None,
+        metadata={"help": "Optional split override for this dataset source."},
+    )
+    max_length: int | None = field(
+        default=None,
+        metadata={"help": "Optional maximum sequence length for this source."},
+    )
+    dataset_kwargs: dict[str, Any] = field(
+        default_factory=dict,
+        metadata={"help": "Extra keyword arguments for this source's loader."},
+    )
+
+    def __post_init__(self) -> None:
+        for name in ("path", "type", "route"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip() or value == MISSING:
+                raise ValueError(f"dataset source {name} must be a non-empty string")
+
+
+@dataclass
 class _DatasetConfig:
     """Configuration for dataset loading and preprocessing."""
 
@@ -3012,15 +3050,21 @@ class _DatasetConfig:
         default="train",
         metadata={"help": "Dataset split to use, e.g., 'train', 'test'."},
     )
-    path: str = field(
-        default=MISSING,
+    path: str | None = field(
+        default=None,
+        metadata={"help": "Path to one dataset. Mutually exclusive with sources."},
+    )
+    type: str | None = field(
+        default=None,
         metadata={
-            "help": "Path to the dataset. Can be a local path or a HuggingFace dataset name."
+            "help": "Training data type for path. Mutually exclusive with sources."
         },
     )
-    type: str = field(
-        default=MISSING,
-        metadata={"help": "Type of training method, e.g., 'sft', 'rl', etc."},
+    sources: list[DatasetSourceConfig] = field(
+        default_factory=list,
+        metadata={
+            "help": "Dataset sources for MOPD. Every source must declare a route."
+        },
     )
     batch_size: int = field(
         default=1, metadata={"help": "Batch size for the dataloader"}
@@ -3381,7 +3425,7 @@ class MOPDLossConfig:
         metadata={"help": "Coefficient applied to the RL objective."},
     )
     distillation_coefficient: float = field(
-        default=0.005,
+        default=1.0,
         metadata={"help": "Coefficient applied to the MOPD objective."},
     )
     importance_ratio_cap: float = field(
@@ -3420,10 +3464,6 @@ class MOPDTeacherEngineConfig(PPOActorConfig):
 class MOPDConfig:
     """Configuration for multi-teacher on-policy distillation."""
 
-    task_type_identifier: str = field(
-        default="task_type",
-        metadata={"help": "Source sample field used to select an MOPD route."},
-    )
     teachers: dict[str, MOPDTeacherSpec] = field(default_factory=dict)
     routes: dict[str, dict[str, float]] = field(default_factory=dict)
     teacher_engine: MOPDTeacherEngineConfig = field(
@@ -3433,11 +3473,6 @@ class MOPDConfig:
     loss: MOPDLossConfig = field(default_factory=MOPDLossConfig)
 
     def __post_init__(self):
-        if (
-            not isinstance(self.task_type_identifier, str)
-            or not self.task_type_identifier.strip()
-        ):
-            raise ValueError("mopd.task_type_identifier must be a non-empty string")
         if not self.teachers:
             raise ValueError("mopd.teachers must not be empty")
         if not self.routes:
@@ -3555,6 +3590,9 @@ class PPOConfig(BaseExperimentConfig):
         from areal.api.alloc_mode import ModelAllocation, ParallelStrategy
 
         assert self.mopd is not None
+        self._validate_mopd_dataset_sources("train_dataset", self.train_dataset)
+        if self.valid_dataset is not None:
+            self._validate_mopd_dataset_sources("valid_dataset", self.valid_dataset)
         teacher_engine = self.mopd.teacher_engine
 
         if not self.actor.backend.startswith("megatron:"):
@@ -3619,6 +3657,26 @@ class PPOConfig(BaseExperimentConfig):
                 raise ValueError(
                     "mopd local_memory provider only supports a single node; use "
                     "disk for multi-node runs"
+                )
+
+    def _validate_mopd_dataset_sources(
+        self,
+        name: str,
+        dataset_config: TrainDatasetConfig | ValidDatasetConfig,
+    ) -> None:
+        """Require one configured route for every MOPD dataset source."""
+        assert self.mopd is not None
+        if not dataset_config.sources:
+            raise ValueError(f"{name}.sources must not be empty when mopd is enabled")
+        if dataset_config.path is not None or dataset_config.type is not None:
+            raise ValueError(
+                f"{name}.path/type cannot be used with {name}.sources in MOPD"
+            )
+        for index, source in enumerate(dataset_config.sources):
+            if source.route not in self.mopd.routes:
+                raise ValueError(
+                    f"{name}.sources[{index}].route references unknown MOPD route "
+                    f"{source.route!r}"
                 )
 
 

@@ -7,12 +7,18 @@ from omegaconf import OmegaConf
 from examples.mopd.gsm8k_qwen3_14b_to_0_6b import (
     MOPD_ROUTE,
     GSM8KRewardDistillationAgent,
-    add_mopd_route,
+    add_no_think_suffix,
     dynamic_filter,
     load_routed_gsm8k_dataset,
 )
 
-from areal.api.cli_args import GRPOConfig, to_structured_cfg
+from areal.api.cli_args import (
+    DatasetSourceConfig,
+    GRPOConfig,
+    TrainDatasetConfig,
+    to_structured_cfg,
+)
+from areal.dataset.mopd import MOPD_ROUTE_METADATA_KEY
 from areal.reward import gsm8k_reward_fn
 
 
@@ -45,9 +51,12 @@ def test_qwen3_heterogeneous_local_example_has_expected_topology(monkeypatch):
     assert config.total_train_epochs == 10
     assert config.total_train_steps is None
     assert config.train_dataset.batch_size == 256
+    assert config.train_dataset.path is None
+    assert config.train_dataset.sources[0].route == MOPD_ROUTE
     assert config.train_dataset.max_length is None
     assert config.valid_dataset is not None
     assert config.valid_dataset.batch_size == 256
+    assert config.valid_dataset.sources[0].route == MOPD_ROUTE
     assert config.valid_dataset.max_length is None
     assert config.rollout.max_concurrent_rollouts == 256
     assert config.sglang.max_running_requests is None
@@ -60,15 +69,15 @@ def test_qwen3_heterogeneous_local_example_has_expected_topology(monkeypatch):
     assert config.actor.reward_norm is None
     assert config.actor.adv_norm is None
     assert config.actor.rejection_sampling is None
-    assert add_mopd_route({"question": "1+1?"}) == {"task_type": MOPD_ROUTE}
+    assert add_no_think_suffix({"question": "1+1?"}) == {}
 
 
-def test_add_mopd_route_appends_no_think_suffix_once():
+def test_add_no_think_suffix_appends_once():
     """Both dataset loaders use the same reference no-think prompt format."""
     sample = {"messages": [{"role": "user", "content": "What is 1 + 1?"}]}
 
-    routed = add_mopd_route(sample)
-    routed_twice = add_mopd_route(routed)
+    routed = add_no_think_suffix(sample)
+    routed_twice = add_no_think_suffix(routed)
 
     assert sample["messages"][0]["content"] == "What is 1 + 1?"
     assert routed["messages"][0]["content"] == "What is 1 + 1? /no_think"
@@ -90,17 +99,24 @@ def test_load_routed_gsm8k_dataset_accepts_local_parquet_mirror(tmp_path):
     Dataset.from_dict(
         {"question": ["What is 1 + 1?"], "answer": ["#### 2"]}
     ).to_parquet(main_path / "train-00000-of-00001.parquet")
-    config = type("DatasetConfig", (), {"path": str(tmp_path), "max_length": 32})()
+    config = TrainDatasetConfig(
+        sources=[
+            DatasetSourceConfig(
+                path=str(tmp_path), type="rl", route=MOPD_ROUTE, max_length=32
+            )
+        ],
+        scheduling_spec=None,
+    )
 
     dataset = load_routed_gsm8k_dataset(
         config,
-        split="train",
         tokenizer=_Tokenizer(),
     )
 
     assert len(dataset) == 1
     assert dataset[0]["answer"] == "#### 2"
-    assert dataset[0]["task_type"] == MOPD_ROUTE
+    assert dataset[0][MOPD_ROUTE_METADATA_KEY] == MOPD_ROUTE
+    assert "task_type" not in dataset[0]
     assert dataset[0]["messages"][0]["content"].startswith("What is 1 + 1?")
     assert dataset[0]["messages"][0]["content"].endswith(" /no_think")
 

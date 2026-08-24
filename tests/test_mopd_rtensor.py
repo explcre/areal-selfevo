@@ -52,7 +52,10 @@ def test_aggregate_mopd_targets_uses_raw_weights_and_removes_teacher_metadata():
     ]
 
     result = aggregate_mopd_targets(
-        batch, rl_coefficient=0.25, distillation_coefficient=0.005
+        batch,
+        rl_coefficient=0.25,
+        distillation_coefficient=1.0,
+        importance_ratio_cap=3.0,
     )
 
     assert result is batch
@@ -82,7 +85,9 @@ def test_aggregate_mopd_targets_uses_raw_weights_and_removes_teacher_metadata():
             "mopd_teacher_weight_sum",
             "mopd_rl_coefficient",
             "mopd_distillation_coefficient",
+            "mopd_importance_ratio_cap",
         }
+        assert trajectory["mopd_importance_ratio_cap"] == 3.0
 
 
 def test_aggregate_mopd_targets_rejects_mismatched_teacher_shapes():
@@ -99,7 +104,10 @@ def test_aggregate_mopd_targets_rejects_mismatched_teacher_shapes():
 
     with pytest.raises(ValueError, match="shape mismatch"):
         aggregate_mopd_targets(
-            batch, rl_coefficient=0.0, distillation_coefficient=0.005
+            batch,
+            rl_coefficient=0.0,
+            distillation_coefficient=1.0,
+            importance_ratio_cap=5.0,
         )
 
 

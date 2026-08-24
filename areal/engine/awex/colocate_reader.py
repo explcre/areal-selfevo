@@ -84,41 +84,6 @@ from areal.utils.logging import getLogger  # noqa: E402
 logger = getLogger("AwexColocateReader")
 
 
-def _patch_awex_qwen3_attention_names() -> None:
-    """Canonicalize Qwen3 SGLang attention names for the AWEX train reader."""
-    from awex.converter.sglang_converter import SGlangToHFWeightConverter
-
-    original_norm = SGlangToHFWeightConverter._convert_layer_norm_param
-    original_attention = SGlangToHFWeightConverter._convert_attention_param
-    if getattr(original_norm, "_areal_qwen3_attention_names", False):
-        return
-
-    def _convert_layer_norm_param(self, name, parameter, layer_number):
-        mapping = {
-            "self_attn.q_norm.weight": "attention.query_layernorm.weight",
-            "self_attn.k_norm.weight": "attention.key_layernorm.weight",
-        }
-        if name in mapping:
-            return [(mapping[name], parameter)]
-        return original_norm(self, name, parameter, layer_number)
-
-    def _convert_attention_param(self, name, parameter, layer_number):
-        mapping = {
-            "self_attn.qkv_proj.weight": "attention.query_key_value_proj.weight",
-            "self_attn.o_proj.weight": "attention.dense.weight",
-        }
-        if name in mapping:
-            return [(mapping[name], parameter)]
-        return original_attention(self, name, parameter, layer_number)
-
-    _convert_layer_norm_param._areal_qwen3_attention_names = True
-    SGlangToHFWeightConverter._convert_layer_norm_param = _convert_layer_norm_param
-    SGlangToHFWeightConverter._convert_attention_param = _convert_attention_param
-
-
-_patch_awex_qwen3_attention_names()
-
-
 def _add_tied_lm_head_meta_alias(
     raw_meta: dict[str, Any], hf_config: Any, model_context: dict[str, Any]
 ) -> None:

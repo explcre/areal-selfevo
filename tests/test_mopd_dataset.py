@@ -1,0 +1,102 @@
+# SPDX-License-Identifier: Apache-2.0
+
+import pytest
+
+from areal.api.cli_args import DatasetSourceConfig, TrainDatasetConfig
+from areal.dataset.mopd import (
+    MOPD_ROUTE_METADATA_KEY,
+    MOPDDataset,
+    get_mopd_dataset,
+    is_remote_dataset,
+)
+from areal.infra.data_service.rdataset import RDataset
+
+
+def test_mopd_dataset_routes_each_source_without_mutating_samples():
+    """Every item inherits only its source route and stored samples stay unchanged."""
+    samples = {
+        "math": [{"messages": ["m0"]}, {"messages": ["m1"]}],
+        "code": [{"messages": ["c0"]}],
+    }
+    config = TrainDatasetConfig(
+        sources=[
+            DatasetSourceConfig(path="math", type="rl", route="math_route"),
+            DatasetSourceConfig(path="code", type="rl", route="code_route"),
+        ]
+    )
+
+    dataset = get_mopd_dataset(
+        config,
+        source_loader=lambda **kwargs: samples[kwargs["source"].path],
+    )
+
+    assert len(dataset) == 3
+    assert [dataset[index][MOPD_ROUTE_METADATA_KEY] for index in range(3)] == [
+        "math_route",
+        "math_route",
+        "code_route",
+    ]
+    assert all("task_type" not in dataset[index] for index in range(3))
+    assert all(
+        MOPD_ROUTE_METADATA_KEY not in sample
+        for data in samples.values()
+        for sample in data
+    )
+
+
+@pytest.mark.parametrize("field", [MOPD_ROUTE_METADATA_KEY, "mopd_route"])
+def test_mopd_dataset_rejects_sample_level_route(field):
+    """Samples cannot override the route declared by their source."""
+    dataset = MOPDDataset([([{field: "sample-route"}], "source-route")])
+
+    with pytest.raises(ValueError, match="configured on the dataset source"):
+        dataset[0]
+
+
+class _RemoteSource(RDataset):
+    def __init__(self, samples):
+        self.samples = samples
+        self.connect_calls = []
+        self.prefetch_indices = []
+        self.closed = False
+
+    def connect(self, controller, dataset_id, **kwargs):
+        self.connect_calls.append((controller, dataset_id, kwargs))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        return self.samples[index]
+
+    def _start_prefetch(self, indices):
+        self.prefetch_indices.append(indices)
+
+    def close(self):
+        self.closed = True
+
+
+def test_remote_mopd_dataset_connects_and_prefetches_each_source():
+    """Global mixture indices are translated to each remote source correctly."""
+    first = _RemoteSource([{"id": 0}, {"id": 1}])
+    second = _RemoteSource([{"id": 2}, {"id": 3}, {"id": 4}])
+    dataset = MOPDDataset([(first, "r0"), (second, "r1")])
+
+    assert is_remote_dataset(dataset)
+    dataset.connect(
+        "controller",
+        dataset_id="mixture",
+        tokenizer_or_processor_path="tokenizer",
+        shuffle=True,
+        drop_last=True,
+    )
+    dataset._start_prefetch([4, 0, 2, 1, 3])
+
+    assert first.connect_calls[0][1] == "mixture_source_0"
+    assert second.connect_calls[0][1] == "mixture_source_1"
+    assert first.prefetch_indices == [[0, 1]]
+    assert second.prefetch_indices == [[2, 0, 1]]
+    assert dataset[2][MOPD_ROUTE_METADATA_KEY] == "r1"
+
+    dataset.close()
+    assert first.closed and second.closed

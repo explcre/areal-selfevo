@@ -15,6 +15,7 @@ def aggregate_mopd_targets(
     *,
     rl_coefficient: float,
     distillation_coefficient: float,
+    importance_ratio_cap: float,
 ) -> list[dict[str, Any]] | None:
     """Aggregate raw weighted teacher log-probabilities on an actor DP head."""
     if data is None:
@@ -67,5 +68,6 @@ def aggregate_mopd_targets(
         trajectory["mopd_teacher_weight_sum"] = weight_sum
         trajectory["mopd_rl_coefficient"] = rl_coefficient
         trajectory["mopd_distillation_coefficient"] = distillation_coefficient
+        trajectory["mopd_importance_ratio_cap"] = importance_ratio_cap
         trajectory.pop("mopd_route", None)
     return data

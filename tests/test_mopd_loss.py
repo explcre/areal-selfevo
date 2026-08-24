@@ -306,8 +306,9 @@ def test_grpo_loss_fn_composes_materialized_mopd_targets():
         "mopd_teacher_weight_sum": weight_sum,
         "mopd_rl_coefficient": 0.0,
         "mopd_distillation_coefficient": 1.0,
+        "mopd_importance_ratio_cap": 1.05,
     }
-    expected_loss, _ = mopd_loss_fn(*inputs)
+    expected_loss, _ = mopd_loss_fn(*inputs, importance_ratio_cap=1.05)
 
     with patch("areal.trainer.ppo.actor.stats_tracker", MagicMock()) as tracker:
         actual_loss = grpo_loss_fn(

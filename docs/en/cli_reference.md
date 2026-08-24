@@ -76,6 +76,7 @@ For detailed examples, see the experiment configurations in the `examples/` dire
 - [ArchonFP8 Configuration](section-archon-fp8)
 - [DPO Configuration](section-dpo)
 - [DPOEngine Configuration](section-dpo-engine)
+- [DatasetSource Configuration](section-dataset-source)
 - [DistributedDataParallel Configuration](section-distributed-data-parallel)
 - [FP8Engine Configuration](section-fp8-engine)
 - [MOPD Configuration](section-mopd)
@@ -692,21 +693,22 @@ https://docs.vllm.ai/en/stable/api/index.html for detailed documentation.
 
 Configuration for training dataset loading and preprocessing.
 
-| Parameter             | Type                                           | Default          | Description                                                                                                                                                                                                        |
-| --------------------- | ---------------------------------------------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `split`               | string                                         | `"train"`        | Dataset split to use, e.g., 'train', 'test'.                                                                                                                                                                       |
-| `path`                | string                                         | **Required**     | Path to the dataset. Can be a local path or a HuggingFace dataset name.                                                                                                                                            |
-| `type`                | string                                         | **Required**     | Type of training method, e.g., 'sft', 'rl', etc.                                                                                                                                                                   |
-| `batch_size`          | integer                                        | `1`              | Batch size for the dataloader                                                                                                                                                                                      |
-| `shuffle`             | boolean                                        | `True`           | Whether to shuffle the dataset                                                                                                                                                                                     |
-| `pin_memory`          | boolean                                        | `False`          | Pin memory for faster data loading (set True for GPU training)                                                                                                                                                     |
-| `num_workers`         | integer                                        | `0`              | Number of worker processes for data loading                                                                                                                                                                        |
-| `num_dataset_workers` | integer                                        | `1`              | Number of remote data-service worker processes to launch when using scheduling_spec.                                                                                                                               |
-| `drop_last`           | boolean                                        | `True`           | Drop the last incomplete batch                                                                                                                                                                                     |
-| `max_length`          | integer \| None                                | `None`           | Maximum token length of sequences in dataset. Longer sequences are filtered out.                                                                                                                                   |
-| `dataset_kwargs`      | `dict`                                         | `{}`             | Additional keyword arguments for dataset loading. These are passed to the dataset loading function `get_custom_dataset`.                                                                                           |
-| `scheduling_spec`     | [`SchedulingSpec`](section-scheduling) \| None | *SchedulingSpec* | Scheduling spec for remote data loading workers. If set, dataset loading will be offloaded to a data service with remote workers.                                                                                  |
-| `setup_timeout`       | float                                          | `120.0`          | Timeout in seconds for the data service to load and register a dataset. Increase this value when loading large datasets for the first time (e.g. HuggingFace datasets that require downloading and preprocessing). |
+| Parameter             | Type                                                    | Default          | Description                                                                                                                                                                                                        |
+| --------------------- | ------------------------------------------------------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `split`               | string                                                  | `"train"`        | Dataset split to use, e.g., 'train', 'test'.                                                                                                                                                                       |
+| `path`                | string \| None                                          | `None`           | Path to one dataset. Mutually exclusive with sources.                                                                                                                                                              |
+| `type`                | string \| None                                          | `None`           | Training data type for path. Mutually exclusive with sources.                                                                                                                                                      |
+| `sources`             | list of [`DatasetSourceConfig`](section-dataset-source) | `[]`             | Dataset sources for MOPD. Every source must declare a route.                                                                                                                                                       |
+| `batch_size`          | integer                                                 | `1`              | Batch size for the dataloader                                                                                                                                                                                      |
+| `shuffle`             | boolean                                                 | `True`           | Whether to shuffle the dataset                                                                                                                                                                                     |
+| `pin_memory`          | boolean                                                 | `False`          | Pin memory for faster data loading (set True for GPU training)                                                                                                                                                     |
+| `num_workers`         | integer                                                 | `0`              | Number of worker processes for data loading                                                                                                                                                                        |
+| `num_dataset_workers` | integer                                                 | `1`              | Number of remote data-service worker processes to launch when using scheduling_spec.                                                                                                                               |
+| `drop_last`           | boolean                                                 | `True`           | Drop the last incomplete batch                                                                                                                                                                                     |
+| `max_length`          | integer \| None                                         | `None`           | Maximum token length of sequences in dataset. Longer sequences are filtered out.                                                                                                                                   |
+| `dataset_kwargs`      | `dict`                                                  | `{}`             | Additional keyword arguments for dataset loading. These are passed to the dataset loading function `get_custom_dataset`.                                                                                           |
+| `scheduling_spec`     | [`SchedulingSpec`](section-scheduling) \| None          | *SchedulingSpec* | Scheduling spec for remote data loading workers. If set, dataset loading will be offloaded to a data service with remote workers.                                                                                  |
+| `setup_timeout`       | float                                                   | `120.0`          | Timeout in seconds for the data service to load and register a dataset. Increase this value when loading large datasets for the first time (e.g. HuggingFace datasets that require downloading and preprocessing). |
 
 (section-valid-dataset)=
 
@@ -717,21 +719,22 @@ Configuration for validation dataset loading and preprocessing.
 It has different default values with `TrainDatasetConfig`. `shuffle` and `drop_last`
 default to False.
 
-| Parameter             | Type                                           | Default          | Description                                                                                                                                                                                                        |
-| --------------------- | ---------------------------------------------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `split`               | string                                         | `"test"`         | Dataset split to use, e.g., 'train', 'test'.                                                                                                                                                                       |
-| `path`                | string                                         | **Required**     | Path to the dataset. Can be a local path or a HuggingFace dataset name.                                                                                                                                            |
-| `type`                | string                                         | **Required**     | Type of training method, e.g., 'sft', 'rl', etc.                                                                                                                                                                   |
-| `batch_size`          | integer                                        | `1`              | Batch size for the dataloader                                                                                                                                                                                      |
-| `shuffle`             | boolean                                        | `False`          | Whether to shuffle the dataset                                                                                                                                                                                     |
-| `pin_memory`          | boolean                                        | `False`          | Pin memory for faster data loading (set True for GPU training)                                                                                                                                                     |
-| `num_workers`         | integer                                        | `0`              | Number of worker processes for data loading                                                                                                                                                                        |
-| `num_dataset_workers` | integer                                        | `1`              | Number of remote data-service worker processes to launch when using scheduling_spec.                                                                                                                               |
-| `drop_last`           | boolean                                        | `False`          | Drop the last incomplete batch                                                                                                                                                                                     |
-| `max_length`          | integer \| None                                | `None`           | Maximum token length of sequences in dataset. Longer sequences are filtered out.                                                                                                                                   |
-| `dataset_kwargs`      | `dict`                                         | `{}`             | Additional keyword arguments for dataset loading. These are passed to the dataset loading function `get_custom_dataset`.                                                                                           |
-| `scheduling_spec`     | [`SchedulingSpec`](section-scheduling) \| None | *SchedulingSpec* | Scheduling spec for remote data loading workers. If set, dataset loading will be offloaded to a data service with remote workers.                                                                                  |
-| `setup_timeout`       | float                                          | `120.0`          | Timeout in seconds for the data service to load and register a dataset. Increase this value when loading large datasets for the first time (e.g. HuggingFace datasets that require downloading and preprocessing). |
+| Parameter             | Type                                                    | Default          | Description                                                                                                                                                                                                        |
+| --------------------- | ------------------------------------------------------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `split`               | string                                                  | `"test"`         | Dataset split to use, e.g., 'train', 'test'.                                                                                                                                                                       |
+| `path`                | string \| None                                          | `None`           | Path to one dataset. Mutually exclusive with sources.                                                                                                                                                              |
+| `type`                | string \| None                                          | `None`           | Training data type for path. Mutually exclusive with sources.                                                                                                                                                      |
+| `sources`             | list of [`DatasetSourceConfig`](section-dataset-source) | `[]`             | Dataset sources for MOPD. Every source must declare a route.                                                                                                                                                       |
+| `batch_size`          | integer                                                 | `1`              | Batch size for the dataloader                                                                                                                                                                                      |
+| `shuffle`             | boolean                                                 | `False`          | Whether to shuffle the dataset                                                                                                                                                                                     |
+| `pin_memory`          | boolean                                                 | `False`          | Pin memory for faster data loading (set True for GPU training)                                                                                                                                                     |
+| `num_workers`         | integer                                                 | `0`              | Number of worker processes for data loading                                                                                                                                                                        |
+| `num_dataset_workers` | integer                                                 | `1`              | Number of remote data-service worker processes to launch when using scheduling_spec.                                                                                                                               |
+| `drop_last`           | boolean                                                 | `False`          | Drop the last incomplete batch                                                                                                                                                                                     |
+| `max_length`          | integer \| None                                         | `None`           | Maximum token length of sequences in dataset. Longer sequences are filtered out.                                                                                                                                   |
+| `dataset_kwargs`      | `dict`                                                  | `{}`             | Additional keyword arguments for dataset loading. These are passed to the dataset loading function `get_custom_dataset`.                                                                                           |
+| `scheduling_spec`     | [`SchedulingSpec`](section-scheduling) \| None          | *SchedulingSpec* | Scheduling spec for remote data loading workers. If set, dataset loading will be offloaded to a data service with remote workers.                                                                                  |
+| `setup_timeout`       | float                                                   | `120.0`          | Timeout in seconds for the data service to load and register a dataset. Increase this value when loading large datasets for the first time (e.g. HuggingFace datasets that require downloading and preprocessing). |
 
 (section-cluster)=
 
@@ -1042,6 +1045,21 @@ fields.
 | `beta`                   | float                                               | `0.1`                  | KL penalty coefficient for DPO loss.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `loss_type`              | string                                              | `"sigmoid"`            | DPO loss variant. 'sigmoid': original DPO loss (Rafailov et al. 2023). 'ipo': Identity Preference Optimization with per-token length normalization (Azar et al. 2023). **Choices:** `sigmoid`, `ipo`                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 
+(section-dataset-source)=
+
+## DatasetSource Configuration
+
+One dataset source in a routed MOPD dataset mixture.
+
+| Parameter        | Type            | Default      | Description                                                   |
+| ---------------- | --------------- | ------------ | ------------------------------------------------------------- |
+| `path`           | string          | **Required** | Local path or HuggingFace name for this dataset source.       |
+| `type`           | string          | **Required** | Training data type, for example 'rl'.                         |
+| `route`          | string          | **Required** | Required MOPD route applied to every sample from this source. |
+| `split`          | string \| None  | `None`       | Optional split override for this dataset source.              |
+| `max_length`     | integer \| None | `None`       | Optional maximum sequence length for this source.             |
+| `dataset_kwargs` | `dict`          | `{}`         | Extra keyword arguments for this source's loader.             |
+
 (section-distributed-data-parallel)=
 
 ## DistributedDataParallel Configuration
@@ -1095,14 +1113,13 @@ is disabled.
 
 Configuration for multi-teacher on-policy distillation.
 
-| Parameter              | Type                                                       | Default                    | Description                                       |
-| ---------------------- | ---------------------------------------------------------- | -------------------------- | ------------------------------------------------- |
-| `task_type_identifier` | string                                                     | `"task_type"`              | Source sample field used to select an MOPD route. |
-| `teachers`             | `dict`                                                     | `{}`                       | -                                                 |
-| `routes`               | `dict`                                                     | `{}`                       | -                                                 |
-| `teacher_engine`       | [`MOPDTeacherEngineConfig`](section-mopd-teacher-engine)   | *MOPDTeacherEngineConfig*  | -                                                 |
-| `manager`              | [`MOPDTeacherManagerConfig`](section-mopd-teacher-manager) | *MOPDTeacherManagerConfig* | -                                                 |
-| `loss`                 | [`MOPDLossConfig`](section-mopd-loss)                      | *MOPDLossConfig*           | -                                                 |
+| Parameter        | Type                                                       | Default                    | Description |
+| ---------------- | ---------------------------------------------------------- | -------------------------- | ----------- |
+| `teachers`       | `dict`                                                     | `{}`                       | -           |
+| `routes`         | `dict`                                                     | `{}`                       | -           |
+| `teacher_engine` | [`MOPDTeacherEngineConfig`](section-mopd-teacher-engine)   | *MOPDTeacherEngineConfig*  | -           |
+| `manager`        | [`MOPDTeacherManagerConfig`](section-mopd-teacher-manager) | *MOPDTeacherManagerConfig* | -           |
+| `loss`           | [`MOPDLossConfig`](section-mopd-loss)                      | *MOPDLossConfig*           | -           |
 
 (section-mopd-loss)=
 
@@ -1113,7 +1130,7 @@ Coefficients for joint RL and multi-teacher distillation training.
 | Parameter                  | Type  | Default | Description                                        |
 | -------------------------- | ----- | ------- | -------------------------------------------------- |
 | `rl_coefficient`           | float | `0.0`   | Coefficient applied to the RL objective.           |
-| `distillation_coefficient` | float | `0.005` | Coefficient applied to the MOPD objective.         |
+| `distillation_coefficient` | float | `1.0`   | Coefficient applied to the MOPD objective.         |
 | `importance_ratio_cap`     | float | `5.0`   | Positive cap applied to the behavior-policy ratio. |
 
 (section-mopd-teacher-engine)=

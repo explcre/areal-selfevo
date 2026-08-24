@@ -225,12 +225,14 @@ class PPOActor:
         *,
         rl_coefficient: float = 0.0,
         distillation_coefficient: float = 0.0,
+        importance_ratio_cap: float = 5.0,
     ) -> list[dict[str, Any]] | None:
         """Fetch-localized teacher contributions and create actor-owned targets."""
         return aggregate_mopd_targets(
             data,
             rl_coefficient=rl_coefficient,
             distillation_coefficient=distillation_coefficient,
+            importance_ratio_cap=importance_ratio_cap,
         )
 
     def assert_mopd_runtime_topology(self) -> None:
@@ -776,8 +778,9 @@ def grpo_loss_fn(
         mopd_config = MOPDLossConfig(
             rl_coefficient=input_data.get("mopd_rl_coefficient", 0.0),
             distillation_coefficient=input_data.get(
-                "mopd_distillation_coefficient", 0.005
+                "mopd_distillation_coefficient", 1.0
             ),
+            importance_ratio_cap=input_data.get("mopd_importance_ratio_cap", 5.0),
         )
         loss, mopd_stats = compose_mopd_loss(
             loss,

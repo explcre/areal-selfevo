@@ -34,6 +34,7 @@ from areal.api.cli_args import (
     ValidDatasetConfig,
     vLLMConfig,
 )
+from areal.dataset.mopd import MOPDDataset, is_remote_dataset
 from areal.engine import RemoteSGLangEngine, RemotevLLMEngine
 from areal.infra import (
     LocalScheduler,
@@ -147,8 +148,8 @@ class PPOTrainer:
         if is_single_controller():
             self.scheduler = self._init_scheduler()
         self.data_controller: DataController | None = None
-        self._train_rdataset: RDataset | None = None
-        self._valid_rdataset: RDataset | None = None
+        self._train_rdataset: RDataset | MOPDDataset | None = None
+        self._valid_rdataset: RDataset | MOPDDataset | None = None
 
         # Set seed.
         seeding.set_random_seed(config.seed, key=f"trainer{rank}")
@@ -251,7 +252,7 @@ class PPOTrainer:
             )
         else:
             assert train_dataset is not None
-            if is_single_controller() and isinstance(train_dataset, RDataset):
+            if is_single_controller() and is_remote_dataset(train_dataset):
                 ds_cfg = DataServiceConfig.from_dataset_config(
                     config.train_dataset, seed=config.seed
                 )
@@ -280,7 +281,7 @@ class PPOTrainer:
         self.valid_dataloader: StatefulDataLoader | None = None
         if self.config.valid_dataset is not None and valid_dataset is not None:
             assert self.config.valid_dataset is not None
-            if is_single_controller() and isinstance(valid_dataset, RDataset):
+            if is_single_controller() and is_remote_dataset(valid_dataset):
                 assert self.data_controller is not None
                 valid_dataset.connect(
                     self.data_controller,
@@ -1385,6 +1386,7 @@ class PPOTrainer:
                 rollout_batch,
                 rl_coefficient=config.loss.rl_coefficient,
                 distillation_coefficient=config.loss.distillation_coefficient,
+                importance_ratio_cap=config.loss.importance_ratio_cap,
             )
             # ``aggregate_mopd_targets`` localizes the original rollout shards
             # on actor heads, then remotizes its result under fresh shard IDs.
@@ -1563,7 +1565,7 @@ class PPOTrainer:
         else:
             controller = engine_cls.as_controller(config, self.scheduler)
         if self.config.mopd is not None and not is_eval:
-            controller.set_mopd_route_identifier(self.config.mopd.task_type_identifier)
+            controller.enable_mopd_routing()
         init_kwargs = dict(
             role="rollout",
             server_args=server_args,

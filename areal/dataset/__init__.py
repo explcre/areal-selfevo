@@ -3,6 +3,7 @@
 from typing import TYPE_CHECKING, Optional
 
 from areal.api.cli_args import _DatasetConfig
+from areal.dataset.mopd import MOPDDataset, get_mopd_dataset
 from areal.utils import logging
 
 if TYPE_CHECKING:
@@ -171,6 +172,18 @@ def get_custom_dataset(
 ) -> "Dataset | RDataset":
     from areal.utils.environ import is_single_controller
 
+    if dataset_config is not None and dataset_config.sources:
+        raise ValueError(
+            "dataset_config.sources requires areal.dataset.get_mopd_dataset()"
+        )
+    if dataset_config is not None and (
+        not isinstance(dataset_config.path, str)
+        or not dataset_config.path.strip()
+        or not isinstance(dataset_config.type, str)
+        or not dataset_config.type.strip()
+    ):
+        raise ValueError("dataset_config.path and dataset_config.type are required")
+
     if (
         is_single_controller()
         and dataset_config is not None
@@ -207,6 +220,8 @@ def get_custom_dataset(
 
 
 __all__ = [
+    "MOPDDataset",
     "VALID_DATASETS",
     "get_custom_dataset",
+    "get_mopd_dataset",
 ]

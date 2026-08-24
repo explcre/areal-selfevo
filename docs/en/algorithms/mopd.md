@@ -1,9 +1,9 @@
 # Multi-Teacher On-Policy Distillation (MOPD)
 
 MOPD combines on-policy reinforcement learning with token-level targets from one or
-more teacher checkpoints. Each sample selects a configured route, and a route assigns
-non-negative weights to its teachers. The weights are applied directly and are not
-normalized.
+more teacher checkpoints. Each dataset source selects one required route, and a route
+assigns non-negative weights to any number of teachers. The weights are applied
+directly and are not normalized.
 
 MOPD currently runs in single-controller mode with Megatron actor and teacher engines,
 an SGLang rollout engine, and AWEX colocated weight transfer. Actor, rollout, and a
@@ -14,8 +14,9 @@ at the same time.
 
 Each training step follows three exclusive phases:
 
-1. **Rollout:** SGLang generates trajectories and propagates the route as
-   `mopd_route`.
+1. **Rollout:** SGLang generates trajectories while AReaL propagates the source route
+   as internal task metadata. Dataset samples and workflow inputs need no routing
+   field.
 2. **Teacher:** rollout weights and KV cache are offloaded. A forked Megatron teacher
    process onloads, loads each required checkpoint, and scores its routed samples. The
    actor materializes and clears all teacher RTensors before the teacher weights are
@@ -42,8 +43,12 @@ rollout:
   backend: sglang:d8t1
   scheduling_strategy: {type: colocation, target: actor, fork: true}
 
+train_dataset:
+  sources:
+    - {path: /data/code, type: rl, route: coding}
+    - {path: /data/mixed, type: rl, route: mixed}
+
 mopd:
-  task_type_identifier: task_type
   teachers:
     coder: {path: /models/teacher-coder}
     reasoning: {path: /models/teacher-reasoning}
@@ -61,12 +66,13 @@ mopd:
     staging_root: /dev/shm/areal-mopd
   loss:
     rl_coefficient: 0.0
-    distillation_coefficient: 0.005
+    distillation_coefficient: 1.0
 ```
 
-Every dataset item must contain the field named by `task_type_identifier`. Its value
-must match a key in `routes`. A route must reference known teacher IDs and contain at
-least one positive weight.
+Every entry in `train_dataset.sources` must declare a `route` that matches a key in
+`mopd.routes`; validation datasets follow the same rule when configured. Samples
+cannot override their source route and need no `task_type` field. A route can reference
+any number of known teacher IDs and must contain at least one positive weight.
 
 `manager.type: disk` loads checkpoints from shared storage and supports multi-node
 runs. `local_memory` asynchronously stages one upcoming checkpoint below

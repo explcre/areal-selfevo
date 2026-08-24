@@ -12,7 +12,7 @@ from typing import Any
 from areal import PPOTrainer
 from areal.api import AsyncRewardWrapper
 from areal.api.cli_args import GRPOConfig, load_expr_config
-from areal.dataset import get_custom_dataset
+from areal.dataset import get_custom_dataset, get_mopd_dataset
 from areal.reward import gsm8k_reward_fn
 from areal.utils.hf_utils import load_hf_tokenizer
 
@@ -67,9 +67,9 @@ class GSM8KRewardDistillationAgent:
         return {response.id: float(reward)}
 
 
-def add_mopd_route(sample: dict[str, Any]) -> dict[str, Any]:
-    """Attach the single-teacher route and the reference no-think prompt suffix."""
-    update: dict[str, Any] = {"task_type": MOPD_ROUTE}
+def add_no_think_suffix(sample: dict[str, Any]) -> dict[str, Any]:
+    """Attach the reference no-think prompt suffix without dataset routing fields."""
+    update: dict[str, Any] = {}
     messages = sample.get("messages")
     if not isinstance(messages, list):
         return update
@@ -85,21 +85,21 @@ def add_mopd_route(sample: dict[str, Any]) -> dict[str, Any]:
     return update
 
 
-def load_routed_gsm8k_dataset(
-    dataset_config: Any,
+def _load_gsm8k_source(
+    source_config: Any,
     *,
     split: str,
     tokenizer: Any,
 ):
     """Load either a local parquet mirror or a standard AReaL dataset snapshot."""
-    path = Path(dataset_config.path)
+    path = Path(source_config.path)
     parquet_files = sorted((path / "main").glob(f"{split}-*.parquet"))
     if not parquet_files:
         return get_custom_dataset(
             split=split,
-            dataset_config=dataset_config,
+            dataset_config=source_config,
             tokenizer=tokenizer,
-        ).map(add_mopd_route, desc="Attach Qwen3-14B MOPD route")
+        ).map(add_no_think_suffix, desc="Attach Qwen3-14B no-think suffix")
 
     from datasets import load_dataset
 
@@ -119,20 +119,41 @@ def load_routed_gsm8k_dataset(
                 }
             ],
         }
-        return formatted | add_mopd_route(formatted)
+        return formatted | add_no_think_suffix(formatted)
 
     dataset = dataset.map(
         process,
         remove_columns=["question"],
         desc=f"Format routed GSM8K {split} split",
     )
-    if dataset_config.max_length is not None:
+    if source_config.max_length is not None:
         dataset = dataset.filter(
             lambda sample: len(tokenizer.encode(sample["messages"][0]["content"]))
-            <= dataset_config.max_length,
+            <= source_config.max_length,
             desc=f"Filter GSM8K {split} prompts by length",
         )
     return dataset
+
+
+def load_routed_gsm8k_dataset(
+    dataset_config: Any,
+    *,
+    tokenizer: Any,
+):
+    """Load all configured GSM8K sources with source-level MOPD routes."""
+
+    def load_source(**kwargs):
+        return _load_gsm8k_source(
+            kwargs["source_config"],
+            split=kwargs["split"],
+            tokenizer=kwargs["tokenizer"],
+        )
+
+    return get_mopd_dataset(
+        dataset_config,
+        tokenizer=tokenizer,
+        source_loader=load_source,
+    )
 
 
 def train(argv: list[str]) -> None:
@@ -142,13 +163,11 @@ def train(argv: list[str]) -> None:
 
     train_dataset = load_routed_gsm8k_dataset(
         config.train_dataset,
-        split="train",
         tokenizer=tokenizer,
     )
     assert config.valid_dataset is not None
     valid_dataset = load_routed_gsm8k_dataset(
         config.valid_dataset,
-        split="test",
         tokenizer=tokenizer,
     )
 

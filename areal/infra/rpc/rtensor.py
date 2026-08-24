@@ -252,7 +252,7 @@ class HttpRTensorBackend:
         _store_local(shard_id, tensor)
         return shard_id
 
-    async def delete(self, node_addr: str, shard_ids: list[str]) -> None:
+    async def delete(self, node_addr: str, shard_ids: list[str]) -> int:
         """Delete shards via HTTP DELETE request."""
         from areal.utils.network import format_hostport, split_hostport
 

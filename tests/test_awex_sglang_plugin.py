@@ -7,7 +7,6 @@ import torch
 
 from areal.engine.awex.colocate_reader import (
     _add_tied_lm_head_meta_alias,
-    _patch_awex_qwen3_attention_names,
     _PhysicalDeviceMetaServerClient,
 )
 from areal.engine.awex.memory_saver import patch_tms_hook_mode
@@ -109,31 +108,6 @@ def test_tms_hook_mode_stays_preload_after_initialization(monkeypatch):
     saver.hook_mode = "torch"
 
     assert saver._impl_ctor_kwargs == {}
-
-
-def test_awex_converter_canonicalizes_qwen3_attention_names():
-    """Qwen3 infer metadata matches AWEX's MCore canonical attention names."""
-    from awex.converter.sglang_converter import SGlangToHFWeightConverter
-
-    _patch_awex_qwen3_attention_names()
-    converter = object.__new__(SGlangToHFWeightConverter)
-    parameter = torch.ones(128, dtype=torch.bfloat16)
-
-    expected = {
-        "self_attn.q_norm.weight": "attention.query_layernorm.weight",
-        "self_attn.k_norm.weight": "attention.key_layernorm.weight",
-    }
-    for name, canonical_name in expected.items():
-        converted = converter._convert_layer_norm_param(name, parameter, "0")
-        assert converted == [(canonical_name, parameter)]
-
-    expected = {
-        "self_attn.qkv_proj.weight": "attention.query_key_value_proj.weight",
-        "self_attn.o_proj.weight": "attention.dense.weight",
-    }
-    for name, canonical_name in expected.items():
-        converted = converter._convert_attention_param(name, parameter, "0")
-        assert converted == [(canonical_name, parameter)]
 
 
 @pytest.mark.parametrize(

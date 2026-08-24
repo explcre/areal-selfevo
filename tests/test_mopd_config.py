@@ -6,6 +6,7 @@ import pytest
 from omegaconf import OmegaConf
 
 from areal.api.cli_args import (
+    DatasetSourceConfig,
     InferenceEngineConfig,
     MOPDConfig,
     MOPDLossConfig,
@@ -17,6 +18,7 @@ from areal.api.cli_args import (
     SchedulerConfig,
     SchedulingStrategy,
     TeacherConfig,
+    TrainDatasetConfig,
     to_structured_cfg,
 )
 
@@ -62,6 +64,16 @@ def _ppo_config(mopd: MOPDConfig | None = None, **overrides) -> PPOConfig:
         ),
         "mopd": mopd,
     }
+    if mopd is not None:
+        kwargs["train_dataset"] = TrainDatasetConfig(
+            sources=[
+                DatasetSourceConfig(
+                    path="datasets/train",
+                    type="rl",
+                    route=next(iter(mopd.routes)),
+                )
+            ]
+        )
     kwargs.update(overrides)
     return PPOConfig(**kwargs)
 
@@ -71,6 +83,14 @@ def test_ppo_config_without_mopd_preserves_disabled_default():
     config = _ppo_config()
 
     assert config.mopd is None
+
+
+def test_mopd_loss_config_defaults_to_unscaled_distillation():
+    """The standalone MOPD objective uses a neutral coefficient by default."""
+    config = MOPDLossConfig()
+
+    assert config.rl_coefficient == 0.0
+    assert config.distillation_coefficient == 1.0
 
 
 def test_mopd_config_valid_preserves_teacher_and_route_order_and_weights():
@@ -85,7 +105,45 @@ def test_mopd_config_valid_preserves_teacher_and_route_order_and_weights():
         "swe_agent": 0.7,
     }
     assert config.mopd.loss.rl_coefficient == 0.0
-    assert config.mopd.loss.distillation_coefficient == 0.005
+    assert config.mopd.loss.distillation_coefficient == 1.0
+    assert config.train_dataset.sources[0].route == "single"
+
+
+def test_mopd_config_requires_routed_dataset_sources():
+    """MOPD rejects the legacy single-path dataset shape."""
+    with pytest.raises(ValueError, match="train_dataset.sources must not be empty"):
+        _ppo_config(
+            _mopd_config(),
+            train_dataset=TrainDatasetConfig(path="dataset", type="rl"),
+        )
+
+
+def test_mopd_dataset_source_requires_route():
+    """Every source must select a route explicitly."""
+    with pytest.raises(ValueError, match="source route must be a non-empty string"):
+        DatasetSourceConfig(path="dataset", type="rl")
+
+
+def test_mopd_dataset_source_rejects_unknown_route():
+    """A source cannot select a route absent from mopd.routes."""
+    train_dataset = TrainDatasetConfig(
+        sources=[DatasetSourceConfig(path="dataset", type="rl", route="missing")]
+    )
+
+    with pytest.raises(ValueError, match="unknown MOPD route 'missing'"):
+        _ppo_config(_mopd_config(), train_dataset=train_dataset)
+
+
+def test_mopd_dataset_sources_reject_legacy_path_and_type():
+    """Mixture sources and the legacy single-source fields are mutually exclusive."""
+    train_dataset = TrainDatasetConfig(
+        path="legacy",
+        type="rl",
+        sources=[DatasetSourceConfig(path="dataset", type="rl", route="single")],
+    )
+
+    with pytest.raises(ValueError, match="path/type cannot be used"):
+        _ppo_config(_mopd_config(), train_dataset=train_dataset)
 
 
 def test_mopd_config_yaml_shape_converts_to_structured_config():
@@ -94,7 +152,9 @@ def test_mopd_config_yaml_shape_converts_to_structured_config():
         {
             "experiment_name": "mopd-test",
             "trial_name": "trial",
-            "train_dataset": {"path": "dataset", "type": "rl"},
+            "train_dataset": {
+                "sources": [{"path": "dataset", "type": "rl", "route": "math"}]
+            },
             "saver": {
                 "experiment_name": "mopd-test",
                 "trial_name": "trial",
@@ -154,6 +214,8 @@ def test_mopd_config_yaml_shape_converts_to_structured_config():
     assert isinstance(config.mopd, MOPDConfig)
     assert isinstance(config.mopd.teachers["agriculture"], MOPDTeacherSpec)
     assert config.mopd.routes["math"]["agriculture"] == 2.0
+    assert isinstance(config.train_dataset.sources[0], DatasetSourceConfig)
+    assert config.train_dataset.sources[0].route == "math"
 
 
 @pytest.mark.parametrize("weight", [-1.0, math.inf, math.nan, True, "1.0"])

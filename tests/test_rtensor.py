@@ -336,6 +336,40 @@ class TestHttpRTensorBackendBatching:
         ):
             asyncio.run(backend._fetch_shard_group(_FakeSession(), "node-a", grouped))
 
+    def test_delete_returns_cleared_shard_count(self, monkeypatch):
+        """The HTTP backend returns the server-reported cleanup count."""
+        backend = HttpRTensorBackend()
+
+        class _FakeResponse:
+            status = 200
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def json(self):
+                return {"status": "ok", "cleared_count": 2}
+
+        class _FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            def delete(self, url, json):
+                assert url == "http://node-a/data/clear"
+                assert json == {"shard_ids": ["s0", "s1"]}
+                return _FakeResponse()
+
+        monkeypatch.setattr(backend, "_create_session", _FakeSession)
+
+        cleared_count = asyncio.run(backend.delete("node-a", ["s0", "s1"]))
+
+        assert cleared_count == 2
+
 
 class TestRTensorErrorHandling:
     """Test error handling for network and storage failures."""
