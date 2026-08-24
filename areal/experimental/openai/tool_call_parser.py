@@ -46,15 +46,6 @@ _SGLANG_TO_VLLM_TOOL_PARSER: dict[str, str] = {
 }
 
 
-_sglang_missing_warned: set[str] = set()
-
-
-def _warn_sglang_missing(feature: str, detail: str) -> None:
-    if feature not in _sglang_missing_warned:
-        _sglang_missing_warned.add(feature)
-        logger.warning("sglang is not installed; %s. %s", feature, detail)
-
-
 def _detect_think_and_return_ori_think(
     text: str, think_start_token: str, think_end_token: str
 ) -> tuple[str, str]:
@@ -283,11 +274,10 @@ def _process_tool_calls_sglang(
         )
         from sglang.srt.parser.reasoning_parser import ReasoningParser
     except ImportError:
-        _warn_sglang_missing(
-            "tool-call parsing is disabled",
-            "Responses pass through with raw text; install sglang to parse tool calls.",
-        )
-        return None, text, finish_reason
+        # Let the backend dispatcher try vLLM before giving up. Returning raw
+        # text here would make an installed vLLM parser unreachable whenever
+        # SGLang is absent.
+        raise ModuleNotFoundError("SGLang tool-call parser is unavailable") from None
 
     if use_responses:
         tools = [

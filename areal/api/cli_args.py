@@ -1462,6 +1462,11 @@ class TrainEngineConfig:
             raise ValueError(
                 f"_version must be either 'v1' or 'v2', got '{self._version}'"
             )
+        if self.weight_update_mode == "awex" and not self.megatron.wrap_with_ddp:
+            raise ValueError(
+                "weight_update_mode='awex' requires megatron.wrap_with_ddp=true "
+                "because AWEX offloads MCore DDP flat buffers"
+            )
 
         # Canonicalize common aliases so getattr(torch, ...) works at runtime.
         # Storage map omits fp16 since float16 is not a valid optimizer_dtype;
@@ -3635,6 +3640,14 @@ class PPOConfig(BaseExperimentConfig):
                 "The shared stats tracker can make rollout metrics inaccurate "
                 "during export_stats; use fork=true when accurate rollout "
                 "telemetry is required."
+            )
+        required_actor_ports = 2 if rollout_schedule.fork else 3
+        actor_worker_ports = self.actor.scheduling_spec[0].port_count
+        if actor_worker_ports < required_actor_ports:
+            raise ValueError(
+                "MOPD colocated rollout requires actor.scheduling_spec[0]."
+                f"port_count >= {required_actor_ports} when fork="
+                f"{rollout_schedule.fork}, got {actor_worker_ports}"
             )
 
         actor_alloc = ModelAllocation.from_str(self.actor.backend, name="actor")

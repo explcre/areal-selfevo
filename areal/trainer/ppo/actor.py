@@ -42,7 +42,6 @@ from areal.utils.data import (
     batched_call,
     split_padded_tensor_dict_into_mb_list,
 )
-from areal.utils.data_hook import DataHookManager
 from areal.utils.functional import (
     cispo_loss_fn,
     ppo_actor_loss_fn,
@@ -103,42 +102,16 @@ class PPOActor:
         self.temperature = config.temperature
 
         self.m2_threshold = config.m2_threshold
-
-        self._data_hook_specs = tuple(getattr(config, "data_hooks", None) or ())
-        self.data_hook_role: str | None = None
-        self.data_hooks: DataHookManager | None = None
-        self._data_hooks_closed = False
+        self._mopd_loss_config: MOPDLossConfig | None = None
 
         # Log critical GSPO/GRPO configuration for reproducibility
         self._log_configuration()
 
-    def setup_data_hooks(self, role: str) -> None:
-        """Set up configured hooks once the worker's algorithm role is known."""
-        if self._data_hooks_closed:
-            raise RuntimeError("Cannot set up data hooks after they were closed")
-        if not isinstance(role, str) or not role:
-            raise ValueError("Data hook role must be a non-empty string")
-        if self.data_hooks is not None:
-            if self.data_hook_role == role or not self._data_hook_specs:
-                self.data_hook_role = role
-                return
-            raise RuntimeError(
-                f"Data hooks are already set up for role {self.data_hook_role!r}, "
-                f"not {role!r}"
-            )
-        self.data_hooks = DataHookManager(self._data_hook_specs, role=role)
-        self.data_hook_role = role
-
-    def _require_data_hooks(self) -> DataHookManager:
-        if self.data_hooks is None:
-            if self._data_hook_specs:
-                raise RuntimeError(
-                    "Configured data hooks were not set up with a worker role"
-                )
-            # Preserve direct unit-level PPOActor usage that has no hook config.
-            self.setup_data_hooks("actor")
-        assert self.data_hooks is not None
-        return self.data_hooks
+    def configure_mopd_loss(self, config: MOPDLossConfig) -> None:
+        """Bind static MOPD loss settings once on each actor worker."""
+        if self._mopd_loss_config is not None and self._mopd_loss_config != config:
+            raise RuntimeError("MOPD loss configuration is already bound")
+        self._mopd_loss_config = config
 
     def _log_configuration(self):
         """Log PPO configuration including how proximal policy is computed."""
@@ -203,14 +176,7 @@ class PPOActor:
     @trace_perf("ppo_actor.compute_logp", category="compute")
     @torch.no_grad()
     def compute_logp(self, data: list[dict[str, Any]]) -> list[torch.Tensor] | None:
-        data_hooks = self._require_data_hooks()
-        data, hook_state = data_hooks.run_pre(
-            f"{self.data_hook_role}_pre_compute_logp", data
-        )
-        result = batched_call(self._compute_logp, data)
-        return data_hooks.run_post(
-            f"{self.data_hook_role}_post_compute_logp", result, hook_state
-        )
+        return batched_call(self._compute_logp, data)
 
     def _compute_logp(self, data: dict[str, Any]) -> torch.Tensor | None:
         self.engine.eval()
@@ -222,18 +188,9 @@ class PPOActor:
     def aggregate_mopd_targets(
         self,
         data: list[dict[str, Any]] | None = None,
-        *,
-        rl_coefficient: float = 0.0,
-        distillation_coefficient: float = 0.0,
-        importance_ratio_cap: float = 5.0,
     ) -> list[dict[str, Any]] | None:
         """Fetch-localized teacher contributions and create actor-owned targets."""
-        return aggregate_mopd_targets(
-            data,
-            rl_coefficient=rl_coefficient,
-            distillation_coefficient=distillation_coefficient,
-            importance_ratio_cap=importance_ratio_cap,
-        )
+        return aggregate_mopd_targets(data)
 
     def assert_mopd_runtime_topology(self) -> None:
         """Validate the live Megatron process groups used for MOPD scoring."""
@@ -241,14 +198,7 @@ class PPOActor:
 
     @trace_perf("ppo_actor.compute_advantages", category="compute")
     def compute_advantages(self, data: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        data_hooks = self._require_data_hooks()
-        data, hook_state = data_hooks.run_pre(
-            f"{self.data_hook_role}_pre_compute_advantages", data
-        )
-        result = batched_call(self._compute_advantages, data, pass_meta=True)
-        return data_hooks.run_post(
-            f"{self.data_hook_role}_post_compute_advantages", result, hook_state
-        )
+        return batched_call(self._compute_advantages, data, pass_meta=True)
 
     def _compute_advantages(
         self, data: dict[str, Any], meta: TrajBatchMeta | None = None
@@ -288,6 +238,14 @@ class PPOActor:
 
         loss_mask = data["loss_mask"].float()
         loss_mask = torch.roll(loss_mask, shifts=-1, dims=-1)
+
+        if "mopd_teacher_logp_sum" in data:
+            # MOPD's correction is always relative to the immutable rollout
+            # behavior policy, even when standard PPO recomputes its proximal
+            # policy and overwrites ``logprobs`` below.
+            data["mopd_behavior_logprobs"] = (
+                torch.roll(data["logprobs"], shifts=-1, dims=-1) * loss_mask
+            ).detach()
 
         # Align structural turn IDs to the same next-token prediction
         # convention used by loss_mask and log probabilities.
@@ -439,22 +397,7 @@ class PPOActor:
     @trace_perf("ppo_actor.ppo_update", category="compute")
     @stats_tracker.scope_func_wrapper("ppo_actor")
     def ppo_update(self, data: list[dict[str, Any]]) -> None:
-        data_hooks = self._require_data_hooks()
-        data, hook_state = data_hooks.run_pre(
-            f"{self.data_hook_role}_pre_ppo_update", data
-        )
-        result = batched_call(self._ppo_update, data, unpack=False)
-        data_hooks.run_post(
-            f"{self.data_hook_role}_post_ppo_update", result, hook_state
-        )
-
-    def close_data_hooks(self) -> None:
-        """Release worker-local hook resources."""
-        if self._data_hooks_closed:
-            return
-        self._data_hooks_closed = True
-        if self.data_hooks is not None:
-            self.data_hooks.close()
+        batched_call(self._ppo_update, data, unpack=False)
 
     def _ppo_update(self, data: dict[str, Any]) -> None:
         attn_mask = data["attention_mask"]
@@ -568,6 +511,7 @@ class PPOActor:
                         sapo_tau_neg=self.config.sapo_tau_neg,
                         use_cispo_loss=self.config.use_cispo_loss,
                         use_decoupled_loss=self.config.use_decoupled_loss,
+                        mopd_loss_config=self._mopd_loss_config,
                     ),
                     loss_weight_fn=lambda x: x["loss_mask"].count_nonzero(),
                 )
@@ -575,6 +519,11 @@ class PPOActor:
 
 
 class PPOActorController(TrainController):
+    def configure_mopd_loss(self, config: MOPDLossConfig) -> None:
+        self._custom_function_call(
+            "configure_mopd_loss", config, rpc_meta={"broadcast": True}
+        )
+
     def compute_logp(self, *args, **kwargs):
         return self._custom_function_call(
             "compute_logp", *args, rpc_meta={"broadcast": True}, **kwargs
@@ -672,6 +621,7 @@ def grpo_loss_fn(
     sapo_tau_neg: float = 1.05,
     use_cispo_loss: bool = False,
     use_decoupled_loss: bool = False,
+    mopd_loss_config: MOPDLossConfig | None = None,
     vocab_min_logits: torch.Tensor | None = None,
     vocab_max_logits: torch.Tensor | None = None,
     vocab_mean_logits: torch.Tensor | None = None,
@@ -775,18 +725,20 @@ def grpo_loss_fn(
         )
     if mopd_teacher_logp_sum is not None:
         teacher_weight_sum = input_data.get("mopd_teacher_weight_sum")
-        mopd_config = MOPDLossConfig(
-            rl_coefficient=input_data.get("mopd_rl_coefficient", 0.0),
-            distillation_coefficient=input_data.get(
-                "mopd_distillation_coefficient", 1.0
-            ),
-            importance_ratio_cap=input_data.get("mopd_importance_ratio_cap", 5.0),
-        )
+        if mopd_loss_config is None:
+            raise RuntimeError(
+                "MOPD targets require actor-local MOPDLossConfig initialization"
+            )
+        behavior_logp = input_data.get("mopd_behavior_logprobs")
+        if behavior_logp is None:
+            raise RuntimeError(
+                "MOPD targets require immutable rollout behavior log-probabilities"
+            )
         loss, mopd_stats = compose_mopd_loss(
             loss,
-            config=mopd_config,
+            config=mopd_loss_config,
             logprobs=logprobs,
-            old_logprobs=old_logp,
+            old_logprobs=behavior_logp,
             teacher_logp_sum=mopd_teacher_logp_sum,
             teacher_weight_sum=teacher_weight_sum,
             loss_mask=mopd_loss_mask,

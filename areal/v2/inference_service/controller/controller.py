@@ -1727,7 +1727,7 @@ class RolloutControllerV2:
         """
         resp = self._sync_client.post(
             f"{guard_addr}/alloc_ports",
-            json={"count": 1},
+            json={"count": 1, "role": role, "worker_index": worker_index},
         )
         resp.raise_for_status()
         port_data = resp.json()
@@ -1736,20 +1736,29 @@ class RolloutControllerV2:
 
         cmd = list(raw_cmd) + ["--host", host, "--port", str(port)]
 
-        resp = self._sync_client.post(
-            f"{guard_addr}/fork",
-            json={
-                "role": role,
-                "worker_index": worker_index,
-                "raw_cmd": cmd,
-            },
-        )
-        resp.raise_for_status()
-
-        self._forked_services.append((guard_addr, role, worker_index))
-
-        addr = f"http://{format_hostport(host, port)}"
-        self._wait_for_service(f"{addr}{health_path}", role)
+        try:
+            resp = self._sync_client.post(
+                f"{guard_addr}/fork",
+                json={
+                    "role": role,
+                    "worker_index": worker_index,
+                    "raw_cmd": cmd,
+                },
+            )
+            resp.raise_for_status()
+            self._forked_services.append((guard_addr, role, worker_index))
+            addr = f"http://{format_hostport(host, port)}"
+            self._wait_for_service(f"{addr}{health_path}", role)
+        except BaseException:
+            for endpoint in ("kill_forked_worker", "release_ports"):
+                try:
+                    self._sync_client.post(
+                        f"{guard_addr}/{endpoint}",
+                        json={"role": role, "worker_index": worker_index},
+                    )
+                except Exception:
+                    pass
+            raise
 
         return host, port
 
@@ -1769,7 +1778,9 @@ class RolloutControllerV2:
         """
         client = await self._get_async_client()
         resp = await client.post(
-            f"{guard_addr}/alloc_ports", json={"count": 1}, timeout=30.0
+            f"{guard_addr}/alloc_ports",
+            json={"count": 1, "role": role, "worker_index": worker_index},
+            timeout=30.0,
         )
         resp.raise_for_status()
         port_data = resp.json()
@@ -1783,11 +1794,24 @@ class RolloutControllerV2:
             "raw_cmd": cmd,
         }
 
-        resp = await client.post(f"{guard_addr}/fork", json=fork_payload, timeout=30.0)
-        resp.raise_for_status()
-
-        addr = f"http://{format_hostport(host, port)}"
-        await self._async_wait_for_service(f"{addr}{health_path}", role)
+        try:
+            resp = await client.post(
+                f"{guard_addr}/fork", json=fork_payload, timeout=30.0
+            )
+            resp.raise_for_status()
+            addr = f"http://{format_hostport(host, port)}"
+            await self._async_wait_for_service(f"{addr}{health_path}", role)
+        except BaseException:
+            for endpoint in ("kill_forked_worker", "release_ports"):
+                try:
+                    await client.post(
+                        f"{guard_addr}/{endpoint}",
+                        json={"role": role, "worker_index": worker_index},
+                        timeout=10.0,
+                    )
+                except Exception:
+                    pass
+            raise
 
         return host, port
 

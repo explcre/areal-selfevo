@@ -5,17 +5,15 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from areal.api.cli_args import MegatronEngineConfig, PPOActorConfig
 from areal.engine.awex.colocate_reader import (
-    _add_tied_lm_head_meta_alias,
     _PhysicalDeviceMetaServerClient,
 )
 from areal.engine.awex.memory_saver import patch_tms_hook_mode
 from areal.engine.awex.sglang_plugin import (
     AwexSchedulerPlugin,
     _load_sglang_plugins_if_available,
-    _resolve_physical_gpu_id,
     _resolve_transfer_rank,
-    _scheduler_instance_world_size,
     _writer_version_key,
 )
 
@@ -110,42 +108,6 @@ def test_tms_hook_mode_stays_preload_after_initialization(monkeypatch):
     assert saver._impl_ctor_kwargs == {}
 
 
-@pytest.mark.parametrize(
-    ("tied", "pp_rank", "pp_size", "params_meta", "expected_count"),
-    [
-        (True, 0, 1, [{"name": "model.embed_tokens.weight"}], 2),
-        (
-            True,
-            0,
-            1,
-            [{"name": "model.embed_tokens.weight"}, {"name": "lm_head.weight"}],
-            2,
-        ),
-        (False, 0, 1, [{"name": "model.embed_tokens.weight"}], 1),
-        (True, 0, 2, [{"name": "model.embed_tokens.weight"}], 1),
-    ],
-)
-def test_awex_infer_meta_adds_only_valid_tied_lm_head_alias(
-    tied, pp_rank, pp_size, params_meta, expected_count
-):
-    for param_meta in params_meta:
-        param_meta.update({"shape": [151936, 1024], "dtype": torch.bfloat16})
-    raw_meta = {"params_meta": params_meta}
-
-    _add_tied_lm_head_meta_alias(
-        raw_meta,
-        SimpleNamespace(tie_word_embeddings=tied),
-        {"pp_rank": pp_rank, "pp_size": pp_size},
-    )
-
-    assert len(raw_meta["params_meta"]) == expected_count
-    if expected_count == 2:
-        assert raw_meta["params_meta"][1] == {
-            **raw_meta["params_meta"][0],
-            "name": "lm_head.weight",
-        }
-
-
 def test_awex_meta_client_uses_physical_device_for_colocate_identity():
     class Client:
         def __init__(self):
@@ -220,7 +182,7 @@ def test_scheduler_instance_world_size_includes_tp_and_pp(tp_size, pp_size):
         server_args=SimpleNamespace(tp_size=tp_size, pp_size=pp_size)
     )
 
-    assert _scheduler_instance_world_size(scheduler) == 4
+    assert AwexSchedulerPlugin(scheduler)._instance_world_size() == 4
 
 
 def test_transfer_rank_uses_scheduler_gpu_for_multi_gpu_server(monkeypatch):
@@ -258,12 +220,26 @@ def test_transfer_rank_falls_back_to_node_local_identity(monkeypatch):
     )
 
 
-def test_physical_gpu_id_and_writer_key_are_node_local():
-    gpu_id = _resolve_physical_gpu_id(
-        transfer_rank=11,
-        infer_world_size=16,
-        nnodes=2,
-    )
+def test_physical_gpu_id_uses_noncontiguous_visible_device(monkeypatch):
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2,5,6,7")
+    scheduler = SimpleNamespace(gpu_id=1)
+    gpu_id = AwexSchedulerPlugin(scheduler)._physical_gpu_id()
 
-    assert gpu_id == 3
-    assert _writer_version_key("10.0.0.1", gpu_id) == "awex_writer_version_10.0.0.1_3"
+    assert gpu_id == 5
+    assert _writer_version_key("10.0.0.1", gpu_id) == "awex_writer_version_10.0.0.1_5"
+
+
+def test_physical_gpu_id_rejects_uuid_visible_device(monkeypatch):
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-deadbeef")
+
+    with pytest.raises(ValueError, match="numeric CUDA_VISIBLE_DEVICES"):
+        AwexSchedulerPlugin(SimpleNamespace(gpu_id=0))._physical_gpu_id()
+
+
+def test_awex_rejects_megatron_without_ddp_flat_buffers():
+    with pytest.raises(ValueError, match="requires megatron.wrap_with_ddp=true"):
+        PPOActorConfig(
+            backend="megatron:d1",
+            weight_update_mode="awex",
+            megatron=MegatronEngineConfig(wrap_with_ddp=False),
+        )

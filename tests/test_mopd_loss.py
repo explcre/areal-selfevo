@@ -7,7 +7,19 @@ import torch
 
 from areal.api.cli_args import MOPDLossConfig, RejectionSamplingConfig
 from areal.trainer.mopd.loss import compose_mopd_loss, mopd_loss_fn
-from areal.trainer.ppo.actor import grpo_loss_fn
+from areal.trainer.ppo.actor import PPOActor, grpo_loss_fn
+
+
+def test_actor_binds_one_mopd_loss_config():
+    actor = object.__new__(PPOActor)
+    actor._mopd_loss_config = None
+    config = MOPDLossConfig(importance_ratio_cap=1.5)
+
+    actor.configure_mopd_loss(config)
+    actor.configure_mopd_loss(config)
+
+    with pytest.raises(RuntimeError, match="already bound"):
+        actor.configure_mopd_loss(MOPDLossConfig(importance_ratio_cap=2.0))
 
 
 def _loss_inputs():
@@ -297,16 +309,15 @@ def test_grpo_loss_fn_composes_materialized_mopd_targets():
     """The actor loss consumes actor-side MOPD sums through the shared composer."""
     inputs = _loss_inputs()
     logprobs, old_logprobs, teacher_sum, weight_sum, loss_mask = inputs
+    proximal_logprobs = torch.zeros_like(old_logprobs)
     input_data = {
-        "logprobs": old_logprobs,
-        "prox_logp": old_logprobs,
+        "logprobs": proximal_logprobs,
+        "prox_logp": proximal_logprobs,
         "advantages": torch.zeros_like(logprobs),
         "loss_mask": loss_mask,
         "mopd_teacher_logp_sum": teacher_sum,
         "mopd_teacher_weight_sum": weight_sum,
-        "mopd_rl_coefficient": 0.0,
-        "mopd_distillation_coefficient": 1.0,
-        "mopd_importance_ratio_cap": 1.05,
+        "mopd_behavior_logprobs": old_logprobs,
     }
     expected_loss, _ = mopd_loss_fn(*inputs, importance_ratio_cap=1.05)
 
@@ -318,6 +329,7 @@ def test_grpo_loss_fn_composes_materialized_mopd_targets():
             eps_clip=0.2,
             eps_clip_higher=None,
             c_clip=None,
+            mopd_loss_config=MOPDLossConfig(importance_ratio_cap=1.05),
         )
 
     torch.testing.assert_close(
@@ -343,8 +355,7 @@ def test_mopd_loss_respects_m2po_filtered_mask():
         "loss_mask": response_mask,
         "mopd_teacher_logp_sum": torch.tensor([[-1.0, -1.0]], dtype=torch.float64),
         "mopd_teacher_weight_sum": torch.ones_like(logprobs),
-        "mopd_rl_coefficient": 0.0,
-        "mopd_distillation_coefficient": 1.0,
+        "mopd_behavior_logprobs": old_logprobs,
     }
 
     with patch("areal.trainer.ppo.actor.stats_tracker", MagicMock()) as tracker:
@@ -356,6 +367,7 @@ def test_mopd_loss_respects_m2po_filtered_mask():
             eps_clip_higher=None,
             c_clip=None,
             m2_threshold=1.0,
+            mopd_loss_config=MOPDLossConfig(),
         )
     loss.backward()
 
@@ -410,8 +422,7 @@ def test_mopd_loss_respects_behavioral_rejection_without_renormalizing(
         "loss_mask": response_mask,
         "mopd_teacher_logp_sum": torch.full_like(logprobs, -1.0),
         "mopd_teacher_weight_sum": torch.ones_like(logprobs),
-        "mopd_rl_coefficient": 0.0,
-        "mopd_distillation_coefficient": 1.0,
+        "mopd_behavior_logprobs": old_logprobs,
     }
 
     with patch("areal.trainer.ppo.actor.stats_tracker", MagicMock()) as tracker:
@@ -428,6 +439,7 @@ def test_mopd_loss_respects_behavioral_rejection_without_renormalizing(
                 metric="ratio",
                 upper=5.0,
             ),
+            mopd_loss_config=MOPDLossConfig(),
         )
     loss.backward()
 

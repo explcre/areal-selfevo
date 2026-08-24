@@ -51,12 +51,7 @@ def test_aggregate_mopd_targets_uses_raw_weights_and_removes_teacher_metadata():
         },
     ]
 
-    result = aggregate_mopd_targets(
-        batch,
-        rl_coefficient=0.25,
-        distillation_coefficient=1.0,
-        importance_ratio_cap=3.0,
-    )
+    result = aggregate_mopd_targets(batch)
 
     assert result is batch
     torch.testing.assert_close(
@@ -83,11 +78,9 @@ def test_aggregate_mopd_targets_uses_raw_weights_and_removes_teacher_metadata():
         assert set(trajectory) >= {
             "mopd_teacher_logp_sum",
             "mopd_teacher_weight_sum",
-            "mopd_rl_coefficient",
-            "mopd_distillation_coefficient",
-            "mopd_importance_ratio_cap",
         }
-        assert trajectory["mopd_importance_ratio_cap"] == 3.0
+        assert not any(key.endswith("coefficient") for key in trajectory)
+        assert "mopd_importance_ratio_cap" not in trajectory
 
 
 def test_aggregate_mopd_targets_rejects_mismatched_teacher_shapes():
@@ -103,12 +96,7 @@ def test_aggregate_mopd_targets_rejects_mismatched_teacher_shapes():
     ]
 
     with pytest.raises(ValueError, match="shape mismatch"):
-        aggregate_mopd_targets(
-            batch,
-            rl_coefficient=0.0,
-            distillation_coefficient=1.0,
-            importance_ratio_cap=5.0,
-        )
+        aggregate_mopd_targets(batch)
 
 
 def _strict_controller(

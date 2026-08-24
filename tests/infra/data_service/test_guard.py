@@ -57,10 +57,29 @@ def test_alloc_ports_success(mock_find, client, state: GuardState):
     assert state.allocated_ports == {9001, 9002}
 
 
+@patch("areal.infra.rpc.guard.app.find_free_ports")
+def test_owned_ports_release_after_failed_fork(mock_find, client, state: GuardState):
+    mock_find.return_value = [9010]
+    alloc = client.post(
+        "/alloc_ports",
+        json={"count": 1, "role": "worker", "worker_index": 2},
+    )
+    assert alloc.status_code == 200
+
+    released = client.post("/release_ports", json={"role": "worker", "worker_index": 2})
+
+    assert released.status_code == 200
+    assert released.get_json()["ports"] == [9010]
+    assert 9010 not in state.allocated_ports
+    assert ("worker", 2) not in state.owned_ports
+
+
 @patch("areal.infra.rpc.guard.app.run_with_streaming_logs")
 def test_fork_raw_command_success(mock_run, client, state: GuardState):
     mock_proc = _make_mock_process(pid=42)
     mock_run.return_value = mock_proc
+    state.owned_ports[("worker", 1)] = {8001}
+    state.allocated_ports.add(8001)
 
     resp = client.post(
         "/fork",
@@ -88,6 +107,21 @@ def test_kill_known_worker(mock_kill, client, state: GuardState):
     assert resp.status_code == 200
     assert ("test", 0) not in state.forked_children_map
     mock_kill.assert_called_once_with(123, timeout=3, graceful=True)
+
+
+@patch("areal.infra.rpc.guard.app.kill_process_tree", side_effect=RuntimeError("busy"))
+def test_failed_kill_keeps_child_and_ports_for_retry(mock_kill, client, state):
+    mock_proc = _make_mock_process(pid=124)
+    state.forked_children.append(mock_proc)
+    state.forked_children_map[("test", 1)] = mock_proc
+    state.owned_ports[("test", 1)] = {9020}
+    state.allocated_ports.add(9020)
+
+    resp = client.post("/kill_forked_worker", json={"role": "test", "worker_index": 1})
+
+    assert resp.status_code == 500
+    assert state.forked_children_map[("test", 1)] is mock_proc
+    assert state.owned_ports[("test", 1)] == {9020}
 
 
 @patch("areal.infra.rpc.guard.app.kill_process_tree")

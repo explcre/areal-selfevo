@@ -330,7 +330,6 @@ class TrainController:
         )
         engine_init_kwargs = dict(kwargs)
         engine_init_kwargs.setdefault("role", role)
-        engine_init_kwargs.setdefault("data_hook_role", role)
         run_async_task(self._async_initialize_engines, ft_spec, **engine_init_kwargs)
 
         self._identify_dp_heads()

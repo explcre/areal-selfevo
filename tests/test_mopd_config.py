@@ -16,6 +16,7 @@ from areal.api.cli_args import (
     PPOActorConfig,
     PPOConfig,
     SchedulerConfig,
+    SchedulingSpec,
     SchedulingStrategy,
     TeacherConfig,
     TrainDatasetConfig,
@@ -57,6 +58,7 @@ def _ppo_config(mopd: MOPDConfig | None = None, **overrides) -> PPOConfig:
         "actor": PPOActorConfig(
             backend=MEGATRON_BACKEND,
             weight_update_mode="awex",
+            scheduling_spec=(SchedulingSpec(port_count=3),),
         ),
         "rollout": InferenceEngineConfig(
             backend="sglang:d4",
@@ -91,6 +93,17 @@ def test_mopd_loss_config_defaults_to_unscaled_distillation():
 
     assert config.rl_coefficient == 0.0
     assert config.distillation_coefficient == 1.0
+
+
+def test_mopd_nonfork_rollout_requires_dedicated_nccl_port():
+    actor = PPOActorConfig(
+        backend=MEGATRON_BACKEND,
+        weight_update_mode="awex",
+        scheduling_spec=(SchedulingSpec(port_count=2),),
+    )
+
+    with pytest.raises(ValueError, match="port_count >= 3"):
+        _ppo_config(_mopd_config(), actor=actor)
 
 
 def test_mopd_config_valid_preserves_teacher_and_route_order_and_weights():
@@ -180,6 +193,7 @@ def test_mopd_config_yaml_shape_converts_to_structured_config():
                 "trial_name": "trial",
                 "backend": MEGATRON_BACKEND,
                 "weight_update_mode": "awex",
+                "scheduling_spec": [{"port_count": 3}],
             },
             "rollout": {
                 "backend": "sglang:d4",
@@ -301,7 +315,11 @@ def test_mopd_config_pipeline_parallelism_accepts_matching_topology():
         disable_dropout=True,
         scheduling_strategy=_colocation(fork=True),
     )
-    actor = PPOActorConfig(backend=backend, weight_update_mode="awex")
+    actor = PPOActorConfig(
+        backend=backend,
+        weight_update_mode="awex",
+        scheduling_spec=(SchedulingSpec(port_count=3),),
+    )
 
     config = _ppo_config(
         _mopd_config(teacher_engine=teacher_engine),
@@ -314,7 +332,11 @@ def test_mopd_config_pipeline_parallelism_accepts_matching_topology():
 
 def test_mopd_config_local_memory_multi_node_raises():
     """Local-memory checkpoint staging cannot span multiple compute nodes."""
-    actor = PPOActorConfig(backend="megatron:d16", weight_update_mode="awex")
+    actor = PPOActorConfig(
+        backend="megatron:d16",
+        weight_update_mode="awex",
+        scheduling_spec=(SchedulingSpec(port_count=3),),
+    )
     teacher_engine = MOPDTeacherEngineConfig(
         backend="megatron:d16",
         optimizer=None,

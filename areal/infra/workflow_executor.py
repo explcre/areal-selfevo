@@ -38,7 +38,6 @@ from areal.experimental.openai.types import (
 from areal.utils import logging, perf_tracer, stats_tracker
 from areal.infra.utils.concurrent import get_executor
 from areal.utils.data import concat_padded_tensors, cycle_dataloader
-from areal.utils.data_hook import DataHookManager
 from areal.utils.perf_tracer import trace_perf, trace_session_event
 from logging import Logger
 
@@ -767,10 +766,6 @@ class WorkflowExecutor:
 
         self.config = config
         self.inference_engine = inference_engine
-        self.data_hooks = DataHookManager(
-            getattr(config, "data_hooks", None), role="rollout"
-        )
-
         # Use provided staleness manager or create a default one
         # The manager will be properly initialized in initialize()
         self._staleness_manager = staleness_manager
@@ -1082,11 +1077,8 @@ class WorkflowExecutor:
         then flushes the performance tracer.
         """
         # Stop background threads and shutdown the async task runner
-        try:
-            if self._dispatcher is not None:
-                self._dispatcher.destroy()
-        finally:
-            self.data_hooks.close()
+        if self._dispatcher is not None:
+            self._dispatcher.destroy()
 
         # Flush performance tracer
         tracer = perf_tracer.get_session_tracer()
@@ -1151,13 +1143,7 @@ class WorkflowExecutor:
             reason: str | None = None
 
             try:
-                hook_state = []
-                if pending_task.is_eval:
-                    workflow_data = pending_task.data
-                else:
-                    workflow_data, hook_state = self.data_hooks.run_pre(
-                        "rollout_pre", pending_task.data
-                    )
+                workflow_data = pending_task.data
                 if workflow_data is not None:
                     traj = await pending_task.workflow.arun_episode(
                         self.inference_engine, workflow_data
@@ -1195,14 +1181,9 @@ class WorkflowExecutor:
 
                 assert traj is None or isinstance(traj, dict), traj
 
-                if traj is not None and not pending_task.is_eval:
-                    traj = self.data_hooks.run_post("rollout_post", traj, hook_state)
-
                 if traj is None:
                     should_accept_traj = False
-                    reason = (
-                        "hook_filtered" if workflow_data is None else "returned_none"
-                    )
+                    reason = "returned_none"
                 else:
                     if should_accept_fn is None:
                         should_accept = True

@@ -320,6 +320,8 @@ class PPOTrainer:
         # before the data controller can colocate with them.
         engine_init_kwargs = {"addr": None, "ft_spec": ft_spec}
         self.actor.initialize(**engine_init_kwargs, role="actor")
+        if self.config.mopd is not None:
+            self.actor.configure_mopd_loss(self.config.mopd.loss)
         if self.critic is not None:
             self.critic.initialize(**engine_init_kwargs, role="critic")
         if self.ref is not None:
@@ -1286,7 +1288,6 @@ class PPOTrainer:
                 addr=None,
                 ft_spec=self._ft_spec,
                 role="mopd-teacher",
-                data_hook_role="teacher",
             )
             # The scoring-only teacher needs DDP-flat-buffer CPU residency,
             # without enabling TMS in the AWEX actor processes.
@@ -1323,12 +1324,18 @@ class PPOTrainer:
         teacher_outputs: list[Any] = []
         teacher_controllers: list[TeacherController] = []
         critic_fetch_buffer_drained = self.critic is None
+        ref_engine = getattr(self, "ref", None)
+        ref_fetch_buffer_drained = ref_engine is None
         teacher_fetch_buffers_drained = False
         receipt: DrainReceipt | None = None
 
         def drain_critic_fetch_buffer() -> None:
             if self.critic is not None:
                 self.critic.strict_clear_batches(rollout_batch)
+
+        def drain_ref_fetch_buffer() -> None:
+            if ref_engine is not None:
+                ref_engine.strict_clear_batches(rollout_batch)
 
         def drain_teacher_fetch_buffers() -> None:
             for teacher_controller in teacher_controllers:
@@ -1382,12 +1389,7 @@ class PPOTrainer:
                         "weight": routed_weights[index][teacher_id],
                     }
 
-            aggregated = self.actor.aggregate_mopd_targets(
-                rollout_batch,
-                rl_coefficient=config.loss.rl_coefficient,
-                distillation_coefficient=config.loss.distillation_coefficient,
-                importance_ratio_cap=config.loss.importance_ratio_cap,
-            )
+            aggregated = self.actor.aggregate_mopd_targets(rollout_batch)
             # ``aggregate_mopd_targets`` localizes the original rollout shards
             # on actor heads, then remotizes its result under fresh shard IDs.
             # Drain the old IDs now: the caller replaces ``rollout_batch`` with
@@ -1397,6 +1399,8 @@ class PPOTrainer:
             # so every process-local fetch buffer needs an explicit fan-out.
             drain_critic_fetch_buffer()
             critic_fetch_buffer_drained = True
+            drain_ref_fetch_buffer()
+            ref_fetch_buffer_drained = True
             drain_teacher_fetch_buffers()
             teacher_fetch_buffers_drained = True
             receipt = DrainReceipt(
@@ -1413,6 +1417,16 @@ class PPOTrainer:
                 except Exception:
                     logger.error(
                         "MOPD emergency critic RTensor drain failed; "
+                        "forcing phase teardown",
+                        exc_info=True,
+                    )
+            if not ref_fetch_buffer_drained:
+                try:
+                    drain_ref_fetch_buffer()
+                    ref_fetch_buffer_drained = True
+                except Exception:
+                    logger.error(
+                        "MOPD emergency reference RTensor drain failed; "
                         "forcing phase teardown",
                         exc_info=True,
                     )
@@ -1443,6 +1457,7 @@ class PPOTrainer:
                 if (
                     receipt is not None
                     and critic_fetch_buffer_drained
+                    and ref_fetch_buffer_drained
                     and teacher_fetch_buffers_drained
                 ):
                     manager.release(receipt)

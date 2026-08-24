@@ -84,32 +84,6 @@ from areal.utils.logging import getLogger  # noqa: E402
 logger = getLogger("AwexColocateReader")
 
 
-def _add_tied_lm_head_meta_alias(
-    raw_meta: dict[str, Any], hf_config: Any, model_context: dict[str, Any]
-) -> None:
-    """Match AWEX's tied-head training alias in SGLang inference metadata."""
-    params_meta = raw_meta.get("params_meta", [])
-    names = {param_meta["name"] for param_meta in params_meta}
-    is_last_pp_rank = (
-        int(model_context.get("pp_rank", 0)) == int(model_context.get("pp_size", 1)) - 1
-    )
-    if (
-        getattr(hf_config, "tie_word_embeddings", False)
-        and is_last_pp_rank
-        and "lm_head.weight" not in names
-        and "model.embed_tokens.weight" in names
-    ):
-        embedding_meta = next(
-            param_meta
-            for param_meta in params_meta
-            if param_meta["name"] == "model.embed_tokens.weight"
-        )
-        lm_head_meta = dict(embedding_meta)
-        lm_head_meta["name"] = "lm_head.weight"
-        params_meta.append(lm_head_meta)
-        logger.info("Infer meta: added lm_head.weight alias for tied embeddings")
-
-
 class _PhysicalDeviceMetaServerClient:
     """Use physical GPU ids in AWEX colocate metadata and handshake keys."""
 
@@ -364,7 +338,6 @@ class AwexColocateReader:
             model=self._get_model(),
             model_context=model_context,
         )
-        _add_tied_lm_head_meta_alias(raw_meta, self._get_model().config, model_context)
         return raw_meta
 
     def _build_instance_params_meta(self):

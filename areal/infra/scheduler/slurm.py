@@ -505,13 +505,21 @@ class SlurmScheduler(Scheduler):
         """
         worker_id = f"{role}/{idx}"
         guard_url = f"http://{format_hostport(target_wi.worker.ip, int(target_wi.worker.worker_ports[0]))}"
-        port_cnt = len(self._workers[target_role][0].worker.worker_ports)
+        port_cnt = len(target_wi.worker.worker_ports)
+        ports_reserved = False
 
         try:
             # 1. Allocate a port on the target guard
             async with session.post(
                 f"{guard_url}/alloc_ports",
-                json={"count": port_cnt},
+                json={
+                    "count": port_cnt,
+                    "role": role,
+                    "worker_index": idx,
+                    "exclude_ports": [
+                        int(port) for port in target_wi.worker.worker_ports
+                    ],
+                },
             ) as alloc_resp:
                 if alloc_resp.status != 200:
                     error_text = await alloc_resp.text()
@@ -524,6 +532,7 @@ class SlurmScheduler(Scheduler):
                 forked_host = alloc_data["host"]
                 forked_ports = alloc_data["ports"]
                 forked_port = forked_ports[0]
+                ports_reserved = True
 
             # 2. Build the full raw command
             module_path = command or "areal.infra.rpc.rpc_server"
@@ -606,12 +615,24 @@ class SlurmScheduler(Scheduler):
                 f"(pid={forked_pid}) from {target_role}/{idx}"
             )
 
-        except aiohttp.ClientError as e:
-            raise WorkerCreationError(
-                role,
-                f"Failed to fork worker {idx} from {target_role}/{idx}",
-                str(e),
-            ) from e
+        except BaseException as e:
+            if ports_reserved:
+                for endpoint in ("kill_forked_worker", "release_ports"):
+                    try:
+                        async with session.post(
+                            f"{guard_url}/{endpoint}",
+                            json={"role": role, "worker_index": idx},
+                        ):
+                            pass
+                    except Exception:
+                        pass
+            if isinstance(e, aiohttp.ClientError):
+                raise WorkerCreationError(
+                    role,
+                    f"Failed to fork worker {idx} from {target_role}/{idx}",
+                    str(e),
+                ) from e
+            raise
 
         worker = Worker(
             id=worker_id,
@@ -766,9 +787,15 @@ class SlurmScheduler(Scheduler):
         )
 
         # Configure forked workers if exp_config is available
-        if self.exp_config is not None:
-            for worker_rank, worker_info in enumerate(workers):
-                self._configure_worker(worker_info, worker_rank)
+        try:
+            if self.exp_config is not None:
+                for worker_rank, worker_info in enumerate(workers):
+                    self._configure_worker(worker_info, worker_rank)
+        except BaseException:
+            await self._cleanup_forked_workers_async(role, target_role, workers)
+            self._workers.pop(role, None)
+            self._colocated_roles.pop(role, None)
+            raise
 
         return worker_ids
 
@@ -1188,6 +1215,7 @@ class SlurmScheduler(Scheduler):
         """
         # Handle colocated/forked roles
         if role in self._colocated_roles:
+            target_role = self._colocated_roles[role]
             # Forked roles have their own workers in _workers
             if role in self._workers:
                 workers = self._workers[role]
@@ -1377,9 +1405,19 @@ class SlurmScheduler(Scheduler):
 
         # Handle colocated/forked role
         if role in self._colocated_roles:
+            target_role = self._colocated_roles[role]
             # Forked roles have their own workers that need cleanup
             if role in self._workers:
                 logger.info(f"Removing forked role '{role}' (managed by parent worker)")
+                try:
+                    run_async_task(
+                        self._cleanup_forked_workers_async,
+                        role,
+                        target_role,
+                        self._workers[role],
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to cleanup forked role '{role}': {e}")
                 del self._workers[role]
             else:
                 logger.info(f"Removing colocated role '{role}' mapping")

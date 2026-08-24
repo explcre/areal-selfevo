@@ -390,9 +390,9 @@ class _PhaseActor:
     def __init__(self, events: list[str]):
         self.events = events
 
-    def aggregate_mopd_targets(self, batch, **coefficients):
+    def aggregate_mopd_targets(self, batch):
         self.events.append("aggregate")
-        return aggregate_mopd_targets(batch, **coefficients)
+        return aggregate_mopd_targets(batch)
 
     def assert_mopd_runtime_topology(self) -> None:
         self.events.append("topology:actor")
@@ -421,9 +421,20 @@ class _PhaseCritic:
         }
 
 
+class _PhaseRef(_PhaseCritic):
+    def strict_clear_batches(self, *targets):
+        target_sizes = ",".join(str(len(target)) for target in targets)
+        self.events.append(f"clear:ref:{target_sizes}")
+        return {
+            "complete": True,
+            "source_shards_cleared": sum(len(target) for target in targets),
+            "actor_fetch_buffers_cleared": 2,
+        }
+
+
 class _FailingPhaseActor(_PhaseActor):
-    def aggregate_mopd_targets(self, batch, **coefficients):
-        del batch, coefficients
+    def aggregate_mopd_targets(self, batch):
+        del batch
         self.events.append("aggregate")
         raise RuntimeError("aggregation failed")
 
@@ -443,6 +454,7 @@ def test_trainer_mopd_phase_routes_reuses_drains_then_releases():
     trainer.mopd_teacher_manager = _PhaseManager(events)
     trainer.actor = _PhaseActor(events)
     trainer.critic = _PhaseCritic(events)
+    trainer.ref = _PhaseRef(events)
     batch = [{"mopd_route": "r0"}, {"mopd_route": "r1"}]
 
     result = trainer._run_mopd_teacher_phase(batch)
@@ -459,6 +471,7 @@ def test_trainer_mopd_phase_routes_reuses_drains_then_releases():
         "compute:t1:1",
         "aggregate",
         "clear:critic:2",
+        "clear:ref:2",
         "clear:t0:2,4",
         "clear:t1:2,4",
         "clear:actor:2,4",
@@ -491,6 +504,7 @@ def test_trainer_mopd_phase_failure_drains_rollout_before_release():
     trainer.mopd_teacher_manager = _PhaseManager(events)
     trainer.actor = _FailingPhaseActor(events)
     trainer.critic = _PhaseCritic(events)
+    trainer.ref = _PhaseRef(events)
 
     with pytest.raises(RuntimeError, match="aggregation failed"):
         trainer._run_mopd_teacher_phase([{"mopd_route": "r0"}])
@@ -503,6 +517,7 @@ def test_trainer_mopd_phase_failure_drains_rollout_before_release():
         "compute:t0:1",
         "aggregate",
         "clear:critic:1",
+        "clear:ref:1",
         "clear:t0:1,1",
         "clear:actor:1,1",
         "release",

@@ -3045,30 +3045,12 @@ class MegatronPPOActor(MegatronEngine):
         addr: str | None,
         ft_spec: FinetuneSpec,
         *args,
-        data_hook_role: str | None = None,
-        role: str | None = None,
         **kwargs,
     ) -> None:
         super().initialize(addr, ft_spec, *args, **kwargs)
-        hook_role = data_hook_role or role
-        if hook_role is None and self.actor._data_hook_specs:
-            raise RuntimeError("Configured data hooks require an explicit worker role")
-        self.actor.setup_data_hooks(hook_role or "actor")
 
-    def destroy(self) -> None:
-        errors: list[BaseException] = []
-        try:
-            super().destroy()
-        except BaseException as exc:
-            errors.append(exc)
-        try:
-            self.actor.close_data_hooks()
-        except BaseException as exc:
-            errors.append(exc)
-        if len(errors) == 1:
-            raise errors[0]
-        if errors:
-            raise BaseExceptionGroup("Megatron PPO actor cleanup failed", errors)
+    def configure_mopd_loss(self, config) -> None:
+        self.actor.configure_mopd_loss(config)
 
     @torch.no_grad()
     def compute_logp(self, *args, **kwargs) -> list[torch.Tensor] | None:

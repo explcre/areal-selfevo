@@ -44,6 +44,9 @@ logger = getLogger("SGLangRemote")
 class SGLangBackend:
     """SGLang-specific backend implementation for remote inference."""
 
+    def __init__(self) -> None:
+        self._readiness_endpoint = "/health"
+
     @staticmethod
     def build_server_env(env: Mapping[str, str]) -> dict[str, str]:
         _env = dict(env)
@@ -371,12 +374,7 @@ class SGLangBackend:
 
     def get_health_check_request(self) -> HttpRequest:
         """Get SGLang readiness check request."""
-        # SGLang's /health is a functional 1-token generation probe in recent
-        # versions. During AWEX colocated startup, generation can legitimately
-        # wait for the first train-side weight publication, so using /health for
-        # launch readiness deadlocks rollout initialization. /model_info only
-        # requires the HTTP server and model metadata to be ready.
-        return HttpRequest(endpoint="/model_info", payload={}, method="GET")
+        return HttpRequest(endpoint=self._readiness_endpoint, payload={}, method="GET")
 
     def get_offload_request(self, tags: list[str] | None = None) -> HttpRequest:
         """Get SGLang offload request."""
@@ -400,6 +398,9 @@ class SGLangBackend:
             "awex_meta_server_addr", None
         ) or os.environ.get("AWEX_META_SERVER_ADDR")
         awex_colocate = server_args.pop("awex_colocate_mode", False)
+        self._readiness_endpoint = (
+            "/model_info" if awex_colocate or awex_meta_addr else "/health"
+        )
         # Colocate placement: derive base_gpu_id from SLURM_LOCALID so two SGLang
         # servers sharing a node never claim the same GPU range. The controller
         # cannot do this reliably because its global rank -> node-slot mapping is
