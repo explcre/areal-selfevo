@@ -84,6 +84,108 @@ from areal.utils.logging import getLogger  # noqa: E402
 logger = getLogger("AwexColocateReader")
 
 
+def _patch_awex_qwen3_attention_names() -> None:
+    """Canonicalize Qwen3 SGLang attention names for the AWEX train reader."""
+    from awex.converter.sglang_converter import SGlangToHFWeightConverter
+
+    original_norm = SGlangToHFWeightConverter._convert_layer_norm_param
+    original_attention = SGlangToHFWeightConverter._convert_attention_param
+    if getattr(original_norm, "_areal_qwen3_attention_names", False):
+        return
+
+    def _convert_layer_norm_param(self, name, parameter, layer_number):
+        mapping = {
+            "self_attn.q_norm.weight": "attention.query_layernorm.weight",
+            "self_attn.k_norm.weight": "attention.key_layernorm.weight",
+        }
+        if name in mapping:
+            return [(mapping[name], parameter)]
+        return original_norm(self, name, parameter, layer_number)
+
+    def _convert_attention_param(self, name, parameter, layer_number):
+        mapping = {
+            "self_attn.qkv_proj.weight": "attention.query_key_value_proj.weight",
+            "self_attn.o_proj.weight": "attention.dense.weight",
+        }
+        if name in mapping:
+            return [(mapping[name], parameter)]
+        return original_attention(self, name, parameter, layer_number)
+
+    _convert_layer_norm_param._areal_qwen3_attention_names = True
+    SGlangToHFWeightConverter._convert_layer_norm_param = _convert_layer_norm_param
+    SGlangToHFWeightConverter._convert_attention_param = _convert_attention_param
+
+
+_patch_awex_qwen3_attention_names()
+
+
+def _add_tied_lm_head_meta_alias(
+    raw_meta: dict[str, Any], hf_config: Any, model_context: dict[str, Any]
+) -> None:
+    """Match AWEX's tied-head training alias in SGLang inference metadata."""
+    params_meta = raw_meta.get("params_meta", [])
+    names = {param_meta["name"] for param_meta in params_meta}
+    is_last_pp_rank = (
+        int(model_context.get("pp_rank", 0)) == int(model_context.get("pp_size", 1)) - 1
+    )
+    if (
+        getattr(hf_config, "tie_word_embeddings", False)
+        and is_last_pp_rank
+        and "lm_head.weight" not in names
+        and "model.embed_tokens.weight" in names
+    ):
+        embedding_meta = next(
+            param_meta
+            for param_meta in params_meta
+            if param_meta["name"] == "model.embed_tokens.weight"
+        )
+        lm_head_meta = dict(embedding_meta)
+        lm_head_meta["name"] = "lm_head.weight"
+        params_meta.append(lm_head_meta)
+        logger.info("Infer meta: added lm_head.weight alias for tied embeddings")
+
+
+class _PhysicalDeviceMetaServerClient:
+    """Use physical GPU ids in AWEX colocate metadata and handshake keys."""
+
+    _DEVICE_KEY_PREFIXES = (
+        "training_serialized_weights_",
+        "weights_update_finished_",
+        "write_finished_",
+    )
+
+    def __init__(self, client: Any, physical_gpu_id: int):
+        self._client = client
+        self._physical_gpu_id = physical_gpu_id
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._client, name)
+
+    def _rewrite_device_key(self, key: str) -> str:
+        if not key.startswith(self._DEVICE_KEY_PREFIXES):
+            return key
+        prefix_and_ip, step = key.rsplit("_", 1)
+        prefix_and_ip, _logical_gpu_id = prefix_and_ip.rsplit("_", 1)
+        return f"{prefix_and_ip}_{self._physical_gpu_id}_{step}"
+
+    def add_object_to_set(self, key: str, value: Any) -> Any:
+        if key == "inference_device_rank_entries":
+            ip_address, _logical_gpu_id, transfer_rank = value
+            value = (ip_address, self._physical_gpu_id, transfer_rank)
+        return self._client.add_object_to_set(key, value)
+
+    def get_object(self, key: str, *args: Any, **kwargs: Any) -> Any:
+        return self._client.get_object(self._rewrite_device_key(key), *args, **kwargs)
+
+    def put_object(self, key: str, *args: Any, **kwargs: Any) -> Any:
+        return self._client.put_object(self._rewrite_device_key(key), *args, **kwargs)
+
+    def get_object_then_delete(self, key: str, *args: Any, **kwargs: Any) -> Any:
+        return self._client.get_object_then_delete(
+            self._rewrite_device_key(key), *args, **kwargs
+        )
+
+
 def _get_router_dtype(config):
     """Read router dtype from a flat or multimodal Hugging Face config."""
     router_dtype = getattr(config, "router_dtype", None)
@@ -289,7 +391,7 @@ class AwexColocateReader:
         """Per-rank raw meta via awex's own staticmethod (HF-converted names)."""
         server_args = self._scheduler.server_args
         model_context = self._build_model_context()
-        return InferParamMetaResolver._get_model_param_info(
+        raw_meta = InferParamMetaResolver._get_model_param_info(
             "sglang",
             server_args,
             convert_params=True,
@@ -297,6 +399,8 @@ class AwexColocateReader:
             model=self._get_model(),
             model_context=model_context,
         )
+        _add_tied_lm_head_meta_alias(raw_meta, self._get_model().config, model_context)
+        return raw_meta
 
     def _build_instance_params_meta(self):
         """Gather single-instance raw meta via the MetaServer, then aggregate.
@@ -489,6 +593,13 @@ class AwexColocateReader:
             ipc_backend="cuda",
             enable_debug_mode=False,
         )
+        # SGLang t1 workers are CUDA_VISIBLE_DEVICES-isolated, so AWEX observes
+        # logical device 0 on every process while the colocated trainer
+        # publishes IPC handles under node-local physical ids. Keep CUDA calls
+        # on logical device 0, but translate only MetaServer identities/keys.
+        reader.meta_server_client = _PhysicalDeviceMetaServerClient(
+            reader.meta_server_client, self._local_gpu_id
+        )
         reader.initialize()
         self._reader = reader
         logger.info(
@@ -500,6 +611,7 @@ class AwexColocateReader:
         )
         return reader
 
+    @torch.no_grad()
     def update_weights(self, version: int) -> None:
         """Run one colocate weight update via the native awex worker reader.
 

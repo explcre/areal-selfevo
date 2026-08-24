@@ -1196,11 +1196,13 @@ Forward-only Megatron engine configuration used by MOPD teachers.
 
 ## MOPDTeacherManager Configuration
 
-Checkpoint source configuration for phase-scoped MOPD teachers.
+Checkpoint provider configuration for phase-scoped MOPD teachers.
 
-| Parameter | Type   | Default  | Description                                      |
-| --------- | ------ | -------- | ------------------------------------------------ |
-| `type`    | string | `"disk"` | Teacher checkpoint provider. **Choices:** `disk` |
+| Parameter        | Type            | Default                 | Description                                                      |
+| ---------------- | --------------- | ----------------------- | ---------------------------------------------------------------- |
+| `type`           | string          | `"disk"`                | Teacher checkpoint provider. **Choices:** `disk`, `local_memory` |
+| `staging_root`   | string          | `"/dev/shm/areal-mopd"` | Node-local staging root for local_memory providers.              |
+| `min_free_bytes` | integer \| None | `None`                  | Optional minimum free space required after staging a checkpoint. |
 
 (section-mopd-teacher)=
 

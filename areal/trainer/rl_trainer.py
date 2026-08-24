@@ -379,6 +379,12 @@ class PPOTrainer:
 
         self.mopd_teacher_manager: PersistentTeacherManager | None = None
         if self.config.mopd is not None:
+            if self.config.mopd.manager.type == "local_memory" and not isinstance(
+                self.scheduler, LocalScheduler
+            ):
+                raise RuntimeError(
+                    "MOPD local_memory staging requires a same-host LocalScheduler"
+                )
             self.mopd_teacher_manager = PersistentTeacherManager(
                 self.config.mopd, self._create_mopd_teacher_controller
             )

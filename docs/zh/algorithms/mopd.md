@@ -53,6 +53,7 @@ mopd:
     scheduling_spec: ${actor.scheduling_spec}
   manager:
     type: disk
+    staging_root: /dev/shm/areal-mopd
   loss:
     rl_coefficient: 0.0
     distillation_coefficient: 0.005
@@ -61,7 +62,11 @@ mopd:
 每条 dataset item 必须包含 `task_type_identifier` 指定的字段，其值必须匹配 `routes` 中的
 key。route 只能引用已知 teacher ID，并且必须至少包含一个正权重。
 
-`manager.type: disk` 从共享存储加载 checkpoint，支持多节点运行。
+`manager.type: disk` 从共享存储加载 checkpoint，支持多节点运行。`local_memory`
+会在 `staging_root` 下异步暂存下一个 checkpoint，使用原子发布后交给常驻 teacher
+加载，并在加载完成后删除。由于该路径只在 controller 所在节点可见，
+`local_memory` 要求 `scheduler.type: local` 且 actor/teacher 为单机拓扑；可通过
+`min_free_bytes` 为暂存目录预留可用空间。
 
 对 teacher 权重 $w_j$，定义 $S_T(a)=\sum_j w_j\log\pi_{T_j}(a)$ 和
 $W=\sum_j w_j$。MOPD 使用 on-policy score-function surrogate 最小化未归一化的加权

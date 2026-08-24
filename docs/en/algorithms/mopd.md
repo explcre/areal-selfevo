@@ -58,6 +58,7 @@ mopd:
     scheduling_spec: ${actor.scheduling_spec}
   manager:
     type: disk
+    staging_root: /dev/shm/areal-mopd
   loss:
     rl_coefficient: 0.0
     distillation_coefficient: 0.005
@@ -68,7 +69,11 @@ must match a key in `routes`. A route must reference known teacher IDs and conta
 least one positive weight.
 
 `manager.type: disk` loads checkpoints from shared storage and supports multi-node
-runs.
+runs. `local_memory` asynchronously stages one upcoming checkpoint below
+`staging_root`, atomically publishes it to the persistent teacher, and removes it
+after loading. Because this path is visible only on the controller host,
+`local_memory` requires `scheduler.type: local` and a single-node actor/teacher
+topology. `min_free_bytes` can reserve free space below the staging root.
 
 For teacher weights $w_j$, define $S_T(a)=\sum_j w_j\log\pi_{T_j}(a)$ and
 $W=\sum_j w_j$. MOPD minimizes the raw weighted reverse KL

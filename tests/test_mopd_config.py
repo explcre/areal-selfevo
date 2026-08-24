@@ -10,9 +10,11 @@ from areal.api.cli_args import (
     MOPDConfig,
     MOPDLossConfig,
     MOPDTeacherEngineConfig,
+    MOPDTeacherManagerConfig,
     MOPDTeacherSpec,
     PPOActorConfig,
     PPOConfig,
+    SchedulerConfig,
     SchedulingStrategy,
     TeacherConfig,
     to_structured_cfg,
@@ -246,6 +248,47 @@ def test_mopd_config_pipeline_parallelism_accepts_matching_topology():
 
     assert config.actor.backend == backend
     assert config.mopd.teacher_engine.backend == backend
+
+
+def test_mopd_config_local_memory_multi_node_raises():
+    """Local-memory checkpoint staging cannot span multiple compute nodes."""
+    actor = PPOActorConfig(backend="megatron:d16", weight_update_mode="awex")
+    teacher_engine = MOPDTeacherEngineConfig(
+        backend="megatron:d16",
+        optimizer=None,
+        disable_dropout=True,
+        scheduling_strategy=_colocation(fork=True),
+    )
+    manager = MOPDTeacherManagerConfig(type="local_memory")
+
+    with pytest.raises(ValueError, match="single node"):
+        _ppo_config(
+            _mopd_config(teacher_engine=teacher_engine, manager=manager),
+            actor=actor,
+            scheduler=SchedulerConfig(type="local"),
+        )
+
+
+@pytest.mark.parametrize("scheduler_type", ["ray", "slurm", None])
+def test_mopd_config_local_memory_requires_same_host_local_scheduler(scheduler_type):
+    """Controller-local staging is rejected when workers may run remotely."""
+    manager = MOPDTeacherManagerConfig(type="local_memory")
+
+    with pytest.raises(ValueError, match="scheduler.type='local'"):
+        _ppo_config(
+            _mopd_config(manager=manager),
+            scheduler=SchedulerConfig(type=scheduler_type),
+        )
+
+
+def test_mopd_config_local_memory_accepts_local_scheduler():
+    """LocalScheduler guarantees controller and fork workers share one host."""
+    config = _ppo_config(
+        _mopd_config(manager=MOPDTeacherManagerConfig(type="local_memory")),
+        scheduler=SchedulerConfig(type="local"),
+    )
+
+    assert config.mopd.manager.type == "local_memory"
 
 
 def test_mopd_config_teacher_v2_raises():

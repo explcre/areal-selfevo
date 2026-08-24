@@ -3,7 +3,13 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 
+from areal.engine.awex.colocate_reader import (
+    _add_tied_lm_head_meta_alias,
+    _patch_awex_qwen3_attention_names,
+    _PhysicalDeviceMetaServerClient,
+)
 from areal.engine.awex.memory_saver import patch_tms_hook_mode
 from areal.engine.awex.sglang_plugin import (
     AwexSchedulerPlugin,
@@ -103,6 +109,119 @@ def test_tms_hook_mode_stays_preload_after_initialization(monkeypatch):
     saver.hook_mode = "torch"
 
     assert saver._impl_ctor_kwargs == {}
+
+
+def test_awex_converter_canonicalizes_qwen3_attention_names():
+    """Qwen3 infer metadata matches AWEX's MCore canonical attention names."""
+    from awex.converter.sglang_converter import SGlangToHFWeightConverter
+
+    _patch_awex_qwen3_attention_names()
+    converter = object.__new__(SGlangToHFWeightConverter)
+    parameter = torch.ones(128, dtype=torch.bfloat16)
+
+    expected = {
+        "self_attn.q_norm.weight": "attention.query_layernorm.weight",
+        "self_attn.k_norm.weight": "attention.key_layernorm.weight",
+    }
+    for name, canonical_name in expected.items():
+        converted = converter._convert_layer_norm_param(name, parameter, "0")
+        assert converted == [(canonical_name, parameter)]
+
+    expected = {
+        "self_attn.qkv_proj.weight": "attention.query_key_value_proj.weight",
+        "self_attn.o_proj.weight": "attention.dense.weight",
+    }
+    for name, canonical_name in expected.items():
+        converted = converter._convert_attention_param(name, parameter, "0")
+        assert converted == [(canonical_name, parameter)]
+
+
+@pytest.mark.parametrize(
+    ("tied", "pp_rank", "pp_size", "params_meta", "expected_count"),
+    [
+        (True, 0, 1, [{"name": "model.embed_tokens.weight"}], 2),
+        (
+            True,
+            0,
+            1,
+            [{"name": "model.embed_tokens.weight"}, {"name": "lm_head.weight"}],
+            2,
+        ),
+        (False, 0, 1, [{"name": "model.embed_tokens.weight"}], 1),
+        (True, 0, 2, [{"name": "model.embed_tokens.weight"}], 1),
+    ],
+)
+def test_awex_infer_meta_adds_only_valid_tied_lm_head_alias(
+    tied, pp_rank, pp_size, params_meta, expected_count
+):
+    for param_meta in params_meta:
+        param_meta.update({"shape": [151936, 1024], "dtype": torch.bfloat16})
+    raw_meta = {"params_meta": params_meta}
+
+    _add_tied_lm_head_meta_alias(
+        raw_meta,
+        SimpleNamespace(tie_word_embeddings=tied),
+        {"pp_rank": pp_rank, "pp_size": pp_size},
+    )
+
+    assert len(raw_meta["params_meta"]) == expected_count
+    if expected_count == 2:
+        assert raw_meta["params_meta"][1] == {
+            **raw_meta["params_meta"][0],
+            "name": "lm_head.weight",
+        }
+
+
+def test_awex_meta_client_uses_physical_device_for_colocate_identity():
+    class Client:
+        def __init__(self):
+            self.calls = []
+
+        def add_object_to_set(self, key, value):
+            self.calls.append(("add", key, value))
+
+        def get_object(self, key, *args, **kwargs):
+            self.calls.append(("get", key, args, kwargs))
+
+        def put_object(self, key, *args, **kwargs):
+            self.calls.append(("put", key, args, kwargs))
+
+        def get_object_then_delete(self, key, *args, **kwargs):
+            self.calls.append(("delete", key, args, kwargs))
+
+    client = Client()
+    physical_client = _PhysicalDeviceMetaServerClient(client, physical_gpu_id=6)
+
+    physical_client.add_object_to_set(
+        "inference_device_rank_entries", ("10.0.0.1", 0, 6)
+    )
+    physical_client.get_object("training_serialized_weights_10.0.0.1_0_3")
+    physical_client.put_object("weights_update_finished_10.0.0.1_0_3", True)
+    physical_client.get_object_then_delete("write_finished_10.0.0.1_0_3")
+
+    assert client.calls == [
+        ("add", "inference_device_rank_entries", ("10.0.0.1", 6, 6)),
+        ("get", "training_serialized_weights_10.0.0.1_6_3", (), {}),
+        ("put", "weights_update_finished_10.0.0.1_6_3", (True,), {}),
+        ("delete", "write_finished_10.0.0.1_6_3", (), {}),
+    ]
+
+
+def test_awex_weight_update_runs_without_grad_tracking():
+    from areal.engine.awex.colocate_reader import AwexColocateReader
+
+    grad_modes = []
+    reader = SimpleNamespace(
+        update_weights=lambda step_id: grad_modes.append(torch.is_grad_enabled())
+    )
+    instance = object.__new__(AwexColocateReader)
+    instance._initialized = True
+    instance._ensure_reader = lambda: reader
+    instance._rebuild_derived_weights = lambda: None
+
+    AwexColocateReader.update_weights(instance, 1)
+
+    assert grad_modes == [False]
 
 
 def test_transfer_rank_uses_global_rank_for_isolated_gpu(monkeypatch):

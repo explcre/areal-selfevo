@@ -20,6 +20,7 @@ from areal.trainer.mopd.targets import MOPD_CONTRIBUTIONS_KEY, aggregate_mopd_ta
 from areal.trainer.mopd.teacher_manager import (
     DiskCheckpointProvider,
     DrainReceipt,
+    LocalMemoryCheckpointProvider,
     PersistentTeacherManager,
     TeacherManagerState,
 )
@@ -38,6 +39,9 @@ def _write_checkpoint(root: Path, teacher_id: str, payload: bytes) -> Path:
 
 def _config(
     checkpoints: dict[str, Path],
+    *,
+    manager_type: str = "disk",
+    staging_root: Path | None = None,
 ) -> MOPDConfig:
     return MOPDConfig(
         teachers={
@@ -45,7 +49,10 @@ def _config(
             for teacher_id, path in checkpoints.items()
         },
         routes={"route": {teacher_id: 1.0 for teacher_id in checkpoints}},
-        manager=MOPDTeacherManagerConfig(type="disk"),
+        manager=MOPDTeacherManagerConfig(
+            type=manager_type,
+            staging_root=str(staging_root or "/unused"),
+        ),
     )
 
 
@@ -140,6 +147,31 @@ def test_persistent_manager_repeated_release_does_not_offload_twice(tmp_path):
     manager.close()
 
 
+def test_persistent_manager_does_not_restage_unchanged_local_checkpoint(tmp_path):
+    """An offloaded unchanged teacher resumes without copying its snapshot again."""
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    t0 = _write_checkpoint(source_root, "t0", b"first")
+    controller = _PersistentController()
+    manager = PersistentTeacherManager(
+        _config(
+            {"t0": t0},
+            manager_type="local_memory",
+            staging_root=tmp_path / "staging",
+        ),
+        lambda _: controller,
+    )
+    manager.pre_fetch("t0")
+    manager.load("t0")
+    manager.release(DrainReceipt(complete=True))
+
+    manager.pre_fetch("t0")
+    manager.load("t0")
+
+    assert controller.events == ["offload", "onload"]
+    manager.close()
+
+
 def test_persistent_manager_rejects_release_before_drain(tmp_path):
     """An incomplete receipt leaves the resident teacher untouched."""
     t0 = _write_checkpoint(tmp_path, "t0", b"first")
@@ -222,6 +254,88 @@ def test_disk_provider_requires_existing_local_snapshot(tmp_path):
 
     with pytest.raises(FileNotFoundError, match="not a local directory"):
         provider.resolve("missing")
+
+
+def test_local_memory_provider_uses_atomic_single_ready_checkpoint(tmp_path):
+    """Staging publishes one ready snapshot and removes it after consumption."""
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    t0 = _write_checkpoint(source_root, "t0", b"first")
+    t1 = _write_checkpoint(source_root, "t1", b"second")
+    staging_root = tmp_path / "staging"
+    provider = LocalMemoryCheckpointProvider(
+        _config(
+            {"t0": t0, "t1": t1},
+            manager_type="local_memory",
+            staging_root=staging_root,
+        )
+    )
+
+    provider.pre_fetch("t0")
+    ready = provider.resolve("t0")
+
+    assert ready.name == "t0.ready"
+    assert (ready / "model.safetensors").read_bytes() == b"first"
+    assert not list(staging_root.rglob("*.tmp.*"))
+    with pytest.raises(RuntimeError, match="already holds ready checkpoint"):
+        provider.pre_fetch("t1")
+
+    provider.consumed("t0")
+    assert not ready.exists()
+    provider.pre_fetch("t1")
+    second = provider.resolve("t1")
+    assert (second / "model.safetensors").read_bytes() == b"second"
+    provider.close()
+    provider.close()
+    assert not list(staging_root.iterdir())
+
+
+def test_local_memory_provider_rejects_insufficient_capacity(tmp_path, monkeypatch):
+    """Capacity is checked before checkpoint bytes enter the staging root."""
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    t0 = _write_checkpoint(source_root, "t0", b"payload")
+    staging_root = tmp_path / "staging"
+    provider = LocalMemoryCheckpointProvider(
+        _config(
+            {"t0": t0},
+            manager_type="local_memory",
+            staging_root=staging_root,
+        )
+    )
+    monkeypatch.setattr(
+        "areal.trainer.mopd.teacher_manager.shutil.disk_usage",
+        lambda _: type("Usage", (), {"free": 0})(),
+    )
+
+    with pytest.raises(OSError, match="Insufficient staging space"):
+        provider.pre_fetch("t0")
+
+    provider.close()
+    assert not list(staging_root.iterdir())
+
+
+def test_local_memory_provider_sweeps_dead_run(tmp_path):
+    """Construction removes run directories whose owning process is gone."""
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    t0 = _write_checkpoint(source_root, "t0", b"payload")
+    staging_root = tmp_path / "staging"
+    stale = staging_root / ".run-stale"
+    stale.mkdir(parents=True)
+    (stale / "owner.json").write_text('{"pid": 999999999}', encoding="utf-8")
+    (stale / "orphan.tmp.data").write_bytes(b"orphan")
+
+    provider = LocalMemoryCheckpointProvider(
+        _config(
+            {"t0": t0},
+            manager_type="local_memory",
+            staging_root=staging_root,
+        )
+    )
+
+    assert not stale.exists()
+    provider.close()
 
 
 class _PhaseController:

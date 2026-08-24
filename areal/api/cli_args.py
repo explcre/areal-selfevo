@@ -3337,20 +3337,38 @@ class MOPDTeacherSpec:
 
 @dataclass
 class MOPDTeacherManagerConfig:
-    """Checkpoint source configuration for phase-scoped MOPD teachers."""
+    """Checkpoint provider configuration for phase-scoped MOPD teachers."""
 
     type: str = field(
         default="disk",
         metadata={
             "help": "Teacher checkpoint provider.",
-            "choices": ["disk"],
+            "choices": ["disk", "local_memory"],
+        },
+    )
+    staging_root: str = field(
+        default="/dev/shm/areal-mopd",
+        metadata={"help": "Node-local staging root for local_memory providers."},
+    )
+    min_free_bytes: int | None = field(
+        default=None,
+        metadata={
+            "help": "Optional minimum free space required after staging a checkpoint."
         },
     )
 
     def __post_init__(self):
-        if self.type != "disk":
+        if self.type not in ("disk", "local_memory"):
             raise ValueError(
-                f"mopd.manager.type currently supports only 'disk', got {self.type!r}"
+                "mopd.manager.type must be either 'disk' or 'local_memory', "
+                f"got {self.type!r}"
+            )
+        if not isinstance(self.staging_root, str) or not self.staging_root.strip():
+            raise ValueError("mopd.manager.staging_root must be a non-empty string")
+        if self.min_free_bytes is not None and self.min_free_bytes < 0:
+            raise ValueError(
+                "mopd.manager.min_free_bytes must be non-negative or None, "
+                f"got {self.min_free_bytes}"
             )
 
 
@@ -3591,6 +3609,17 @@ class PPOConfig(BaseExperimentConfig):
             raise ValueError(
                 "mopd teacher and actor must use the same parallel strategy"
             )
+        if self.mopd.manager.type == "local_memory":
+            if self.scheduler.type != "local":
+                raise ValueError(
+                    "mopd local_memory provider requires scheduler.type='local' "
+                    "so controller and teacher workers share the same host"
+                )
+            if actor_alloc.parallel.world_size > self.cluster.n_gpus_per_node:
+                raise ValueError(
+                    "mopd local_memory provider only supports a single node; use "
+                    "disk for multi-node runs"
+                )
 
 
 @dataclass
