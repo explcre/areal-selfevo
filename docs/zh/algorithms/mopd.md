@@ -39,6 +39,7 @@ rollout:
   scheduling_strategy: {type: colocation, target: actor, fork: true}
 
 train_dataset:
+  mixture_sampling_policy: proportional
   sources:
     - {path: /data/code, type: rl, route: coding}
     - {path: /data/mixed, type: rl, route: mixed}
@@ -68,6 +69,9 @@ mopd:
 `mopd.routes` 中的 key；配置 valid dataset 时也遵循相同规则。sample 不能覆盖数据源 route，
 也不需要 `task_type` 字段。每个 route 可以引用任意数量的已知 teacher ID，并且必须至少包含
 一个正权重。
+`mixture_sampling_policy: proportional` 保持各数据源按长度占比采样；`uniform`
+则通过确定性循环较短数据源，使每个数据源在一个 epoch 中贡献相同数量的样本，再由分布式
+sampler 对全局索引进行 shuffle。
 
 `manager.type: disk` 从共享存储加载 checkpoint，支持多节点运行。`local_memory`
 会在 `staging_root` 下异步暂存下一个 checkpoint，使用原子发布后交给常驻 teacher

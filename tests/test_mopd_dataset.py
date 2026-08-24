@@ -31,7 +31,7 @@ def test_mopd_dataset_routes_each_source_without_mutating_samples():
     )
 
     assert len(dataset) == 3
-    assert [dataset[index][MOPD_ROUTE_METADATA_KEY] for index in range(3)] == [
+    assert [dataset[index][MOPD_ROUTE_METADATA_KEY].route for index in range(3)] == [
         "math_route",
         "math_route",
         "code_route",
@@ -42,6 +42,36 @@ def test_mopd_dataset_routes_each_source_without_mutating_samples():
         for data in samples.values()
         for sample in data
     )
+
+
+def test_routed_dataset_uniform_policy_balances_unequal_sources():
+    """Uniform policy deterministically cycles shorter sources per epoch."""
+    config = TrainDatasetConfig(
+        mixture_sampling_policy="uniform",
+        sources=[
+            DatasetSourceConfig(path="short", type="rl", route="short-route"),
+            DatasetSourceConfig(path="long", type="rl", route="long-route"),
+        ],
+    )
+    samples = {
+        "short": [{"id": "s0"}],
+        "long": [{"id": "l0"}, {"id": "l1"}, {"id": "l2"}],
+    }
+
+    dataset = get_mopd_dataset(
+        config,
+        source_loader=lambda **kwargs: samples[kwargs["source"].path],
+    )
+
+    assert len(dataset) == 6
+    assert [dataset[index]["id"] for index in range(6)] == [
+        "s0",
+        "l0",
+        "s0",
+        "l1",
+        "s0",
+        "l2",
+    ]
 
 
 @pytest.mark.parametrize("field", [MOPD_ROUTE_METADATA_KEY, "mopd_route"])
@@ -96,7 +126,7 @@ def test_remote_mopd_dataset_connects_and_prefetches_each_source():
     assert second.connect_calls[0][1] == "mixture_source_1"
     assert first.prefetch_indices == [[0, 1]]
     assert second.prefetch_indices == [[2, 0, 1]]
-    assert dataset[2][MOPD_ROUTE_METADATA_KEY] == "r1"
+    assert dataset[2][MOPD_ROUTE_METADATA_KEY].route == "r1"
 
     dataset.close()
     assert first.closed and second.closed

@@ -22,6 +22,7 @@ from areal.api.cli_args import (
     TrainDatasetConfig,
     to_structured_cfg,
 )
+from areal.trainer.mopd.execution import MOPDExecutionPlan
 
 MEGATRON_BACKEND = "megatron:(attn:d1p1t2c2|ffn:d1p1e4)"
 
@@ -62,7 +63,7 @@ def _ppo_config(mopd: MOPDConfig | None = None, **overrides) -> PPOConfig:
         ),
         "rollout": InferenceEngineConfig(
             backend="sglang:d4",
-            scheduling_strategy=_colocation(fork=False),
+            scheduling_strategy=_colocation(fork=True),
         ),
         "mopd": mopd,
     }
@@ -95,14 +96,49 @@ def test_mopd_loss_config_defaults_to_unscaled_distillation():
     assert config.distillation_coefficient == 1.0
 
 
-def test_mopd_nonfork_rollout_requires_dedicated_nccl_port():
+def test_mopd_teacher_config_exposes_only_scoring_engine_fields():
+    config = MOPDTeacherEngineConfig(backend=MEGATRON_BACKEND)
+
+    assert config.optimizer is None
+    assert config.disable_dropout is True
+    assert not hasattr(config, "ppo_n_minibatches")
+    assert not hasattr(config, "eps_clip")
+
+
+@pytest.mark.parametrize(
+    ("rl_coefficient", "distillation_coefficient", "expected"),
+    [
+        (0.0, 1.0, (True, False)),
+        (1.0, 0.0, (False, True)),
+        (0.4, 0.6, (True, True)),
+    ],
+)
+def test_mopd_execution_plan_short_circuits_disabled_objectives(
+    rl_coefficient, distillation_coefficient, expected
+):
+    config = _ppo_config(
+        _mopd_config(
+            loss=MOPDLossConfig(
+                rl_coefficient=rl_coefficient,
+                distillation_coefficient=distillation_coefficient,
+            )
+        )
+    )
+
+    plan = MOPDExecutionPlan.from_config(config)
+
+    assert plan is not None
+    assert (plan.requires_teacher_scoring, plan.requires_rl) == expected
+
+
+def test_mopd_forked_rollout_requires_worker_and_nccl_ports():
     actor = PPOActorConfig(
         backend=MEGATRON_BACKEND,
         weight_update_mode="awex",
-        scheduling_spec=(SchedulingSpec(port_count=2),),
+        scheduling_spec=(SchedulingSpec(port_count=1),),
     )
 
-    with pytest.raises(ValueError, match="port_count >= 3"):
+    with pytest.raises(ValueError, match="port_count >= 2"):
         _ppo_config(_mopd_config(), actor=actor)
 
 
@@ -149,14 +185,12 @@ def test_mopd_dataset_source_rejects_unknown_route():
 
 def test_mopd_dataset_sources_reject_legacy_path_and_type():
     """Mixture sources and the legacy single-source fields are mutually exclusive."""
-    train_dataset = TrainDatasetConfig(
-        path="legacy",
-        type="rl",
-        sources=[DatasetSourceConfig(path="dataset", type="rl", route="single")],
-    )
-
-    with pytest.raises(ValueError, match="path/type cannot be used"):
-        _ppo_config(_mopd_config(), train_dataset=train_dataset)
+    with pytest.raises(ValueError, match="path/type cannot be combined"):
+        TrainDatasetConfig(
+            path="legacy",
+            type="rl",
+            sources=[DatasetSourceConfig(path="dataset", type="rl", route="single")],
+        )
 
 
 def test_mopd_config_yaml_shape_converts_to_structured_config():
@@ -200,7 +234,7 @@ def test_mopd_config_yaml_shape_converts_to_structured_config():
                 "scheduling_strategy": {
                     "type": "colocation",
                     "target": "actor",
-                    "fork": False,
+                    "fork": True,
                 },
             },
             "mopd": {
@@ -263,34 +297,28 @@ def test_mopd_loss_config_rejects_disabled_objective():
         MOPDLossConfig(rl_coefficient=0.0, distillation_coefficient=0.0)
 
 
-@pytest.mark.parametrize("fork", [False, True])
-def test_mopd_config_rollout_colocation_accepts_both_fork_modes(fork):
-    """MOPD supports reused and process-isolated rollout workers."""
+def test_mopd_config_rollout_colocation_accepts_forked_workers():
+    """The current v1 runtime accepts process-isolated rollout workers."""
     rollout = InferenceEngineConfig(
         backend="sglang:d4",
-        scheduling_strategy=_colocation(fork=fork),
+        scheduling_strategy=_colocation(fork=True),
     )
 
     config = _ppo_config(_mopd_config(), rollout=rollout)
 
-    assert config.rollout.scheduling_strategy.fork is fork
+    assert config.rollout.scheduling_strategy.fork is True
 
 
-def test_mopd_config_rollout_reused_workers_warn_about_stats(monkeypatch):
-    """Same-process rollout warns about the known stats export limitation."""
-    warnings = []
-    monkeypatch.setattr("areal.api.cli_args.logger.warning", warnings.append)
-
-    _ppo_config(
-        _mopd_config(),
-        rollout=InferenceEngineConfig(
-            backend="sglang:d4",
-            scheduling_strategy=_colocation(fork=False),
-        ),
-    )
-
-    assert len(warnings) == 1
-    assert "shared stats tracker" in warnings[0]
+def test_mopd_config_rollout_reused_workers_are_rejected():
+    """Same-process rollout is outside the current v1 runtime capability."""
+    with pytest.raises(ValueError, match="current MOPD v1 runtime"):
+        _ppo_config(
+            _mopd_config(),
+            rollout=InferenceEngineConfig(
+                backend="sglang:d4",
+                scheduling_strategy=_colocation(fork=False),
+            ),
+        )
 
 
 def test_mopd_config_teacher_parallelism_mismatch_raises():

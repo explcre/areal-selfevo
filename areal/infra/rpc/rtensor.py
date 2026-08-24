@@ -21,6 +21,34 @@ from areal.utils import logging
 logger = logging.getLogger("HttpRTensor")
 
 
+@dataclass(frozen=True)
+class RTensorDrainReceipt:
+    """Typed proof that one controller drained its registered consumers.
+
+    This receipt describes one controller fan-out. Cross-role lease ownership
+    remains with the caller until the runtime has a dynamic consumer registry;
+    callers must collect a receipt from every role that localized the batch
+    before releasing its storage owner.
+    """
+
+    consumer_role: str
+    shard_count: int
+    source_node_count: int
+    consumer_dp_head_count: int
+
+    def __post_init__(self) -> None:
+        if not self.consumer_role:
+            raise ValueError("consumer_role must be a non-empty string")
+        for name in (
+            "shard_count",
+            "source_node_count",
+            "consumer_dp_head_count",
+        ):
+            value = getattr(self, name)
+            if value < 0:
+                raise ValueError(f"{name} must be non-negative, got {value}")
+
+
 class RTensorBackend(Protocol):
     def fetch(self, shards: list[TensorShardInfo]) -> list[torch.Tensor]:
         """Fetch multiple tensors concurrently.

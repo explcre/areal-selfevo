@@ -5,7 +5,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from areal.api.cli_args import InferenceEngineConfig
-from areal.dataset.mopd import MOPD_ROUTE_METADATA_KEY
+from areal.dataset.mopd import MOPD_ROUTE_METADATA_KEY, DatasetRoute
 from areal.infra.controller.rollout_controller import RolloutController
 
 
@@ -33,7 +33,7 @@ def test_source_route_metadata_is_removed_from_workflow_data():
 
     prepared, route = controller._extract_mopd_route(
         {
-            MOPD_ROUTE_METADATA_KEY: "gsm8k_single_a",
+            MOPD_ROUTE_METADATA_KEY: DatasetRoute(0, "gsm8k_single_a"),
             "instance_id": "unique-sample",
         },
         required=True,
@@ -57,7 +57,7 @@ def test_invalid_source_route_type_raises(route):
     """Only non-empty configured route strings are accepted."""
     controller = _controller()
 
-    with pytest.raises(ValueError, match="non-empty string"):
+    with pytest.raises(ValueError, match="DatasetRoute provenance"):
         controller._extract_mopd_route({MOPD_ROUTE_METADATA_KEY: route}, required=True)
 
 
@@ -106,7 +106,7 @@ def test_training_submit_keeps_route_outside_workflow_data():
     controller.submit(
         {
             "messages": [{"role": "user", "content": "train me"}],
-            MOPD_ROUTE_METADATA_KEY: "gsm8k_single_a",
+            MOPD_ROUTE_METADATA_KEY: DatasetRoute(0, "gsm8k_single_a"),
         },
         object(),
     )

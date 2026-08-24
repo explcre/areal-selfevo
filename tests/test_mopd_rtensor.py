@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+from dataclasses import FrozenInstanceError
 from typing import Any
 
 import pytest
 import torch
 
 from areal.infra.controller.train_controller import TrainController
-from areal.infra.rpc.rtensor import RTensor, TensorShardInfo
+from areal.infra.rpc.rtensor import RTensor, RTensorDrainReceipt, TensorShardInfo
 from areal.trainer.mopd.targets import (
     MOPD_CONTRIBUTIONS_KEY,
     aggregate_mopd_targets,
@@ -106,6 +107,7 @@ def _strict_controller(
 ) -> tuple[TrainController, list[tuple[str, tuple[Any, ...]]]]:
     controller = object.__new__(TrainController)
     controller.workers_is_dp_head = [True, False, True]
+    controller._worker_role = "actor"
     calls: list[tuple[str, tuple[Any, ...]]] = []
 
     def call_all(method: str, *args: Any, **_: Any) -> list[Any]:
@@ -144,11 +146,12 @@ def test_strict_clear_batches_covers_sources_and_every_actor_dp_head(monkeypatch
 
     receipt = controller.strict_clear_batches(targets)
 
-    assert receipt == {
-        "complete": True,
-        "source_shards_cleared": 2,
-        "actor_fetch_buffers_cleared": 2,
-    }
+    assert receipt == RTensorDrainReceipt(
+        consumer_role="actor",
+        shard_count=2,
+        source_node_count=2,
+        consumer_dp_head_count=2,
+    )
     assert source_calls == [
         ("teacher:8000", ["a"]),
         ("teacher:8001", ["b"]),
@@ -158,6 +161,18 @@ def test_strict_clear_batches_covers_sources_and_every_actor_dp_head(monkeypatch
         "fetch_buffer_stats",
     ]
     assert calls[0][1] == (["a", "b"],)
+
+
+def test_rtensor_drain_receipt_is_frozen_and_role_typed():
+    receipt = RTensorDrainReceipt(
+        consumer_role="actor",
+        shard_count=1,
+        source_node_count=1,
+        consumer_dp_head_count=2,
+    )
+
+    with pytest.raises(FrozenInstanceError):
+        receipt.consumer_role = "teacher"
 
 
 def test_strict_clear_batches_source_failure_prevents_receipt(monkeypatch):

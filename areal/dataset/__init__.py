@@ -3,7 +3,14 @@
 from typing import TYPE_CHECKING, Optional
 
 from areal.api.cli_args import _DatasetConfig
-from areal.dataset.mopd import MOPDDataset, get_mopd_dataset
+from areal.dataset.mopd import (
+    ROUTE_METADATA_KEY,
+    DatasetRoute,
+    MOPDDataset,
+    RoutedDataset,
+    get_mopd_dataset,
+    get_routed_dataset,
+)
 from areal.utils import logging
 
 if TYPE_CHECKING:
@@ -173,8 +180,10 @@ def get_custom_dataset(
     from areal.utils.environ import is_single_controller
 
     if dataset_config is not None and dataset_config.sources:
-        raise ValueError(
-            "dataset_config.sources requires areal.dataset.get_mopd_dataset()"
+        return get_routed_dataset(
+            dataset_config,
+            tokenizer=tokenizer,
+            processor=processor,
         )
     if dataset_config is not None and (
         not isinstance(dataset_config.path, str)
@@ -220,8 +229,12 @@ def get_custom_dataset(
 
 
 __all__ = [
+    "ROUTE_METADATA_KEY",
+    "DatasetRoute",
     "MOPDDataset",
+    "RoutedDataset",
     "VALID_DATASETS",
     "get_custom_dataset",
     "get_mopd_dataset",
+    "get_routed_dataset",
 ]

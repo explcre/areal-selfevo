@@ -306,14 +306,13 @@ def test_mopd_loss_rejects_invalid_importance_ratio_cap(cap):
 
 
 def test_grpo_loss_fn_composes_materialized_mopd_targets():
-    """The actor loss consumes actor-side MOPD sums through the shared composer."""
+    """Pure distillation consumes MOPD targets without an RL advantage tensor."""
     inputs = _loss_inputs()
     logprobs, old_logprobs, teacher_sum, weight_sum, loss_mask = inputs
     proximal_logprobs = torch.zeros_like(old_logprobs)
     input_data = {
         "logprobs": proximal_logprobs,
         "prox_logp": proximal_logprobs,
-        "advantages": torch.zeros_like(logprobs),
         "loss_mask": loss_mask,
         "mopd_teacher_logp_sum": teacher_sum,
         "mopd_teacher_weight_sum": weight_sum,
@@ -341,6 +340,37 @@ def test_grpo_loss_fn_composes_materialized_mopd_targets():
         if "mopd_teacher_weight_sum" in call.kwargs
     )
     assert "mopd_loss" in mopd_stat_call.kwargs
+
+
+def test_grpo_loss_fn_scales_pure_rl_without_teacher_targets():
+    """A disabled distillation objective neither requires targets nor drops RL scale."""
+    logprobs = torch.tensor([[-0.3, -0.4]], dtype=torch.float64, requires_grad=True)
+    input_data = {
+        "logprobs": torch.tensor([[-0.5, -0.5]], dtype=torch.float64),
+        "prox_logp": torch.tensor([[-0.5, -0.5]], dtype=torch.float64),
+        "advantages": torch.ones_like(logprobs),
+        "loss_mask": torch.ones_like(logprobs, dtype=torch.bool),
+    }
+    kwargs = dict(
+        logprobs=logprobs,
+        entropy=torch.zeros_like(logprobs),
+        input_data=input_data,
+        eps_clip=0.2,
+        eps_clip_higher=None,
+        c_clip=None,
+    )
+
+    with patch("areal.trainer.ppo.actor.stats_tracker", MagicMock()):
+        base_loss = grpo_loss_fn(**kwargs)
+        scaled_loss = grpo_loss_fn(
+            **kwargs,
+            mopd_loss_config=MOPDLossConfig(
+                rl_coefficient=0.25,
+                distillation_coefficient=0.0,
+            ),
+        )
+
+    torch.testing.assert_close(scaled_loss, 0.25 * base_loss, rtol=1e-12, atol=1e-12)
 
 
 def test_mopd_loss_respects_m2po_filtered_mask():

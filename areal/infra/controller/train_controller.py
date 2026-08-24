@@ -21,7 +21,7 @@ from areal.api import (
 )
 from areal.api.alloc_mode import ModelAllocation
 from areal.api.cli_args import PerfTracerConfig, TrainEngineConfig
-from areal.infra.rpc.rtensor import RTensor, flatten_shard_ids
+from areal.infra.rpc.rtensor import RTensor, RTensorDrainReceipt, flatten_shard_ids
 from areal.infra.utils.concurrent import run_async_task
 from areal.utils import logging, stats_tracker
 from areal.utils.data import make_dummy_eval_item
@@ -956,10 +956,10 @@ class TrainController:
                 self._worker_role,
             )
 
-    def strict_clear_batches(self, *targets: Any) -> dict[str, int | bool]:
-        """Clear teacher shards and prove every actor DP head drained them.
+    def strict_clear_batches(self, *targets: Any) -> RTensorDrainReceipt:
+        """Clear source shards and prove every consumer DP head drained them.
 
-        Unlike :meth:`clear_batches`, any source-delete or actor RPC failure is
+        Unlike :meth:`clear_batches`, any source-delete or consumer RPC failure is
         fatal.  The returned receipt is suitable for the MOPD teacher lifecycle
         gate; callers must not destroy teacher workers before this succeeds.
         """
@@ -973,13 +973,12 @@ class TrainController:
             for shard_id in node_shards
         ]
         if not shard_ids:
-            return {
-                "complete": True,
-                "source_shards_cleared": 0,
-                "actor_fetch_buffers_cleared": len(
-                    [is_head for is_head in self.workers_is_dp_head if is_head]
-                ),
-            }
+            return RTensorDrainReceipt(
+                consumer_role=self._worker_role,
+                shard_count=0,
+                source_node_count=0,
+                consumer_dp_head_count=0,
+            )
 
         async def _strict_clear_sources() -> None:
             await asyncio.gather(
@@ -1003,11 +1002,12 @@ class TrainController:
         ]
         if leaking_heads:
             raise RuntimeError(
-                "MOPD RTensor drain incomplete on actor DP heads "
+                f"RTensor drain incomplete on {self._worker_role} DP heads "
                 f"{leaking_heads}: stats={stats}"
             )
-        return {
-            "complete": True,
-            "source_shards_cleared": len(shard_ids),
-            "actor_fetch_buffers_cleared": len(stats),
-        }
+        return RTensorDrainReceipt(
+            consumer_role=self._worker_role,
+            shard_count=len(shard_ids),
+            source_node_count=len(shards_by_node),
+            consumer_dp_head_count=len(stats),
+        )

@@ -115,7 +115,7 @@ def test_load_routed_gsm8k_dataset_accepts_local_parquet_mirror(tmp_path):
 
     assert len(dataset) == 1
     assert dataset[0]["answer"] == "#### 2"
-    assert dataset[0][MOPD_ROUTE_METADATA_KEY] == MOPD_ROUTE
+    assert dataset[0][MOPD_ROUTE_METADATA_KEY].route == MOPD_ROUTE
     assert "task_type" not in dataset[0]
     assert dataset[0]["messages"][0]["content"].startswith("What is 1 + 1?")
     assert dataset[0]["messages"][0]["content"].endswith(" /no_think")

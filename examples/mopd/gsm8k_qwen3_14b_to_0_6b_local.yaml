@@ -120,6 +120,7 @@ sglang:
   mem_fraction_static: 0.8
 
 train_dataset:
+  mixture_sampling_policy: proportional
   sources:
     - path: ${oc.env:MOPD_GSM8K_PATH}
       type: rl
@@ -130,6 +131,7 @@ train_dataset:
   num_workers: 4
 
 valid_dataset:
+  mixture_sampling_policy: proportional
   sources:
     - path: ${oc.env:MOPD_GSM8K_PATH}
       type: rl

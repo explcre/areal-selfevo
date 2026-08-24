@@ -1,27 +1,55 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Dataset-source routing for multi-teacher on-policy distillation."""
+"""Generic routed dataset mixtures used by MOPD and other consumers."""
 
 from __future__ import annotations
 
 from bisect import bisect_right
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from typing import Any
 
 from areal.api.cli_args import _DatasetConfig
 
-MOPD_ROUTE_METADATA_KEY = "__areal_mopd_route"
+ROUTE_METADATA_KEY = "__areal_route"
+MOPD_ROUTE_METADATA_KEY = ROUTE_METADATA_KEY
 
 
-class MOPDDataset:
-    """Concatenate routed sources without modifying their stored samples."""
+@dataclass(frozen=True)
+class DatasetRoute:
+    """Typed route provenance stripped before a sample reaches its workflow."""
 
-    def __init__(self, sources: list[tuple[Any, str]]) -> None:
+    source_index: int
+    route: str
+
+    def __post_init__(self) -> None:
+        if self.source_index < 0:
+            raise ValueError("source_index must be non-negative")
+        if not isinstance(self.route, str) or not self.route.strip():
+            raise ValueError("route must be a non-empty string")
+
+
+class RoutedDataset:
+    """Combine routed sources with an explicit deterministic sampling policy."""
+
+    def __init__(
+        self,
+        sources: list[tuple[Any, str]],
+        *,
+        sampling_policy: str = "proportional",
+    ) -> None:
         if not sources:
-            raise ValueError("MOPD dataset sources must not be empty")
+            raise ValueError("Routed dataset sources must not be empty")
+        if sampling_policy not in ("proportional", "uniform"):
+            raise ValueError(
+                "sampling_policy must be 'proportional' or 'uniform', "
+                f"got {sampling_policy!r}"
+            )
         self._datasets = [dataset for dataset, _ in sources]
         self._routes = [route for _, route in sources]
+        self._sampling_policy = sampling_policy
         self._offsets: list[int] = []
+        self._source_lengths: list[int] = []
 
         from areal.infra.data_service.rdataset import RDataset
 
@@ -39,15 +67,36 @@ class MOPDDataset:
     def _refresh_offsets(self) -> None:
         total = 0
         offsets: list[int] = []
+        source_lengths: list[int] = []
         for dataset in self._datasets:
-            total += len(dataset)
+            source_length = len(dataset)
+            source_lengths.append(source_length)
+            total += source_length
             offsets.append(total)
         self._offsets = offsets
+        self._source_lengths = source_lengths
+        if self._sampling_policy == "uniform" and any(
+            length == 0 for length in source_lengths
+        ):
+            raise ValueError("uniform routed mixtures do not support empty sources")
 
     def __len__(self) -> int:
         if not self._offsets:
             self._refresh_offsets()
+        if self._sampling_policy == "uniform":
+            return max(self._source_lengths) * len(self._datasets)
         return self._offsets[-1]
+
+    def _locate(self, index: int) -> tuple[int, int]:
+        if self._sampling_policy == "uniform":
+            source_index = index % len(self._datasets)
+            local_index = (index // len(self._datasets)) % self._source_lengths[
+                source_index
+            ]
+            return source_index, local_index
+        source_index = bisect_right(self._offsets, index)
+        source_start = 0 if source_index == 0 else self._offsets[source_index - 1]
+        return source_index, index - source_start
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         size = len(self)
@@ -56,18 +105,20 @@ class MOPDDataset:
         if index < 0 or index >= size:
             raise IndexError(index)
 
-        source_index = bisect_right(self._offsets, index)
-        source_start = 0 if source_index == 0 else self._offsets[source_index - 1]
-        sample = self._datasets[source_index][index - source_start]
+        source_index, local_index = self._locate(index)
+        sample = self._datasets[source_index][local_index]
         if not isinstance(sample, Mapping):
             raise TypeError(
                 f"MOPD dataset samples must be mappings, got {type(sample).__name__}"
             )
-        if MOPD_ROUTE_METADATA_KEY in sample or "mopd_route" in sample:
-            raise ValueError("MOPD route must be configured on the dataset source")
+        if ROUTE_METADATA_KEY in sample or "mopd_route" in sample:
+            raise ValueError("route must be configured on the dataset source")
 
         routed_sample = dict(sample)
-        routed_sample[MOPD_ROUTE_METADATA_KEY] = self._routes[source_index]
+        routed_sample[ROUTE_METADATA_KEY] = DatasetRoute(
+            source_index=source_index,
+            route=self._routes[source_index],
+        )
         return routed_sample
 
     def connect(
@@ -97,9 +148,8 @@ class MOPDDataset:
             return
         source_indices: list[list[int]] = [[] for _ in self._datasets]
         for index in indices:
-            source_index = bisect_right(self._offsets, index)
-            source_start = 0 if source_index == 0 else self._offsets[source_index - 1]
-            source_indices[source_index].append(index - source_start)
+            source_index, local_index = self._locate(index)
+            source_indices[source_index].append(local_index)
         for dataset, local_indices in zip(self._datasets, source_indices, strict=True):
             dataset._start_prefetch(local_indices)
 
@@ -116,16 +166,16 @@ def is_remote_dataset(dataset: Any) -> bool:
     from areal.infra.data_service.rdataset import RDataset
 
     return isinstance(dataset, RDataset) or (
-        isinstance(dataset, MOPDDataset) and dataset.is_remote
+        isinstance(dataset, RoutedDataset) and dataset.is_remote
     )
 
 
-def get_mopd_dataset(
+def get_routed_dataset(
     dataset_config: _DatasetConfig,
     tokenizer: Any = None,
     processor: Any = None,
     source_loader: Callable[..., Any] | None = None,
-) -> MOPDDataset:
+) -> RoutedDataset:
     """Load configured sources and attach their mandatory route as metadata."""
     if not dataset_config.sources:
         raise ValueError("MOPD dataset config must contain at least one source")
@@ -166,12 +216,24 @@ def get_mopd_dataset(
             processor=processor,
         )
         routed_sources.append((dataset, source.route))
-    return MOPDDataset(routed_sources)
+    return RoutedDataset(
+        routed_sources,
+        sampling_policy=dataset_config.mixture_sampling_policy,
+    )
+
+
+# Compatibility names for the first MOPD consumer of the routed mixture API.
+MOPDDataset = RoutedDataset
+get_mopd_dataset = get_routed_dataset
 
 
 __all__ = [
     "MOPDDataset",
     "MOPD_ROUTE_METADATA_KEY",
+    "ROUTE_METADATA_KEY",
+    "DatasetRoute",
+    "RoutedDataset",
     "get_mopd_dataset",
+    "get_routed_dataset",
     "is_remote_dataset",
 ]

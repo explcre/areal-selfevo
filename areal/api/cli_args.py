@@ -1431,6 +1431,7 @@ class TrainEngineConfig:
             "help": "Timeout (seconds) for initialize() to wait for guards to be ready."
         },
     )
+
     scheduling_strategy: SchedulingStrategy = field(
         default_factory=SchedulingStrategy,
         metadata={
@@ -3011,7 +3012,7 @@ class SchedulerConfig:
 
 @dataclass
 class DatasetSourceConfig:
-    """One dataset source in a routed MOPD dataset mixture."""
+    """One routed source in a dataset mixture."""
 
     path: str = field(
         default=MISSING,
@@ -3023,9 +3024,7 @@ class DatasetSourceConfig:
     )
     route: str = field(
         default=MISSING,
-        metadata={
-            "help": "Required MOPD route applied to every sample from this source."
-        },
+        metadata={"help": "Required route provenance applied to this entire source."},
     )
     split: str | None = field(
         default=None,
@@ -3067,8 +3066,17 @@ class _DatasetConfig:
     )
     sources: list[DatasetSourceConfig] = field(
         default_factory=list,
+        metadata={"help": "Routed dataset sources. Every source must declare a route."},
+    )
+    mixture_sampling_policy: str = field(
+        default="proportional",
         metadata={
-            "help": "Dataset sources for MOPD. Every source must declare a route."
+            "help": (
+                "How a routed mixture represents sources in one epoch: "
+                "'proportional' preserves source-size proportions; 'uniform' "
+                "balances source counts by deterministically cycling shorter sources."
+            ),
+            "choices": ["proportional", "uniform"],
         },
     )
     batch_size: int = field(
@@ -3125,6 +3133,15 @@ class _DatasetConfig:
             "(e.g. HuggingFace datasets that require downloading and preprocessing)."
         },
     )
+
+    def __post_init__(self) -> None:
+        if self.mixture_sampling_policy not in ("proportional", "uniform"):
+            raise ValueError(
+                "mixture_sampling_policy must be 'proportional' or 'uniform', "
+                f"got {self.mixture_sampling_policy!r}"
+            )
+        if self.sources and (self.path is not None or self.type is not None):
+            raise ValueError("dataset path/type cannot be combined with sources")
 
 
 @dataclass
@@ -3461,8 +3478,24 @@ class MOPDLossConfig:
 
 
 @dataclass
-class MOPDTeacherEngineConfig(PPOActorConfig):
-    """Forward-only Megatron engine configuration used by MOPD teachers."""
+class MOPDTeacherEngineConfig(TrainEngineConfig):
+    """Forward-only scoring engine configuration used by MOPD teachers."""
+
+    disable_dropout: bool = field(
+        default=True,
+        metadata={"help": "Disable dropout for deterministic teacher scoring."},
+    )
+    optimizer: OptimizerConfig | None = field(
+        default=None,
+        metadata={"help": "MOPD scoring teachers do not construct an optimizer."},
+    )
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.optimizer is not None:
+            raise ValueError("MOPDTeacherEngineConfig.optimizer must be null")
+        if not self.disable_dropout:
+            raise ValueError("MOPDTeacherEngineConfig.disable_dropout must be true")
 
 
 @dataclass
@@ -3598,6 +3631,11 @@ class PPOConfig(BaseExperimentConfig):
         self._validate_mopd_dataset_sources("train_dataset", self.train_dataset)
         if self.valid_dataset is not None:
             self._validate_mopd_dataset_sources("valid_dataset", self.valid_dataset)
+        if self.mopd.loss.distillation_coefficient == 0:
+            # A pure-RL MOPD plan only scales the actor objective. It must not
+            # require teacher workers, checkpoint compatibility, or colocated
+            # actor/rollout infrastructure to initialize successfully.
+            return
         teacher_engine = self.mopd.teacher_engine
 
         if not self.actor.backend.startswith("megatron:"):
@@ -3622,32 +3660,25 @@ class PPOConfig(BaseExperimentConfig):
             or not teacher_schedule.fork
         ):
             raise ValueError(
-                "mopd.teacher_engine must use colocation target='actor' with fork=true"
+                "the current MOPD v1 runtime supports teacher colocation "
+                "target='actor' with fork=true"
             )
 
         rollout_schedule = self.rollout.scheduling_strategy
         if (
             rollout_schedule.type != SchedulingStrategyType.colocation.value
             or rollout_schedule.target != "actor"
+            or not rollout_schedule.fork
         ):
-            raise ValueError("mopd rollout must use colocation target='actor'")
-        if not rollout_schedule.fork:
-            # TODO(agent): Give rollout trackers explicit export ownership so
-            # same-process actor/rollout engines cannot drain or overwrite each
-            # other's statistics.
-            logger.warning(
-                "MOPD rollout with fork=false may reuse actor worker processes. "
-                "The shared stats tracker can make rollout metrics inaccurate "
-                "during export_stats; use fork=true when accurate rollout "
-                "telemetry is required."
-            )
-        required_actor_ports = 2 if rollout_schedule.fork else 3
-        actor_worker_ports = self.actor.scheduling_spec[0].port_count
-        if actor_worker_ports < required_actor_ports:
             raise ValueError(
-                "MOPD colocated rollout requires actor.scheduling_spec[0]."
-                f"port_count >= {required_actor_ports} when fork="
-                f"{rollout_schedule.fork}, got {actor_worker_ports}"
+                "the current MOPD v1 runtime supports rollout colocation "
+                "target='actor' with fork=true"
+            )
+        actor_worker_ports = self.actor.scheduling_spec[0].port_count
+        if actor_worker_ports < 2:
+            raise ValueError(
+                "the current MOPD v1 runtime requires actor.scheduling_spec[0]."
+                f"port_count >= 2, got {actor_worker_ports}"
             )
 
         actor_alloc = ModelAllocation.from_str(self.actor.backend, name="actor")

@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -16,15 +15,24 @@ from areal.api.cli_args import (
     MOPDTeacherManagerConfig,
     MOPDTeacherSpec,
 )
+from areal.infra.rpc.rtensor import RTensorDrainReceipt
 from areal.trainer.mopd.targets import MOPD_CONTRIBUTIONS_KEY, aggregate_mopd_targets
 from areal.trainer.mopd.teacher_manager import (
     DiskCheckpointProvider,
-    DrainReceipt,
     LocalMemoryCheckpointProvider,
     PersistentTeacherManager,
     TeacherManagerState,
 )
-from areal.trainer.rl_trainer import PPOTrainer
+from areal.trainer.mopd.teacher_phase import MOPDTeacherPhase
+
+
+def _receipt(role: str = "actor") -> RTensorDrainReceipt:
+    return RTensorDrainReceipt(
+        consumer_role=role,
+        shard_count=1,
+        source_node_count=1,
+        consumer_dp_head_count=1,
+    )
 
 
 def _write_checkpoint(root: Path, teacher_id: str, payload: bytes) -> Path:
@@ -100,7 +108,7 @@ def test_persistent_manager_reuses_controller_across_phases_and_checkpoints(tmp_
     manager = PersistentTeacherManager(_config({"t0": t0, "t1": t1}), factory)
 
     first = manager.load("t0")
-    manager.release(DrainReceipt(complete=True))
+    manager.release(_receipt())
     second = manager.load("t0")
     third = manager.load("t1")
 
@@ -122,7 +130,7 @@ def test_persistent_manager_onloads_before_cross_phase_checkpoint_switch(tmp_pat
         _config({"t0": t0, "t1": t1}), lambda _: controller
     )
     manager.load("t0")
-    manager.release(DrainReceipt(complete=True))
+    manager.release(_receipt())
     controller.events.clear()
 
     manager.load("t1")
@@ -139,8 +147,8 @@ def test_persistent_manager_repeated_release_does_not_offload_twice(tmp_path):
     manager = PersistentTeacherManager(_config({"t0": t0}), lambda _: controller)
     manager.load("t0")
 
-    manager.release(DrainReceipt(complete=True))
-    manager.release(DrainReceipt(complete=True))
+    manager.release(_receipt())
+    manager.release(_receipt())
 
     assert controller.events == ["offload"]
     assert manager.state is TeacherManagerState.OFFLOADED
@@ -163,7 +171,7 @@ def test_persistent_manager_does_not_restage_unchanged_local_checkpoint(tmp_path
     )
     manager.pre_fetch("t0")
     manager.load("t0")
-    manager.release(DrainReceipt(complete=True))
+    manager.release(_receipt())
 
     manager.pre_fetch("t0")
     manager.load("t0")
@@ -172,15 +180,15 @@ def test_persistent_manager_does_not_restage_unchanged_local_checkpoint(tmp_path
     manager.close()
 
 
-def test_persistent_manager_rejects_release_before_drain(tmp_path):
-    """An incomplete receipt leaves the resident teacher untouched."""
+def test_persistent_manager_rejects_non_actor_receipt(tmp_path):
+    """A non-actor receipt leaves the resident teacher untouched."""
     t0 = _write_checkpoint(tmp_path, "t0", b"first")
     controller = _PersistentController()
     manager = PersistentTeacherManager(_config({"t0": t0}), lambda _: controller)
     manager.load("t0")
 
-    with pytest.raises(RuntimeError, match="before actor RTensor drain"):
-        manager.release(DrainReceipt(complete=False))
+    with pytest.raises(RuntimeError, match="without an actor RTensor drain receipt"):
+        manager.release(_receipt("teacher"))
 
     assert controller.events == []
     assert manager.state is TeacherManagerState.RESIDENT
@@ -205,13 +213,13 @@ def test_persistent_manager_failure_destroys_companion(tmp_path, failure, prepar
     )
     manager.load("t0")
     if prepare == "offload":
-        manager.release(DrainReceipt(complete=True))
+        manager.release(_receipt())
         controller.events.clear()
     controller.fail_on = failure
 
     with pytest.raises(RuntimeError, match=f"{failure} failed"):
         if failure == "offload":
-            manager.release(DrainReceipt(complete=True))
+            manager.release(_receipt())
         elif failure == "load:t1":
             manager.load("t1")
         else:
@@ -235,11 +243,11 @@ def test_persistent_manager_close_is_idempotent_in_every_live_state(
     manager = PersistentTeacherManager(_config({"t0": t0}), lambda _: controller)
     manager.load("t0")
     if close_state == "offloaded":
-        manager.release(DrainReceipt(complete=True))
+        manager.release(_receipt())
     elif close_state == "broken":
         controller.fail_on = "offload"
         with pytest.raises(RuntimeError, match="offload failed"):
-            manager.release(DrainReceipt(complete=True))
+            manager.release(_receipt())
 
     manager.close()
     manager.close()
@@ -357,11 +365,7 @@ class _PhaseController:
     def strict_clear_batches(self, *targets):
         target_sizes = ",".join(str(len(target)) for target in targets)
         self.events.append(f"clear:{self.teacher_id}:{target_sizes}")
-        return {
-            "complete": True,
-            "source_shards_cleared": sum(len(target) for target in targets),
-            "actor_fetch_buffers_cleared": 2,
-        }
+        return _receipt("mopd-teacher")
 
 
 class _PhaseManager:
@@ -377,8 +381,8 @@ class _PhaseManager:
         self.events.append(f"load:{teacher_id}")
         return _PhaseController(teacher_id, self.events)
 
-    def release(self, receipt: DrainReceipt) -> None:
-        assert receipt.complete
+    def release(self, receipt: RTensorDrainReceipt) -> None:
+        assert receipt.consumer_role == "actor"
         self.events.append("release")
 
     def close(self) -> None:
@@ -400,11 +404,7 @@ class _PhaseActor:
     def strict_clear_batches(self, *targets):
         target_sizes = ",".join(str(len(target)) for target in targets)
         self.events.append(f"clear:actor:{target_sizes}")
-        return {
-            "complete": True,
-            "source_shards_cleared": sum(len(target) for target in targets),
-            "actor_fetch_buffers_cleared": 2,
-        }
+        return _receipt("actor")
 
 
 class _PhaseCritic:
@@ -414,22 +414,14 @@ class _PhaseCritic:
     def strict_clear_batches(self, *targets):
         target_sizes = ",".join(str(len(target)) for target in targets)
         self.events.append(f"clear:critic:{target_sizes}")
-        return {
-            "complete": True,
-            "source_shards_cleared": sum(len(target) for target in targets),
-            "actor_fetch_buffers_cleared": 2,
-        }
+        return _receipt("critic")
 
 
 class _PhaseRef(_PhaseCritic):
     def strict_clear_batches(self, *targets):
         target_sizes = ",".join(str(len(target)) for target in targets)
         self.events.append(f"clear:ref:{target_sizes}")
-        return {
-            "complete": True,
-            "source_shards_cleared": sum(len(target) for target in targets),
-            "actor_fetch_buffers_cleared": 2,
-        }
+        return _receipt("ref")
 
 
 class _FailingPhaseActor(_PhaseActor):
@@ -437,6 +429,13 @@ class _FailingPhaseActor(_PhaseActor):
         del batch
         self.events.append("aggregate")
         raise RuntimeError("aggregation failed")
+
+
+class _FailingPhaseRef(_PhaseRef):
+    def strict_clear_batches(self, *targets):
+        target_sizes = ",".join(str(len(target)) for target in targets)
+        self.events.append(f"clear:ref:{target_sizes}")
+        raise RuntimeError("ref drain failed")
 
 
 def test_trainer_mopd_phase_routes_reuses_drains_then_releases():
@@ -449,15 +448,16 @@ def test_trainer_mopd_phase_routes_reuses_drains_then_releases():
         },
         routes={"r0": {"t0": 2.0}, "r1": {"t0": 0.5, "t1": 1.5}},
     )
-    trainer = object.__new__(PPOTrainer)
-    trainer.config = SimpleNamespace(mopd=mopd)
-    trainer.mopd_teacher_manager = _PhaseManager(events)
-    trainer.actor = _PhaseActor(events)
-    trainer.critic = _PhaseCritic(events)
-    trainer.ref = _PhaseRef(events)
+    phase = MOPDTeacherPhase(
+        config=mopd,
+        manager=_PhaseManager(events),
+        actor=_PhaseActor(events),
+        critic=_PhaseCritic(events),
+        ref=_PhaseRef(events),
+    )
     batch = [{"mopd_route": "r0"}, {"mopd_route": "r1"}]
 
-    result = trainer._run_mopd_teacher_phase(batch)
+    result = phase.materialize(batch)
 
     assert events == [
         "topology:actor",
@@ -499,15 +499,16 @@ def test_trainer_mopd_phase_failure_drains_rollout_before_release():
         teachers={"t0": MOPDTeacherSpec(path="/unused/t0")},
         routes={"r0": {"t0": 1.0}},
     )
-    trainer = object.__new__(PPOTrainer)
-    trainer.config = SimpleNamespace(mopd=mopd)
-    trainer.mopd_teacher_manager = _PhaseManager(events)
-    trainer.actor = _FailingPhaseActor(events)
-    trainer.critic = _PhaseCritic(events)
-    trainer.ref = _PhaseRef(events)
+    phase = MOPDTeacherPhase(
+        config=mopd,
+        manager=_PhaseManager(events),
+        actor=_FailingPhaseActor(events),
+        critic=_PhaseCritic(events),
+        ref=_PhaseRef(events),
+    )
 
     with pytest.raises(RuntimeError, match="aggregation failed"):
-        trainer._run_mopd_teacher_phase([{"mopd_route": "r0"}])
+        phase.materialize([{"mopd_route": "r0"}])
 
     assert events == [
         "topology:actor",
@@ -522,3 +523,24 @@ def test_trainer_mopd_phase_failure_drains_rollout_before_release():
         "clear:actor:1,1",
         "release",
     ]
+
+
+def test_mopd_phase_closes_teacher_when_any_consumer_drain_has_no_ack():
+    """A missing consumer ACK forces teardown instead of teacher offload."""
+    events: list[str] = []
+    mopd = MOPDConfig(
+        teachers={"t0": MOPDTeacherSpec(path="/unused/t0")},
+        routes={"r0": {"t0": 1.0}},
+    )
+    phase = MOPDTeacherPhase(
+        config=mopd,
+        manager=_PhaseManager(events),
+        actor=_PhaseActor(events),
+        ref=_FailingPhaseRef(events),
+    )
+
+    with pytest.raises(RuntimeError, match="ref drain failed"):
+        phase.materialize([{"mopd_route": "r0"}])
+
+    assert "close" in events
+    assert "release" not in events

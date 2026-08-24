@@ -8,7 +8,6 @@ import shutil
 import uuid
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
 from threading import Lock
@@ -16,6 +15,7 @@ from typing import Any, Protocol
 
 from areal.api import SaveLoadMeta
 from areal.api.cli_args import MOPDConfig
+from areal.infra.rpc.rtensor import RTensorDrainReceipt
 
 
 class TeacherController(Protocol):
@@ -31,18 +31,9 @@ class TeacherController(Protocol):
 
     def offload(self) -> None: ...
 
-    def strict_clear_batches(self, *targets: Any) -> dict[str, int | bool]: ...
+    def strict_clear_batches(self, *targets: Any) -> RTensorDrainReceipt: ...
 
     def destroy(self) -> None: ...
-
-
-@dataclass(frozen=True)
-class DrainReceipt:
-    """Proof that actor-owned targets no longer reference teacher storage."""
-
-    complete: bool
-    source_shards_cleared: int = 0
-    actor_fetch_buffers_cleared: int = 0
 
 
 class TeacherManager(Protocol):
@@ -50,7 +41,7 @@ class TeacherManager(Protocol):
 
     def load(self, teacher_id: str) -> TeacherController: ...
 
-    def release(self, receipt: DrainReceipt) -> None: ...
+    def release(self, receipt: RTensorDrainReceipt) -> None: ...
 
     def close(self) -> None: ...
 
@@ -366,11 +357,11 @@ class PersistentTeacherManager:
             if loaded:
                 self._provider.consumed(teacher_id)
 
-    def release(self, receipt: DrainReceipt) -> None:
+    def release(self, receipt: RTensorDrainReceipt) -> None:
         self._ensure_usable()
-        if not receipt.complete:
+        if receipt.consumer_role != "actor":
             raise RuntimeError(
-                "Cannot release MOPD teacher before actor RTensor drain completes"
+                "Cannot release MOPD teacher without an actor RTensor drain receipt"
             )
         if self._state in (
             TeacherManagerState.EMPTY,

@@ -44,6 +44,7 @@ rollout:
   scheduling_strategy: {type: colocation, target: actor, fork: true}
 
 train_dataset:
+  mixture_sampling_policy: proportional
   sources:
     - {path: /data/code, type: rl, route: coding}
     - {path: /data/mixed, type: rl, route: mixed}
@@ -73,6 +74,9 @@ Every entry in `train_dataset.sources` must declare a `route` that matches a key
 `mopd.routes`; validation datasets follow the same rule when configured. Samples
 cannot override their source route and need no `task_type` field. A route can reference
 any number of known teacher IDs and must contain at least one positive weight.
+`mixture_sampling_policy: proportional` preserves source-size proportions.
+`uniform` gives every source the same number of samples per epoch by cycling shorter
+sources deterministically before the distributed sampler shuffles global indices.
 
 `manager.type: disk` loads checkpoints from shared storage and supports multi-node
 runs. `local_memory` asynchronously stages one upcoming checkpoint below

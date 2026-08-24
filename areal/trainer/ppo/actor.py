@@ -43,6 +43,7 @@ from areal.utils.data import (
     split_padded_tensor_dict_into_mb_list,
 )
 from areal.utils.functional import (
+    apply_rejection_sampling,
     cispo_loss_fn,
     ppo_actor_loss_fn,
     reward_overlong_penalty,
@@ -199,6 +200,25 @@ class PPOActor:
     @trace_perf("ppo_actor.compute_advantages", category="compute")
     def compute_advantages(self, data: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return batched_call(self._compute_advantages, data, pass_meta=True)
+
+    @trace_perf("ppo_actor.prepare_mopd_batch", category="compute")
+    def prepare_mopd_batch(self, data: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Align pure-distillation inputs without computing rewards or GAE."""
+        return batched_call(self._prepare_mopd_batch, data)
+
+    def _prepare_mopd_batch(self, data: dict[str, Any]) -> dict[str, Any]:
+        if self._mopd_loss_config is None:
+            raise RuntimeError("MOPD loss configuration is not bound")
+        if self._mopd_loss_config.rl_coefficient != 0:
+            raise RuntimeError("prepare_mopd_batch is only valid for pure distillation")
+        if "mopd_teacher_logp_sum" not in data:
+            raise RuntimeError("Pure MOPD distillation requires teacher targets")
+        loss_mask = torch.roll(data["loss_mask"].float(), shifts=-1, dims=-1)
+        behavior_logp = torch.roll(data["logprobs"], shifts=-1, dims=-1)
+        data["mopd_behavior_logprobs"] = (behavior_logp * loss_mask).detach()
+        data["logprobs"] = behavior_logp * loss_mask
+        data["loss_mask"] = loss_mask
+        return data
 
     def _compute_advantages(
         self, data: dict[str, Any], meta: TrajBatchMeta | None = None
@@ -440,12 +460,17 @@ class PPOActor:
             incorrect_seq_len=seqlens.float(), denominator="incorrect_n_seqs"
         )
 
-        stats = dict(
-            advantages=data["advantages"],
-            kl_rewards=data["kl_rewards"],
-            final_reward=data["tot_rewards"],
+        pure_mopd_distillation = (
+            self._mopd_loss_config is not None
+            and self._mopd_loss_config.rl_coefficient == 0
         )
-        stats_tracker.stat(**stats, denominator="n_valid_tokens")
+        if not pure_mopd_distillation:
+            stats_tracker.stat(
+                advantages=data["advantages"],
+                kl_rewards=data["kl_rewards"],
+                final_reward=data["tot_rewards"],
+                denominator="n_valid_tokens",
+            )
 
         prompt_lens = _infer_prompt_lens(data["attention_mask"], data["loss_mask"])
         seq_stats = dict(
@@ -562,6 +587,11 @@ class PPOActorController(TrainController):
             "compute_advantages", *args, rpc_meta={"broadcast": True}, **kwargs
         )
 
+    def prepare_mopd_batch(self, *args, **kwargs):
+        return self._custom_function_call(
+            "prepare_mopd_batch", *args, rpc_meta={"broadcast": True}, **kwargs
+        )
+
     def aggregate_mopd_targets(self, *args, **kwargs):
         return self._custom_function_call(
             "aggregate_mopd_targets",
@@ -629,9 +659,70 @@ def grpo_loss_fn(
 ):
     """Loss function for actor step, all inputs should be splitted into
     pipeline micro batches, returns loss and logging stats."""
+    loss_mask = input_data["loss_mask"].bool()
+    if mopd_loss_config is not None and mopd_loss_config.rl_coefficient == 0:
+        teacher_logp_sum = input_data.get("mopd_teacher_logp_sum")
+        teacher_weight_sum = input_data.get("mopd_teacher_weight_sum")
+        behavior_logp = input_data.get("mopd_behavior_logprobs")
+        if teacher_logp_sum is None or teacher_weight_sum is None:
+            raise RuntimeError("Pure MOPD distillation requires teacher targets")
+        if behavior_logp is None:
+            raise RuntimeError(
+                "MOPD targets require immutable rollout behavior log-probabilities"
+            )
+        normalization_mask = loss_mask
+        prox_logp_gt = input_data.get("prox_logp")
+        if m2_threshold is not None or rejection_sampling is not None:
+            prox_logp = _resolve_proximal_logp(
+                prox_logp_gt=prox_logp_gt,
+                prox_logp_method=prox_logp_method,
+                old_logp=input_data["logprobs"],
+                logprobs=logprobs.detach(),
+                versions=input_data.get("versions"),
+                current_version=current_version,
+            )
+            if m2_threshold is not None:
+                loss_mask = _apply_m2po_masking(
+                    input_data["logprobs"], prox_logp, loss_mask, m2_threshold
+                )
+                normalization_mask = loss_mask
+            if rejection_sampling is not None:
+                loss_mask = apply_rejection_sampling(
+                    proximal_logprobs=prox_logp,
+                    old_logprobs=input_data["logprobs"],
+                    loss_mask=loss_mask,
+                    cu_seqlens=input_data.get("cu_seqlens"),
+                    config=rejection_sampling,
+                ).loss_mask
+        loss, mopd_stats = compose_mopd_loss(
+            logprobs.new_zeros(()),
+            config=mopd_loss_config,
+            logprobs=logprobs,
+            old_logprobs=behavior_logp,
+            teacher_logp_sum=teacher_logp_sum,
+            teacher_weight_sum=teacher_weight_sum,
+            loss_mask=loss_mask,
+            normalization_mask=normalization_mask,
+        )
+        stats_tracker.denominator(
+            n_tokens=infer_token_denominator(input_data, loss_mask),
+            n_valid_tokens=normalization_mask,
+            n_mopd_tokens=normalization_mask,
+        )
+        stats_tracker.stat(
+            mopd_loss=mopd_stats["loss_per_token"].float(),
+            mopd_reward=mopd_stats["score_reward"].float(),
+            mopd_importance_weight=mopd_stats["importance_weight"].float(),
+            mopd_teacher_weight_sum=mopd_stats["teacher_weight_sum"].float(),
+            new_logp=logprobs.detach(),
+            old_logp=behavior_logp,
+            entropy=entropy.detach().float(),
+            denominator="n_mopd_tokens",
+        )
+        return loss
+
     old_logp = input_data["logprobs"]
     advantages = input_data["advantages"]
-    loss_mask = input_data["loss_mask"].bool()
     prox_logp_gt = input_data.get("prox_logp")  # Could be None if skipped
 
     entropy = entropy.detach()
@@ -745,6 +836,10 @@ def grpo_loss_fn(
             normalization_mask=mopd_normalization_mask,
         )
         rkl_stat = mopd_stats["reverse_kl"].float()
+    elif mopd_loss_config is not None:
+        if mopd_loss_config.distillation_coefficient != 0:
+            raise RuntimeError("MOPD distillation is enabled but targets are missing")
+        loss = mopd_loss_config.rl_coefficient * loss
     elif teacher_logp is not None:
         rl_loss_weight = input_data.get("rl_loss_weight", 1.0)
         distill_loss_weight = input_data.get("distill_loss_weight", 0.005)

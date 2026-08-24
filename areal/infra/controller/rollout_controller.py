@@ -36,7 +36,7 @@ from areal.api.cli_args import (
     SchedulingSpec,
     SchedulingStrategyType,
 )
-from areal.dataset.mopd import MOPD_ROUTE_METADATA_KEY
+from areal.dataset.mopd import MOPD_ROUTE_METADATA_KEY, DatasetRoute
 from areal.infra.rpc.serialization import deserialize_value
 from areal.infra.utils.concurrent import run_async_task
 from areal.utils import logging, perf_tracer
@@ -175,12 +175,14 @@ class RolloutController:
                 raise ValueError("MOPD dataset-source route metadata is missing")
             return data, None
 
-        route = data[MOPD_ROUTE_METADATA_KEY]
-        if not isinstance(route, str) or not route.strip():
-            raise ValueError("MOPD dataset-source route must be a non-empty string")
+        provenance = data[MOPD_ROUTE_METADATA_KEY]
+        if not isinstance(provenance, DatasetRoute):
+            raise ValueError(
+                "MOPD dataset-source route must contain DatasetRoute provenance"
+            )
         prepared = dict(data)
         prepared.pop(MOPD_ROUTE_METADATA_KEY)
-        return prepared, route
+        return prepared, provenance.route
 
     @staticmethod
     def _propagate_mopd_route(
