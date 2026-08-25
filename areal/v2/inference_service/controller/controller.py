@@ -477,6 +477,18 @@ class RolloutControllerV2:
                 "--engine-max-tokens",
                 str(agent_cfg.engine_max_tokens),
             ]
+        if cfg.deterministic_sampling:
+            data_proxy_base_cmd.append("--deterministic-sampling")
+        for preprocessor_path in agent_cfg.message_preprocessors:
+            data_proxy_base_cmd += [
+                "--message-preprocessor",
+                preprocessor_path,
+            ]
+        if agent_cfg.prefix_matcher:
+            data_proxy_base_cmd += [
+                "--prefix-matcher",
+                agent_cfg.prefix_matcher,
+            ]
 
         async def _fork_data_proxy(group_idx: int) -> tuple[str, int, str]:
             if self.external_mode:
@@ -1592,6 +1604,8 @@ class RolloutControllerV2:
             discount=turn_discount,
             export_style=export_style,
             group_size=group_size,
+            serialize_group_samples=self.config.serialize_group_samples,
+            drop_retry_orphans=agent_cfg.drop_retry_orphans,
         )
 
     def _resolve_workflow(
@@ -1646,6 +1660,9 @@ class RolloutControllerV2:
 
             online_kwargs = dict(workflow_kwargs or {})
             online_kwargs.pop("controller", None)
+            online_kwargs.setdefault(
+                "drop_retry_orphans", self._agent_config.drop_retry_orphans
+            )
             return InferenceServiceWorkflow(
                 controller=self,
                 agent=None,

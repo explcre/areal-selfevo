@@ -55,9 +55,7 @@ class MOPDTeacherPhase:
         self._critic = critic
         self._ref = ref
 
-    def materialize(
-        self, rollout_batch: list[dict[str, Any]]
-    ) -> list[dict[str, Any]]:
+    def materialize(self, rollout_batch: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Materialize actor-owned MOPD targets and release teacher residency."""
         routed_weights = self._resolve_routed_weights(rollout_batch)
         required_teachers = [
@@ -96,9 +94,7 @@ class MOPDTeacherPhase:
             self._actor.assert_mopd_runtime_topology()
             self._manager.pre_fetch(required_teachers[0])
             for teacher_index, teacher_id in enumerate(required_teachers):
-                was_offloaded = (
-                    self._manager.state is TeacherManagerState.OFFLOADED
-                )
+                was_offloaded = self._manager.state is TeacherManagerState.OFFLOADED
                 controller = self._manager.load(teacher_id)
                 if all(existing is not controller for existing in teacher_controllers):
                     teacher_controllers.append(controller)
@@ -228,9 +224,7 @@ class MOPDTeacherPhase:
             expected.add("critic")
         if self._ref is not None:
             expected.add("ref")
-        expected.update(
-            f"teacher:{index}" for index in range(len(teacher_controllers))
-        )
+        expected.update(f"teacher:{index}" for index in range(len(teacher_controllers)))
         missing = sorted(expected - receipts.keys())
         if missing:
             raise RuntimeError(

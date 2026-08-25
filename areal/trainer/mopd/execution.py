@@ -33,9 +33,7 @@ class MOPDExecutionPlan:
             )
         )
         return cls(
-            requires_teacher_scoring=(
-                config.mopd.loss.distillation_coefficient > 0
-            ),
+            requires_teacher_scoring=(config.mopd.loss.distillation_coefficient > 0),
             requires_rl=requires_rl,
             requires_critic=requires_rl and config.critic is not None,
             requires_ref=(

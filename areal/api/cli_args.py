@@ -224,6 +224,14 @@ class GenerationHyperparameters:
             )
         },
     )
+    seed: int | None = field(
+        default=None,
+        metadata={
+            "help": "Per-request sampling seed sent to the inference backend. Leave "
+            "unset for grouped deterministic rollouts so each sample receives a "
+            "stable, distinct derived seed."
+        },
+    )
     lora_name: str = field(
         default="default_lora",
         metadata={"help": "Lora name to be used for this generation."},
@@ -1338,8 +1346,26 @@ class TrainEngineConfig:
         default="xccl",
         metadata={
             "help": "Weight update backend type. 'awex' requires a Megatron actor "
-            "and an SGLang rollout, and targets colocated actor-rollout setups.",
+            "and an SGLang rollout.",
             "choices": ["disk", "xccl", "awex"],
+        },
+    )
+    enable_delta_weight_update: bool = field(
+        default=False,
+        metadata={"help": "Enable sparse delta weight updates for separation AWEX."},
+    )
+    weight_update_delta_method: str = field(
+        default="adamw",
+        metadata={
+            "help": "Change detection method used for delta weight transfer.",
+            "choices": ["adamw"],
+        },
+    )
+    weight_update_anchor_interval: int = field(
+        default=0,
+        metadata={
+            "help": "Force a full sync every N committed deltas. 0 disables "
+            "periodic anchors."
         },
     )
     fsdp: FSDPEngineConfig = field(default_factory=FSDPEngineConfig)
@@ -1664,7 +1690,11 @@ class PPOActorConfig(TrainEngineConfig):
 
     # Core PPO/GRPO Parameters
     ppo_n_minibatches: int = field(
-        default=4, metadata={"help": "Number of minibatches for each PPO update"}
+        default=4,
+        metadata={
+            "help": "Number of minibatches for each PPO update. Separation DTE "
+            "AdamW delta transfer currently requires 1."
+        },
     )
     eps_clip: float = field(
         default=0.2, metadata={"help": "Clipping factor for policy ratio"}
@@ -1907,6 +1937,13 @@ class PPOActorConfig(TrainEngineConfig):
                 "to a single optimizer step per PPO update."
             )
             self.ppo_n_minibatches = 1
+        if self.enable_delta_weight_update and self.ppo_n_minibatches != 1:
+            raise ValueError(
+                "actor.enable_delta_weight_update=true currently requires "
+                "ppo_n_minibatches=1 because separation AdamW inversion "
+                "supports exactly one optimizer step between weight updates; "
+                f"got ppo_n_minibatches={self.ppo_n_minibatches}"
+            )
         # Warn if rejection_sampling is configured but use_decoupled_loss is False
         if not self.use_decoupled_loss and self.rejection_sampling is not None:
             logger.warning(
@@ -2123,6 +2160,11 @@ class vLLMConfig:
         return vLLMConfig.build_cmd_from_args(args)
 
 
+# Keep this list aligned with SGLang's deterministic inference documentation:
+# https://docs.sglang.ai/advanced_features/deterministic_inference.html
+_SGLANG_DETERMINISTIC_ATTENTION_BACKENDS = frozenset({"flashinfer", "fa3", "triton"})
+
+
 @dataclass
 class SGLangConfig:
     """Configuration for SGLang runtime. Refer to:
@@ -2156,6 +2198,7 @@ class SGLangConfig:
     enable_memory_saver: bool = False
     allow_auto_truncate: bool = False
     attention_backend: str | None = "fa3"
+    enable_deterministic_inference: bool = False
     enable_multimodal: bool = False
     sampling_backend: str | None = None
     context_length: int | None = 32768
@@ -2239,6 +2282,19 @@ class SGLangConfig:
         node_rank: int = 0,
         pp_size: int = 1,
     ):
+        attention_backend = sglang_config.attention_backend
+        if (
+            sglang_config.enable_deterministic_inference
+            and attention_backend is not None
+            and attention_backend.lower()
+            not in _SGLANG_DETERMINISTIC_ATTENTION_BACKENDS
+        ):
+            logger.warning(
+                "SGLang deterministic inference is only documented for attention "
+                "backends %s; configured attention_backend=%r may be non-deterministic.",
+                sorted(_SGLANG_DETERMINISTIC_ATTENTION_BACKENDS),
+                attention_backend,
+            )
         # Map "all-linear" to "all"
         args: dict = conf_as_dict(sglang_config)
         if sglang_config.enable_multithread_load:
@@ -2473,6 +2529,25 @@ class InferenceEngineConfig:
             "help": "Whether to output verbose tracing messages for each generation request."
         },
     )
+    deterministic_sampling: bool = field(
+        default=False,
+        metadata={
+            "help": "Use stable request seeds for internal OpenAI-proxy/data-proxy "
+            "sessions, canonical group ordering, and task-ID ordering of completed "
+            "rollout results. Concurrent SGLang generation also requires "
+            "sglang.enable_deterministic_inference. End-to-end determinism is only "
+            "supported with max_head_offpolicyness=0."
+        },
+    )
+    serialize_group_samples: bool = field(
+        default=False,
+        metadata={
+            "help": "Run RolloutControllerV2 samples within each group sequentially "
+            "instead of concurrently. This provides stable within-group member "
+            "submission order at the cost of rollout throughput; it does not "
+            "serialize requests across groups."
+        },
+    )
     check_trajectory_format: bool = field(
         default=False,
         metadata={
@@ -2617,6 +2692,13 @@ class InferenceEngineConfig:
             )
         if not self.admin_api_key or not self.admin_api_key.strip():
             raise ValueError("admin_api_key must not be empty or whitespace-only")
+        if self.deterministic_sampling and self.max_head_offpolicyness > 0:
+            logger.warning(
+                "deterministic_sampling=True with max_head_offpolicyness=%d does "
+                "not guarantee deterministic task-to-weight-version mapping; "
+                "set max_head_offpolicyness=0 for end-to-end determinism.",
+                self.max_head_offpolicyness,
+            )
         if (
             self._version == "v2"
             and self.agent is not None
@@ -3609,6 +3691,21 @@ class PPOConfig(BaseExperimentConfig):
             self._validate_mopd_config()
         if self.eval_gconfig is None:
             self.eval_gconfig = self.gconfig.new()
+        if self.rollout.deterministic_sampling:
+            for config_name, generation_config in (
+                ("gconfig", self.gconfig),
+                ("eval_gconfig", self.eval_gconfig),
+            ):
+                if (
+                    generation_config.n_samples > 1
+                    and generation_config.seed is not None
+                ):
+                    raise ValueError(
+                        "deterministic_sampling with grouped rollouts cannot use "
+                        f"a shared {config_name}.seed, because every sample would "
+                        "receive the same sampling seed. Set the seed to null to "
+                        "derive stable per-sample seeds, or set n_samples=1."
+                    )
         if self.gconfig.reward_normalization and self.actor.reward_norm is not None:
             raise ValueError(
                 "gconfig.reward_normalization (rollout-time, per-prompt) and "
