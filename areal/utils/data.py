@@ -18,6 +18,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from areal.api.cli_args import MicroBatchSpec, NormConfig
 from areal.infra.platforms import current_platform
 from areal.utils import logging, seqpack
+from areal.utils.group_stats import GroupStatsRecorder
 from areal.utils.math import align
 from areal.utils.seqpack import get_allocate_fn
 
@@ -1483,13 +1484,20 @@ class Normalization:
     - None: no centering or no std scaling
     """
 
-    def __init__(self, config: NormConfig):
+    def __init__(self, config: NormConfig, recorder: GroupStatsRecorder | None = None):
+        """Build a normalizer, optionally with a pure observer attached.
+
+        ``recorder`` is instrumentation only: it is shown the pre-normalization
+        values and the group layout, and can neither read nor influence the
+        normalized result. Defaults to None (no observation).
+        """
         self.mean_level = config.mean_level
         self.mean_leave1out = config.mean_leave1out
         self.std_level = config.std_level
         self.std_unbiased = config.std_unbiased
         self.group_size = config.group_size
         self.eps = config.eps
+        self.recorder = recorder
 
     def _build_group_slices(
         self, bs: int, group_sizes: list[int] | None
@@ -1530,6 +1538,7 @@ class Normalization:
         high_precision: bool = True,
         reduce_group=None,
         group_sizes: list[int] | None = None,
+        step: int | None = None,
     ) -> torch.Tensor:
         bs = x.size(0)
         eps = self.eps
@@ -1542,6 +1551,27 @@ class Normalization:
         group_slices = None
         if self.mean_level == "group" or self.std_level == "group":
             group_slices = self._build_group_slices(bs, group_sizes)
+
+        # Pure observation, before any normalization math. It reads ``x`` and
+        # the group layout and writes nothing back, so the value returned below
+        # is bitwise identical with and without a recorder. When the levels do
+        # not need group slices we build them here for recording only, into a
+        # throwaway expression, so ``group_slices`` stays None downstream. Any
+        # failure (e.g. ``group_sizes`` that only the recorder path validates)
+        # is swallowed: instrumentation must never break training.
+        if self.recorder is not None and self.recorder.enabled:
+            try:
+                self.recorder.record(
+                    x,
+                    (
+                        group_slices
+                        if group_slices is not None
+                        else self._build_group_slices(bs, group_sizes)
+                    ),
+                    step=step,
+                )
+            except Exception as e:
+                logger.warning(f"GroupStatsRecorder.record failed, skipped: {e}")
 
         # Step 1: Compute mean
         if self.mean_level == "batch":
