@@ -235,21 +235,37 @@ class GroupStatsRecorder:
         n_silent = 0
         n_all_zero = 0
         n_all_one = 0
-        sum_mean = 0.0
-        sum_mean_sq = 0.0
-        sum_var = 0.0
         for r in self.records:
             n_silent += int(r.is_silent)
             n_all_zero += int(r.p_hat == 0.0)
             n_all_one += int(r.p_hat == 1.0)
-            sum_mean += r.reward_mean
-            sum_mean_sq += r.reward_mean * r.reward_mean
-            sum_var += r.reward_std * r.reward_std
             bin_index = min(int(r.p_hat * P_HAT_HIST_BINS), P_HAT_HIST_BINS - 1)
             hist[max(bin_index, 0)] += 1
 
-        mean_of_means = sum_mean / n_groups
-        between_group_var = max(sum_mean_sq / n_groups - mean_of_means**2, 0.0)
+        # Size-weighted (ANOVA) decomposition, population convention (ddof=0).
+        # Weighting by group size is not cosmetic: it is the only convention under
+        # which between + within equals the total population variance of the batch,
+        # which makes both components checkable against a single number. An
+        # unweighted average over groups does not decompose and cannot be verified.
+        n_samples = sum(r.size for r in self.records)
+        if n_samples == 0:
+            between_group_var = 0.0
+            within_group_var = 0.0
+        else:
+            grand_mean = (
+                sum(r.size * r.reward_mean for r in self.records) / n_samples
+            )
+            between_group_var = max(
+                sum(
+                    r.size * (r.reward_mean - grand_mean) ** 2
+                    for r in self.records
+                )
+                / n_samples,
+                0.0,
+            )
+            within_group_var = (
+                sum(r.size * r.reward_std**2 for r in self.records) / n_samples
+            )
         return {
             "n_groups": n_groups,
             "silent_rate": n_silent / n_groups,
@@ -257,7 +273,7 @@ class GroupStatsRecorder:
             "all_one_rate": n_all_one / n_groups,
             "p_hat_hist": hist,
             "between_group_var": between_group_var,
-            "within_group_var": sum_var / n_groups,
+            "within_group_var": within_group_var,
         }
 
     def flush(self) -> None:
