@@ -22,6 +22,6 @@ echo "endpoint up; scoring $TAG"
 # Repo copy, never a stale $HOME copy: numbers must come from audited code.
 python3 "$(dirname "$0")/math_bench.py" --base-url "http://127.0.0.1:$PORT/v1" \
   --benchmarks "${BENCHES:-aime24,aime25,amc23,math500}" \
-  --max-tokens "${MAXTOK:-3072}" --concurrency "${CONC:-64}" \
+  --max-tokens "${MAXTOK:-3072}" --concurrency "${CONC:-64}" --limit "${LIMIT:-0}" \
   --timeout "${TIMEOUT:-600}" \
   --out "$OUT/results.json" --gen-out "$OUT/generations.jsonl" 2>&1 | tee "$OUT/math.log"

@@ -998,3 +998,63 @@ verifying a value at one layer and asserting it about the whole path.
 read directly instead. Generation and sandboxed execution-grading are not wired end to end;
 what is established is the data, the difficulty profile, and that the endpoint integration
 costs nothing.
+
+---
+
+## step0d scored on a held-out benchmark: the train reward was blind to a real collapse
+
+Six checkpoints were saved across step0d (globalstep 28/57/86/115/144/173). All six, plus
+the untrained `Qwen2.5-1.5B-Instruct` anchor, were scored on the full MATH-500 (500
+problems, greedy, 8192-token cap, one job per GPU under a hard `timeout`).
+
+The anchor matters: without it, "flat" and "already collapsed before the first checkpoint"
+are indistinguishable.
+
+| ckpt  | entropy | train reward | MATH-500 | 95% CI          | acc\|boxed | nobox | trunc | mean len (ch) |
+|-------|---------|--------------|----------|-----------------|-----------|-------|-------|---------------|
+| base  | --      | --           | 0.528    | [0.484, 0.571]  | 0.537     | 0.016 | 0.012 | 1728          |
+| gs028 | 0.2533  | 0.5469       | 0.454    | [0.411, 0.498]  | 0.467     | 0.028 | 0.006 | 1398          |
+| gs057 | 0.1344  | 0.2090       | 0.440    | [0.397, 0.484]  | 0.489     | 0.100 | 0.014 | 1445          |
+| gs086 | 0.1436  | 0.7207       | 0.466    | [0.423, 0.510]  | 0.478     | 0.026 | 0.020 | 1812          |
+| gs115 | 0.0989  | 0.4932       | 0.356    | [0.315, 0.399]  | 0.408     | 0.128 | 0.082 | 3068          |
+| gs144 | 0.0253  | 0.5459       | 0.292    | [0.254, 0.333]  | 0.366     | 0.202 | 0.490 | 12898         |
+| gs173  | 0.0182  | 0.4814       | 0.316    | [0.277, 0.358]  | 0.404     | 0.218 | 0.598 | 15482         |
+
+**1. Training reward cannot see the collapse.** Over 200 GRPO steps the GSM8K task reward
+oscillates between 0.209 and 0.721 with no trend, while held-out MATH-500 falls from 0.528
+to 0.316. The base and final Wilson intervals do not overlap, so the decline is not noise.
+Ranking these checkpoints by train reward puts gs086 (0.721) first and gs057 (0.209) last;
+ranking by MATH-500 puts gs086 third and gs057 fourth. The train signal does not merely
+understate the damage, it orders the checkpoints wrongly. Every claim in this project that
+rested on GSM8K train reward was measuring something that does not track capability.
+
+**2. The mechanism is length degeneration, not sharpening.** Policy entropy falls 14x
+(0.253 -> 0.018), which would ordinarily suggest a policy collapsing onto a confident mode.
+The generations show the opposite: mean output grows 9x (1728 -> 15482 characters) and the
+fraction hitting the token cap goes from 1.2% to 59.8%. The policy becomes locally
+deterministic and globally non-terminating -- it commits hard to each next token while
+losing the ability to stop.
+
+**3. Why training never noticed.** step0d trains on GSM8K with
+`gconfig.max_new_tokens=1024`. GSM8K answers are short, so a 1024-token cap is not binding
+for a healthy policy and the rambling has no room to express itself in-distribution. The
+degeneration is only visible on harder, longer problems with a budget large enough to let
+the model run. A short-answer training set with a tight generation cap hides exactly this
+failure.
+
+**Stated as a limitation, not a result.** `acc|boxed` is survivor-biased and must not be
+read as "the model still solves 40%". At gs144 and gs173 roughly half the generations never
+produce a parseable answer, and the ones that do are disproportionately the short, easy
+problems the model can still finish. The honest reading is that the -0.212 drop in overall
+accuracy is real, that the -0.132 drop in `acc|boxed` shows the loss is not purely a
+formatting artefact, and that the two cannot be cleanly separated at this truncation rate.
+Establishing the split would need a much larger cap on the collapsed checkpoints.
+
+**Not yet done:** the same series has not been scored on AIME24/25 or AMC23. At 30 problems
+those cannot resolve a 4-point difference, so MATH-500 was run first on purpose.
+
+Reproduce with `experiments/bench/sweep_entropy.sh` then
+`experiments/bench/analyze_sweep.py <suite-dir>`. The analyser recomputes every accuracy
+from the raw generations and aborts if it disagrees with the harness's own `results.json`;
+an earlier version of it silently reported 0.000 for all seven checkpoints because it read
+a key name (`graded`) that the current artefact schema does not use.
