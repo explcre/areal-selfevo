@@ -31,20 +31,23 @@ def test_meds_style_shaper_with_prefix_gate_is_rejected():
     """The rule this module exists for: entropy bonus voids sum_i A_i = 0."""
     register_shaper("entropy_bonus", None, breaks_centring=True)
     cfg = PipelineConfig(shaper="entropy_bonus", gate="prefix_dead")
-    problems = validate(cfg)
+    problems = validate(cfg, allow_stubs=True)  # rule under test is the pairing
     assert problems, "MEDS-style shaping + prefix gating must be rejected"
-    assert any(p.axes == ("shaper", "gate") for p in problems)
-    assert "sum_i A_i" in str(problems[0])
-    assert "dp_actor.py:560" in str(problems[0]), "must cite where the claim is grounded"
+    hits = [p for p in problems if p.axes == ("shaper", "gate")]
+    assert hits, problems
+    assert "sum_i A_i" in str(hits[0])
+    assert "dp_actor.py:560" in str(hits[0]), "must cite where the claim is grounded"
 
 
 def test_the_same_shaper_is_fine_without_the_gate():
     register_shaper("entropy_bonus", None, breaks_centring=True)
-    assert is_valid(PipelineConfig(shaper="entropy_bonus", gate="none"))
+    assert is_valid(PipelineConfig(shaper="entropy_bonus", gate="none"),
+                    allow_stubs=True)  # rule under test is the pairing, not the stub
 
 
 def test_the_same_gate_is_fine_without_the_shaper():
-    assert is_valid(PipelineConfig(shaper="none", gate="prefix_dead"))
+    assert is_valid(PipelineConfig(shaper="none", gate="prefix_dead"),
+                    allow_stubs=True)  # rule under test is the pairing, not the stub
 
 
 def test_learned_policy_without_feedback_is_rejected():
@@ -107,7 +110,8 @@ def test_registering_a_shaper_inconsistently_raises():
 
 def test_a_new_safe_shaper_composes_with_the_gate():
     register_shaper("rescale_only", None, breaks_centring=False)
-    assert is_valid(PipelineConfig(shaper="rescale_only", gate="prefix_dead"))
+    assert is_valid(PipelineConfig(shaper="rescale_only", gate="prefix_dead"),
+                    allow_stubs=True)  # rule under test is the pairing, not the stub
     assert "rescale_only" in SHAPERS and "prefix_dead" in GATES
 
 
@@ -221,7 +225,8 @@ def test_entropy_bonus_is_marked_unsafe_by_the_shipped_registry():
     prog = (
         "from selfevo.compose import _BREAKS_CENTRING, validate, PipelineConfig;"
         "assert 'entropy_bonus' in _BREAKS_CENTRING, 'not in shipped registry';"
-        "p = validate(PipelineConfig(shaper='entropy_bonus', gate='prefix_dead'));"
+        "p = validate(PipelineConfig(shaper='entropy_bonus', gate='prefix_dead'),"
+        "             allow_stubs=True);"
         "assert p, 'MEDS shaper + prefix gate not rejected out of the box';"
         "assert any(x.axes == ('shaper', 'gate') for x in p), 'wrong axes';"
         "print('OK')"
@@ -235,10 +240,13 @@ def test_entropy_bonus_is_marked_unsafe_by_the_shipped_registry():
 
 def test_meds_combination_is_rejected_without_any_test_setup():
     """The exact MEDS cell, validated with nothing registered by the test."""
-    problems = validate(PipelineConfig(shaper="entropy_bonus", gate="prefix_dead"))
+    problems = validate(
+        PipelineConfig(shaper="entropy_bonus", gate="prefix_dead"), allow_stubs=True
+    )
     assert problems, "the MEDS shaper + prefix gate must be rejected out of the box"
-    assert any(p.axes == ("shaper", "gate") for p in problems)
-    assert "dp_actor.py:560" in str(problems[0])
+    hits = [p for p in problems if p.axes == ("shaper", "gate")]
+    assert hits, problems
+    assert "dp_actor.py:560" in str(hits[0])
 
 
 # ------------------------------------------------ reward evolution and critic axes
@@ -301,10 +309,93 @@ def test_critics_compose_freely_with_the_other_axes():
 
     assert {"none", "scalar", "two_level"} <= CRITICS
     for c in CRITICS:
-        assert is_valid(PipelineConfig(critic=c))
+        assert is_valid(PipelineConfig(critic=c),
+                        allow_stubs=True)  # rule under test is composition, not the stub
 
 
 def test_frozen_reward_flag_alone_is_harmless():
     """Setting the guard when not evolving the reward must not reject anything."""
     assert is_valid(PipelineConfig(frozen_eval_reward=True))
     assert is_valid(PipelineConfig(policy_scored_by_frozen_reward=True))
+
+
+# --------------------------------------------------------------- stub guard
+
+
+def test_naming_an_unimplemented_component_is_rejected():
+    """A config that names a stub would run and silently do nothing."""
+    problems = validate(PipelineConfig(critic="two_level"))
+    assert any(p.axes == ("critic",) for p in problems), problems
+    assert "no implementation" in str(problems[0])
+
+
+def test_stubs_are_allowed_only_when_explicitly_requested():
+    assert is_valid(PipelineConfig(critic="two_level"), allow_stubs=True)
+    assert not is_valid(PipelineConfig(critic="two_level"))
+
+
+def test_none_is_not_treated_as_a_stub():
+    """'none' means there is no component, not an unbuilt one."""
+    assert is_valid(PipelineConfig(critic="none", shaper="none", gate="none"))
+
+
+def test_the_gate_stub_is_caught_too():
+    problems = validate(PipelineConfig(gate="prefix_dead"))
+    assert any(p.axes == ("gate",) for p in problems)
+
+
+def test_stub_guard_does_not_mask_the_real_rules():
+    """With allow_stubs, the MEDS incompatibility must still fire."""
+    register_shaper("entropy_bonus", None, breaks_centring=True)
+    problems = validate(
+        PipelineConfig(shaper="entropy_bonus", gate="prefix_dead"), allow_stubs=True
+    )
+    assert any(p.axes == ("shaper", "gate") for p in problems), problems
+
+
+# ------------------------------------------------- meta-critic (BigBang paper 2.3)
+
+
+def test_meta_critic_without_a_critic_is_rejected():
+    """It calibrates a critic's judgements; with no critic there is nothing to calibrate."""
+    problems = validate(
+        PipelineConfig(meta_critic="outcome_calibrated", critic="none",
+                       frozen_eval_reward=True),
+        allow_stubs=True,
+    )
+    assert any(p.axes == ("meta_critic", "critic") for p in problems), problems
+
+
+def test_meta_critic_without_a_frozen_anchor_is_rejected():
+    """Otherwise it compares the critic against a target the critic itself influences."""
+    problems = validate(
+        PipelineConfig(meta_critic="outcome_calibrated", critic="two_level"),
+        allow_stubs=True,
+    )
+    assert any(p.axes == ("meta_critic", "frozen_eval_reward") for p in problems), problems
+
+
+def test_the_full_bigbang_shape_validates():
+    """generator/critic + meta-critic + held-out anchor: the paper's configuration."""
+    assert is_valid(
+        PipelineConfig(
+            critic="two_level",
+            meta_critic="outcome_calibrated",
+            frozen_eval_reward=True,
+        ),
+        allow_stubs=True,
+    )
+
+
+def test_unknown_meta_critic_is_rejected():
+    problems = validate(PipelineConfig(meta_critic="nope"), allow_stubs=True)
+    assert any(p.axes == ("meta_critic",) for p in problems)
+
+
+def test_meta_critic_stub_is_caught_like_any_other():
+    problems = validate(
+        PipelineConfig(meta_critic="outcome_calibrated", critic="two_level",
+                       frozen_eval_reward=True)
+    )
+    assert any(p.axes == ("meta_critic",) and "no implementation" in p.reason
+               for p in problems), problems

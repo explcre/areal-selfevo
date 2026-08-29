@@ -33,6 +33,7 @@ from typing import Callable
 
 __all__ = [
     "PipelineConfig",
+    "CRITIC_FACTORIES",
     "Incompatibility",
     "validate",
     "SHAPERS",
@@ -41,6 +42,7 @@ __all__ = [
     "EVOLVE_TARGETS",
     "EVOLVE_POLICIES",
     "CRITICS",
+    "META_CRITICS",
     "register_shaper",
     "register_router",
 ]
@@ -56,6 +58,24 @@ EVOLVE_TARGETS: frozenset[str] = frozenset({"model", "harness", "reward", "both"
 # evaluation only -- no critic code -- so this is built from the description, not their
 # implementation, and is labelled as such.
 CRITICS: frozenset[str] = frozenset({"none", "scalar", "two_level"})
+# Factories per critic. None means DECLARED BUT NOT IMPLEMENTED -- validate() rejects a
+# config naming one unless allow_stubs=True, so a stub cannot be mistaken for a component.
+# The meta-critic (BigBang paper 2.3): compares the critic's assessments against OBSERVED
+# training outcomes on held-out real tasks, and uses the discrepancy to refine both the
+# evaluation criteria and the generation strategy. Without it an evolving critic has no
+# anchor and can drift to whatever it finds easy to score.
+META_CRITICS: frozenset[str] = frozenset({"none", "outcome_calibrated"})
+META_CRITIC_FACTORIES: dict[str, Callable[..., object] | None] = {
+    "none": None,
+    "outcome_calibrated": None,  # not implemented
+}
+CRITIC_FACTORIES: dict[str, Callable[..., object] | None] = {
+    "none": None,      # "none" is the absence of a critic, so a None factory is correct
+    "scalar": None,    # not implemented
+    "two_level": None, # not implemented; BigBang-v1 ships no critic code to build on
+}
+# Components whose None factory means "nothing to build", not "not built yet".
+_LEGITIMATELY_EMPTY: frozenset[str] = frozenset({"none"})
 EVOLVE_POLICIES: frozenset[str] = frozenset({"rule", "learned_weights", "learned_code"})
 
 # Shapers that break the centred-advantage invariant `sum_i A_i = 0`. Membership here is a
@@ -157,11 +177,36 @@ class PipelineConfig:
     evolve_policy: str = "rule"
     require_feedback: bool = False
     critic: str = "none"
+    meta_critic: str = "none"
     frozen_eval_reward: bool = False
     policy_scored_by_frozen_reward: bool = False
 
 
-def validate(cfg: PipelineConfig) -> list[Incompatibility]:
+def _stub_problems(cfg: "PipelineConfig") -> list["Incompatibility"]:
+    """Components named by ``cfg`` that are declared but have no implementation."""
+    out: list[Incompatibility] = []
+    for axis, name, registry in (
+        ("shaper", cfg.shaper, SHAPERS),
+        ("gate", cfg.gate, GATES),
+        ("critic", cfg.critic, CRITIC_FACTORIES),
+        ("meta_critic", cfg.meta_critic, META_CRITIC_FACTORIES),
+    ):
+        if name in _LEGITIMATELY_EMPTY:
+            continue
+        if name in registry and registry[name] is None:
+            out.append(
+                Incompatibility(
+                    (axis,),
+                    f"{axis}={name!r} is declared but has no implementation; running it "
+                    "would silently do nothing. Pass allow_stubs=True to explore the "
+                    "configuration space before building it.",
+                    "registry factory is None",
+                )
+            )
+    return out
+
+
+def validate(cfg: PipelineConfig, *, allow_stubs: bool = False) -> list[Incompatibility]:
     """Return every reason ``cfg`` is invalid; empty means it can be run.
 
     Returns a list rather than raising on the first problem, so a sweep can report all
@@ -169,11 +214,16 @@ def validate(cfg: PipelineConfig) -> list[Incompatibility]:
 
     Args:
         cfg: The configuration to check.
+        allow_stubs: If True, do not reject components that are declared but unimplemented.
+            For sweeping the design space before building; a real run must leave it False,
+            or a stub silently becomes a no-op component.
 
     Returns:
         Incompatibilities, possibly empty.
     """
     out: list[Incompatibility] = []
+    if not allow_stubs:
+        out.extend(_stub_problems(cfg))
 
     if cfg.shaper not in SHAPERS:
         out.append(Incompatibility(("shaper",), f"unknown shaper {cfg.shaper!r}", "registry"))
@@ -204,6 +254,37 @@ def validate(cfg: PipelineConfig) -> list[Incompatibility]:
                 "prefix_cancellation.py; MEDS dp_actor.py:560",
             )
         )
+
+    if cfg.meta_critic not in META_CRITICS:
+        out.append(
+            Incompatibility(
+                ("meta_critic",), f"unknown meta_critic {cfg.meta_critic!r}", "registry"
+            )
+        )
+
+    # A meta-critic exists to compare critic judgements against real outcomes; with no
+    # critic there is nothing to calibrate, and with no frozen anchor there is nothing to
+    # compare against. Both would run and quietly do nothing.
+    if cfg.meta_critic != "none":
+        if cfg.critic == "none":
+            out.append(
+                Incompatibility(
+                    ("meta_critic", "critic"),
+                    "a meta-critic calibrates a critic's judgements against observed "
+                    "outcomes; with critic='none' there is nothing to calibrate",
+                    "BigBang paper 2.3",
+                )
+            )
+        if not cfg.frozen_eval_reward:
+            out.append(
+                Incompatibility(
+                    ("meta_critic", "frozen_eval_reward"),
+                    "outcome calibration needs a held-out measure that does not move; "
+                    "without one the meta-critic compares the critic against a target "
+                    "the critic itself influences",
+                    "BigBang paper 2.3",
+                )
+            )
 
     if cfg.critic not in CRITICS:
         out.append(
@@ -265,6 +346,6 @@ def validate(cfg: PipelineConfig) -> list[Incompatibility]:
     return out
 
 
-def is_valid(cfg: PipelineConfig) -> bool:
+def is_valid(cfg: PipelineConfig, *, allow_stubs: bool = False) -> bool:
     """True when :func:`validate` finds nothing."""
-    return not validate(cfg)
+    return not validate(cfg, allow_stubs=allow_stubs)
