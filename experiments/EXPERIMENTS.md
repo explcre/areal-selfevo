@@ -436,3 +436,60 @@ step 290.
 Entropy did not collapse. It bottomed near 0.21 around step 16-23 and has since recovered
 (0.2541, 0.2912, 0.3084, 0.3175). The predeclared failure branch (entropy < 0.1 with
 declining reward) has not triggered.
+
+### ROOT-CAUSE FIX: single-threaded callback server discards finished rollouts
+
+**Symptom.** step0c logged a growing count of
+`Callback to http://<host>:<port>/callback/rollout_complete failed: HTTPConnectionPool: Read timed out`
+(43 at step 18, 103 by step 39), alongside a few `Too many open files`.
+
+**Chain, end to end.**
+
+1. `WorkflowExecutor._send_callback` (`areal/infra/workflow_executor.py:371-385`) posts one
+   callback per finished rollout, `timeout=30`, **fire-and-forget**: a failure is logged and
+   swallowed, with no retry.
+2. The receiver is built at `areal/infra/controller/rollout_controller.py:680` as
+   `make_server(host, port, app, threaded=False)` -- **single-threaded**. It serves one
+   callback at a time.
+3. At the published `batch_size: 256` with `gconfig.n_samples: 4`, 1024 rollouts finish and
+   post concurrently. They serialise behind one handler thread; later senders exceed 30s.
+4. On the controller, `asyncio.wait_for(future, timeout=request_timeout)` then raises, and
+   `_handle_rollout` takes `except TimeoutError` (`rollout_controller.py:921-927`):
+
+       self._pending_futures.pop(task_id, None)
+       manager.on_rollout_rejected()
+       return None                      # <-- never fetches the result
+
+   The success path fetches the trajectory via `wait_for_task`; the timeout path does not.
+   So a rollout whose generation had **already completed** is discarded.
+
+**Why the batch still looked fine.** `n_seqs` is 1024 on every step, because the executor
+submits replacements for rejected rollouts. Nothing is missing from the batch -- the cost is
+wasted GPU work, and the choice of which rollouts survive is made by callback-queue
+position rather than anything meaningful.
+
+**Reproduction** (`experiments/harness/test_callback_threading.py`), at the real
+concurrency, handler work 0.02s, client timeout 5s:
+
+| server | callbacks OK | timed out | wall |
+|---|---|---|---|
+| `threaded=False` | 377 | **647 / 1024** | 10.07s |
+| `threaded=True`  | **1024** | **0** | 4.31s |
+
+At 64 concurrent the serial server does not yet drop anything but is already 6.4x slower
+(1.47s vs 0.23s) -- perfectly serial, 64 x 0.02s. The failure only appears once serial
+service time crosses the client timeout, which is why this surfaced when we moved from our
+under-sized `batch_size=32` (128 rollouts) to the published 256 (1024 rollouts).
+
+**Fix.** `threaded=True`. This is a correction, not a tuning choice: the handler was
+already written to be called concurrently -- `_resolve_task_future` pops under
+`self._futures_lock` and resolves the asyncio future via `loop.call_soon_threadsafe`, and
+the `.pop()` makes double-resolution impossible. `threaded=False` prevented the concurrency
+the handler was designed for.
+
+**Residual design flaw, NOT fixed here.** The `except TimeoutError` branch throws away a
+result that is very likely still retrievable -- it could attempt the same `wait_for_task`
+fetch the success path uses before rejecting. Fixing that changes upstream control flow, so
+it is recorded rather than changed: with `threaded=True` the branch should now be rare.
+Worth revisiting before any self-evolving run, where rollouts are longer and callbacks
+burstier.

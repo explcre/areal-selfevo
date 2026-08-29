@@ -677,8 +677,19 @@ class RolloutController:
         self._callback_port = find_free_ports(1)[0]
         self._callback_host = gethostip()
         self._callback_app = app
+        # threaded=True is required, not an optimisation. The trainer fires one
+        # rollout_complete callback per finished rollout: at the published
+        # batch_size=256 with gconfig.n_samples=4 that is 1024 concurrent POSTs. A
+        # single-threaded werkzeug server serialises them, later senders exceed the
+        # 30s timeout in WorkflowExecutor._send_callback, and _handle_rollout then
+        # takes the `except TimeoutError` branch -- which REJECTS a rollout whose
+        # generation had already completed, discarding finished GPU work.
+        # Measured at 1024 concurrent callbacks with a 5s client timeout:
+        #   threaded=False -> 647/1024 callbacks lost;  threaded=True -> 0 lost.
+        # The handler is already thread-safe: _resolve_task_future pops under
+        # self._futures_lock and resolves via loop.call_soon_threadsafe.
         self._callback_server = make_server(
-            self._callback_host, self._callback_port, app, threaded=False
+            self._callback_host, self._callback_port, app, threaded=True
         )
 
         # Suppress Werkzeug access logs (e.g., "POST /callback/rollout_complete 200 -")
