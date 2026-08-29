@@ -16,6 +16,8 @@ from enum import Enum
 
 __all__ = [
     "SilenceSide",
+    "attainable_solve_rates",
+    "threshold_is_inert",
     "rl_informativeness",
     "silent_group_probability",
     "silence_side",
@@ -108,9 +110,12 @@ def silence_side(
         raise ValueError(f"threshold must be in [0, 1], got {threshold}")
     if rl_informativeness(p, group_size) >= threshold:
         return SilenceSide.INFORMATIVE
-    # Exactly 0.5 cannot be silent for G >= 2, so this branch only sees the tails; ties
-    # resolve to SOLVED, which is the conservative choice (spend less, rather than pull in
-    # a teacher for something the model may already handle).
+    # p == 0.5 CAN reach this branch: it is silent whenever threshold > 1 - 2**(1-G),
+    # and threshold is validated up to 1.0. Verified: silence_side(0.5, 2, 0.51) and
+    # silence_side(0.5, 4, 0.885) both return SOLVED. At the default threshold of 0.1 this
+    # is unreachable, but the guarantee is conditional on the threshold, not unconditional.
+    # Ties resolve to SOLVED, the conservative choice: spend less, rather than pull in a
+    # teacher for something the model may already handle.
     return SilenceSide.UNSOLVED if p < 0.5 else SilenceSide.SOLVED
 
 
@@ -138,6 +143,15 @@ def min_group_size(p: float, eps: float) -> float:
         raise ValueError(f"p must be in [0, 1], got {p}")
     if eps <= 0.0:
         raise ValueError(f"eps must be positive, got {eps}")
+    if eps >= 0.5:
+        # Without this, the bound is satisfiable by group_size 1 -- which this very
+        # module proves is identically silent (A = r - rbar = 0 for a singleton). A
+        # bound whose feasible region contains a provably degenerate configuration is
+        # worse than no bound, because it reads as permission.
+        raise ValueError(
+            f"eps must be < 0.5, got {eps}: larger tolerances admit group_size < 2, "
+            "which has zero informativeness by construction"
+        )
     denom = 8.0 * eps * p * (1.0 - p)
     if denom == 0.0:
         return math.inf
@@ -173,3 +187,64 @@ def _validate(p: float, group_size: int) -> None:
         raise ValueError(f"p must be in [0, 1], got {p}")
     if group_size < 1:
         raise ValueError(f"group_size must be >= 1, got {group_size}")
+
+
+def attainable_solve_rates(group_size: int) -> list[float]:
+    """Solve rates a single group can actually produce: ``k / G`` for k in 0..G.
+
+    Matters because :func:`rl_informativeness` is continuous in ``p`` while an observed
+    ``p_hat`` from one group is not -- it takes only ``G + 1`` values.
+
+    Args:
+        group_size: Samples per prompt, >= 1.
+
+    Returns:
+        The attainable rates in increasing order.
+
+    Raises:
+        ValueError: If ``group_size`` < 1.
+    """
+    if group_size < 1:
+        raise ValueError(f"group_size must be >= 1, got {group_size}")
+    return [k / group_size for k in range(group_size + 1)]
+
+
+def threshold_is_inert(group_size: int, threshold: float) -> bool:
+    """Whether ``threshold`` can change any decision at single-group granularity.
+
+    **This is the sharpest limitation of the whole criterion, so it is exposed as code
+    rather than left in a docstring.** With ``p_hat = k / G``, ``I_RL(p_hat, G)`` is zero
+    exactly when the group was unanimous and is otherwise bounded below by
+    ``I_RL(1/G, G)``. So every threshold in ``(0, I_RL(1/G, G)]`` induces the *identical*
+    partition, and at that granularity the criterion is not estimating anything -- it is
+    a re-encoding of "was this group unanimous?", an outcome already observed.
+
+    At ``G = 4`` the attainable informativeness values are
+    ``[0.0, 0.6797, 0.875, 0.6797, 0.0]``, so any threshold in ``(0, 0.6797]`` -- including
+    the default 0.1 -- is inert.
+
+    ``I_RL`` earns its keep only at task/cluster granularity, where ``p`` is pooled over
+    many prompts and genuinely takes intermediate values. Note also that ``I_RL(p_hat, G)``
+    is a *biased* plug-in estimate of ``I_RL(p, G)``, by Jensen, since ``I_RL`` is concave
+    in ``p``.
+
+    Args:
+        group_size: Samples per prompt, >= 1.
+        threshold: Informativeness threshold in [0, 1].
+
+    Returns:
+        True when no attainable solve rate straddles ``threshold``, i.e. tuning it cannot
+        change any routing decision.
+
+    Raises:
+        ValueError: If ``threshold`` is outside [0, 1] or ``group_size`` < 1.
+    """
+    if not 0.0 <= threshold <= 1.0:
+        raise ValueError(f"threshold must be in [0, 1], got {threshold}")
+    vals = [rl_informativeness(p, group_size) for p in attainable_solve_rates(group_size)]
+    nonzero = [v for v in vals if v > 0.0]
+    if not nonzero:
+        return True
+    # Inert when the threshold separates nothing: every non-zero value lands on the same
+    # side of it as every other non-zero value.
+    return all(v >= threshold for v in nonzero) or all(v < threshold for v in nonzero)

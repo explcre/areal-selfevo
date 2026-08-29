@@ -144,8 +144,13 @@ class RoutingDecision:
     reason: str = ""
 
     def __post_init__(self) -> None:
+        # Order matters: a mixture like {RL: 2.0, SFT: -1.0} sums to 1.0, so a sum check
+        # alone would accept a negative weight. Each condition is checked on its own so a
+        # test for one cannot pass because of another.
         if not self.weights:
-            raise ValueError("weights must be non-empty; use {TrainingMode.SKIP: 1.0}")
+            raise ValueError(
+                "weights must be non-empty; spell 'no decision' as {TrainingMode.SKIP: 1.0}"
+            )
         for mode, w in self.weights.items():
             if mode not in _MODES:
                 raise ValueError(f"unknown mode {mode!r}; register it first")

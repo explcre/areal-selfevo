@@ -48,7 +48,21 @@ class StaticRouter:
         RoutingDecision(self.weights)  # validate eagerly, not at first route()
 
     def route(self, ctx: RoutingContext) -> RoutingDecision:
-        """Return the fixed weights, ignoring ``ctx``."""
+        """Return the fixed weights, minus any mode the context cannot supply.
+
+        Honours the invariant stated in :mod:`selfevo.routing.base`: a router must not
+        select a teacher-requiring mode when no teacher is available. A fixed-mode
+        baseline is not exempt -- an all-SFT arm run on teacherless data would otherwise
+        emit decisions the signal layer cannot fulfil.
+        """
+        if not ctx.has_teacher:
+            usable = {m: w for m, w in self.weights.items() if not known_modes()[m]}
+            if not usable:
+                return RoutingDecision(
+                    {TrainingMode.SKIP: 1.0}, reason="static, no teacher available"
+                )
+            if len(usable) != len(self.weights):
+                return RoutingDecision(usable, reason="static, teacher modes dropped")
         return RoutingDecision(dict(self.weights), reason="static")
 
 
