@@ -677,3 +677,85 @@ whole path. Twice for `min_new_tokens` (config field; then request protocol), on
 reward contamination (handler line, not batch membership). The check that would have caught
 all three is the same: measure the effect end to end on data the running system produced,
 before asserting the mechanism.
+
+## Step 0 reproduction: outcome, and three upstream findings
+
+### The reproduction FAILED, per a criterion committed before the outcome (e25a30f5)
+
+step0c ran AReaL's published GSM8K GRPO config with no deviation except the forced
+`attn_impl=sdpa`. It collapsed:
+
+| step | entropy | train reward | seq_len |
+|---|---|---|---|
+| 6 | 4.032 | 0.761 | 341 |
+| 22 | **0.029** | 0.775 | 367 |
+| 62 | 0.026 | 0.748 | 362 |
+| 76 | 0.037 | **0.039** | 209 |
+
+Held-out `eval-rollout/reward`: 0.677, 0.677, 0.707, 0.687 -> **0.378**.
+
+**The shape is the lesson.** Entropy collapsed by step 22 and the policy then looked
+healthy -- reward ~0.78 -- for *forty more steps* before falling off a cliff. Any run
+sampled in steps 22-62 reads as a successful reproduction. This is the same error made
+earlier in this session when an early window was called "reproducing"; here the misleading
+window was 40 steps wide.
+
+The honest report is that the published config does not reproduce on this setup -- not that
+a better setting was found.
+
+### Why it has no defence against collapse
+
+- **AReaL has no entropy regulariser at all.** No `entropy_coef`/`entropy_bonus` anywhere;
+  entropy is `.detach()`ed and logged as a metric. This is presumably why MEDS patches its
+  own in at `verl/workers/actor/dp_actor.py:560`.
+- The reference config sets `kl_ctl: 0.0`, so the reference policy is not even loaded.
+- `reward_scaling: 10.0` is **not** a lever: `adv_norm` normalises by batch mean *and std*,
+  so scaling rewards scales the advantage and its std together and cancels exactly.
+- `importance_weight` is exactly 1.0 (min and max) and `clip_ratio` exactly 0.0, so with
+  `ppo_n_minibatches: 1` the update is plain on-policy policy gradient with no trust region.
+
+So nothing in the published configuration constrains the update. `kl_ctl` is the only
+regulariser the framework offers, and it is genuinely wired (`actor.py:255`).
+
+### FINDING: `min_new_tokens` is unusable with AReaL
+
+Not a plumbing problem -- the plumbing is correct through all 10 hops
+(`experiments/harness/verify_chain.py`). The feature itself is incompatible:
+
+    AttributeError: 'NoneType' object has no attribute 'additional_stop_token_ids'
+    sglang/srt/sampling/penaltylib/min_new_tokens.py:24
+
+sglang's min-new-tokens penalizer reads `req.tokenizer`, and AReaL sends raw `input_ids`
+with no tokenizer attached to the request. Every prefill kills the scheduler. Observed with
+`min_new_tokens=1`: all four rollout servers dead, 28,146 500s, **zero training steps**.
+
+So all-EOS completions cannot be prevented this way. Do not retry it.
+
+Getting here took four attempts, each of which fixed one link and asserted the whole chain:
+`gconfig.min_new_tokens` (dead field), `extra_body min_tokens` (dropped when ArealOpenAI
+rebuilds the gconfig), `sglang_remote` forwarding (forwards a value nothing sets), and then
+forwarding to only one of two sub-clients (`TypeError` at startup). The verifier now checks
+every hop individually and names the one that fails.
+
+### FINDING: infrastructure failures are dropped, NOT scored as reward 0.0
+
+Retracted claim, corrected by measurement. `_set_last_reward(..., 0.0)` in the exception
+handler is gateway session bookkeeping; the `return None` on the same path decides batch
+membership, and None trajectories are dropped and replaced. Per-step failure counts
+correlate **positively** with that step's reward (+0.18 and +0.40 in two runs), and the
+single worst step (62 failures) carried the highest reward in its window. `n_seqs` is 1024
+every step.
+
+The cost of these failures is wasted compute and queue-position-determined selection, not
+signal contamination.
+
+### Fixed, and worth keeping
+
+- **Callback server was single-threaded** (`rollout_controller.py:680`, `threaded=False`),
+  serialising 1024 concurrent rollout-completion POSTs. Senders exceeded the 30s
+  fire-and-forget timeout and the controller then REJECTED rollouts that had already
+  finished generating. Reproduced: 647/1024 callbacks lost vs 0 with `threaded=True`. Side
+  effect: step time 50.7s -> 38.2s.
+- **File-descriptor soft limit 1024** against a hard limit of 1048576, exhausted by 1024
+  concurrent rollouts. Raised in place with `prlimit` (no restart), `ulimit -n 131072` in
+  the launcher.
