@@ -829,3 +829,43 @@ currently unrepresented in the axes.
 BigBang does this implicitly: their meta-critic compares critic judgements against held-out
 outcomes on a *periodic* cadence, not continuously. We encoded the anchor and missed the
 cadence.
+
+### CAUGHT IN THE WILD: survivor bias would have reported Qwen3.8-27B at 100% on AIME
+
+The math-harness audit predicted this failure in the abstract:
+
+> *a partial outage silently shrinks the denominator... timeouts correlate with long/hard
+> generations -> upward bias*
+
+It happened in production within hours, on the first frontier-model measurement:
+
+    aime24   acc=1.0000  se=0.0000  n=17/30  fail=13
+    aime25   acc=1.0000  se=0.0000  n=16/30  fail=14
+
+**100% accuracy on AIME**, computed over survivors, with 13-14 of 30 problems timed out.
+The problems that finished are the ones the model solved *quickly* -- the easy ones. The
+hard ones exceeded the 600s timeout and vanished from the denominator entirely. `se=0.0000`
+compounded it by asserting zero uncertainty, which is what a binomial SE does at 17/17.
+
+Had the log been trusted, the reported result would have been
+"Qwen3.8-27B: 100% on AIME24" -- a number that is wrong, headline-shaped, and would have
+survived casual review because AIME accuracy near 100% is not obviously absurd for a 2026
+frontier thinking model.
+
+**Two mechanisms, both now fixed.**
+
+1. The run used the STALE `$HOME/math_bench.py`, not the audited repo copy, because
+   `~/run_math.sh` resolved `$(dirname $0)` to `$HOME`. The audit flagged exactly this
+   ("nothing enforces it -- a stale copy would produce numbers credited to audited code").
+   Both `$HOME` paths are now **symlinks into the repo**, so a stale copy is impossible
+   rather than merely discouraged.
+2. The parameters were wrong for a thinking model: 600s timeout at concurrency 32 with
+   8192 max tokens. Re-running at timeout 2400, concurrency 8, 16384 tokens.
+
+The audited harness would have caught it regardless: it counts `n_failed` separately from
+wrong answers, warns whenever `n_graded < n_problems` rather than only at zero, and reports
+a Wilson interval instead of an SE that reads 0.0000 at the extremes.
+
+**The invalid run is quarantined, not deleted**, at
+`~/runs/math/qwen38_27b_INVALID_survivor_bias/`. A wrong number that is kept and labelled
+is evidence; a wrong number that is deleted is a lesson someone repeats.
