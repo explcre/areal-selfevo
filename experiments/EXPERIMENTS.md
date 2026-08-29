@@ -328,3 +328,42 @@ prefix, so `genebench-pro/README.md` and `bio-mystery/README.md` both collapse t
 `README.md` and the two trees' namespaces merged. A failing integrity check is a claim that
 needs its own verification before it is acted on -- use `rsync --checksum` and let the tool
 that understands the trees do the comparison.
+
+### Controlled comparison: batch size sets the entropy-decay RATE
+
+Same config, same model, same data order; only `train_dataset.batch_size` differs
+(32 vs the published 256). Compared at **matched sequences consumed**, which is the fair
+axis -- step0c does 1024 sequences per step, step0b 128, so step0c step 5 == step0b step 40.
+
+| sequences consumed | step0b (batch 32) | step0c (batch 256) |
+|---|---|---|
+| 1,024 | 4.387 | 4.372 |
+| 2,048 | 2.405 | 4.338 |
+| 3,072 | 1.689 | 4.337 |
+| 4,096 | 0.716 | 4.062 |
+| 5,120 | 0.436 | 3.685 |
+| 6,144 | (collapsed) | 2.917 |
+
+Entropy is not a function of data consumed; it is a function of how many *updates* that
+data was split into. step0b took 40 noisy steps to consume what step0c took 5 clean steps
+to consume, and paid for it with an 8x lower entropy at the same point. This is the
+variance argument made visible: with G=4 and 32 groups per update, the advantage sign is
+unreliable (see the group-size law note), and repeatedly stepping on unreliable signs with
+`kl_ctl=0.0` and `eps_clip=0.4` drives the policy deterministic.
+
+### PREDECLARED TEST (written before the outcome is known)
+
+step0c's entropy is still falling monotonically: 4.37, 4.34, 4.34, 4.06, 3.69, 2.92. The
+published config has no entropy bonus and no KL anchor, so nothing in it obviously arrests
+the decay. Two outcomes, declared now so the result cannot be rationalized after the fact:
+
+- **If entropy stabilizes above ~1.0 and `task_reward/avg` rises over 290 steps**, the
+  published config is sound and our batch cut was the whole story.
+- **If entropy falls below 0.1 before step ~15 and reward declines**, then the published
+  config collapses too, only more slowly, and batch size is a rate parameter rather than
+  the cause. In that case Step 0 does not reproduce as published on this hardware, and the
+  honest report is that we could not reproduce it -- not that we found a better setting.
+
+Either way the number that decides it is `update/entropy/avg` against
+`ppo_actor/task_reward/avg`, read across all 290 steps, not an early window. Reading an
+early window is exactly the mistake made on step0b.
