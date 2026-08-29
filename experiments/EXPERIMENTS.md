@@ -915,3 +915,42 @@ Consequences to act on rather than note:
 3. The claim "AIME leaves real headroom" was true for Qwen2.5-7B and is **not** established
    for a frontier base. It was recorded as an assumption to be measured; it has now been
    measured and partly falsified.
+
+### The AIME numbers measure the token budget, not the model
+
+Complete audited run, Qwen3.8-27B, max_tokens 16384:
+
+    aime24  acc=0.7333  wilson=[0.556,0.858]  n=30/30  fail=0  trunc=13  nobox=4
+    aime25  acc=0.7333  wilson=[0.556,0.858]  n=30/30  fail=0  trunc=11  nobox=7
+
+Sensitivity, measured from the persisted generations
+(`experiments/bench/trunc_analysis.py`):
+
+| bench | n | correct | truncated | trunc WITH a box | of those, correct | acc | hard upper |
+|---|---|---|---|---|---|---|---|
+| aime24 | 30 | 22 | 13 | 5 | **5/5** | 0.733 | **1.000** |
+| aime25 | 30 | 22 | 11 | 3 | **3/3** | 0.733 | **1.000** |
+
+Two facts make this decisive rather than a caveat:
+
+1. **Every truncated generation that emitted a box at all was correct** (8/8 across both
+   benchmarks). The rest never reached an answer. There is no evidence that truncation is
+   selecting for *wrong* reasoning -- it is selecting for *unfinished* reasoning.
+2. **Truncated generations are ~5x longer than completed ones** (aime24 median 45,084 chars
+   vs 8,292). Truncation lands on the hard problems, exactly where a method effect would
+   have to show up.
+
+So the true score lies in **[0.733, 1.000]** and the interval from truncation (up to 26.7
+points) dwarfs the Wilson interval (+/-15 points) that the harness reports. **At 16384
+tokens, an AIME comparison on this model measures the token budget, not the policy.**
+
+**Consequence, which is a methodology rule and not a to-do.** No AIME number from a
+thinking model enters a comparison until `trunc` is near zero; otherwise the token budget
+is confounded with the method, and a method that merely produces shorter reasoning would
+score higher for the wrong reason. This is the same shape as the earlier survivor bias --
+a plausible-looking number produced by a mechanism unrelated to what is being measured --
+and it is caught only because the harness reports `finish_reason` and persists generations.
+
+The previous entry called 0.733 a lower bound and said truncation "must be driven near
+zero". That was right but understated: the bound is so loose that the measurement carries
+almost no information about the model.
