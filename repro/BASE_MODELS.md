@@ -11,6 +11,7 @@ noise band.
 
 | model | HF id | params | why |
 |---|---|---|---|
+| **Qwen3.8-27B** | `Qwen/Qwen3.8-27B` | 27B dense | **Apache 2.0**, sglang explicitly supported (our stack), 262K ctx, thinking model. Published: GPQA Diamond 89.2, LiveCodeBench v6 90.3, SWE-bench Pro 61.7 |
 | Ornith-1.5-35B-A3B | `ornith-ai/Ornith-1.5-35B-A3B` | 35B total / ~3B active (MoE) | self-improving coding model; published numbers to compare against directly |
 | BigBang-v1 | `endless-frontier/BigBang-v1` | 35B-A3B | the self-evolving-synthesis model this work positions against; its own benchmark table is in the frozen set |
 | Ornith-1.5-9B | `ornith-ai/Ornith-1.5-9B` | 9B | cheapest frontier option; Terminal-Bench 2.1 46.2, SWE-bench Verified 70.6 |
@@ -19,9 +20,21 @@ noise band.
 A ~35B MoE with ~3B active fits comfortably on 8xA100-80GB; the 9B fits trivially. The
 397B Ornith variant does not.
 
-**Not verified yet:** none of these have been downloaded or served here. "Qwen3.8" was
-mentioned as a candidate but I could not confirm such a release exists, so it is not listed
-rather than guessed at.
+**Correction (2026-08-29):** I previously recorded that I could not confirm a Qwen3.8
+release. That was wrong -- it is released. `Qwen/Qwen3.8-27B` (Apache 2.0, 27B dense) is now
+the first choice: it is the only candidate whose license is unambiguously permissive and
+whose serving stack (sglang) is the one we already run. The Max-class
+`Qwen/Qwen3.8-2.4T-A95B` is out of reach: 2.4T total parameters will not fit on
+8xA100-80GB regardless of the 95B active.
+
+**Not verified yet:** none of these have been downloaded or served here.
+
+**A risk this base introduces, which must be measured before it is assumed away.**
+Qwen3.8-27B reports LiveCodeBench v6 **90.3** and SWE-bench Pro **61.7**. If those hold,
+code is close to saturated from this base and the headroom argument that motivated the
+frozen set does not apply there. No AIME score is published, so AIME headroom is likewise
+unknown. Measure it with `experiments/bench/math_bench.py` BEFORE building a claim on it --
+this is the same mistake as assuming GSM8K had room, which cost several runs.
 
 ## Why this matters for the claim
 
