@@ -94,8 +94,14 @@ def run(
     us = [replace(u) for u in units]
     spent = 0.0
     counts: dict[str, int] = {}
+    made: list = []          # the decisions actually taken, for building a real control
     i = 0
-    while spent < budget:
+    # SKIP costs 0, so a router that skips everything never advances `spent` and this loop
+    # would never terminate. That is not hypothetical: SolveRateRouter skips every unsolved
+    # unit when no teacher is available, which is the whole `no_teacher` regime. Cap the
+    # iterations and report the shortfall rather than hanging.
+    max_iters = int(budget * 20)
+    while spent < budget and i < max_iters:
         u = us[i % len(us)]
         i += 1
         # p_hat is what a real rollout gives: an observed group mean, not the latent p.
@@ -106,7 +112,9 @@ def run(
             granularity=Granularity.CLUSTER,
             has_teacher=u.has_teacher,
         )
-        mode = router.route(ctx).argmax()
+        decision = router.route(ctx)
+        mode = decision.argmax()
+        made.append(decision)
         counts[mode] = counts.get(mode, 0) + 1
         spent += COSTS[mode]
         if mode == TrainingMode.RL:
@@ -115,7 +123,9 @@ def run(
             u.p = _sft_update(u, lr_sft)
         if spent >= budget:
             break
-    return sum(x.p for x in us) / len(us), counts
+    if i >= max_iters:
+        counts["_budget_unspent"] = int(budget - spent)
+    return sum(x.p for x in us) / len(us), counts, made
 
 
 def make_units(regime: str, n: int, rng: random.Random) -> list[Unit]:
@@ -171,22 +181,24 @@ def main() -> None:
                 )
                 for u in units
             ]
+            _, _, crit_decisions = run(
+                crit, units, budget=args.budget, group_size=args.group_size,
+                lr_rl=args.lr_rl, lr_sft=args.lr_sft, seed=seed,
+            )
             arms = {
                 "criterion": crit,
-                "matched_control": MatchedPermutationControl.from_router(
-                    # Pool sized to the budget: at most `budget` decisions are
-                    # served (SKIP costs 0, so the loop can exceed budget in
-                    # iterations), with headroom. Building 200x that was the
-                    # bottleneck -- every RoutingDecision validates on construction.
-                    crit, ctxs * (int(args.budget // len(ctxs)) + 3), seed=seed
-                ),
+                # Built from what the criterion ACTUALLY did, below. Seeding it from
+                # contexts carrying each unit's initial latent p gave the wrong pool: the
+                # run routes on observed group means of an evolving p, so the two
+                # distributions differ (measured 32% skip vs 8%). "Measured, not assumed."
+                "matched_control": MatchedPermutationControl(crit_decisions, seed=seed),
                 "inverted": InvertedRouter(),
                 "all_rl": StaticRouter({TrainingMode.RL: 1.0}),
                 "all_sft": StaticRouter({TrainingMode.SFT: 1.0}),
             }
             res = {}
             for name, r in arms.items():
-                mean_p, counts = run(
+                mean_p, counts, _ = run(
                     r, units, budget=args.budget, group_size=args.group_size,
                     lr_rl=args.lr_rl, lr_sft=args.lr_sft, seed=seed,
                 )

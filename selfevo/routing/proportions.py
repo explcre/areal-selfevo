@@ -83,6 +83,7 @@ class MatchedPermutationControl:
         self._rng = random.Random(seed)
         self._rng.shuffle(self._pool)
         self._i = 0
+        self._served: list[RoutingDecision] = []
 
     @classmethod
     def from_router(
@@ -115,17 +116,18 @@ class MatchedPermutationControl:
         :meth:`realised_proportions`, so a shift away from the intended match is visible
         rather than silent.
 
-        Raises:
-            RuntimeError: If called more times than there were decisions. Wrapping around
-                would silently correlate the control with the unit ordering.
+        Draws with replacement, so the control never exhausts and its realised
+        proportions converge to the criterion router's regardless of how many iterations
+        each arm takes.
         """
-        if self._i >= len(self._pool):
-            raise RuntimeError(
-                f"control exhausted after {len(self._pool)} decisions; build it over the "
-                "same number of contexts as the run it controls"
-            )
-        d = self._pool[self._i]
+        # Draw WITH REPLACEMENT rather than replaying the multiset in order. In-order
+        # replay only matches proportions if the control takes exactly as many iterations
+        # as the router it matches, and it does not: SKIP costs 0, so an arm that skips
+        # more runs longer at the same budget. Measured with in-order replay, the control
+        # realised 8.5% skip against the criterion's 32%.
+        d = self._pool[self._rng.randrange(len(self._pool))]
         self._i += 1
+        self._served.append(d)
         from .base import known_modes  # local import keeps module import order simple
 
         mode = d.argmax()
@@ -140,7 +142,7 @@ class MatchedPermutationControl:
         SKIP-migration, and it must be reported alongside a routing result rather than
         assumed to be zero.
         """
-        counts: Counter[str] = Counter(d.argmax() for d in self._pool[: self._i])
+        counts: Counter[str] = Counter(d.argmax() for d in self._served)
         total = sum(counts.values())
         if total == 0:
             return {}
