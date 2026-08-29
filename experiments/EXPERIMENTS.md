@@ -566,3 +566,55 @@ zero". A generation of length 0 is not a datum about the policy's quality.
 `kl_ctl: 0.0` with no entropy bonus. `min_tokens=1` removes the crash and the false zeros
 so the collapse can be measured cleanly; it does not prevent it. Whether the published
 config avoids collapse over 290 steps is still the open reproduction question.
+
+### ROOT-CAUSE FIX: all-EOS generations 500 sglang and are scored as reward 0.0
+
+**The error returned at the PUBLISHED config**, which corrects my earlier attribution.
+step0's 3,468,076 copies of
+
+    500 {'detail': 'All output_tokens are EOS or PAD tokens; cannot strip stop tokens
+                    without removing entire output.'}
+
+were blamed on our `max_new_tokens=512` override. That made it catastrophic; it did not
+cause it. step0c runs the published 1024 and hit the same error: 2 occurrences at step 27,
+**32 one step later**, while entropy fell to 0.0296.
+
+**Mechanism, and why it is self-reinforcing.**
+1. As entropy falls the policy starts sampling EOS as the *first* token.
+2. The completion is then entirely EOS/PAD. sglang's stop-token stripping would empty the
+   output, so it returns 500.
+3. `OpenAIProxyWorkflow` catches it, and AReaL assigns the trajectory **reward 0.0**
+   (`controller/workflow.py:207-231`).
+4. A false zero enters training and pushes entropy lower, which makes step 1 more likely.
+
+Entropy collapse and this error are not two problems; the error is a *consequence* of low
+entropy that then *accelerates* it.
+
+**Fix: force at least one non-EOS token.** `extra_body={"min_tokens": 1}` in the GSM8K
+workflow kwargs.
+
+The field name is the whole subtlety, and it is exactly the dead-field trap twice over:
+- AReaL's `gconfig.min_new_tokens` is declared in `cli_args.py` and **read nowhere**, so
+  setting it does nothing.
+- sglang's OpenAI adapter declares **`min_tokens`** on `ChatCompletionRequest` and maps it
+  in `to_sampling_params()` as `"min_new_tokens": self.min_tokens` (`protocol.py:771`), so
+  sending `min_new_tokens` over the API is also silently ignored.
+
+Verified directly (`experiments/harness/test_min_tokens.py`):
+
+| sent on the request | resulting `min_new_tokens` |
+|---|---|
+| `min_tokens=1` | **1** |
+| (nothing) | **0**  <- what every run so far used |
+| `min_new_tokens=1` | **0** (ignored) |
+| `max_completion_tokens=1024` | `max_new_tokens=1024`, undisturbed |
+
+**This is a deviation from the published config and is recorded as one.** It changes
+sampling by suppressing EOS at position 0. The justification is that the alternative is not
+"unmodified behaviour" but "a 500 that is silently converted into a training signal of
+zero". A generation of length 0 is not a datum about the policy's quality.
+
+**What it does NOT fix.** Entropy still collapses (4.46 -> 0.0296 by step 28) under
+`kl_ctl: 0.0` with no entropy bonus. `min_tokens=1` removes the crash and the false zeros
+so the collapse can be measured cleanly; it does not prevent it. Whether the published
+config avoids collapse over 290 steps is still the open reproduction question.
