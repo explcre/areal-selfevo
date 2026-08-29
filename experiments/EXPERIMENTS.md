@@ -869,3 +869,49 @@ a Wilson interval instead of an SE that reads 0.0000 at the extremes.
 **The invalid run is quarantined, not deleted**, at
 `~/runs/math/qwen38_27b_INVALID_survivor_bias/`. A wrong number that is kept and labelled
 is evidence; a wrong number that is deleted is a lesson someone repeats.
+
+### First trustworthy frontier measurement: Qwen3.8-27B on AIME24
+
+    aime24  acc=0.7333  wilson=[0.556, 0.858]  n=30/30  fail=0  trunc=13  nobox=4
+
+Audited harness, all 30 problems graded, zero generation failures, 865 KB of generations
+persisted for re-audit. Settings: temperature 0, seed 0, max_tokens 16384, concurrency 8,
+timeout 2400s, sglang with CUDA graphs disabled, TP=4 on A100-80GB.
+
+**This is a LOWER BOUND, not a point estimate.** 13 of 30 generations hit the 16384-token
+cap and were graded as wrong answers. A thinking model that has not finished thinking has
+not answered incorrectly -- it has not answered. The true score at a larger budget is
+somewhere in [0.733, 0.733 + 13/30], and the only way to close that is to re-run with a
+larger cap and compare. The harness surfaces `trunc` precisely so this cannot be reported
+as a settled number.
+
+Contrast with the run this replaced, quarantined at
+`runs/math/qwen38_27b_INVALID_survivor_bias/`:
+
+| | accuracy | n graded | failures |
+|---|---|---|---|
+| invalid (stale harness, 600s timeout) | **1.0000** | 17/30 | 13 |
+| audited (2400s timeout) | **0.7333** | 30/30 | 0 |
+
+The invalid run's 100% was survivor bias: at a 600s timeout the problems that finished were
+the ones solved quickly, and the hard ones left the denominator.
+
+### What this means for headroom, which was the reason to measure
+
+| model | AIME24 | AIME25 |
+|---|---|---|
+| Qwen2.5-7B-Instruct | 10.0% | 3.3% |
+| Qwen3.8-27B | **73.3%** (>=) | pending |
+
+AIME24 has **less headroom than the frozen-benchmark rationale assumed**. At 73.3% with a
+further 13/30 truncated, a method effect has perhaps 25 points of room, and the truncation
+uncertainty alone is comparable to any plausible effect size. This is the same saturation
+problem as GSM8K at 76%, arriving one benchmark later.
+
+Consequences to act on rather than note:
+1. **AIME25 and HMMT are the better axes** for this base; AIME24 is close to spent.
+2. The truncation rate must be driven near zero before any AIME number is used in a
+   comparison, or the token budget becomes a confound with the method.
+3. The claim "AIME leaves real headroom" was true for Qwen2.5-7B and is **not** established
+   for a frontier base. It was recorded as an assumption to be measured; it has now been
+   measured and partly falsified.
