@@ -954,3 +954,47 @@ and it is caught only because the harness reports `finish_reason` and persists g
 The previous entry called 0.733 a lower bound and said truncation "must be driven near
 zero". That was right but understated: the bound is so loose that the measurement carries
 almost no information about the model.
+
+### LiveCodeBench v6 obtained; integration needs no code changes
+
+175 problems, all with private test cases, downloaded to the HF cache
+(`livecodebench/code_generation_lite`, `test6.jsonl`, 134 MB).
+
+| property | value |
+|---|---|
+| difficulty | **hard 80**, medium 52, easy 43 |
+| platform | atcoder 112, leetcode 63 |
+| contest dates | 2025-01-04 to 2025-04-06 |
+| private test cases | 175 / 175 |
+
+The **hard** bucket is the largest, which makes this the sharpest difficult-code axis
+available, and the contest window post-dates most training cutoffs, so contamination is
+bounded by construction rather than by assertion. The count also confirms EvoTrainer's
+coding evaluation *is* LCB v6: they report "175 held-out problems", which is exactly this
+release.
+
+**Integration requires no patches.** Three things were checked rather than assumed:
+
+1. LCB ships `lcb_runner/runner/oai_runner.py`, an OpenAI-compatible backend, so unlike
+   AZR's math harness it does not need vLLM.
+2. That runner constructs `OpenAI(api_key=os.getenv("OPENAI_KEY"))` with no `base_url`
+   argument, which looked like a blocker. It is not: the installed `openai==3.5.0` reads
+   `OPENAI_BASE_URL` from the environment. Verified directly -- setting it yields a client
+   whose `base_url` is the local endpoint. So pointing LCB at our sglang server is two
+   environment variables.
+3. Every dependency is already present in the venv (`datasets`, `openai`,
+   `huggingface_hub`, `pyarrow`, `fsspec`), and `pyext` -- an unmaintained package that
+   would have been the real risk -- is **commented out** in `evaluation/testing_util.py`,
+   replaced by `types.ModuleType`.
+
+**A correction worth recording.** An earlier pass reported three missing dependencies
+including a fragile `pyext`, and concluded the integration was costly. That was wrong: the
+check had run against the system Python 3.10 rather than the venv's 3.12. Querying the
+wrong interpreter produced a confident and entirely inverted assessment -- the same shape as
+verifying a value at one layer and asserting it about the whole path.
+
+**Not yet done, and not claimed:** the dataset's own loading script is incompatible with
+`datasets 5.0.1` ("Dataset scripts are no longer supported"), so the raw `test6.jsonl` is
+read directly instead. Generation and sandboxed execution-grading are not wired end to end;
+what is established is the data, the difficulty profile, and that the endpoint integration
+costs nothing.
