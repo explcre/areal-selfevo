@@ -493,3 +493,24 @@ fetch the success path uses before rejecting. Fixing that changes upstream contr
 it is recorded rather than changed: with `threaded=True` the branch should now be rare.
 Worth revisiting before any self-evolving run, where rollouts are longer and callbacks
 burstier.
+
+### step0c error triage: all three accounted for
+
+Verified on the relaunched run (with the `threaded=True` fix) at step 8, against the old
+run which had 103 callback failures by step 39.
+
+| error | count before | count after | status |
+|---|---|---|---|
+| `callback/rollout_complete ... Read timed out` | 103 | **0** | root cause fixed (`threaded=True`) |
+| `OSError: [Errno 24] Too many open files` | 6 | **0** | fixed (`ulimit -n 131072` in step0c.sh) |
+| `Failed to get yes/no token IDs dynamically` | 4 | 4 | **benign, no action** |
+
+**The third is not ours and is not an error.** It comes from
+`sglang/srt/entrypoints/openai/serving_rerank.py:43` -- sglang caching yes/no token IDs for
+**Qwen3 reranker scoring**. It is a `logger.warning`, it fires during CUDA-graph capture at
+server startup (hence its appearance inside the "Capturing batches" progress bar, not per
+rollout), and the function carries its own fallback to hardcoded IDs (9693/2152). We never
+call the `/v1/rerank` endpoint, so nothing we do depends on it.
+
+Recorded rather than silenced: a warning from an unused endpoint is noise, but suppressing
+it would also hide it if we ever did use reranking.
