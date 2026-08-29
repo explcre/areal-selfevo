@@ -8,7 +8,7 @@ OUT="$HOME/runs/math/$TAG"; mkdir -p "$OUT"
 CUDA_VISIBLE_DEVICES="$GPUS" python3 -m sglang.launch_server \
   --model-path "$MODEL" --served-model-name evalmodel \
   --host 127.0.0.1 --port "$PORT" --tp $(echo "$GPUS" | tr ',' '\n' | wc -l) \
-  --mem-fraction-static 0.85 > "$OUT/server.log" 2>&1 &
+  --mem-fraction-static "${MEMFRAC:-0.85}" ${SGL_EXTRA:-} > "$OUT/server.log" 2>&1 &
 SRV=$!
 cleanup(){ [ -n "${SRV:-}" ] && kill -TERM "$SRV" 2>/dev/null; }
 trap cleanup EXIT INT TERM
@@ -19,7 +19,8 @@ for _ in $(seq 1 180); do
 done
 curl -sf "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1 || { echo "NOT READY"; tail -25 "$OUT/server.log"; exit 5; }
 echo "endpoint up; scoring $TAG"
-python3 "$HOME/math_bench.py" --base-url "http://127.0.0.1:$PORT/v1" \
+# Repo copy, never a stale $HOME copy: numbers must come from audited code.
+python3 "$(dirname "$0")/math_bench.py" --base-url "http://127.0.0.1:$PORT/v1" \
   --benchmarks "${BENCHES:-aime24,aime25,amc23,math500}" \
   --max-tokens "${MAXTOK:-3072}" --concurrency "${CONC:-64}" \
-  --out "$OUT/results.json" 2>&1 | tee "$OUT/math.log"
+  --out "$OUT/results.json" --gen-out "$OUT/generations.jsonl" 2>&1 | tee "$OUT/math.log"
