@@ -832,12 +832,14 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         tool_call_parser: str,
         reasoning_parser: str,
         engine_max_tokens: int | None = None,
+        min_new_tokens: int = 0,
         chat_template_type: str = "hf",
         lora_name: str = "",
         require_multimodal_processor: bool = False,
     ):
         super().__init__(client)
         self.engine = engine
+        self.min_new_tokens = min_new_tokens
         self.tokenizer = tokenizer
         self.processor = processor
         self.tool_call_parser = tool_call_parser
@@ -1132,6 +1134,10 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
 
         # Create generation config
         gconfig = GenerationHyperparameters(
+            # Forwarded to sglang by SGLangBackend.build_generation_request. Without
+            # this the gconfig carries the default 0, which is why three earlier
+            # attempts at this fix were inert on the OpenAI-proxy path.
+            min_new_tokens=self.min_new_tokens,
             n_samples=n,
             temperature=temp,
             max_new_tokens=max_new_tokens,
@@ -1705,6 +1711,7 @@ class ArealOpenAI(AsyncOpenAI):
         tool_call_parser: str = "qwen",
         reasoning_parser: str = "qwen3",
         engine_max_tokens: int | None = None,
+        min_new_tokens: int = 0,
         chat_template_type: str = "hf",
         lora_name: str = "",
         processor: "ProcessorMixin | None" = None,
@@ -1732,6 +1739,7 @@ class ArealOpenAI(AsyncOpenAI):
             tool_call_parser=self.tool_call_parser,
             reasoning_parser=self.reasoning_parser,
             engine_max_tokens=engine_max_tokens,
+            min_new_tokens=min_new_tokens,
             chat_template_type=chat_template_type,
             lora_name=lora_name,
             require_multimodal_processor=require_multimodal_processor,
@@ -1747,6 +1755,7 @@ class ArealOpenAI(AsyncOpenAI):
             tool_call_parser=self.tool_call_parser,
             reasoning_parser=self.reasoning_parser,
             engine_max_tokens=engine_max_tokens,
+            min_new_tokens=min_new_tokens,
             chat_template_type=chat_template_type,
             lora_name=lora_name,
             require_multimodal_processor=require_multimodal_processor,

@@ -289,6 +289,7 @@ def _setup_openai_client():
         tool_call_parser=agent_cfg.tool_call_parser,
         reasoning_parser=agent_cfg.reasoning_parser,
         engine_max_tokens=agent_cfg.engine_max_tokens,
+        min_new_tokens=agent_cfg.min_new_tokens,
         chat_template_type=agent_cfg.chat_template_type,
         lora_name=config.lora_name,
         require_multimodal_processor=True,

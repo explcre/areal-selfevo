@@ -2389,6 +2389,19 @@ class AgentConfig:
         default=None,
         metadata={"help": "Maximum total tokens for the engine (prompt + completion)."},
     )
+    min_new_tokens: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Minimum tokens to generate before EOS is permitted. Set to 1 or more to "
+                "stop the policy emitting an all-EOS completion, which sglang rejects "
+                "with 500 'All output_tokens are EOS or PAD tokens'. Distinct from "
+                "gconfig.min_new_tokens, which the OpenAI-proxy path does not read: this "
+                "one reaches the engine because ArealOpenAI writes it into the "
+                "GenerationHyperparameters it constructs."
+            )
+        },
+    )
     turn_discount: float = field(
         default=1.0,
         metadata={"help": "Discount factor for multi-turn reward propagation."},
