@@ -70,8 +70,10 @@ def _sft_update(u: Unit, lr: float) -> float:
     return min(1.0, u.p + lr * (u.teacher_p - u.p))
 
 
-COSTS = {TrainingMode.RL: 1.0, TrainingMode.SFT: 1.0, TrainingMode.DISTILL: 1.0,
-         TrainingMode.SKIP: 0.0}
+# Cost of the UPDATE, on top of the rollout. SKIP performs no update, so 0 here -- but it
+# is not free overall, because the rollout that produced the solve rate was still paid for.
+UPDATE_COSTS = {TrainingMode.RL: 1.0, TrainingMode.SFT: 1.0, TrainingMode.DISTILL: 1.0,
+                TrainingMode.SKIP: 0.0}
 
 
 def run(
@@ -83,6 +85,7 @@ def run(
     lr_rl: float,
     lr_sft: float,
     seed: int,
+    rollout_cost: float = 0.0,
     control_from: list | None = None,
 ) -> tuple[float, dict[str, int]]:
     """Spend ``budget`` under ``router``; return (mean p, mode counts).
@@ -116,7 +119,9 @@ def run(
         mode = decision.argmax()
         made.append(decision)
         counts[mode] = counts.get(mode, 0) + 1
-        spent += COSTS[mode]
+        # Every routed unit pays for the generation that revealed its solve rate, whatever
+        # mode is then chosen. Skipping avoids the update, not the rollout.
+        spent += rollout_cost + UPDATE_COSTS[mode]
         if mode == TrainingMode.RL:
             u.p, _ = _grpo_update(u.p, group_size, lr_rl, rng)
         elif mode == TrainingMode.SFT:
@@ -164,11 +169,18 @@ def main() -> None:
     ap.add_argument("--group-size", type=int, default=8)
     ap.add_argument("--lr-rl", type=float, default=0.05)
     ap.add_argument("--lr-sft", type=float, default=0.05)
+    ap.add_argument(
+        "--rollout-cost", type=float, default=1.0,
+        help="cost of the generation needed to observe a unit's solve rate. The old "
+             "default of 0 made SKIP free and inflated the criterion; you cannot know "
+             "p_hat without paying for the rollout, so 1.0 is the honest default.",
+    )
     args = ap.parse_args()
 
     for regime in ("mixed", "all_informative", "no_teacher"):
         print(f"\n=== regime: {regime} ===")
         diffs: dict[str, list[float]] = {}
+        abs_means: dict[str, list[float]] = {}
         props: dict[str, dict[str, int]] = {}
         for seed in range(args.seeds):
             rng = random.Random(10_000 + seed)
@@ -194,13 +206,16 @@ def main() -> None:
                 mean_p, counts, made = run(
                     r, units, budget=args.budget, group_size=args.group_size,
                     lr_rl=args.lr_rl, lr_sft=args.lr_sft, seed=seed,
+                    rollout_cost=args.rollout_cost,
                 )
                 ctrl = MatchedPermutationControl(made, seed=seed)
                 ctrl_p, ctrl_counts, _ = run(
                     ctrl, units, budget=args.budget, group_size=args.group_size,
                     lr_rl=args.lr_rl, lr_sft=args.lr_sft, seed=seed,
+                    rollout_cost=args.rollout_cost,
                 )
                 diffs.setdefault(name, []).append(mean_p - ctrl_p)
+                abs_means.setdefault(name, []).append(mean_p)
                 props.setdefault(name, {})
                 for m, c in counts.items():
                     props[name][m] = props[name].get(m, 0) + c
@@ -215,8 +230,23 @@ def main() -> None:
             m = statistics.mean(ds)
             se = statistics.stdev(ds) / (len(ds) ** 0.5) if len(ds) > 1 else float("nan")
             z = m / se if se and se == se and se > 0 else float("nan")
+            if "_budget_unspent" in props.get(name, {}):
+                print(f"{name:<16} {'DID NOT RUN':>16} {'':>10} {'':>7}  "
+                      f"{props[name]}  <- no paid updates; mean is meaningless")
+                continue
             print(f"{name:<16} {m:+16.4f} {se:10.4f} {z:7.2f}  {props[name]}")
             print(f"{'':<16} {'':>16} {'':>10} {'':>7}  ctrl: {props.get(name + '__ctrl', {})}")
+        # The comparison the shuffle control cannot make: absolute outcome per arm. If a
+        # fixed-mode baseline wins here, "beats its own shuffle" is not a useful claim.
+        print("  absolute mean p (higher is better):")
+        ranked = sorted(
+            ((n, statistics.mean(v)) for n, v in abs_means.items()
+             if "_budget_unspent" not in props.get(n, {})),
+            key=lambda kv: -kv[1],
+        )
+        for rank, (n, v) in enumerate(ranked):
+            best = "  <- BEST" if rank == 0 else ""
+            print(f"    {n:<16} {v:.4f}{best}")
 
 
 if __name__ == "__main__":

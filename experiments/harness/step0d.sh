@@ -18,7 +18,7 @@
 #                     (undefined symbol c10_cuda_check_implementation). sdpa is
 #                     numerically equivalent, only slower. It does not touch generation.
 #
-#   gconfig.min_new_tokens=1 -- forces at least one non-EOS token. As entropy falls the
+#   (min_new_tokens was tried and REMOVED: it crashes sglang with AReaL, see EXPERIMENTS.md)
 #                     policy samples EOS first; the all-EOS completion makes sglang return
 #                     500 (both EOS and PAD are stop tokens), and AReaL scores the failed
 #                     trajectory as reward 0.0, which drives entropy lower still. Note this
@@ -38,7 +38,6 @@
 #
 # Hygiene, not a treatment -- prevents a crash and wasted compute, does not change the
 # objective:
-#   rollout.agent.min_new_tokens=1 -- stops all-EOS completions (836 of them in step0c)
 #                     which sglang rejects with a 500. Verified end to end across all 9
 #                     hops by experiments/harness/verify_chain.py.
 #
@@ -83,7 +82,6 @@ python3 examples/math/gsm8k_rl.py \
   cluster.fileroot="$HOME/areal-runs" \
   evaluator.freq_steps=20 \
   actor.kl_ctl=0.01 \
-  +rollout.agent.min_new_tokens=1 \
   +actor.attn_impl=sdpa +ref.attn_impl=sdpa \
   +rollout.agent.admin_api_key="$KEY" \
   experiment_name=step0d trial_name=t1 2>&1 \
