@@ -759,3 +759,73 @@ signal contamination.
 - **File-descriptor soft limit 1024** against a hard limit of 1048576, exhausted by 1024
   concurrent rollouts. Raised in place with `prlimit` (no restart), `ulimit -n 131072` in
   the launcher.
+
+## The four failed runs are a known failure mode, not a botched reproduction
+
+**"Self-Improvement Can Self-Regress: The Rise-and-Collapse Failure Mode of LLM
+Self-Training"**, arXiv 2606.21090.
+
+The paper reports: *"pass@1 shows a robust rise-then-collapse pattern: it peaks within tens
+of gradient steps and then falls back, sometimes to near zero."* Observed on Qwen-2.5-3B
+and Qwen-2.5-7B with a binary CodeGrader reward over 20-step campaigns.
+
+Our data matches it point for point, on the same model family:
+
+| paper | our runs |
+|---|---|
+| peaks within tens of gradient steps, then falls to near zero | step0c held reward ~0.78 through step 62, then **0.748 -> 0.039** by step 76 |
+| **"KL- and EWC-style constraints do not prevent it"** | step0d added `kl_ctl=0.01`. Collapse not prevented -- entropy still fell to 0.017 |
+| **"GRPO raises the floor but does not remove the cliff"** | step0d's reward *floor* held at ~0.51 (vs step0c's 0.039), but the policy still degenerated, via length blowup to the 1024 cap |
+| cause: *"within-task policy over-optimization on a fixed distribution"*, NOT catastrophic forgetting | GSM8K, fixed distribution, p=0.76 |
+| Qwen-2.5-3B / 7B | Qwen-2.5-1.5B-Instruct |
+
+**This reframes the Step 0 result.** We did not fail to reproduce AReaL through
+incompetence, and the published config is not uniquely broken. AReaL's demo config is
+aggressive (lr 6e-6 and eps_clip 0.4, against lr 1e-6 and eps_clip 0.2 in their own
+`scaffolding/gsm8k_rlvr_scaffolding.yaml`), which brings the cliff forward -- but the cliff
+is a property of the training procedure, not of that config alone.
+
+It also explains a day of wasted GPU: **the paper had already established that KL does not
+prevent this**, and step0d spent hours rediscovering it.
+
+### The mitigation that actually works, and is cheap
+
+The paper tests three control loops. The one that transfers immediately:
+
+* **ES (early stop)** -- *"a within-campaign early-stop rule that rolls forward the peak
+  checkpoint and sets the next budget to peak_step+3"*. On Qwen-2.5-7B it reached 22.2%.
+* **CARE** -- between-campaign memory with a capability posterior, transfer gate, and
+  regression-aware belief revision. Heavier; needs a campaign structure we do not have.
+* **GRPO** -- group-relative normalisation. We already use it, and the paper is explicit
+  that it *"raises the floor but does not remove the cliff"*.
+
+So the immediately actionable change is **early stopping on a held-out signal, keeping the
+peak checkpoint** -- not another hyperparameter sweep. Note this requires an eval that runs
+often enough to find the peak, which is why `evaluator.freq_steps` and
+`experiments/bench/math_bench.py` matter: with `freq_epochs: 1` the peak is invisible.
+
+### Co-evolution stability, and what it means for our framework
+
+Three further papers bear on the evolving-critic question:
+
+* **MetaSkill-Evolve** (arXiv 2607.05297) -- *"a two-timescale framework separates fast
+  task-skill from slow meta-skill evolution"*, i.e. alternating optimisation with explicit
+  timescale separation.
+* **Multi-Agent Evolve** (arXiv 2510.23595) -- co-evolution with **critic freeze**
+  mechanisms; notes that prior LLM-interaction approaches *"suffer from instability and
+  collapse during training"*.
+* **Self-evolving LLM agents with in-distribution Optimization** (arXiv 2606.07367) --
+  *"If the evaluator and policy adapt too closely to one another without external
+  grounding, the entire loop can spontaneously collapse into shared shortcuts rather than
+  the intended objective."*
+
+That last sentence is the published form of the guard already in `selfevo/compose.py`: an
+evolving reward requires a frozen anchor, and a learned policy that can evolve its own
+reward must be scored by the frozen one. **What the guard does NOT yet express is
+alternation**: the critic and the policy must not both update on every step. Two-timescale
+separation -- freeze one while the other optimises -- is the standard remedy and is
+currently unrepresented in the axes.
+
+BigBang does this implicitly: their meta-critic compares critic judgements against held-out
+outcomes on a *periodic* cadence, not continuously. We encoded the anchor and missed the
+cadence.
