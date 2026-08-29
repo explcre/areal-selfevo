@@ -1,0 +1,199 @@
+"""Tests for the composition axes and the routing feedback channel."""
+
+from __future__ import annotations
+
+import pytest
+
+from selfevo.compose import (
+    GATES,
+    PipelineConfig,
+    SHAPERS,
+    is_valid,
+    register_shaper,
+    validate,
+)
+from selfevo.routing.base import RoutingContext, TrainingMode
+from selfevo.routing.feedback import (
+    BanditRouter,
+    ConfoundedUpdate,
+    DecisionOutcome,
+    LearningRouter,
+)
+
+# --------------------------------------------------------------------------- compose
+
+
+def test_plain_config_is_valid():
+    assert is_valid(PipelineConfig())
+
+
+def test_meds_style_shaper_with_prefix_gate_is_rejected():
+    """The rule this module exists for: entropy bonus voids sum_i A_i = 0."""
+    register_shaper("entropy_bonus", None, breaks_centring=True)
+    cfg = PipelineConfig(shaper="entropy_bonus", gate="prefix_dead")
+    problems = validate(cfg)
+    assert problems, "MEDS-style shaping + prefix gating must be rejected"
+    assert any(p.axes == ("shaper", "gate") for p in problems)
+    assert "sum_i A_i" in str(problems[0])
+    assert "dp_actor.py:560" in str(problems[0]), "must cite where the claim is grounded"
+
+
+def test_the_same_shaper_is_fine_without_the_gate():
+    register_shaper("entropy_bonus", None, breaks_centring=True)
+    assert is_valid(PipelineConfig(shaper="entropy_bonus", gate="none"))
+
+
+def test_the_same_gate_is_fine_without_the_shaper():
+    assert is_valid(PipelineConfig(shaper="none", gate="prefix_dead"))
+
+
+def test_learned_policy_without_feedback_is_rejected():
+    problems = validate(PipelineConfig(evolve_policy="learned_weights"))
+    assert any("require_feedback" in p.reason for p in problems)
+    assert is_valid(
+        PipelineConfig(evolve_policy="learned_weights", require_feedback=True)
+    )
+
+
+def test_learned_code_policy_is_held_to_the_same_rule():
+    assert validate(PipelineConfig(evolve_policy="learned_code"))
+    assert is_valid(PipelineConfig(evolve_policy="learned_code", require_feedback=True))
+
+
+def test_evolving_both_under_a_fixed_rule_is_unattributable():
+    problems = validate(PipelineConfig(evolve_target="both", evolve_policy="rule"))
+    assert any(p.axes == ("evolve_target", "evolve_policy") for p in problems)
+    # but a policy that records its choice is fine
+    assert is_valid(
+        PipelineConfig(
+            evolve_target="both", evolve_policy="learned_weights", require_feedback=True
+        )
+    )
+
+
+def test_unknown_names_are_reported_not_ignored():
+    problems = validate(
+        PipelineConfig(shaper="nope", gate="nope", evolve_target="nope", evolve_policy="nope")
+    )
+    assert len(problems) >= 4
+
+
+def test_validate_reports_every_problem_not_just_the_first():
+    register_shaper("entropy_bonus", None, breaks_centring=True)
+    problems = validate(
+        PipelineConfig(
+            shaper="entropy_bonus",
+            gate="prefix_dead",
+            evolve_policy="learned_weights",
+        )
+    )
+    assert len(problems) >= 2, "a sweep needs all rejected reasons at once"
+
+
+def test_registering_a_shaper_inconsistently_raises():
+    register_shaper("probe_shaper", None, breaks_centring=True)
+    register_shaper("probe_shaper", None, breaks_centring=True)  # idempotent
+    with pytest.raises(ValueError):
+        register_shaper("probe_shaper", None, breaks_centring=False)
+    with pytest.raises(ValueError):
+        register_shaper("", None, breaks_centring=False)
+
+
+def test_a_new_safe_shaper_composes_with_the_gate():
+    register_shaper("rescale_only", None, breaks_centring=False)
+    assert is_valid(PipelineConfig(shaper="rescale_only", gate="prefix_dead"))
+    assert "rescale_only" in SHAPERS and "prefix_dead" in GATES
+
+
+# -------------------------------------------------------------------------- feedback
+
+
+def _out(mode: str, value: float, batch: str = "b0", cost: float = 1.0) -> DecisionOutcome:
+    return DecisionOutcome(mode=mode, value=value, batch_id=batch, cost=cost)
+
+
+def test_outcome_validation():
+    with pytest.raises(ValueError):
+        DecisionOutcome(mode="nope", value=1.0, batch_id="b")
+    with pytest.raises(ValueError):
+        DecisionOutcome(mode=TrainingMode.RL, value=1.0, batch_id="")
+    with pytest.raises(ValueError):
+        DecisionOutcome(mode=TrainingMode.RL, value=1.0, batch_id="b", cost=0.0)
+    with pytest.raises(ValueError):
+        DecisionOutcome(mode=TrainingMode.RL, value=float("nan"), batch_id="b")
+
+
+def test_bandit_satisfies_the_learning_protocol():
+    assert isinstance(BanditRouter(), LearningRouter)
+
+
+def test_zero_exploration_is_rejected():
+    """Without exploration the router only ever observes the mode it already prefers."""
+    with pytest.raises(ValueError, match="explore"):
+        BanditRouter(explore_prob=0.0)
+
+
+def test_single_mode_batch_is_refused_as_confounded():
+    b = BanditRouter()
+    with pytest.raises(ConfoundedUpdate, match="confounded"):
+        b.observe({"u1": _out(TrainingMode.RL, 1.0), "u2": _out(TrainingMode.RL, 2.0)})
+
+
+def test_outcomes_spanning_batches_are_refused():
+    b = BanditRouter()
+    with pytest.raises(ConfoundedUpdate, match="span"):
+        b.observe(
+            {
+                "u1": _out(TrainingMode.RL, 1.0, batch="b0"),
+                "u2": _out(TrainingMode.SFT, 2.0, batch="b1"),
+            }
+        )
+
+
+def test_empty_observation_is_a_noop():
+    b = BanditRouter()
+    b.observe({})
+    assert b.value_estimates() == {}
+
+
+def test_estimates_are_value_per_cost_so_cheap_modes_compete():
+    b = BanditRouter()
+    b.observe({"u1": _out(TrainingMode.RL, 2.0, cost=4.0), "u2": _out(TrainingMode.SKIP, 1.0, cost=1.0)})
+    est = b.value_estimates()
+    assert est[TrainingMode.RL] == pytest.approx(0.5)
+    assert est[TrainingMode.SKIP] == pytest.approx(1.0)
+
+
+def test_unobserved_modes_are_absent_not_zero():
+    b = BanditRouter()
+    b.observe({"u1": _out(TrainingMode.RL, 1.0), "u2": _out(TrainingMode.SFT, 1.0)})
+    assert TrainingMode.SKIP not in b.value_estimates()
+
+
+def test_bandit_eventually_prefers_the_better_mode():
+    b = BanditRouter(explore_prob=0.05, min_observations=2, seed=3)
+    for i in range(60):
+        b.observe(
+            {
+                "a": _out(TrainingMode.RL, 1.0, batch=f"b{i}"),
+                "c": _out(TrainingMode.SKIP, 0.0, batch=f"b{i}"),
+                "b": _out(TrainingMode.SFT, 5.0, batch=f"b{i}"),
+            }
+        )
+    ctx = RoutingContext(solve_rate=0.5, group_size=4, has_teacher=True)
+    picks = [b.route(ctx).argmax() for _ in range(200)]
+    assert picks.count(TrainingMode.SFT) > 150, f"did not converge: {set(picks)}"
+
+
+def test_bandit_honours_the_teacher_invariant():
+    b = BanditRouter(explore_prob=1.0, seed=0)
+    ctx = RoutingContext(solve_rate=0.5, group_size=4, has_teacher=False)
+    for _ in range(100):
+        assert b.route(ctx).argmax() != TrainingMode.SFT
+
+
+def test_bandit_is_reproducible_given_a_seed():
+    ctx = RoutingContext(solve_rate=0.5, group_size=4, has_teacher=True)
+    a = [BanditRouter(seed=11).route(ctx).argmax() for _ in range(1)]
+    c = [BanditRouter(seed=11).route(ctx).argmax() for _ in range(1)]
+    assert a == c
