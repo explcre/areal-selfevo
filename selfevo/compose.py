@@ -79,10 +79,21 @@ META_CRITIC_FACTORIES: dict[str, Callable[..., object] | None] = {
     "none": None,
     "outcome_calibrated": None,  # not implemented
 }
+def _scalar_critic(**kw: object) -> object:
+    """Factory for :class:`selfevo.critics.ScalarCritic`.
+
+    Imported lazily so `compose` stays importable without pulling the critic module (and
+    through it the routing criteria) at configuration-validation time.
+    """
+    from .critics import ScalarCritic
+
+    return ScalarCritic(**kw)  # type: ignore[arg-type]
+
+
 CRITIC_FACTORIES: dict[str, Callable[..., object] | None] = {
-    "none": None,      # "none" is the absence of a critic, so a None factory is correct
-    "scalar": None,    # not implemented
-    "two_level": None, # not implemented; BigBang-v1 ships no critic code to build on
+    "none": None,               # "none" is the absence of a critic, so None is correct
+    "scalar": _scalar_critic,   # IMPLEMENTED: scores by I_RL with the solved/unsolved split
+    "two_level": None,          # not implemented; BigBang ships no critic code to build on
 }
 # Components whose None factory means "nothing to build", not "not built yet".
 _LEGITIMATELY_EMPTY: frozenset[str] = frozenset({"none"})
