@@ -181,46 +181,42 @@ def main() -> None:
                 )
                 for u in units
             ]
-            _, _, crit_decisions = run(
-                crit, units, budget=args.budget, group_size=args.group_size,
-                lr_rl=args.lr_rl, lr_sft=args.lr_sft, seed=seed,
-            )
             arms = {
                 "criterion": crit,
-                # Built from what the criterion ACTUALLY did, below. Seeding it from
-                # contexts carrying each unit's initial latent p gave the wrong pool: the
-                # run routes on observed group means of an evolving p, so the two
-                # distributions differ (measured 32% skip vs 8%). "Measured, not assumed."
-                "matched_control": MatchedPermutationControl(crit_decisions, seed=seed),
                 "inverted": InvertedRouter(),
                 "all_rl": StaticRouter({TrainingMode.RL: 1.0}),
                 "all_sft": StaticRouter({TrainingMode.SFT: 1.0}),
             }
-            res = {}
+            # Each arm gets a per-arm control: the SAME decisions it made, shuffled
+            # across units. The pairing isolates targeting from mixture, which a single
+            # shared control cannot do.
             for name, r in arms.items():
-                mean_p, counts, _ = run(
+                mean_p, counts, made = run(
                     r, units, budget=args.budget, group_size=args.group_size,
                     lr_rl=args.lr_rl, lr_sft=args.lr_sft, seed=seed,
                 )
-                res[name] = mean_p
+                ctrl = MatchedPermutationControl(made, seed=seed)
+                ctrl_p, ctrl_counts, _ = run(
+                    ctrl, units, budget=args.budget, group_size=args.group_size,
+                    lr_rl=args.lr_rl, lr_sft=args.lr_sft, seed=seed,
+                )
+                diffs.setdefault(name, []).append(mean_p - ctrl_p)
                 props.setdefault(name, {})
                 for m, c in counts.items():
                     props[name][m] = props[name].get(m, 0) + c
-            for name, v in res.items():
-                if name != "matched_control":
-                    diffs.setdefault(name, []).append(v - res["matched_control"])
-            diffs.setdefault("matched_control", []).append(0.0)
+                # Record the control's realised mix so a mismatch is visible, not assumed.
+                props.setdefault(name + "__ctrl", {})
+                for m, c in ctrl_counts.items():
+                    props[name + "__ctrl"][m] = props[name + "__ctrl"].get(m, 0) + c
 
-        print(f"{'arm':<18} {'mean p - control':>18} {'se(diff)':>10} {'z':>7}  modes")
+        print(f"{'arm':<16} {'vs OWN control':>16} {'se(diff)':>10} {'z':>7}  "
+              f"{'arm modes / control modes'}")
         for name, ds in diffs.items():
             m = statistics.mean(ds)
-            if name == "matched_control":
-                print(f"{'matched_control':<18} {'0 (reference)':>18} {'':>10} {'':>7}  "
-                      f"{props[name]}")
-                continue
             se = statistics.stdev(ds) / (len(ds) ** 0.5) if len(ds) > 1 else float("nan")
             z = m / se if se and se == se and se > 0 else float("nan")
-            print(f"{name:<18} {m:+18.4f} {se:10.4f} {z:7.2f}  {props[name]}")
+            print(f"{name:<16} {m:+16.4f} {se:10.4f} {z:7.2f}  {props[name]}")
+            print(f"{'':<16} {'':>16} {'':>10} {'':>7}  ctrl: {props.get(name + '__ctrl', {})}")
 
 
 if __name__ == "__main__":
