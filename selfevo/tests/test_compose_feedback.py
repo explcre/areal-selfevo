@@ -63,10 +63,16 @@ def test_learned_code_policy_is_held_to_the_same_rule():
 def test_evolving_both_under_a_fixed_rule_is_unattributable():
     problems = validate(PipelineConfig(evolve_target="both", evolve_policy="rule"))
     assert any(p.axes == ("evolve_target", "evolve_policy") for p in problems)
-    # but a policy that records its choice is fine
+    # A policy that records its choice fixes attribution -- but "both" now includes the
+    # reward, so it must also carry the frozen-reward guards. Tightened deliberately:
+    # the old config is genuinely unsafe, not merely newly-rejected.
     assert is_valid(
         PipelineConfig(
-            evolve_target="both", evolve_policy="learned_weights", require_feedback=True
+            evolve_target="both",
+            evolve_policy="learned_weights",
+            require_feedback=True,
+            frozen_eval_reward=True,
+            policy_scored_by_frozen_reward=True,
         )
     )
 
@@ -233,3 +239,72 @@ def test_meds_combination_is_rejected_without_any_test_setup():
     assert problems, "the MEDS shaper + prefix gate must be rejected out of the box"
     assert any(p.axes == ("shaper", "gate") for p in problems)
     assert "dp_actor.py:560" in str(problems[0])
+
+
+# ------------------------------------------------ reward evolution and critic axes
+
+
+def test_evolving_the_reward_without_a_frozen_one_is_rejected():
+    """A rising curve cannot be told from a reward that got easier."""
+    problems = validate(PipelineConfig(evolve_target="reward"))
+    assert any("unmeasurable" in p.reason for p in problems)
+    assert is_valid(PipelineConfig(evolve_target="reward", frozen_eval_reward=True))
+
+
+def test_learned_policy_evolving_its_own_reward_is_rejected():
+    """The degenerate fixed point: lowering the bar is the optimum, not a risk."""
+    cfg = PipelineConfig(
+        evolve_target="reward",
+        evolve_policy="learned_weights",
+        require_feedback=True,
+        frozen_eval_reward=True,
+    )
+    problems = validate(cfg)
+    assert any(p.axes == ("evolve_target", "evolve_policy") for p in problems), problems
+    assert any("easier" in p.reason for p in problems)
+    # scoring the policy by the frozen reward removes the incentive
+    assert is_valid(
+        PipelineConfig(
+            evolve_target="reward",
+            evolve_policy="learned_weights",
+            require_feedback=True,
+            frozen_eval_reward=True,
+            policy_scored_by_frozen_reward=True,
+        )
+    )
+
+
+def test_both_target_inherits_the_reward_guards():
+    """'both' includes the reward, so it must carry the same protections."""
+    problems = validate(
+        PipelineConfig(evolve_target="both", evolve_policy="learned_weights",
+                       require_feedback=True)
+    )
+    assert any("unmeasurable" in p.reason for p in problems)
+
+
+def test_a_rule_based_policy_may_evolve_the_reward_with_a_frozen_anchor():
+    """No learned objective to game, so only the measurement guard applies."""
+    assert is_valid(
+        PipelineConfig(evolve_target="reward", evolve_policy="rule",
+                       frozen_eval_reward=True)
+    )
+
+
+def test_unknown_critic_is_rejected():
+    problems = validate(PipelineConfig(critic="nope"))
+    assert any(p.axes == ("critic",) for p in problems)
+
+
+def test_critics_compose_freely_with_the_other_axes():
+    from selfevo.compose import CRITICS
+
+    assert {"none", "scalar", "two_level"} <= CRITICS
+    for c in CRITICS:
+        assert is_valid(PipelineConfig(critic=c))
+
+
+def test_frozen_reward_flag_alone_is_harmless():
+    """Setting the guard when not evolving the reward must not reject anything."""
+    assert is_valid(PipelineConfig(frozen_eval_reward=True))
+    assert is_valid(PipelineConfig(policy_scored_by_frozen_reward=True))

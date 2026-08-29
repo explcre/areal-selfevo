@@ -40,6 +40,7 @@ __all__ = [
     "GATES",
     "EVOLVE_TARGETS",
     "EVOLVE_POLICIES",
+    "CRITICS",
     "register_shaper",
     "register_router",
 ]
@@ -49,7 +50,12 @@ __all__ = [
 SHAPERS: dict[str, Callable[..., object] | None] = {"none": None}
 ROUTERS: dict[str, Callable[..., object] | None] = {}
 GATES: dict[str, Callable[..., object] | None] = {"none": None, "prefix_dead": None}
-EVOLVE_TARGETS: frozenset[str] = frozenset({"model", "harness", "both"})
+EVOLVE_TARGETS: frozenset[str] = frozenset({"model", "harness", "reward", "both"})
+# A critic scores candidates before they are trained on. `two_level` is the BigBang-v1
+# design (a fast proxy for training value, then a slower check); their repo ships
+# evaluation only -- no critic code -- so this is built from the description, not their
+# implementation, and is labelled as such.
+CRITICS: frozenset[str] = frozenset({"none", "scalar", "two_level"})
 EVOLVE_POLICIES: frozenset[str] = frozenset({"rule", "learned_weights", "learned_code"})
 
 # Shapers that break the centred-advantage invariant `sum_i A_i = 0`. Membership here is a
@@ -131,6 +137,17 @@ class PipelineConfig:
         require_feedback: Whether the run will supply outcomes to the router. A learned
             policy that never observes is a fixed policy with extra steps, so this is
             checked rather than assumed.
+        critic: Candidate scorer, from :data:`CRITICS`. ``two_level`` follows the
+            BigBang-v1 description; their released repo is evaluation-only and contains no
+            critic implementation, so nothing here is derived from their code.
+        frozen_eval_reward: Whether a reward that never changes is retained for
+            measurement, alongside any evolving training reward. Required when
+            ``evolve_target`` touches the reward: otherwise a rising curve cannot be
+            distinguished from a reward that got easier.
+        policy_scored_by_frozen_reward: Whether the evolve-policy's own objective is the
+            frozen reward rather than the evolving one. Required when a learned policy can
+            evolve the reward, because otherwise lowering the bar is the optimum of the
+            objective as written, not a failure mode to watch for.
     """
 
     shaper: str = "none"
@@ -139,6 +156,9 @@ class PipelineConfig:
     evolve_target: str = "model"
     evolve_policy: str = "rule"
     require_feedback: bool = False
+    critic: str = "none"
+    frozen_eval_reward: bool = False
+    policy_scored_by_frozen_reward: bool = False
 
 
 def validate(cfg: PipelineConfig) -> list[Incompatibility]:
@@ -182,6 +202,39 @@ def validate(cfg: PipelineConfig) -> list[Incompatibility]:
                 f"shaper {cfg.shaper!r} destroys sum_i A_i = 0, which prefix_dead gating "
                 "requires; the combination produces wrong gradients without raising",
                 "prefix_cancellation.py; MEDS dp_actor.py:560",
+            )
+        )
+
+    if cfg.critic not in CRITICS:
+        out.append(
+            Incompatibility(("critic",), f"unknown critic {cfg.critic!r}", "registry")
+        )
+
+    evolves_reward = cfg.evolve_target in ("reward", "both")
+
+    if evolves_reward and not cfg.frozen_eval_reward:
+        out.append(
+            Incompatibility(
+                ("evolve_target", "frozen_eval_reward"),
+                "evolving the reward without a frozen held-out reward makes progress "
+                "unmeasurable: a rising score can mean the policy improved or the reward "
+                "got easier, and the two are not separable after the run",
+                "measurement",
+            )
+        )
+
+    if (
+        evolves_reward
+        and cfg.evolve_policy.startswith("learned")
+        and not cfg.policy_scored_by_frozen_reward
+    ):
+        out.append(
+            Incompatibility(
+                ("evolve_target", "evolve_policy"),
+                "a learned policy that can evolve the reward AND is scored by that same "
+                "reward has an optimum at 'make the reward easier'; score the policy by "
+                "the frozen reward instead",
+                "degenerate fixed point",
             )
         )
 
