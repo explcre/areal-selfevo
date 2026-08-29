@@ -396,3 +396,43 @@ steps were kept. `ulimit -n 131072` is now set in `step0c.sh` for future runs.
 **Operational rule:** raise the fd limit before any large-batch rollout run, and count
 failures by exception type per step. A reward curve alone cannot distinguish a harness
 failure from a wrong answer.
+
+### CORRECTION: held-out evaluation IS wired; the metric key is `eval-rollout/reward`
+
+Two earlier statements in this file are wrong and are corrected here.
+
+1. *"`evaluator.freq_epochs: 1` with one epoch fires the evaluator exactly once, so there
+   is no validation curve."* Wrong.
+2. *"`gsm8k_rl.py` never instantiates an Evaluator, so `evaluator.freq_steps` is inert."*
+   Also wrong -- I concluded this from `grep -n "Evaluat" examples/math/gsm8k_rl.py`
+   returning nothing.
+
+What is actually true: `gsm8k_rl.py` passes `valid_dataset`, `eval_workflow` and
+`eval_workflow_kwargs` (with `temperature=0.6`, vs 1.0 for training) into
+`PPOTrainer.train()`. The Evaluator is constructed inside `PPOTrainer`, not in the example
+script, and it runs. The reason nothing matched is that the metric is logged as
+**`eval-rollout/reward`**, which contains neither "Evaluat" nor "valid". There are also
+dedicated `eval-rollout.log` and `proxy-eval-rollout.log` worker logs.
+
+The lesson is the one already recorded for `min_new_tokens`, applied in the opposite
+direction: grepping for a *name I expected* is not evidence of absence. For the dead field
+the check was right (no reads anywhere); here I grepped one file for a class name and
+generalised to "the feature does not run". Confirm a feature is off by finding the metric
+it would emit, not by failing to find the word.
+
+### First held-out numbers
+
+| step | train `task_reward/avg` | held-out `eval-rollout/reward` |
+|------|------------------------|-------------------------------|
+| ~20  | ~0.80                  | 0.7210                        |
+| ~40  | ~0.85                  | 0.7204                        |
+
+Train reward is climbing (0.69 -> 0.86) while held-out reward is **flat** (0.7210 ->
+0.7204). Two points cannot distinguish "no generalisation yet" from "overfitting to the
+train split" from noise, so no conclusion is drawn here -- but this is the number that
+matters for the predeclared test, not the train curve, and it is the number to read at
+step 290.
+
+Entropy did not collapse. It bottomed near 0.21 around step 16-23 and has since recovered
+(0.2541, 0.2912, 0.3084, 0.3175). The predeclared failure branch (entropy < 0.1 with
+declining reward) has not triggered.
