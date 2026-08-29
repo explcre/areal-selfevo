@@ -618,3 +618,62 @@ zero". A generation of length 0 is not a datum about the policy's quality.
 `kl_ctl: 0.0` with no entropy bonus. `min_tokens=1` removes the crash and the false zeros
 so the collapse can be measured cleanly; it does not prevent it. Whether the published
 config avoids collapse over 290 steps is still the open reproduction question.
+
+### RETRACTION: failed rollouts are NOT scored as reward 0.0
+
+Several entries above claim that AReaL "launders infrastructure failures into the training
+signal as reward 0.0", and build a self-reinforcing feedback loop on top of it
+(all-EOS -> 500 -> false zero -> entropy falls -> more all-EOS). **That claim is wrong and
+is retracted here.** The entries are left in place rather than edited, so the reasoning
+error stays visible.
+
+**Where it came from.** The exception handler at
+`areal/v2/inference_service/controller/workflow.py:207-231` calls
+`_set_last_reward(http_session, 0.0, session_api_key)`. I read that line and concluded the
+zero enters training. I never checked the very next line, `return None`, or what happens to
+a None trajectory.
+
+**What `_set_last_reward` actually is.** It POSTs `{"interaction_id": None, "reward": 0.0}`
+to the gateway and returns a trajectory id -- session bookkeeping. The `return None` on the
+same path is what decides whether the rollout reaches the batch, and None trajectories are
+dropped and replaced.
+
+**The measurement.** `experiments/harness/eos_reward_correlation.py` counts all-EOS
+failures between consecutive step markers and pairs each count with that step's
+`task_reward/avg`. If N failures out of a 1024-sequence batch became zeros, reward would
+fall by roughly `reward * N / 1024`.
+
+| log | steps with failures | max in one step | corr(failures, reward) | observed slope | slope predicted if zeros were injected |
+|---|---|---|---|---|---|
+| step0c pre-fix | 2/21 | 12 | **+0.182** | +0.00245 | -0.00073 |
+| step0c current | 4/18 | 62 | **+0.401** | +0.00090 | -0.00075 |
+
+The observed correlation is *positive* in both runs, and the single worst step (62 failures)
+carried the **highest** reward in its window (0.8135). `n_seqs` is exactly 1024 at every
+step. Failures are dropped and replaced.
+
+**What this invalidates.**
+- The "self-reinforcing loop" account of all-EOS. Entropy collapse still *causes* all-EOS
+  generations, but all-EOS does not push entropy down through false zeros. There is no loop.
+- The framing that four failure paths "all converge on reward 0.0". The shared consequence
+  is wasted compute and queue-position-determined selection, not signal contamination.
+- The urgency behind three restarts. They were chasing corruption that was not occurring,
+  at a cost of roughly an hour of GPU time.
+
+**What survives.**
+- The callback fix (`threaded=True`) is still correct and still worth having: it stopped
+  discarding finished rollouts and cut step time from 50.7s to 38.2s. Only my stated
+  *reason for its severity* was inflated.
+- The fd-limit fix stands on the same footing.
+- `min_new_tokens` genuinely was a dead field, and forwarding it in
+  `SGLangBackend.build_generation_request` is a real fix -- but it did **not** reduce
+  all-EOS here (132 by step 19), because `OpenAIProxyWorkflow` reaches sglang through
+  `/v1/chat/completions`, not the native generate path that builder serves. So it is a
+  correct patch to a path this workflow does not use.
+
+**The lesson, stated so it is checkable next time.** Three separate errors in this session
+share one shape: I confirmed a value or behaviour at one layer and asserted it about the
+whole path. Twice for `min_new_tokens` (config field; then request protocol), once for
+reward contamination (handler line, not batch membership). The check that would have caught
+all three is the same: measure the effect end to end on data the running system produced,
+before asserting the mechanism.
