@@ -367,3 +367,32 @@ the decay. Two outcomes, declared now so the result cannot be rationalized after
 Either way the number that decides it is `update/entropy/avg` against
 `ppo_actor/task_reward/avg`, read across all 290 steps, not an early window. Reading an
 early window is exactly the mistake made on step0b.
+
+### FINDING: default fd limit (1024) breaks large-batch rollouts, and the failure is silent
+
+step0c at the published `batch_size: 256` with `gconfig.n_samples: 4` runs 1024 concurrent
+rollouts against `max_concurrent_rollouts: 256`. The default soft limit of **1024** file
+descriptors is not enough:
+
+    OSError: [Errno 24] Too many open files
+    aiohttp.client_exceptions.ClientConnectorError: Cannot connect to host ... [Too many open files]
+    [RemoteInfEngine Rank N] ERROR: Workflow execution failed: ... [Too many open files]
+
+Counts at step 18: 6 fd errors, 2 failed workflows, 43 `callback/rollout_complete` read
+timeouts (the timeouts are downstream of the same pressure). The soft limit was 1024
+against a **hard limit of 1048576** -- headroom was always available, nothing was tuned.
+
+**Why this is dangerous rather than merely noisy.** A failed workflow does not raise; per
+`areal/v2/inference_service/controller/workflow.py:207-231` it is assigned
+`_set_last_reward(..., 0.0)`. So fd exhaustion is laundered into the reward signal as
+"the model got this wrong". At 2 failures in ~18,000 sequences the bias is negligible, but
+it grows with concurrency and it is invisible in the reward curve. This is the same
+silent-zero family as the `max_new_tokens` truncation.
+
+**Fix applied without restarting.** `prlimit --pid <p> --nofile=131072:1048576` on all 335
+processes in the trainer's process group raised the limit in place, so the 18 completed
+steps were kept. `ulimit -n 131072` is now set in `step0c.sh` for future runs.
+
+**Operational rule:** raise the fd limit before any large-batch rollout run, and count
+failures by exception type per step. A reward curve alone cannot distinguish a harness
+failure from a wrong answer.

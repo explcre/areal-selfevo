@@ -27,6 +27,12 @@ export PATH="$HOME/.local/bin:$PATH"
 source "$HOME/venv312b/bin/activate"
 cd "$HOME/areal-selfevo" || exit 1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# The default soft limit of 1024 file descriptors cannot serve 1024 concurrent rollouts
+# (batch 256 x n_samples 4) plus max_concurrent_rollouts=256. Exhaustion surfaces as
+# "OSError: [Errno 24] Too many open files" inside the rollout workflow -- and AReaL
+# scores a failed workflow as reward 0.0, so the failure is laundered into the training
+# signal instead of raised. The hard limit here is 1048576.
+ulimit -n 131072 || echo "WARNING: could not raise the file-descriptor limit"
 # stdbuf cannot unbuffer CPython (it overrides libc stdio, which CPython bypasses), so the
 # trainer's stdout was block-buffered into the pipe and delayed stall detection (audit D8).
 export PYTHONUNBUFFERED=1
