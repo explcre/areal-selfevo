@@ -83,7 +83,7 @@ python3 examples/math/gsm8k_rl.py \
   cluster.fileroot="$HOME/areal-runs" \
   evaluator.freq_steps=20 \
   actor.kl_ctl=0.01 \
-  rollout.agent.min_new_tokens=1 \
+  +rollout.agent.min_new_tokens=1 \
   +actor.attn_impl=sdpa +ref.attn_impl=sdpa \
   +rollout.agent.admin_api_key="$KEY" \
   experiment_name=step0d trial_name=t1 2>&1 \
