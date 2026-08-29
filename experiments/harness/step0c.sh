@@ -18,6 +18,14 @@
 #                     (undefined symbol c10_cuda_check_implementation). sdpa is
 #                     numerically equivalent, only slower. It does not touch generation.
 #
+#   gconfig.min_new_tokens=1 -- forces at least one non-EOS token. As entropy falls the
+#                     policy samples EOS first; the all-EOS completion makes sglang return
+#                     500 (both EOS and PAD are stop tokens), and AReaL scores the failed
+#                     trajectory as reward 0.0, which drives entropy lower still. Note this
+#                     field was DEAD upstream -- declared in cli_args.py and never
+#                     forwarded -- so it is only effective together with our
+#                     sglang_remote.py change that puts it in sampling_params.
+#
 # One addition, which changes measurement and not training:
 #   evaluator.freq_steps=20 -- the reference fires the evaluator once per epoch, so a
 #                     1-epoch run yields a single eval point and no validation curve.
@@ -58,6 +66,7 @@ python3 examples/math/gsm8k_rl.py \
   scheduler.type=local \
   cluster.fileroot="$HOME/areal-runs" \
   evaluator.freq_steps=20 \
+  gconfig.min_new_tokens=1 \
   +actor.attn_impl=sdpa +ref.attn_impl=sdpa \
   +rollout.agent.admin_api_key="$KEY" \
   experiment_name=step0c trial_name=t1 2>&1 \

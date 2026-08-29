@@ -68,6 +68,16 @@ class SGLangBackend:
             "top_p": gconfig.top_p,
             "top_k": gconfig.top_k,
             "max_new_tokens": gconfig.max_new_tokens,
+            # Forward the floor as well. Without this, gconfig.min_new_tokens was a dead
+            # field -- declared at cli_args.py:173 and read nowhere -- so nothing stopped
+            # the policy emitting EOS as its very first token. sglang treats both EOS and
+            # PAD as stop tokens (see stop_token_ids below), so an all-EOS completion
+            # makes stop-stripping empty the output and the server returns
+            #   500 "All output_tokens are EOS or PAD tokens; cannot strip stop tokens
+            #        without removing entire output."
+            # AReaL then scores that failed trajectory as reward 0.0, feeding a false zero
+            # into training that drives entropy lower and makes the next one more likely.
+            "min_new_tokens": gconfig.min_new_tokens,
             "temperature": 0.0 if gconfig.greedy else gconfig.temperature,
             "stop_token_ids": stop_token_ids,
             "ignore_eos": gconfig.ignore_eos,
