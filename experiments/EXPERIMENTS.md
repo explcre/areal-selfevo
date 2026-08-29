@@ -270,3 +270,43 @@ the guard with exit 0 (D4); `cur()` was dead code that returned the FIRST step n
 All fixed in `experiments/harness/`, with 9 behavioural tests that reproduce the critical
 findings: an advancing counter survives, a frozen one is killed, step 233/233 reaches the
 log, and invalid pgids keep the guard alive instead of retiring it.
+
+### Theory link: the group-size law flagged this config before we ran it
+
+Our own analysis (Bay & Yearick, `2607.00152`, carried in `paper_src/`) gives the GRPO
+group-size requirement
+
+    G  >=  1 / (8 * eps * p * (1 - p))
+
+for a group of size G to resolve the sign of the advantage at tolerance `eps`, where `p`
+is the solve rate. At the observed early solve rate **p = 0.76** (`p(1-p) = 0.1824`):
+
+| eps  | required G | config's G = 4 |
+|------|-----------|----------------|
+| 0.20 | 3.4       | ok             |
+| 0.10 | 6.9       | **below**      |
+| 0.05 | 13.7      | **below**      |
+
+`gconfig.n_samples: 4` is below the threshold for any tolerance tighter than 0.2. Our
+`batch_size=32` then compounded it: the number of groups contributing to each update fell
+from 256 to 32, so the per-update advantage estimate was both individually noisy (small G)
+and averaged over 8x fewer groups.
+
+**Stated precisely, to avoid overclaiming.** The law bounds the group size needed to
+recover the *sign* of the advantage at a given tolerance. It does not itself predict
+entropy collapse; collapse is a downstream consequence of repeatedly taking large,
+badly-signed steps with `kl_ctl = 0.0` (no anchor to the reference policy) and
+`eps_clip = 0.4` (loose trust region). So this is *consistent with* the theory and
+retrospectively explained by it, not a preregistered prediction that it confirmed. The
+honest claim is: the diagnostic we already had would have flagged this config as
+underpowered, and we did not run it before deviating.
+
+**Two consequences for the paper.**
+1. The group-size law has practical diagnostic content -- it identifies an underpowered RL
+   config from `p` and `G` alone, before any GPU time is spent. That is worth stating as a
+   usable check, not just an inequality.
+2. It constrains our own experimental design. Any self-evolving loop we build on GRPO must
+   report `G`, `p`, and the implied `eps`, because a method effect measured with an
+   underpowered group is indistinguishable from advantage noise. This is the same
+   underpowered-comparison trap recorded previously: put the standard error on the
+   *difference*, and check the group is large enough to resolve it at all.
