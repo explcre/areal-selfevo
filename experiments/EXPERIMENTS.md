@@ -1058,3 +1058,83 @@ Reproduce with `experiments/bench/sweep_entropy.sh` then
 from the raw generations and aborts if it disagrees with the harness's own `results.json`;
 an earlier version of it silently reported 0.000 for all seven checkpoints because it read
 a key name (`graded`) that the current artefact schema does not use.
+
+### Correction to the above: the grader was biased against the checkpoints being measured
+
+An adversarial audit of the sweep found one real defect, and it points the wrong way.
+
+`extract_boxed` took only the **last** `\boxed{` and returned `None` when it was unbalanced,
+by an explicit design decision ("a completion cut off mid-answer has not actually
+answered"). On a degenerate looping policy whose token cap lands mid-box, that discards a
+correct answer the model already emitted -- often hundreds of times. Measured cost, by
+regrading the persisted generations with the same `grade()`:
+
+| ckpt  | as reported | regraded | delta  | items recovered |
+|-------|-------------|----------|--------|-----------------|
+| base  | 0.528       | 0.528    | +0.000 | 0               |
+| gs028 | 0.454       | 0.454    | +0.000 | 0               |
+| gs057 | 0.440       | 0.440    | +0.000 | 0               |
+| gs086 | 0.466       | 0.466    | +0.000 | 0               |
+| gs115 | 0.356       | 0.364    | +0.008 | 4               |
+| gs144 | 0.292       | 0.334    | +0.042 | 21              |
+| gs173 | 0.316       | 0.358    | +0.042 | 21              |
+
+The base model gains **exactly zero** and every degraded checkpoint gains, monotonically
+with degradation. 100% of recovered items are `finish_reason=="length"`, and the audit
+measured that 92-93% of those repeat the same boxed value three or more times before the
+cut -- the model committed long before the cap. The rule was not measuring "did not
+answer", it was measuring "rambled", and charging it only to one side of the comparison.
+
+The audit caught a single case outright: gs173 problem idx=2 graded **correct** at a
+2048-token cap and **wrong** at 8192, on byte-identical prefix text. A larger budget
+produced a lower score. A grader whose bias tracks the effect under study cannot be used to
+study it. Fixed in `math_bench.py` (fall back to the last *balanced* box), with four
+regression tests, one pre-existing test reversed and annotated, and 6/7 mutants killed --
+the survivor is equivalent (with no boxes the loop body never runs and control reaches the
+same `return None`).
+
+**Two claims from the entry above are withdrawn.**
+
+1. **"Monotone" is wrong.** Corrected and uncorrected series both invert twice: gs057 <
+   gs086 (0.440 vs 0.466) and gs144 < gs173 (0.334 vs 0.358). Both inversions sit inside
+   the harness's own documented +/-1.6pp run-to-run band, so neither direction is real.
+   Only three tiers are defensible: base ~0.53; gs028/gs057/gs086 ~0.44-0.47;
+   gs115/gs144/gs173 ~0.33-0.36.
+
+2. **"Truncated items were all graded wrong" is wrong.** 82 of gs144's 245 and 111 of
+   gs173's 299 truncated completions grade correct, because the loop happened to end on a
+   balanced box.
+
+**The decline survives, and is stronger than reported.** The Wilson intervals were the
+wrong test: they ignore that all seven models answer the *same* 500 problems. A paired
+McNemar test gives, against base:
+
+| ckpt  | discordant (base-only / ckpt-only) | p        |
+|-------|------------------------------------|----------|
+| gs028 | 80 / 43                            | 1.17e-03 |
+| gs057 | 92 / 48                            | 2.79e-04 |
+| gs086 | 66 / 35                            | 2.83e-03 |
+| gs115 | 105 / 23                           | 8.10e-13 |
+| gs144 | 123 / 26                           | 3.55e-15 |
+| gs173 | 118 / 33                           | 8.15e-12 |
+
+Every checkpoint is significantly worse than the base, including the three whose Wilson
+intervals overlapped it. The audit further showed the decline holds with truncation removed
+from the picture entirely: on the 201 problems gs173 did *not* truncate, base scores 0.458
+against gs173's 0.338, and that subset is not the easy one (base scores higher on the
+truncated problems than the rest).
+
+**Also verified clean by the audit, and worth recording because each would have been fatal:**
+identical chat template (byte-identical to the base's, md5 `9a1b1065...`) and identical
+token ids across all seven; identical prompt, problem order and golds; identical sglang,
+torch, transformers, dtype, rope and context length; 0 formatting false negatives out of
+1715 wrong-with-box items under aggressive LaTeX normalisation; 0/3500 regrade
+disagreements; no survivor bias (`n_graded=500/500`, `n_failed=0` everywhere).
+
+**Two things remain unverified.** (a) Decoding is argmax over *repetition-penalised*
+logits: `sampling_defaults='model'` silently applies `repetition_penalty=1.1` and
+`top_k=20` from `generation_config.json`. It is uniform across all seven so it does not
+confound the comparison, but the methods text must not say "greedy, temperature 0" without
+it. (b) **No replicate of this sweep exists**, so the series carries no run-to-run error
+bar -- and the harness's own docstring notes that error dominates problem-sampling error.
+The two inversions above are exactly the size that a replicate would settle.

@@ -47,9 +47,22 @@ def test_missing_and_unbalanced():
     assert extract_boxed(r"\boxed{1") is None
 
 
-def test_truncated_final_box_discards_earlier_box():
-    """A completion cut off mid-answer has not answered, even if an earlier box exists."""
-    assert extract_boxed(r"\boxed{1} then \boxed{") is None
+def test_truncated_final_box_falls_back_to_the_earlier_box():
+    """Reversed on 2026-08-29 after measuring what the old rule cost.
+
+    This test used to assert None, on the reasoning that a completion cut off mid-answer
+    has not answered. An audit measured the rule's effect across seven checkpoints scored
+    on MATH-500: it flipped 0 items for the base model and 21 and 23 items for the two most
+    degraded checkpoints (4.2% and 4.6%). Every flip was a finish_reason=="length" item,
+    and 92-93% of those repeat the SAME boxed value three or more times before the cut.
+
+    So the rule did not measure "did not answer", it measured "rambled" -- and charged it
+    only to the checkpoints under comparison. One item was caught scoring correct at a
+    2048-token cap and wrong at 8192 on byte-identical prefix text, meaning a LARGER budget
+    produced a LOWER score. A grader whose bias tracks the effect being measured cannot be
+    used to measure it.
+    """
+    assert extract_boxed(r"\boxed{1} then \boxed{") == "1"
 
 
 def test_text_after_final_brace_is_ignored():
@@ -323,3 +336,41 @@ def test_generations_are_persisted(tmp_path):
         assert r["boxed"] == "7"
         assert r["gold"] and r["status"] == "ok"
         assert "correct" in r and "finish_reason" in r
+
+
+def test_extract_boxed_falls_back_past_a_truncated_final_box():
+    """The token cap landing mid-box must not discard an earlier complete answer.
+
+    Returning None here charged 4.2-4.6% of items to the two most degraded checkpoints and
+    0.0% to the base model, so it biased exactly the comparison it was used for.
+    """
+    assert extract_boxed(r"\boxed{7} and \boxed{8") == "7"
+    # The shape actually observed in gs173: a verbatim loop cut mid-box.
+    assert extract_boxed(r"\boxed{\frac{14}{3}} x \boxed{\frac{14") == r"\frac{14}{3}"
+    # Many repeats, final one truncated.
+    assert extract_boxed(r"\boxed{5} " * 4 + r"\boxed{5") == "5"
+
+
+def test_extract_boxed_still_prefers_the_last_complete_box():
+    """The fallback must not turn into "first box wins" -- later answers supersede."""
+    assert extract_boxed(r"\boxed{1} then \boxed{2}") == "2"
+    assert extract_boxed(r"\boxed{1} \boxed{2} \boxed{3}") == "3"
+
+
+def test_extract_boxed_returns_none_when_no_box_is_balanced():
+    """A completion with only a truncated box has genuinely not answered."""
+    assert extract_boxed(r"\boxed{a") is None
+    assert extract_boxed("no box here") is None
+    assert extract_boxed(r"\boxed{\frac{1") is None
+
+
+def test_extract_boxed_keeps_nested_braces():
+    """Guards the original bug: a naive regex mangles \\boxed{\\frac{1}{2}}."""
+    assert extract_boxed(r"\boxed{\frac{1}{2}}") == r"\frac{1}{2}"
+    assert extract_boxed(r"\boxed{\text{a}b}") == r"\text{a}b"
+
+
+def test_extract_boxed_strips_surrounding_whitespace():
+    """Models emit \\boxed{ 42 }; an unstripped answer fails string comparison."""
+    assert extract_boxed(r"\boxed{ 42 }") == "42"
+    assert extract_boxed("\\boxed{\n  7\n}") == "7"

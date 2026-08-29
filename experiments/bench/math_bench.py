@@ -82,31 +82,43 @@ _BOXED = re.compile(r"\\boxed\{")
 
 
 def extract_boxed(text: str) -> str | None:
-    """Return the content of the LAST \\boxed{...}, brace-balanced.
+    """Return the content of the last BALANCED \\boxed{...}.
 
     A regex like ``\\\\boxed\\{([^}]*)\\}`` truncates at the first inner brace, silently
     mangling ``\\boxed{\\frac{1}{2}}`` into ``\\frac{1``. A mangled extraction grades as
     wrong, so that bug surfaces as a plausible lower score rather than an error.
 
-    An unbalanced final box (the token cap landing mid-box) returns None rather than a
-    truncated string. Note this discards any earlier complete box in the same completion --
-    deliberate, because a completion cut off mid-answer has not actually answered.
+    Falls back to the last BALANCED box when the final one is cut off by the token cap.
+
+    This used to return None whenever the last box was unbalanced, on the reasoning that a
+    completion cut off mid-answer has not answered. An audit measured what that costs: it
+    flips 0 items for the base model and 21/23 items for the two most degraded checkpoints
+    (4.2% and 4.6%), because those completions are verbatim loops that emit the same box
+    ~500 times and get cut mid-box on the last one. 100% of the flips are
+    finish_reason=="length", and in 92-93% of them the last three boxes hold the SAME
+    value -- the model committed long before the cap.
+
+    So the old rule did not measure "did not answer", it measured "rambled", and it charged
+    that only to the checkpoints being argued about. One case was caught scoring CORRECT at
+    a 2048-token cap and WRONG at 8192 on byte-identical prefix text: raising the budget
+    lowered the score.
     """
     starts = [m.end() for m in _BOXED.finditer(text)]
     if not starts:
         return None
-    i = starts[-1]
-    depth, buf = 1, []
-    while i < len(text):
-        c = text[i]
-        if c == "{":
-            depth += 1
-        elif c == "}":
-            depth -= 1
-            if depth == 0:
-                return "".join(buf).strip()
-        buf.append(c)
-        i += 1
+    for start in reversed(starts):
+        i = start
+        depth, buf = 1, []
+        while i < len(text):
+            c = text[i]
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    return "".join(buf).strip()
+            buf.append(c)
+            i += 1
     return None
 
 
