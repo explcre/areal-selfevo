@@ -43,6 +43,7 @@ __all__ = [
     "EVOLVE_POLICIES",
     "CRITICS",
     "META_CRITICS",
+    "CADENCES",
     "register_shaper",
     "register_router",
 ]
@@ -64,6 +65,15 @@ CRITICS: frozenset[str] = frozenset({"none", "scalar", "two_level"})
 # training outcomes on held-out real tasks, and uses the discrepancy to refine both the
 # evaluation criteria and the generation strategy. Without it an evolving critic has no
 # anchor and can drift to whatever it finds easy to score.
+# How often an evolving evaluator updates RELATIVE to the policy.
+#   simultaneous -- both update every step. This is the configuration the co-evolution
+#                   literature reports collapsing; allowed only with nothing to co-evolve.
+#   alternating  -- one side is frozen while the other optimises, with an explicit
+#                   timescale gap (critic_update_every > 1).
+#   frozen       -- the evaluator never updates. Safe, and the degenerate case of
+#                   alternating with an infinite period.
+CADENCES: frozenset[str] = frozenset({"frozen", "alternating", "simultaneous"})
+
 META_CRITICS: frozenset[str] = frozenset({"none", "outcome_calibrated"})
 META_CRITIC_FACTORIES: dict[str, Callable[..., object] | None] = {
     "none": None,
@@ -157,6 +167,12 @@ class PipelineConfig:
         require_feedback: Whether the run will supply outcomes to the router. A learned
             policy that never observes is a fixed policy with extra steps, so this is
             checked rather than assumed.
+        cadence: How an evolving evaluator updates relative to the policy, from
+            :data:`CADENCES`. Defaults to ``frozen`` because that is the only value safe
+            with no further configuration.
+        critic_update_every: Policy steps between evaluator updates. Must exceed 1 under
+            ``alternating``: a period of 1 IS simultaneous update, whatever the axis is
+            labelled, and mislabelling it would defeat the guard rather than satisfy it.
         critic: Candidate scorer, from :data:`CRITICS`. ``two_level`` follows the
             BigBang-v1 description; their released repo is evaluation-only and contains no
             critic implementation, so nothing here is derived from their code.
@@ -178,6 +194,8 @@ class PipelineConfig:
     require_feedback: bool = False
     critic: str = "none"
     meta_critic: str = "none"
+    cadence: str = "frozen"
+    critic_update_every: int = 1
     frozen_eval_reward: bool = False
     policy_scored_by_frozen_reward: bool = False
 
@@ -252,6 +270,46 @@ def validate(cfg: PipelineConfig, *, allow_stubs: bool = False) -> list[Incompat
                 f"shaper {cfg.shaper!r} destroys sum_i A_i = 0, which prefix_dead gating "
                 "requires; the combination produces wrong gradients without raising",
                 "prefix_cancellation.py; MEDS dp_actor.py:560",
+            )
+        )
+
+    if cfg.cadence not in CADENCES:
+        out.append(
+            Incompatibility(("cadence",), f"unknown cadence {cfg.cadence!r}", "registry")
+        )
+
+    # Anything that makes the evaluator a moving target.
+    coevolving = cfg.meta_critic != "none" or cfg.evolve_target in ("reward", "both")
+
+    if coevolving and cfg.cadence == "simultaneous":
+        out.append(
+            Incompatibility(
+                ("cadence", "meta_critic" if cfg.meta_critic != "none" else "evolve_target"),
+                "updating the evaluator and the policy on every step is the configuration "
+                "the co-evolution literature reports collapsing into shared shortcuts; use "
+                "cadence='alternating' with critic_update_every > 1, or 'frozen'",
+                "arXiv 2606.07367; 2607.05297; 2510.23595",
+            )
+        )
+
+    if cfg.cadence == "alternating" and cfg.critic_update_every <= 1:
+        out.append(
+            Incompatibility(
+                ("cadence", "critic_update_every"),
+                f"critic_update_every={cfg.critic_update_every} under 'alternating' IS "
+                "simultaneous update; alternation needs a timescale gap, so this label "
+                "would defeat the guard rather than satisfy it",
+                "two-timescale separation",
+            )
+        )
+
+    if cfg.cadence == "frozen" and cfg.evolve_target in ("reward", "both"):
+        out.append(
+            Incompatibility(
+                ("cadence", "evolve_target"),
+                "cadence='frozen' says the evaluator never updates, but evolve_target "
+                f"{cfg.evolve_target!r} says it does; one of them is wrong",
+                "internal consistency",
             )
         )
 

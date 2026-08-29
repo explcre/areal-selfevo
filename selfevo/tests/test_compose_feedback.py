@@ -76,6 +76,7 @@ def test_evolving_both_under_a_fixed_rule_is_unattributable():
             require_feedback=True,
             frozen_eval_reward=True,
             policy_scored_by_frozen_reward=True,
+            **ALT,
         )
     )
 
@@ -116,6 +117,10 @@ def test_a_new_safe_shaper_composes_with_the_gate():
 
 
 # -------------------------------------------------------------------------- feedback
+
+
+# A real two-timescale gap, required whenever the evaluator moves.
+ALT = {"cadence": "alternating", "critic_update_every": 10}
 
 
 def _out(mode: str, value: float, batch: str = "b0", cost: float = 1.0) -> DecisionOutcome:
@@ -256,7 +261,7 @@ def test_evolving_the_reward_without_a_frozen_one_is_rejected():
     """A rising curve cannot be told from a reward that got easier."""
     problems = validate(PipelineConfig(evolve_target="reward"))
     assert any("unmeasurable" in p.reason for p in problems)
-    assert is_valid(PipelineConfig(evolve_target="reward", frozen_eval_reward=True))
+    assert is_valid(PipelineConfig(evolve_target="reward", frozen_eval_reward=True, **ALT))
 
 
 def test_learned_policy_evolving_its_own_reward_is_rejected():
@@ -278,6 +283,7 @@ def test_learned_policy_evolving_its_own_reward_is_rejected():
             require_feedback=True,
             frozen_eval_reward=True,
             policy_scored_by_frozen_reward=True,
+            **ALT,
         )
     )
 
@@ -295,7 +301,7 @@ def test_a_rule_based_policy_may_evolve_the_reward_with_a_frozen_anchor():
     """No learned objective to game, so only the measurement guard applies."""
     assert is_valid(
         PipelineConfig(evolve_target="reward", evolve_policy="rule",
-                       frozen_eval_reward=True)
+                       frozen_eval_reward=True, **ALT)
     )
 
 
@@ -399,3 +405,71 @@ def test_meta_critic_stub_is_caught_like_any_other():
     )
     assert any(p.axes == ("meta_critic",) and "no implementation" in p.reason
                for p in problems), problems
+
+
+# ------------------------------------------- cadence: two-timescale separation
+
+
+def test_simultaneous_update_of_a_coevolving_evaluator_is_rejected():
+    """The configuration the co-evolution literature reports collapsing."""
+    problems = validate(
+        PipelineConfig(meta_critic="outcome_calibrated", critic="two_level",
+                       frozen_eval_reward=True, cadence="simultaneous"),
+        allow_stubs=True,
+    )
+    hits = [p for p in problems if "cadence" in p.axes]
+    assert hits, problems
+    assert "shared shortcuts" in hits[0].reason
+    assert "2606.07367" in hits[0].evidence, "must cite where the claim comes from"
+
+
+def test_alternating_with_period_one_is_simultaneous_in_disguise():
+    """Labelling it 'alternating' must not defeat the guard."""
+    problems = validate(
+        PipelineConfig(meta_critic="outcome_calibrated", critic="two_level",
+                       frozen_eval_reward=True, cadence="alternating",
+                       critic_update_every=1),
+        allow_stubs=True,
+    )
+    assert any(p.axes == ("cadence", "critic_update_every") for p in problems), problems
+
+
+def test_alternating_with_a_real_timescale_gap_is_accepted():
+    assert is_valid(
+        PipelineConfig(meta_critic="outcome_calibrated", critic="two_level",
+                       frozen_eval_reward=True, cadence="alternating",
+                       critic_update_every=10),
+        allow_stubs=True,
+    )
+
+
+def test_evolving_reward_also_triggers_the_cadence_guard():
+    """Not only a meta-critic makes the evaluator a moving target."""
+    problems = validate(
+        PipelineConfig(evolve_target="reward", frozen_eval_reward=True,
+                       cadence="simultaneous"),
+        allow_stubs=True,
+    )
+    assert any("cadence" in p.axes for p in problems), problems
+
+
+def test_frozen_cadence_contradicts_an_evolving_reward():
+    problems = validate(
+        PipelineConfig(evolve_target="reward", frozen_eval_reward=True, cadence="frozen"),
+        allow_stubs=True,
+    )
+    assert any(p.axes == ("cadence", "evolve_target") for p in problems), problems
+
+
+def test_simultaneous_is_fine_when_nothing_co_evolves():
+    """The guard must not fire on configs with no moving evaluator."""
+    assert is_valid(PipelineConfig(cadence="simultaneous"), allow_stubs=True)
+
+
+def test_default_cadence_is_the_safe_one():
+    assert PipelineConfig().cadence == "frozen"
+
+
+def test_unknown_cadence_is_rejected():
+    problems = validate(PipelineConfig(cadence="nope"), allow_stubs=True)
+    assert any(p.axes == ("cadence",) for p in problems)
