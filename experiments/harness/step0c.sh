@@ -10,6 +10,8 @@
 #          unregularized updates: entropy collapsed 4.13 -> 1.2e-06, sequence length ran
 #          to the 1024 cap, and task_reward fell 0.85 -> 0.23.
 #   step0c changes NOTHING the reference sets. Both failures were our own deviations.
+#          A third was caught before it ran: we had set total_train_epochs to 1 against a
+#          published 10, which at batch 256 gives only ~29 optimizer steps.
 #
 # The only remaining deviation is forced, and is documented rather than silent:
 #   attn_impl=sdpa -- the prebuilt flash-attn wheel is ABI-incompatible with torch 2.9.1
@@ -17,7 +19,7 @@
 #                     numerically equivalent, only slower. It does not touch generation.
 #
 # One addition, which changes measurement and not training:
-#   evaluator.freq_steps=40 -- the reference fires the evaluator once per epoch, so a
+#   evaluator.freq_steps=20 -- the reference fires the evaluator once per epoch, so a
 #                     1-epoch run yields a single eval point and no validation curve.
 set -u -o pipefail
 
@@ -49,8 +51,7 @@ python3 examples/math/gsm8k_rl.py \
   --config examples/math/gsm8k_grpo.yaml \
   scheduler.type=local \
   cluster.fileroot="$HOME/areal-runs" \
-  total_train_epochs=1 \
-  evaluator.freq_steps=40 \
+  evaluator.freq_steps=20 \
   +actor.attn_impl=sdpa +ref.attn_impl=sdpa \
   +rollout.agent.admin_api_key="$KEY" \
   experiment_name=step0c trial_name=t1 2>&1 \

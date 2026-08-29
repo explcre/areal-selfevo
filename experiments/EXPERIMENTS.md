@@ -310,3 +310,21 @@ underpowered, and we did not run it before deviating.
    underpowered group is indistinguishable from advantage noise. This is the same
    underpowered-comparison trap recorded previously: put the standard error on the
    *difference*, and check the group is large enough to resolve it at all.
+
+### Science eval kits staged on the A100 host (`~/evalkits/`)
+
+`genebench-pro` (16 MB) and `bio-mystery` (11 MB) copied from the READ-ONLY local tree
+`~/text-dna/genebench-pro/` to a NEW folder `~/evalkits/` on the A100 host. Excluded
+`.git`, `__pycache__`, `.pytest_cache`, `.hf_cache`, `results` -- prior results stay on the
+source machine so they cannot be confused with ours. Source tree verified clean
+(`git status --porcelain` empty) after the copy: nothing in it was modified.
+
+**Integrity verified by `rsync -naic --checksum`: zero files would re-transfer, i.e. every
+file is byte-identical.**
+
+A first attempt to verify with a hand-rolled manifest (`find -printf '%P %s'`) reported a
+checksum mismatch. That was the *check's* bug, not the copy's: `%P` strips the starting-point
+prefix, so `genebench-pro/README.md` and `bio-mystery/README.md` both collapse to
+`README.md` and the two trees' namespaces merged. A failing integrity check is a claim that
+needs its own verification before it is acted on -- use `rsync --checksum` and let the tool
+that understands the trees do the comparison.
