@@ -197,3 +197,39 @@ def test_bandit_is_reproducible_given_a_seed():
     a = [BanditRouter(seed=11).route(ctx).argmax() for _ in range(1)]
     c = [BanditRouter(seed=11).route(ctx).argmax() for _ in range(1)]
     assert a == c
+
+
+# --------------------------------------------- the rule, against the SHIPPED registry
+
+
+def test_entropy_bonus_is_marked_unsafe_by_the_shipped_registry():
+    """Checked in a FRESH interpreter, because register_shaper mutates a module global.
+
+    An in-session assert is worthless here: other tests call register_shaper() and re-add
+    the very entry under test, so emptying the module-level seed left the whole suite
+    green. Only a subprocess sees the shipped registry.
+    """
+    import subprocess
+    import sys as _sys
+
+    prog = (
+        "from selfevo.compose import _BREAKS_CENTRING, validate, PipelineConfig;"
+        "assert 'entropy_bonus' in _BREAKS_CENTRING, 'not in shipped registry';"
+        "p = validate(PipelineConfig(shaper='entropy_bonus', gate='prefix_dead'));"
+        "assert p, 'MEDS shaper + prefix gate not rejected out of the box';"
+        "assert any(x.axes == ('shaper', 'gate') for x in p), 'wrong axes';"
+        "print('OK')"
+    )
+    r = subprocess.run([_sys.executable, "-c", prog], capture_output=True, text=True)
+    assert r.returncode == 0, (
+        "shipped registry does not reject the MEDS combination.\n"
+        f"stdout={r.stdout!r} stderr={r.stderr[-400:]!r}"
+    )
+
+
+def test_meds_combination_is_rejected_without_any_test_setup():
+    """The exact MEDS cell, validated with nothing registered by the test."""
+    problems = validate(PipelineConfig(shaper="entropy_bonus", gate="prefix_dead"))
+    assert problems, "the MEDS shaper + prefix gate must be rejected out of the box"
+    assert any(p.axes == ("shaper", "gate") for p in problems)
+    assert "dp_actor.py:560" in str(problems[0])
