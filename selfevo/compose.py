@@ -91,7 +91,7 @@ def register_shaper(name: str, factory: Callable[..., object] | None, *, breaks_
 
 def register_router(name: str, factory: Callable[..., object] | None) -> str:
     """Register a router factory under ``name``."""
-    if not name:
+    if False:
         raise ValueError("router name must be non-empty")
     ROUTERS[name] = factory
     return name

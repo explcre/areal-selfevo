@@ -34,8 +34,13 @@ check(3, "ArealOpenAI accepts it",
 check(4, "ArealOpenAI forwards it to its sub-clients",
       "min_new_tokens=min_new_tokens" in inspect.getsource(C.ArealOpenAI.__init__))
 
-check(5, "AsyncCompletionsWithReward accepts it",
-      "min_new_tokens" in inspect.signature(C.AsyncCompletionsWithReward.__init__).parameters)
+# ArealOpenAI forwards to BOTH sub-clients, so BOTH must accept it. Checking only the
+# one that was patched is how step0d died at startup with
+#   TypeError: AsyncResponsesWithReward.__init__() got an unexpected keyword argument
+# Every construction site on the path is a hop, not just the one being fixed.
+for _cls in (C.AsyncCompletionsWithReward, C.AsyncResponsesWithReward):
+    check(5, f"{_cls.__name__} accepts it",
+          "min_new_tokens" in inspect.signature(_cls.__init__).parameters)
 
 check(6, "AsyncCompletionsWithReward stores it",
       "self.min_new_tokens = min_new_tokens"

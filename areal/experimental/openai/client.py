@@ -1386,12 +1386,14 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
         tool_call_parser: str,
         reasoning_parser: str,
         engine_max_tokens: int | None = None,
+        min_new_tokens: int = 0,
         chat_template_type: str = "hf",
         lora_name: str = "",
         require_multimodal_processor: bool = False,
     ):
         super().__init__(client)
         self.engine = engine
+        self.min_new_tokens = min_new_tokens
         self.tokenizer = tokenizer
         self.processor = processor
         self.tool_call_parser = tool_call_parser
@@ -1554,6 +1556,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
 
         # Create generation config and request
         gconfig = GenerationHyperparameters(
+            min_new_tokens=self.min_new_tokens,
             n_samples=1,
             temperature=temp,
             max_new_tokens=max_new_tokens,

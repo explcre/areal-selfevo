@@ -174,7 +174,11 @@ def main() -> None:
             arms = {
                 "criterion": crit,
                 "matched_control": MatchedPermutationControl.from_router(
-                    crit, ctxs * 200, seed=seed
+                    # Pool sized to the budget: at most `budget` decisions are
+                    # served (SKIP costs 0, so the loop can exceed budget in
+                    # iterations), with headroom. Building 200x that was the
+                    # bottleneck -- every RoutingDecision validates on construction.
+                    crit, ctxs * (int(args.budget // len(ctxs)) + 3), seed=seed
                 ),
                 "inverted": InvertedRouter(),
                 "all_rl": StaticRouter({TrainingMode.RL: 1.0}),
