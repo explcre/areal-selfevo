@@ -168,6 +168,20 @@ def route_token_weights(
         )
     if packed:
         original_shape_1d = True
+        # group_ids arrives per TOKEN (see actor.py); collapse it to one id per sequence.
+        # Taking the first token of each row is exact because every token of a sequence
+        # carries that sequence's group, and it is checked below rather than trusted.
+        if group_ids is not None and group_ids.ndim == 1 and group_ids.numel() == loss_mask.numel():
+            per_tok = unpack(group_ids, cu_seqlens)
+            first = per_tok[:, 0]
+            lens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+            for i, n in enumerate(lens):
+                if n and not bool((per_tok[i, :n] == first[i]).all()):
+                    raise ValueError(
+                        f"sequence {i} carries more than one group id; the per-token group "
+                        "tensor was corrupted by splitting and cannot be collapsed"
+                    )
+            group_ids = first
         loss_mask = unpack(loss_mask, cu_seqlens)
         if tokens is not None and tokens.ndim == 1:
             tokens = unpack(tokens, cu_seqlens)

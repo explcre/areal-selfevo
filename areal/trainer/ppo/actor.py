@@ -349,10 +349,17 @@ class PPOActor:
                      if isinstance(group_sizes, int) and group_sizes > 0
                      else list(group_sizes) if not isinstance(group_sizes, int) else [])
             if sum(sizes) == bs:
-                data["group_ids"] = torch.repeat_interleave(
+                gid = torch.repeat_interleave(
                     torch.arange(len(sizes), device=advantages.device),
                     torch.tensor(sizes, device=advantages.device),
                 )
+                # Stored PER TOKEN, not per sequence. A (B,) tensor does not survive the
+                # pipeline: microbatch splitting and packing are written for tensors shaped
+                # like loss_mask, and a per-sequence tensor arrives at the loss with the
+                # wrong length -- which is exactly how the first routed run died. Broadcast
+                # to (B, T) and it is split, packed and unpacked identically to the tensors
+                # beside it, so whatever the engine does to advantages it does to this.
+                data["group_ids"] = gid.unsqueeze(1).expand_as(data["loss_mask"]).contiguous()
             else:
                 # A mismatch means the rows were regrouped somewhere between rollout and
                 # here. Emitting a wrong grouping is worse than emitting none: the router
@@ -644,6 +651,15 @@ def grpo_loss_fn(
             tokens=input_data.get("input_ids"),
             gen_mask=input_data.get("gen_mask"),
             group_ids=input_data.get("group_ids"),
+            # Required, and omitting them is not a silent degradation:
+            #  - cu_seqlens: microbatches arrive PACKED 1-D, and without boundaries the
+            #    router would read the whole batch as one group and mark every token dead.
+            #  - advantages: the rule's precondition (sum_i A_i = 0 per group) is checked,
+            #    not assumed, and cannot be checked without them.
+            # The first routed run died here because both were missing -- the guards
+            # refused, which is the behaviour they exist for.
+            cu_seqlens=input_data.get("cu_seqlens"),
+            advantages=advantages,
         )
         # Apply the per-token RL weight by SCALING ADVANTAGES, not by narrowing the mask.
         #
