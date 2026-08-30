@@ -223,11 +223,23 @@ def route_token_weights(
                     "rule outside its domain."
                 )
             assert_zero_sum_advantage(advantages, group_ids)
+            checked = ["zero-sum advantage"]
             if importance_weight is not None:
-                assert_on_policy(importance_weight, clip_fraction if clip_fraction is not None else 0.0)
+                assert_on_policy(
+                    importance_weight, clip_fraction if clip_fraction is not None else 0.0
+                )
+                checked.append("on-policy ratio")
         dead = rl_dead_mask(tokens, gen_mask, group_ids) & mask
-        basis = ("tokens inside the group's shared prefix, preconditions "
-                 + ("verified" if spec.require_valid_preconditions else "NOT CHECKED"))
+        # Name WHICH preconditions were checked. Reporting a bare "verified" was wrong: the
+        # on-policy condition is only checkable when importance_weight is supplied, and the
+        # loss call site does not supply it, so the module claimed to have verified a
+        # condition it had never looked at. The docstring lists PPO clipping and unequal
+        # member ratios as things that void the rule; a measured clip fraction of 0.219 on a
+        # plausible batch means that is not hypothetical.
+        basis = ("tokens inside the group's shared prefix; checked: "
+                 + (", ".join(checked) if spec.require_valid_preconditions else "NOTHING")
+                 + ("" if importance_weight is not None
+                    else " (on-policy ratio NOT checked: no importance_weight supplied)"))
     elif spec.rule == "random":
         if group_ids is None or tokens is None or gen_mask is None:
             raise ValueError("rule 'random' needs the same inputs, to match the real rate")

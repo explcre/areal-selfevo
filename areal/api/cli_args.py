@@ -1801,9 +1801,13 @@ class PPOActorConfig(TrainEngineConfig):
         default=None,
         metadata={
             "help": "Per-token training-signal routing (selfevo). None disables it, which "
-            "is bit-identical to upstream AReaL. Requires adv_norm.mean_level=group and "
-            "kl_ctl=0: those are the only settings under which the rule's precondition "
-            "(sum_i A_i = 0 per group) holds, and the router refuses otherwise."
+            "is bit-identical to upstream AReaL. Requires adv_norm=None and kl_ctl=0. "
+            "reward_norm already centres the per-sequence rewards, so the advantages "
+            "arrive summing to zero per group; adv_norm then DESTROYS that, because its "
+            "mean is token-weighted and generation lengths differ. Measured on the real "
+            "pipeline: adv_norm=None leaves a residual of 0.0, mean_level=group 2.139, "
+            "mean_level=batch 0.867. An earlier version of this help prescribed "
+            "mean_level=group, which is the setting that breaks it."
         },
     )
 

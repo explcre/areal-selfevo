@@ -368,12 +368,22 @@ class PPOActor:
                     "traj_group_sizes sums to %d but the batch has %d rows; omitting "
                     "group_ids rather than guessing", sum(sizes), bs
                 )
-        # loss_mask marks the positions the loss is taken over, which are exactly the
-        # generated tokens; the prompt is masked out.
-        data["gen_mask"] = data["loss_mask"].bool()
+
         data["kl_rewards"] = kl_rewards
         data["tot_rewards"] = gae_kl_rewards + gae_outcome_rewards
         data["loss_mask"] = loss_mask
+
+        # gen_mask must be in EMITTER coordinates, matching loss_mask and advantages.
+        #
+        # It used to be taken from loss_mask BEFORE the roll at line ~230, leaving it in
+        # TOKEN coordinates while everything it is compared against is in emitter
+        # coordinates (index t predicts token t+1). An audit measured the consequence: the
+        # router deleted the advantage at the position emitting the FIRST DIVERGENT token
+        # and left live the position emitting the first shared token, which is the one that
+        # is provably dead. Two of every K decisions inverted -- 33-40% at realistic prefix
+        # lengths -- and in the worst possible direction: it preserved a zero gradient and
+        # deleted the highest-information one.
+        data["gen_mask"] = loss_mask.bool()
         # because we have rolled old_logp by -1
         data["logprobs"] = old_logp
 

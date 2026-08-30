@@ -140,7 +140,7 @@ python3 examples/math/gsm8k_rl.py \
   actor.eps_clip=0.2 \
   saver.freq_steps=25 \
   actor.kl_ctl=0.0 \
-  actor.adv_norm.mean_level=group \
+  ~actor.adv_norm \
   +actor.token_routing.enabled=true \
   +actor.token_routing.rule=rl_dead_to_distill \
   evaluator.freq_epochs=null \

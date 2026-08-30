@@ -284,4 +284,52 @@ def test_precondition_check_can_be_waived_only_explicitly():
         spec=TokenRoutingSpec(enabled=True, require_valid_preconditions=False),
         rl_loss_weight=1.0, distill_loss_weight=0.005, loss_mask=loss_mask,
         tokens=tokens, gen_mask=gen, group_ids=gids, advantages=bad)
-    assert "NOT CHECKED" in r.basis, "waiving the check must be visible in the basis"
+    assert "NOTHING" in r.basis, "waiving the check must be visible in the basis"
+
+
+def test_gen_mask_is_not_interchangeable_with_loss_mask():
+    """A mutation survivor: every other test sets gen_mask == loss_mask.
+
+    That equality is exactly the bug an audit found in the producer -- gen_mask was taken
+    before loss_mask was rolled, so it lived in token coordinates while everything it is
+    compared against lived in emitter coordinates. The suite could not see it because no
+    test ever distinguished the two masks. Here they differ, so substituting one for the
+    other changes the routed set.
+    """
+    tokens = torch.tensor([[7, 7, 1, 2],
+                           [7, 7, 3, 4]])
+    gids = torch.tensor([0, 0])
+    # loss carries on all four positions, but only the last three are GENERATED.
+    loss_mask = torch.ones_like(tokens, dtype=torch.bool)
+    gen_mask = torch.tensor([[False, True, True, True],
+                             [False, True, True, True]])
+    adv = torch.tensor([[1.0] * 4, [-1.0] * 4])
+
+    with_gen = route_token_weights(
+        spec=TokenRoutingSpec(enabled=True), rl_loss_weight=1.0, distill_loss_weight=0.005,
+        loss_mask=loss_mask, tokens=tokens, gen_mask=gen_mask, group_ids=gids, advantages=adv)
+    with_loss = route_token_weights(
+        spec=TokenRoutingSpec(enabled=True), rl_loss_weight=1.0, distill_loss_weight=0.005,
+        loss_mask=loss_mask, tokens=tokens, gen_mask=loss_mask, group_ids=gids, advantages=adv)
+    assert not torch.equal(with_gen.rl_weight, with_loss.rl_weight), (
+        "substituting loss_mask for gen_mask changed nothing; the test cannot see the "
+        "coordinate-system bug it exists to catch"
+    )
+
+
+def test_routed_fraction_denominator_is_live_tokens_not_element_count():
+    """A mutation survivor: the headline number would be understated by ~47% otherwise."""
+    tokens = torch.tensor([[5, 5, 1, 0],
+                           [5, 5, 2, 0]])
+    gen = torch.tensor([[True, True, True, False],
+                        [True, True, True, False]])
+    gids = torch.tensor([0, 0])
+    adv = torch.tensor([[1.0] * 4, [-1.0] * 4])
+    r = route_token_weights(spec=TokenRoutingSpec(enabled=True), rl_loss_weight=1.0,
+                            distill_loss_weight=0.005, loss_mask=gen, tokens=tokens,
+                            gen_mask=gen, group_ids=gids, advantages=adv)
+    # 6 loss-carrying tokens, 4 routed -> 2/3, not 4/8.
+    assert r.n_routed == 4
+    assert abs(r.routed_fraction - 4 / 6) < 1e-9, (
+        f"denominator is not the live-token count: {r.routed_fraction}"
+    )
