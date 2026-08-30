@@ -19,12 +19,32 @@ from typing import Mapping, Protocol, runtime_checkable
 __all__ = [
     "Granularity",
     "TrainingMode",
+    "HarnessAction",
     "RoutingContext",
     "RoutingDecision",
     "Router",
     "register_mode",
     "known_modes",
 ]
+
+
+class HarnessAction(Enum):
+    """What a unit contributes to harness evolution, orthogonal to its training mode.
+
+    A trajectory can feed the gradient and the harness at the same time: the two read
+    different things from it -- the estimator reads the tokens, the harness evolver reads
+    the failure mode -- so forcing a partition throws one of them away. Co-Harness
+    (2607.22688) does partition (success -> model, failure -> harness); keeping this axis
+    separate lets that rule be reproduced exactly *and* relaxed, as an ablation rather
+    than a rewrite.
+
+    ``NONE`` is the default everywhere, so a config that never mentions harness evolution
+    behaves exactly as it did before this axis existed.
+    """
+
+    NONE = "none"
+    PROPOSE = "propose"
+    VALIDATE = "validate"
 
 
 class Granularity(Enum):
@@ -101,8 +121,12 @@ class RoutingContext:
             prompt this is the group's mean binary reward, which GRPO already computes.
         group_size: Samples drawn for this unit, >= 1.
         granularity: Resolution this context describes.
-        has_teacher: Whether an external target is available. A router must not select a
-            teacher-requiring mode when this is False.
+        has_teacher: Whether an *external* target is available. A router must not select
+            a teacher-requiring mode when this is False and the unit has no self-target
+            (see :attr:`has_target`).
+        can_evolve_harness: Whether harness evolution is wired for this run. A router must
+            not emit a non-NONE :class:`HarnessAction` when this is False -- the same
+            guard shape as ``has_teacher``, so neither can be forgotten independently.
         unit_id: Optional identifier (prompt id, cluster id) for logging and for
             reproducing a decision.
         extra: Escape hatch for router-specific features (cluster stats, difficulty
@@ -113,6 +137,9 @@ class RoutingContext:
     group_size: int
     granularity: Granularity = Granularity.SAMPLE
     has_teacher: bool = False
+    # Keyword-only: kept next to has_teacher because it is the same guard shape, but
+    # appended to __init__ so it cannot capture the positional slot unit_id already had.
+    can_evolve_harness: bool = field(default=False, kw_only=True)
     unit_id: str | None = None
     extra: Mapping[str, float] = field(default_factory=dict)
 
@@ -121,6 +148,29 @@ class RoutingContext:
             raise ValueError(f"solve_rate must be in [0, 1], got {self.solve_rate}")
         if self.group_size < 1:
             raise ValueError(f"group_size must be >= 1, got {self.group_size}")
+
+    @property
+    def has_self_target(self) -> bool:
+        """Whether this unit's own rollout already contains a usable SFT target.
+
+        A group with ``solve_rate > 0`` drew at least one correct sample, and that sample
+        is a target -- this is rejection-sampling fine-tuning, and it needs no external
+        teacher. It matters because the fully-solved groups that GRPO cannot learn from
+        (their advantages are identically zero) are exactly the groups where a free target
+        is guaranteed to exist.
+
+        Only meaningful when ``solve_rate`` is a group mean over sampled answers, i.e. at
+        TASK/CLUSTER/SAMPLE granularity. At TOKEN granularity there is no per-token notion
+        of a correct sibling sample, so this is forced to False.
+        """
+        if self.granularity is Granularity.TOKEN:
+            return False
+        return self.solve_rate > 0.0
+
+    @property
+    def has_target(self) -> bool:
+        """Whether *any* target exists for a teacher-requiring mode: external or self."""
+        return self.has_teacher or self.has_self_target
 
 
 @dataclass(frozen=True)
@@ -134,6 +184,9 @@ class RoutingDecision:
             code never has to guess what an absent decision meant.
         reason: Short human-readable justification, carried into logs so a decision can be
             audited after the fact.
+        harness: What this unit contributes to harness evolution. Defaults to
+            ``HarnessAction.NONE``, which is what every decision constructed before this
+            field existed meant, so adding it changed no behaviour.
 
     Raises:
         ValueError: If ``weights`` is empty, contains a negative weight, sums to zero, or
@@ -142,6 +195,7 @@ class RoutingDecision:
 
     weights: Mapping[str, float]
     reason: str = ""
+    harness: HarnessAction = HarnessAction.NONE
 
     def __post_init__(self) -> None:
         # Order matters: a mixture like {RL: 2.0, SFT: -1.0} sums to 1.0, so a sum check

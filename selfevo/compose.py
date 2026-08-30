@@ -79,6 +79,13 @@ def _random_router(**kw: object) -> object:
     return RandomRouter(**kw)  # type: ignore[arg-type]
 
 
+def _coharness_router(**kw: object) -> object:
+    """Factory for :class:`selfevo.routing.harness.CoHarnessRouter` (model and/or harness)."""
+    from .routing.harness import CoHarnessRouter
+
+    return CoHarnessRouter(**kw)  # type: ignore[arg-type]
+
+
 # These were implemented but never registered, so no config could select them and the
 # `router` axis was unusable despite four working routers existing. Imported lazily for the
 # same reason as the critic factories: `compose` must stay importable for configuration
@@ -88,6 +95,7 @@ ROUTERS: dict[str, Callable[..., object] | None] = {
     "solve_rate": _solve_rate_router,    # SAMPLE granularity, I_RL silence split
     "cluster": _cluster_router,          # CLUSTER granularity, one signal per cluster
     "random": _random_router,            # matched control: same proportions, shuffled units
+    "coharness": _coharness_router,      # model AND/OR harness; validate() demands a harness
 }
 GATES: dict[str, Callable[..., object] | None] = {"none": None, "prefix_dead": None}
 EVOLVE_TARGETS: frozenset[str] = frozenset({"model", "harness", "reward", "both"})
@@ -459,6 +467,20 @@ def validate(cfg: PipelineConfig, *, allow_stubs: bool = False) -> list[Incompat
                 "attribute a gain to either; run them as separate arms, or use a policy "
                 "that records which target it chose",
                 "factorial design",
+            )
+        )
+
+    # A harness router with no harness to evolve is a null arm that still reports as one.
+    if cfg.router == "coharness" and cfg.evolve_target not in ("harness", "both"):
+        out.append(
+            Incompatibility(
+                ("router", "evolve_target"),
+                f"router='coharness' routes units to the harness, but evolve_target "
+                f"{cfg.evolve_target!r} gives it no harness to evolve; every HarnessAction "
+                "is dropped and the arm degenerates into a solve-rate split under another "
+                "name, which no logged metric distinguishes from the real thing",
+                "routing.harness.CoHarnessRouter.route drops the action when "
+                "RoutingContext.can_evolve_harness is False",
             )
         )
 

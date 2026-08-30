@@ -403,6 +403,43 @@ class PPOActor:
                         unsolved_group_fraction=float((silent * unsolved).mean()),
                         n_groups=float(n_groups),
                     )
+
+                # OPTIONAL: give the silent groups a signal instead of only counting them.
+                #
+                # Applied HERE, outside the no_grad block above but using the same group
+                # tensors, because this is the only point where group membership and the
+                # advantage tensor coexist -- by loss time the batch is packed and the
+                # grouping is gone.
+                #
+                # A solved group's advantages are identically zero, so ADDING a positive
+                # constant to them is exactly SFT on that group's own correct samples: the
+                # policy-gradient step maximising log p(y) for a sampled y is the supervised
+                # step on y, and on-policy the importance ratio is 1. PPO's clip still
+                # bounds how far one update can sharpen an already-correct policy, which is
+                # the failure mode this is most likely to provoke.
+                #
+                # The weights default to 0.0 and the feature defaults to disabled, so
+                # rollback is exact: adding 0.0 to a zero tensor changes no bit.
+                gr = getattr(self.config, "group_routing", None)
+                if gr is not None and getattr(gr, "enabled", False):
+                    sizes_t = torch.tensor(sizes, device=advantages.device)
+                    row_adv = torch.zeros(bs, device=advantages.device, dtype=advantages.dtype)
+                    if gr.solved_advantage != 0.0:
+                        row_adv = row_adv + torch.repeat_interleave(
+                            silent * solved, sizes_t
+                        ).to(row_adv.dtype) * gr.solved_advantage
+                    if gr.unsolved_advantage != 0.0:
+                        row_adv = row_adv + torch.repeat_interleave(
+                            silent * unsolved, sizes_t
+                        ).to(row_adv.dtype) * gr.unsolved_advantage
+                    if bool((row_adv != 0).any()):
+                        # Mask so the constant lands only on response tokens, in the same
+                        # coordinates the metric above used to read the advantages.
+                        advantages = advantages + row_adv.unsqueeze(1) * data["loss_mask"]
+                        data["advantages"] = advantages
+                    stats_tracker.scalar(
+                        routed_group_fraction=float((row_adv != 0).float().mean()),
+                    )
             else:
                 # A mismatch means the rows were regrouped somewhere between rollout and
                 # here. Emitting a wrong grouping is worse than emitting none: the router
