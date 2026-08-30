@@ -1316,3 +1316,43 @@ Consequences, stated rather than buried:
 **The lesson for future sweeps:** score a series in ONE pass whenever the comparison depends
 on the base as an anchor. Splitting to fit a GPU budget buys statistics and costs
 comparability, and here it cost more than it bought.
+
+---
+
+## OlympiadBench: the collapse replicates, and the frontier tier finally has a target
+
+Two results from scoring on OlympiadBench (675 problems, harder than AIME and large enough
+to resolve a few points).
+
+**1. The step0d collapse is not a MATH-500 artefact.** The same six checkpoints plus the
+base, on a benchmark that shares no problems with MATH-500:
+
+| checkpoint | MATH-500 | OlympiadBench |
+|------------|----------|---------------|
+| base       | 0.528    | 0.188 |
+| gs028      | 0.454    | 0.170 |
+| gs057      | 0.440    | 0.190 |
+| gs086      | 0.466    | 0.148 |
+| gs115      | 0.364    | 0.135 |
+| gs144      | 0.334    | 0.108 |
+| gs173      | 0.358    | 0.107 |
+
+0.188 -> 0.107 is a 43% relative drop, same direction as MATH-500's 0.528 -> 0.358, on an
+independent problem set. A finding that reproduces on a second benchmark is worth more than
+the same finding measured more precisely on the first.
+
+OlympiadBench is also *more* sensitive to the degeneration: gs173 truncates 328 of 675
+generations (49%) against MATH-500's 60%, and the accuracy floor is proportionally lower.
+
+**2. OlympiadBench is the frontier target AIME could not be.** Ornith-1.5-35B-A3B scores
+**0.716** with a 95% interval only 7 points wide, against AIME24's 0.867 with an interval 24
+points wide on 30 problems. That is ~28 points of headroom measured at a resolution that can
+actually see a routing effect.
+
+Stated as a bound, not a score: 174 of 675 generations (26%) hit the 24576-token cap, so
+0.716 is a LOWER bound and the true headroom is smaller than 28 points. The number to quote
+after a higher-budget rerun, not this one.
+
+**Reading across the three scales**, and this is what makes the benchmark usable: base 1.5B
+0.188, Ornith-35B-A3B 0.716. Both ends are far from the ceiling and far from the floor, which
+is the property MATH-500 (0.966 at 27B) and AIME (0.000 at 1.5B) each lack at one end.
