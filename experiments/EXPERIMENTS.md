@@ -1629,3 +1629,53 @@ already-correct distribution and spends entropy, and entropy collapse is the fai
 this project has already measured twice. The measurement says where the reachable mass is,
 not what to do with it. The A/B that answers that is the next run, and until it exists the
 solved branch should default to SKIP rather than SFT.
+
+---
+
+## PREDECLARED: step0m, the solved-branch A/B (written before any outcome is known)
+
+Registered before the run produces a checkpoint, so the reading of the result cannot be
+chosen after seeing it.
+
+**Question.** 31.4% of all groups are RL-silent because they are SOLVED, and those groups
+already contain a correct sample. Does training on that free self-target help held-out
+accuracy, or does it merely sharpen an already-correct policy and spend entropy?
+
+**Design.** One script, two arms, `ARM=off|on`. Identical model
+(Qwen2.5-1.5B-Instruct), data, seed, optimiser, normalisation and token budget; the arms
+differ in exactly one flag, and the off arm is bit-identical to vanilla GRPO because
+`group_routing` defaults to None. `solved_advantage=0.5`, chosen as half a typical
+standardised advantage -- a deliberate first value, NOT tuned, and it will be reported that
+way. Arms run sequentially on the same 8 H200s, so hardware is matched.
+
+**Preconditions, all verified before launch rather than assumed:**
+
+* `preflight_group_routing.py` resolves the config through the trainer's own loader and
+  confirms the override arrives as a real `GroupRoutingConfig` with both values intact, that
+  the control arm is still exactly `None`, and that the sign guard raises through the CLI.
+* 17 tests drive the real `PPOActor._compute_advantages`; 7/7 mutations killed.
+* The run must emit a NON-ZERO `routed_group_fraction`. If it is zero, the arm did nothing
+  and no comparison may be reported.
+
+**What each outcome means, fixed now:**
+
+| outcome on held-out MATH-500, paired McNemar | reading |
+|---|---|
+| ON > OFF, p < 0.05, effect above the noise floor | the free self-target is usable; this is the method's main positive result |
+| ON < OFF significantly | sharpening a correct policy costs capability. A real finding, and the one the entropy argument predicts |
+| no significant difference | the 31.4% channel is reachable but inert at this weight. Report as a null, then vary `solved_advantage` ONCE before abandoning |
+
+**The noise floor applies and is not negotiable.** The base checkpoint appears in both arms;
+its difference is measurement noise and bounds what may be claimed. On the last comparison
+that floor was 0.022 at n=500, so an effect below ~0.03 will not be reported as real
+regardless of its p-value.
+
+**Entropy is a co-primary readout, not a diagnostic.** The mechanism's predicted failure is
+entropy collapse. Entropy will be reported for both arms whatever the accuracy shows,
+because an accuracy win bought with collapsed entropy is not a win -- that is exactly the
+pattern the demo-vs-scaffold comparison already caught once.
+
+**Known limitation, stated in advance.** This is GSM8K training at 1.5B. The 87.5%-solved
+split is a property of that operating point; a harder task moves mass to the unsolved branch
+where no free target exists. A positive result here does NOT transfer to the frontier tier
+without re-measuring the split there.
