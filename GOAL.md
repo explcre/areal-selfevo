@@ -1,5 +1,10 @@
 # GOAL — self-evolving LLM agents
 
+**Objective: a publishable top-AI-conference paper on self-evolving LLMs that is innovative
+and beats SOTA.** Not a system report. That means (a) a claim prior art does not already
+own, (b) a number that beats a named baseline on the benchmark that baseline reports, and
+(c) evaluation that survives arXiv 2607.12227's controls. All three, or it is not the paper.
+
 Single reference for what we are claiming, what is built, what is measured, and what is
 open. Every status here is checkable; nothing is marked done on intent.
 
@@ -66,18 +71,68 @@ Legend: **DONE** built + tested + audited · **PARTIAL** exists but incomplete o
 | E7 | Save progress promptly | **DONE** — HF verified 288 artifacts + 67.75 GB checkpoints |
 | E8 | Per-server branches | **DONE** — `selfevo/a100`, `selfevo/h200` |
 
-### Benchmarks
+### Benchmarks — named, with the paper each belongs to
 
-| # | requirement | status |
-|---|---|---|
-| B1 | Frontier math | **DONE** — MATH-500, AIME, AMC, HMMT, OlympiadBench all scored |
-| B2 | Frontier code | **NOT BUILT** — LiveCodeBench data obtained, generation/grading unwired |
-| B3 | Enterprise SQL | **NOT BUILT** — Spider2 + BIRD on disk, never run |
-| B4 | BioMysteryBench | **NOT BUILT** |
-| B5 | GeneBench-Pro | **NOT BUILT** |
-| B6 | Ornith / BigBang / EvoTrainer models | **PARTIAL** — Ornith-9B and 35B-A3B downloaded + scored; BigBang not pulled |
+We must be able to say "we beat X on the benchmark X reports". Each row names the source so
+a comparison is like-for-like rather than a benchmark of our choosing.
+
+| # | benchmark | whose | status | note |
+|---|---|---|---|---|
+| B1 | MATH-500 | ours/common | **DONE** | saturated at 27B (0.966); usable only at 1.5B/7B |
+| B2 | AIME 24/25 | common | **DONE** | unusable: 0.000 @1.5B, 0.867 @27B with a 24-pt CI on 30 problems |
+| B3 | AMC23, HMMT 24/25 | common | **DONE** | 30-40 problems; indicative only |
+| B4 | **OlympiadBench** | common | **DONE** | **the frontier target**: 675 problems, 7-pt CI, 27B = 0.825 @8% trunc |
+| B5 | **Terminal-Bench 2.1** (Terminus-2 harness) | **Ornith-1.5** | **NOT BUILT** | Ornith-397B 86.1, 35B-A3B 67.8. Also AI2 2607.12227's benchmark, so it is where the evaluation bar was set |
+| B6 | **DeepSWE** (Claude Code harness) | **Ornith-1.5** | **NOT BUILT** | Ornith-397B 56.0 |
+| B7 | **Frontier-Bench** | **Ornith-1.5** | **NOT BUILT** | competitors near zero |
+| B8 | **SWE-bench Pro** (+ `-os`) | **BigBang-v1** | **NOT BUILT** | `ScaleAI/SWE-bench_Pro` |
+| B9 | **HLE** (Humanity's Last Exam) | **BigBang-v1** | **NOT BUILT** | `cais/hle` |
+| B10 | **FrontierScience** | **BigBang-v1** | **NOT BUILT** | `openai/frontierscience` |
+| B11 | math + competitive programming + repo-level SWE | **EvoTrainer** (2606.03108) | **PARTIAL** | math done; the other two are B8/B12 |
+| B12 | **LiveCodeBench v6** | common | **NOT BUILT** | data obtained; generation + sandboxed grading unwired |
+| B13 | **Spider2 / BIRD** | enterprise SQL | **NOT BUILT** | both on disk, never run |
+| B14 | BioMysteryBench | domain | **NOT BUILT** | 90 gated, 155 GB |
+| B15 | GeneBench-Pro | domain | **NOT BUILT** | 10/129 public |
+
+**Ornith-1.5 evaluation protocol, to copy rather than invent:** five independent runs
+averaged; Terminal-Bench 2.1 via Harbor/Terminus-2 with `parser=json`, `temperature=1.0`,
+`top_p=1.0`, 128K context, 4h timeout / 32 CPU / 48 GB; DeepSWE via the Claude Code harness
+at `temperature=1.0`, `top_p=0.95`, 256K context. Five-run averaging matters — our own
+measured noise floor is 0.008-0.027 depending on the benchmark.
+
+### Models
+
+| model | status |
+|---|---|
+| Qwen2.5-1.5B / 7B-Instruct | **DONE** — both trained and scored |
+| Qwen3.8-27B | **DONE** — scored on all math benchmarks |
+| **Ornith-1.5-9B**, **Ornith-1.5-35B-A3B** (MoE, 35B total / ~3B active) | **DONE** — downloaded and scored on OlympiadBench |
+| Ornith-1.5-397B | **NOT PULLED** — too large for this training loop |
+| **BigBang-v1** (`endless-frontier/BigBang-v1`) | **NOT PULLED** |
 
 ---
+
+## 2b. Methods to compare against, and code to reuse rather than reimplement
+
+Standing preference: **use the authors' own repo** where one exists.
+
+| method | role for us | code | status |
+|---|---|---|---|
+| **SIA** (2605.27276) | the **baseline to beat** — task-level algorithm selection is theirs, so our finer granularity must beat it at matched budget | `hexo-ai/sia` | **NOT CLONED** |
+| **MEDS** (2604.11297) | a concrete **`key_fn` for `ClusterRouter`**: reuses **layer-wise logits** as lightweight behaviour representations and clusters **error patterns** with **HDBSCAN**. `cluster_method=hdbscan`, `use_layer_diff`; actor-side logic in `verl/workers/actor/dp_actor.py` | on disk at `~/baselines/MEDS` | **PRESENT, unused** |
+| **Co-Harness** (2607.22688) | prior art for success→model / failure→harness; our extension is that one trajectory can feed **both**, decided by routing | — | **NOT CLONED** |
+| **EvoTrainer** (2606.03108) | co-evolves policy **and training harness**; closest to our evolve-target axis | — | **NOT CLONED** |
+| **Learning Fast & Slow** (2605.12484) | bounds the cadence claim; 3x sample efficiency, 70% less KL drift | — | reference only |
+| **autoresearch** | an **additional baseline method** to compare against | on disk at `~/baselines/autoresearch` | **PRESENT, unused** |
+| **deepseek-harness** (`deepseek-ai/deepseek-harness`) | the **target** for the `evolve_target=harness` arm — a real plugin-architected agent runtime, ~453K lines TS. Far more credible than a toy scaffold | — | **NOT CLONED** — bring in only when the harness arm actually runs |
+| **hermes-agent** | second harness candidate | — | **NOT CLONED**; no canonical repo confirmed |
+| **R-Zero, RAGEN, Search-R1, Absolute-Zero-Reasoner** | related self-improvement baselines already on disk | `~/baselines/` | **PRESENT, unused** |
+
+**MEDS is the highest-value of these**, because it plugs straight into the `key_fn` seam
+`ClusterRouter` already exposes: derived (`SilenceSide`) clustering versus learned
+(layer-logit HDBSCAN) clustering becomes a direct ablation, with
+`MatchedPermutationControl` separating "clustering helped" from "the mode proportions
+changed".
 
 ## 3. Measured constraints — do not rediscover
 
