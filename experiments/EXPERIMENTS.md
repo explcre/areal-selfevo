@@ -1278,3 +1278,41 @@ mandatory, and building it after the fact invites choosing the half that flatter
 checkpoints were scored on the report half only, so its search half must be run before the
 A/B table can be restated at n=500. The current table stands at n=250 and is labelled as
 such; it is not wrong, only weaker than it needed to be.
+
+---
+
+## The A/B restated at the full 500, and a noise floor that grew
+
+step0h's search half was scored, so the demo-vs-scaffold comparison no longer runs on half
+the benchmark. Merging is checked rather than assumed: the two halves must be disjoint by
+source index and must together cover exactly the 500 rows, or the script refuses.
+
+| step | demo (lr 6e-6, clip 0.4) | scaffold (lr 1e-6, clip 0.2) | diff | McNemar p |
+|------|--------------------------|------------------------------|--------|-----------|
+| base | 0.528                    | 0.506                        | -0.022 | same model |
+| 28   | 0.454                    | 0.530                        | +0.076 | 7.3e-04   |
+| 57   | 0.440                    | 0.530                        | +0.090 | 1.7e-04   |
+| 86   | 0.466                    | 0.526                        | +0.060 | 4.1e-03   |
+| 115  | 0.364                    | 0.536                        | +0.172 | 2.1e-13   |
+| 144  | 0.334                    | 0.522                        | +0.188 | 9.3e-15   |
+
+Significance improves from 4/5 to **5/5** at the larger n, as it should.
+
+**The noise floor rose and that qualifies the smallest effect.** The base model appears in
+both series, so its difference is pure measurement noise: 0.0080 at n=250, but **0.0220** at
+n=500. That is the wrong direction for a larger sample and the reason is procedural, not
+statistical -- step0h's base was scored in TWO HALVES at different times on different server
+processes, so it accumulates between-run variance that step0d's single sweep does not. A
+merged series is not the same measurement as a contiguous one.
+
+Consequences, stated rather than buried:
+
+* The +0.060 at step 86 is only 2.7x the noise floor and should not be reported as a
+  standalone result.
+* The +0.172 and +0.188 at steps 115 and 144 are ~8x it and survive comfortably.
+* The direction is unchanged at every step, and the claim remains PRESERVATION, not
+  improvement: scaffold sits at 0.506-0.536 throughout, which brackets its own base.
+
+**The lesson for future sweeps:** score a series in ONE pass whenever the comparison depends
+on the base as an anchor. Splitting to fit a GPU budget buys statistics and costs
+comparability, and here it cost more than it bought.
