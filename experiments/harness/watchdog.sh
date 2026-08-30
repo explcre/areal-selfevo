@@ -34,7 +34,17 @@ DUMP_DIR="${DUMP_DIR:-$(dirname "$PGIDF")}"
 _dumped=0
 dump_stacks() {
     [ "$_dumped" -eq 0 ] || return 0
-    command -v py-spy >/dev/null 2>&1 || return 0
+    # py-spy lives in the venv, and the watchdog runs under setsid with a BARE PATH
+    # (/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:...). `command -v
+    # py-spy` therefore failed and this function returned silently, so step0h stalled
+    # twice at strikes=1 and wrote no dump at all. The end-to-end check that "verified"
+    # this ran in a shell with the venv sourced -- the wrong environment.
+    local PYSPY="${PYSPY:-$HOME/venv312b/bin/py-spy}"
+    [ -x "$PYSPY" ] || PYSPY=$(command -v py-spy 2>/dev/null)
+    [ -n "$PYSPY" ] && [ -x "$PYSPY" ] || {
+        echo "[watchdog] py-spy not executable; no stack dump possible" >&2
+        return 0
+    }
     local pg out
     pg=$(cat "$PGIDF" 2>/dev/null) || return 0
     out="$DUMP_DIR/stall_stacks_$(date +%s).txt"
@@ -45,8 +55,8 @@ dump_stacks() {
         # guard that looks armed and is not. Fall back to the plain call where sudo is
         # available passwordless-less or unnecessary.
         { echo "===== pid $p ====="
-          ( sudo -n env "PATH=$PATH" py-spy dump --pid "$p" 2>/dev/null \
-            || timeout 60 py-spy dump --pid "$p" 2>&1 ) | head -60
+          ( sudo -n "$PYSPY" dump --pid "$p" 2>/dev/null \
+            || timeout 60 "$PYSPY" dump --pid "$p" 2>&1 ) | head -60
         } >> "$out"
     done
     [ -s "$out" ] && echo "[watchdog] stall stacks written to $out"
