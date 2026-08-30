@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Serve a model and score it on the frozen math suite. Kills the server on every exit path.
 set -u
-export PATH="$HOME/.local/bin:$PATH"; source "$HOME/venv312b/bin/activate"
+export PATH="$HOME/.local/bin:$PATH"; source "/venv/main/bin/activate"
 ulimit -n 131072 || true
 MODEL="${1:?model path or hf id}"; TAG="${2:?tag}"; GPUS="${3:-0,1}"; PORT="${4:-8404}"
-OUT="$HOME/runs/math/$TAG"; mkdir -p "$OUT"
+OUT="/root/runs/math/$TAG"; mkdir -p "$OUT"
 CUDA_VISIBLE_DEVICES="$GPUS" python3 -m sglang.launch_server \
   --model-path "$MODEL" --served-model-name evalmodel \
   --host 127.0.0.1 --port "$PORT" --tp $(echo "$GPUS" | tr ',' '\n' | wc -l) \
