@@ -1239,3 +1239,42 @@ The corrected numbers happen to tell the same story as the wrong ones, which is 
 uncomfortable part: a broken pairing produced a table close enough to the truth that nothing
 in it looked wrong. The check that caught it was not the result's plausibility but an
 invariant that had to hold regardless of the result.
+
+---
+
+## Correction: the held-out split was applied where nothing was held out
+
+The A/B above scored the `report` half of MATH-500 (250 problems) rather than all 500. That
+was premature, and it cost half the statistical power for nothing.
+
+The split exists for one reason: arXiv 2607.12227 shows that a method which SEARCHES against
+a benchmark and then REPORTS on it overstates its gain. That condition does not hold here.
+Both runs train on GSM8K; MATH-500 is never queried during training and never informs a
+decision. It is already entirely held out, so splitting it protects against a contamination
+route that does not exist while halving n.
+
+**Standing rule from here:**
+
+- **Capability measurement uses the FULL benchmark.** MATH-500 means all 500 problems.
+- **The split is used only when MATH-500 feedback drives a decision** -- a routing rule, an
+  evolve-policy, a stopping criterion, any harness search. Then search on `search` and report
+  on `report`, and say so.
+
+The split infrastructure stays: the moment we fit anything against MATH-500 it becomes
+mandatory, and building it after the fact invites choosing the half that flatters.
+
+**Datasets of record.**
+
+- Training: `openai/gsm8k`, `split: train` -- the full 7,473-problem train split, batch 256,
+  29 optimizer steps per epoch, 290 steps for 10 epochs. Nothing subsampled.
+- Held-out capability: MATH-500, all 500.
+- Available and not yet used: AIME24 (30), AIME25 (29), AMC23 (40), and the wider suite
+  under the AZR eval tree (olympiadbench, minerva_math, college_math, gaokao*, gpqa,
+  mmlu_stem). AIME and AMC are recorded as too small to resolve the effects we are
+  measuring -- 30 problems cannot separate a four-point difference -- and are for reporting
+  alongside, not for deciding anything.
+
+**What this obliges us to redo.** step0d already has full-500 generations. step0h's six
+checkpoints were scored on the report half only, so its search half must be run before the
+A/B table can be restated at n=500. The current table stands at n=250 and is labelled as
+such; it is not wrong, only weaker than it needed to be.
