@@ -66,7 +66,7 @@ if [ "${#JOBS[@]}" -gt "$NGPU" ]; then
 fi
 
 mkdir -p "$SUITE"
-echo "sweep -> $SUITE  (limit=$LIMIT, split=${SPLIT:-all}, root=$CKPT_ROOT)"
+echo "sweep -> $SUITE  (benches=${BENCHES:-math500}, limit=$LIMIT, split=${SPLIT:-all}, maxtok=${MAXTOK:-8192}, root=$CKPT_ROOT)"
 gpu=0
 for j in "${JOBS[@]}"; do
   tag="${j%%:*}"; model="${j#*:}"
@@ -75,7 +75,7 @@ for j in "${JOBS[@]}"; do
     echo "MISSING: $tag -> $model" | tee -a "$SUITE/errors.txt"; gpu=$((gpu+1)); continue
   fi
   port=$((8410 + gpu))
-  ( BENCHES=math500 MAXTOK="${MAXTOK:-8192}" CONC=48 LIMIT="$LIMIT" MEMFRAC=0.82 \
+  ( BENCHES="${BENCHES:-math500}" MAXTOK="${MAXTOK:-8192}" CONC=48 LIMIT="$LIMIT" MEMFRAC=0.82 \
     SPLIT="${SPLIT:-all}" \
     timeout "${JOB_TIMEOUT:-5400}" bash "$RUN" "$model" "sweep_$STAMP/$tag" "$gpu" "$port" \
       > "$SUITE/$tag.log" 2>&1

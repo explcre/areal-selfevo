@@ -71,6 +71,29 @@ def load(bench: str, split: str = "all") -> list[dict]:
     raw = f.read_bytes()
     rows = [json.loads(l) for l in raw.decode().splitlines() if l.strip()]
     keep = _split_indices(bench, split, raw)
+    # Schema adapters. Every benchmark is normalised to problem/answer HERE rather than by
+    # relaxing the check below, so a genuinely unknown schema still fails loudly instead of
+    # silently scoring zero.
+    #
+    # OlympiadBench uses question/final_answer, and final_answer is a one-element list for
+    # all 675 rows. 94 of them are flagged is_multiple_answer, meaning that single string
+    # holds several answers; an exact-match grader will systematically mark those wrong.
+    # They are kept (dropping them would quietly change the benchmark) and the count is
+    # reported, so the score is read as a lower bound rather than mistaken for the model's
+    # true rate.
+    n_multi = 0
+    for r in rows:
+        if "question" in r and "final_answer" in r and "problem" not in r:
+            fa = r["final_answer"]
+            r["problem"] = r["question"]
+            r["answer"] = fa[0] if isinstance(fa, list) and fa else fa
+            if r.get("is_multiple_answer"):
+                n_multi += 1
+    if n_multi:
+        print(f"NOTE {bench}: {n_multi}/{len(rows)} problems have multiple gold answers in "
+              f"one string; exact-match grading will mark them wrong, so the reported "
+              f"accuracy is a LOWER BOUND", file=sys.stderr)
+
     out = []
     for i, r in enumerate(rows):
         if "problem" not in r or "answer" not in r:
