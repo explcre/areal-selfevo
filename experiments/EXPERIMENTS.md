@@ -1401,3 +1401,49 @@ batch normalisation, or none at all -- leaves a live gradient there.
 
 The cheapest useful next run is therefore three arms, not two: demo baseline,
 `mean_level=group` with routing off, and `mean_level=group` with routing on.
+
+---
+
+## The first routed run, and how much of the batch the rule actually reaches
+
+step0j is the first run in this project with token routing active. It took six attempts;
+every failure was a real defect and every one was caught by a guard rather than by producing
+a wrong number: missing `cu_seqlens`, group ids shaped per-sequence instead of per-token,
+`adv_norm` set to the value that breaks the precondition, GRPO groups split across
+microbatches, and a Hydra override that could not reach `mb_spec`.
+
+**How much is routed, measured rather than assumed:**
+
+| step | routed fraction | entropy | task reward |
+|------|-----------------|---------|-------------|
+| 13   | 0.0047          | 3.939   | 0.730 |
+| 25   | 0.0051          | 3.175   | 0.738 |
+| 37   | 0.0084          | 2.087   | 0.793 |
+| 49   | 0.0154          | 1.457   | 0.775 |
+| 61   | 0.0166          | 1.140   | 0.791 |
+
+**Two things worth stating plainly.**
+
+**1. The reach is small.** At most 1.7% of loss-carrying tokens are RL-dead under this rule.
+Whatever the method does, it cannot do much through a 1.7% channel, and any downstream
+difference larger than that needs a different explanation. This is a ceiling on the
+token-level claim and it should be reported as one rather than discovered by a reviewer.
+
+**2. The reach GROWS as entropy falls -- 3.5x while entropy drops from 3.94 to 1.14.** That
+is the mechanism behaving as the theory predicts: group members agree on longer prefixes as
+the policy sharpens, so more positions become provably RL-dead. The rule becomes most active
+exactly when the policy is degenerating, which is when redirecting that budget is most
+valuable. It also means the fraction measured early understates the fraction late, and a
+short run understates the method.
+
+**What this arm is NOT.** With no teacher configured, `teacher_logp` is absent and the KD
+branch never runs, so routed tokens lose their RL weight and gain nothing. Measured
+separately by an audit: routing removes 19.5% of the gradient norm and adds nothing back.
+So step0j is a *gradient-deletion ablation* -- "withhold RL from provably dead tokens" -- and
+not the RL-to-teacher redirect the method claims. The full claim needs a teacher arm.
+
+**Trajectory health, for context, not as a result.** At step 61 entropy is 1.14 and reward
+0.791, against step0d's collapse to 0.018 entropy with directionless reward. That is almost
+certainly the conservative recipe (lr 1e-6, eps_clip 0.2, kl_ctl 0, adv_norm off) rather
+than the 1.7% routing channel, and the three-arm design exists precisely so the two cannot
+be confused.
