@@ -2,6 +2,7 @@
 
 from .base import (
     Granularity,
+    HarnessAction,
     Router,
     RoutingContext,
     RoutingDecision,
@@ -21,6 +22,7 @@ from .routers import InvertedRouter, RandomRouter, SolveRateRouter, StaticRouter
 
 __all__ = [
     "Granularity",
+    "HarnessAction",
     "Router",
     "RoutingContext",
     "RoutingDecision",

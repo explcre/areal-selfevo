@@ -1447,3 +1447,185 @@ not the RL-to-teacher redirect the method claims. The full claim needs a teacher
 certainly the conservative recipe (lr 1e-6, eps_clip 0.2, kl_ctl 0, adv_norm off) rather
 than the 1.7% routing channel, and the three-arm design exists precisely so the two cannot
 be confused.
+
+---
+
+## NEGATIVE RESULT: token-level routing has no measurable effect at 1.7% reach
+
+The first held-out measurement of a routed run. step0j (routing ON) scored on full MATH-500
+at the steps it shares with the other two arms, paired McNemar against the routing-off arm:
+
+| step | demo (0d) | scaffold (0h) | scaffold+routing (0j) | 0h vs 0j p |
+|------|-----------|---------------|------------------------|------------|
+| base | 0.528     | 0.506         | 0.536                  | 0.092 |
+| 28   | 0.454     | 0.530         | 0.516                  | 0.534 |
+| 57   | 0.440     | 0.530         | 0.526                  | 0.920 |
+| 86   | 0.466     | 0.526         | 0.522                  | 0.923 |
+| 115  | 0.364     | 0.536         | 0.496                  | 0.065 |
+| 144  | 0.334     | 0.522         | 0.526                  | 0.922 |
+
+**Routing changes nothing detectable.** Every p is >= 0.065 and most sit near 0.92. The
+entire distance from the demo recipe is explained by the conservative optimiser settings,
+which the scaffold arm already has without any routing.
+
+**This was predicted and should be read as consistent, not disappointing.** The rule reaches
+at most 1.7% of loss-carrying tokens, and an intervention on 1.7% of the gradient cannot
+move a benchmark by more than noise. The measurement confirms the ceiling rather than
+discovering a new problem. It also means any future arm claiming a routing effect larger
+than this must first explain what changed about the reach.
+
+**The between-arm noise floor is larger than the effect.** The base model appears in both
+the 0h and 0j series and scores 0.506 and 0.536 -- a 0.030 gap on the same checkpoint, wider
+than any routing difference in the table. No conclusion at this reach can survive that.
+
+**Confound, stated rather than buried.** step0j differs from step0h in THREE ways, not one:
+routing, `kl_ctl` (0.01 -> 0) and `adv_norm` (batch -> off). Those had to move together
+because the rule's precondition does not hold otherwise. So even a significant difference
+here could not have been attributed to routing alone. The clean control is a routing-OFF arm
+at step0j's exact config, and it does not exist yet -- that is the single most useful run to
+add next, and it costs one training run.
+
+**What would make the token tier worth keeping.** Either raise the reach (route on the
+group-silence channel, where whole unanimous groups contribute zero gradient rather than 1.7%
+of tokens), or supply a teacher so routed tokens gain a signal instead of merely losing one.
+The present arm deletes 19.5% of gradient norm and adds nothing back, which is a
+gradient-deletion ablation, not the method.
+
+---
+
+## 57% of groups are RL-silent -- 34x the token-level channel
+
+Measured live on step0l, 64 groups per batch:
+
+    silent_group_fraction   = 0.574
+    n_groups                = 64
+
+**More than half of every batch contributes exactly zero gradient.** A group whose members
+all score alike has every advantage identically zero, so the entire group -- all eight
+sequences, every token -- is RL-dead. Against the token-level shared-prefix rule's 1.7%,
+this channel is **34 times larger**.
+
+That reframes where the method's leverage is. The token tier was measured to have no
+detectable effect on held-out capability, and the 1.7% reach explains why: an intervention on
+1.7% of the gradient cannot move a benchmark. A 57% channel can.
+
+**It also explains the negative result without appealing to noise.** Nothing was wrong with
+the token rule; it was simply operating on the wrong tier.
+
+**A bug in the accompanying split, found and fixed.** The metric also reported
+`solved_group_fraction = 0.000` and `unsolved_group_fraction = 0.574` -- 0% solved at a
+measured 82% solve rate, which is impossible. Cause: the split thresholded `reward_score`,
+which by that point has had bias, scaling, clipping AND reward_norm applied, so a 0.5
+threshold classifies nothing. It now uses the raw `data["rewards"]` captured before any
+transformation. The runs in flight carry the old code, so their solved/unsolved numbers
+should be ignored; `silent_group_fraction` is unaffected because it is computed from the
+advantages being zero, which is correct either way.
+
+**Why the split matters and is not bookkeeping.** The two silent regimes need OPPOSITE
+responses, and their sum hides that:
+
+* silent because SOLVED (p_hat = 1): the model already answers it. Spend less compute here;
+  adding SFT would sharpen an already-correct policy and burn entropy for nothing.
+* silent because UNSOLVED (p_hat = 0): the model cannot answer it. RL has nothing to push
+  on, but a teacher would -- this is precisely the case distillation exists for.
+
+Until the fixed metric runs, we know 57% of groups are silent but not how that splits. That
+number decides which signal the 57% should be routed to, and it is the next measurement.
+
+---
+
+## GPU utilization is not a liveness signal: a dead run held 4 GPUs at 100% for 46 minutes
+
+`step0l` raised at step 44 and then sat there. `nvidia-smi` reported **100% utilization on
+all four training GPUs the entire time**, which is what a routine check reads as "healthy and
+busy". It was a corpse: the log had not grown in 46 minutes.
+
+    log mtime 21:15:50, checked 22:01:49   -> 2759s stale
+    20s byte-delta on the log              -> 0
+
+**Cause.** The rollout server dropped during a weight push:
+
+    HTTPUtils WARNING: HTTP request to <addr>/update_weights_from_distributed failed with
+    ServerDisconnectedError: Server disconnected (attempt 1/1)
+    RuntimeError: Failed after 1 retries each.
+
+`attempt 1/1` is the whole story. `areal/infra/remote_inf_engine.py` hardcodes
+`max_retries=1` at both weight-sync call sites, and `DEFAULT_RETRIES = 1`. A single transient
+disconnect during weight sync therefore aborts a multi-hour run. The rank that raised exits;
+the other three stay in their collective and spin, which is what produces 100% utilization
+with zero progress.
+
+**Why this matters beyond one run.** Every "are the GPUs busy?" check in this project has
+been reading `nvidia-smi`. That check cannot distinguish training from a dead NCCL wait. The
+last 46 minutes of GPU time on this box were reported as fully utilized and produced nothing.
+
+**Three fixes, all landed.**
+
+1. `_weight_sync_retries()` reads `AREAL_WEIGHT_SYNC_RETRIES`, default **1**. The default
+   reproduces upstream exactly, so this is a rollback-clean change; runs opt in with the env
+   var. Current runs use 5.
+2. `experiments/harness/supervise.sh` watches **log growth**, not utilization: if
+   `train.log` is stale for more than `stall_seconds` (default 1200) it dumps py-spy stacks
+   for the actor ranks, kills the run, and relaunches, up to `max_restarts`.
+3. `step0l.sh` takes `$EXTRA_ARGS`, so the supervisor can add `recover.mode=auto` on a
+   restart without a second copy of the script.
+
+**One honest note on the restart.** `recover.mode=auto` did *not* resume from the saved
+`globalstep28`; the run restarted at step 0. AReaL's recover checkpoints are a different
+artefact from the saver checkpoints, and `auto` finds nothing when only the latter exist. For
+this particular run that is the better outcome anyway -- step0l is the routing-off control
+for step0j, and a contiguous fresh run is comparable to step0j's in a way a resumed run with
+reset Adam moments would not be. Recorded rather than glossed, because the flag did not do
+what its name suggests.
+
+**Standing consequence.** Liveness is log growth. Utilization is at best a secondary signal
+and at worst, as here, a confident lie.
+
+---
+
+## The silent channel is 87.5% SOLVED -- so most of it needs no teacher at all
+
+The measurement the critical path was waiting on. `step0l` (routing OFF, the control arm)
+relaunched on the corrected metric, 18 logged batches at 64 groups each = 1152 group
+observations:
+
+| quantity | mean | range |
+|---|---|---|
+| `silent_group_fraction`   | 0.3592 | [0.2891, 0.4414] |
+| `solved_group_fraction`   | 0.3145 | [0.2461, 0.4219] |
+| `unsolved_group_fraction` | 0.0447 | [0.0117, 0.0703] |
+| **solved share of the silent channel** | **0.875** | [0.827, 0.959] |
+
+**Internal consistency, checked rather than assumed.** `solved + unsolved == silent` holds
+with a maximum residual of `1.0e-05` across all 18 batches, which is float32 rounding. The
+earlier version of this metric failed exactly this check (it reported 0.000 solved at an 82%
+solve rate), so the check is the first thing that runs on it now.
+
+**This re-orders the critical path.** The standing plan had "supply a teacher" as item 1, on
+the reasoning that without a teacher every routed arm is gradient deletion. That reasoning
+was right about the mechanism and wrong about the magnitude:
+
+* **31.4% of all groups are silent because they are SOLVED.** Those groups contain at least
+  one correct sample, so a supervised target already exists inside the rollout. This is
+  rejection-sampling fine-tuning and it costs no teacher, no extra inference, and no extra
+  GPU. It is 87.5% of the silent channel.
+* **4.5% of all groups are silent because they are UNSOLVED.** Only these need an external
+  teacher -- and they are precisely the units the harness arm is for, since with no target
+  and no gradient the harness is the only consumer that can use them at all.
+
+So the external teacher is a lever on ~4.5% of groups, not on the whole silent channel. It
+drops from critical-path item 1 to a smaller, later one, and the self-target path takes its
+place. That is a 7x difference in reach between the two options, and we had it backwards.
+
+**Scope, stated because it limits the claim.** This is GSM8K, Qwen2.5-1.5B-Instruct, early
+training (the first ~18 logged batches), where the solve rate is high. A harder task or a
+weaker model moves mass from solved to unsolved and the balance shifts toward needing a
+teacher. The 87.5% is a property of this operating point, not a constant, and the split
+should be re-measured on OlympiadBench before any claim leans on it.
+
+**What it does not say.** Nothing here shows that training on the solved half helps. There is
+a real argument that it hurts: SFT on a policy's own correct output sharpens an
+already-correct distribution and spends entropy, and entropy collapse is the failure mode
+this project has already measured twice. The measurement says where the reachable mass is,
+not what to do with it. The A/B that answers that is the next run, and until it exists the
+solved branch should default to SKIP rather than SFT.

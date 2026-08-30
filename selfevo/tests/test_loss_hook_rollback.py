@@ -17,7 +17,11 @@ import torch
 REPO = pathlib.Path("/home/ubuntu/areal-selfevo")
 # importlib cannot infer a loader from a .bak suffix, so the pre-patch copy is
 # kept under a .py name. Verified to contain no rl_mask/token_routing reference.
-BASELINE = pathlib.Path("/tmp/actor_baseline_pkg.py")
+# Committed to the repo, NOT /tmp. In /tmp it vanished on any fresh machine and every
+# rollback test SKIPPED while the suite reported green -- a guarantee that silently
+# stops being checked is worse than none. This was "fixed" once before and the edit
+# never landed; the print said otherwise and I believed it instead of the file.
+BASELINE = pathlib.Path(__file__).parent / "baselines" / "actor_upstream_baseline.py"
 
 
 def _load(path, name):
@@ -49,7 +53,10 @@ def _inputs(B=4, T=12, seed=0, with_teacher=False):
 @pytest.fixture(scope="module")
 def mods():
     if not BASELINE.exists():
-        pytest.skip("pre-patch baseline copy is absent")
+        raise FileNotFoundError(
+            f"rollback baseline missing at {BASELINE}. It is committed to the repo; "
+            f"restore it from git rather than skipping the guarantee."
+        )
     return _load(BASELINE, "actor_baseline"), _load(REPO / "areal/trainer/ppo/actor.py", "actor_patched")
 
 

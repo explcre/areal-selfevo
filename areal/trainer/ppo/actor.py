@@ -214,6 +214,10 @@ class PPOActor:
 
         # Reward Scaling
         reward_score = data["rewards"]
+        # Kept for the group-silence split below: by the time reward_score reaches
+        # it, bias, scaling, clipping and reward_norm have all been applied, so a
+        # 0.5 threshold on it classifies nothing meaningful.
+        raw_reward = data["rewards"].detach().float().clone()
         reward_score = (reward_score + self.reward_bias) * self.reward_scaling
         reward_score = torch.clip(
             reward_score, max=self.reward_clip, min=-self.reward_clip
@@ -360,6 +364,82 @@ class PPOActor:
                 # to (B, T) and it is split, packed and unpacked identically to the tensors
                 # beside it, so whatever the engine does to advantages it does to this.
                 data["group_ids"] = gid.unsqueeze(1).expand_as(data["loss_mask"]).contiguous()
+
+                # How much of the batch is RL-SILENT at GROUP level.
+                #
+                # This is the channel that matters. The token-level shared-prefix rule
+                # reaches ~1.7% of tokens; a group whose members all score the same has
+                # every advantage exactly 0, so the WHOLE group contributes no gradient --
+                # a far larger share of the batch, and the one an evolve-policy should be
+                # deciding about. Measured here because it is the only place group
+                # membership and advantages coexist.
+                #
+                # p_hat is the group's solve rate. silent means p_hat in {0, 1}: unsolved
+                # (nothing to push on, needs a teacher) or solved (nothing left to learn).
+                # The two are recorded separately because they call for OPPOSITE responses
+                # and reporting only their sum would hide that.
+                with torch.no_grad():
+                    seq_adv = (advantages * data["loss_mask"]).sum(-1)
+                    n_groups = len(sizes)
+                    per_group = seq_adv.split(sizes)
+                    silent = torch.tensor(
+                        [float(g.abs().max() < 1e-6) for g in per_group],
+                        device=advantages.device,
+                    )
+                    # RAW reward, not reward_score: solved/unsolved is a statement about
+                    # whether the model answered correctly, and only the untransformed
+                    # reward carries that. An earlier version thresholded the normalised
+                    # value and reported 0% solved at an 82% solve rate.
+                    per_group_r = raw_reward.split(sizes)
+                    solved = torch.tensor(
+                        [float(g.min() > 0.5) for g in per_group_r], device=advantages.device
+                    )
+                    unsolved = torch.tensor(
+                        [float(g.max() <= 0.5) for g in per_group_r], device=advantages.device
+                    )
+                    stats_tracker.scalar(
+                        silent_group_fraction=float(silent.mean()),
+                        solved_group_fraction=float((silent * solved).mean()),
+                        unsolved_group_fraction=float((silent * unsolved).mean()),
+                        n_groups=float(n_groups),
+                    )
+
+                # OPTIONAL: give the silent groups a signal instead of only counting them.
+                #
+                # Applied HERE, outside the no_grad block above but using the same group
+                # tensors, because this is the only point where group membership and the
+                # advantage tensor coexist -- by loss time the batch is packed and the
+                # grouping is gone.
+                #
+                # A solved group's advantages are identically zero, so ADDING a positive
+                # constant to them is exactly SFT on that group's own correct samples: the
+                # policy-gradient step maximising log p(y) for a sampled y is the supervised
+                # step on y, and on-policy the importance ratio is 1. PPO's clip still
+                # bounds how far one update can sharpen an already-correct policy, which is
+                # the failure mode this is most likely to provoke.
+                #
+                # The weights default to 0.0 and the feature defaults to disabled, so
+                # rollback is exact: adding 0.0 to a zero tensor changes no bit.
+                gr = getattr(self.config, "group_routing", None)
+                if gr is not None and getattr(gr, "enabled", False):
+                    sizes_t = torch.tensor(sizes, device=advantages.device)
+                    row_adv = torch.zeros(bs, device=advantages.device, dtype=advantages.dtype)
+                    if gr.solved_advantage != 0.0:
+                        row_adv = row_adv + torch.repeat_interleave(
+                            silent * solved, sizes_t
+                        ).to(row_adv.dtype) * gr.solved_advantage
+                    if gr.unsolved_advantage != 0.0:
+                        row_adv = row_adv + torch.repeat_interleave(
+                            silent * unsolved, sizes_t
+                        ).to(row_adv.dtype) * gr.unsolved_advantage
+                    if bool((row_adv != 0).any()):
+                        # Mask so the constant lands only on response tokens, in the same
+                        # coordinates the metric above used to read the advantages.
+                        advantages = advantages + row_adv.unsqueeze(1) * data["loss_mask"]
+                        data["advantages"] = advantages
+                    stats_tracker.scalar(
+                        routed_group_fraction=float((row_adv != 0).float().mean()),
+                    )
             else:
                 # A mismatch means the rows were regrouped somewhere between rollout and
                 # here. Emitting a wrong grouping is worse than emitting none: the router

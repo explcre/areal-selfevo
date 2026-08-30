@@ -1700,6 +1700,58 @@ class TokenRoutingConfig:
 
 
 @dataclass
+class GroupRoutingConfig:
+    """Route whole GRPO groups that carry no gradient.
+
+    A group whose samples all score alike has every advantage identically zero, so it
+    contributes nothing to the update. Measured on the control arm, that is 29-44% of
+    groups, of which ~87.5% are silent because they were SOLVED.
+
+    A solved group's advantages being zero is what makes this cheap to act on: replacing
+    them with a positive constant IS supervised fine-tuning on the group's own correct
+    samples. The policy-gradient step that maximises log p(y) for a sampled y is the
+    supervised step on y, and for on-policy data the importance ratio is 1, so no separate
+    loss path or teacher is needed. PPO's clip still bounds how far one update can sharpen.
+
+    Both weights default to 0.0, which leaves a zero tensor a zero tensor. With
+    ``enabled=False`` -- the default -- nothing is read at all. Either way the update is
+    bit-identical to vanilla GRPO.
+
+    Args:
+        enabled: Master switch. False means this feature does not execute.
+        solved_advantage: Constant added to the advantages of groups that are silent
+            because every sample was CORRECT. Must be >= 0: this direction is SFT on
+            self-targets. A useful scale is the magnitude of ordinary GRPO advantages,
+            which for binary rewards is at most 0.5.
+        unsolved_advantage: Constant added to the advantages of groups that are silent
+            because every sample was WRONG. Must be <= 0: the only sensible direction is
+            down (unlikelihood on known-wrong samples). A positive value here would train
+            the model to reproduce wrong answers, so it is rejected rather than trusted.
+
+    Raises:
+        ValueError: If either weight has the wrong sign, which is a footgun rather than a
+            preference.
+    """
+
+    enabled: bool = False
+    solved_advantage: float = 0.0
+    unsolved_advantage: float = 0.0
+
+    def __post_init__(self):
+        if self.solved_advantage < 0:
+            raise ValueError(
+                f"solved_advantage must be >= 0 (it is SFT on samples known to be "
+                f"correct), got {self.solved_advantage}"
+            )
+        if self.unsolved_advantage > 0:
+            raise ValueError(
+                f"unsolved_advantage must be <= 0: every sample in an unsolved group is "
+                f"WRONG, so a positive weight trains the model to reproduce wrong answers. "
+                f"Got {self.unsolved_advantage}"
+            )
+
+
+@dataclass
 class PPOActorConfig(TrainEngineConfig):
     """Configuration for PPO actor model, a subclass of a TrainEngine."""
 
@@ -1796,6 +1848,15 @@ class PPOActorConfig(TrainEngineConfig):
     )
     adv_norm: NormConfig | None = field(
         default=None, metadata={"help": "Normalization configuration for advantages."}
+    )
+    group_routing: "GroupRoutingConfig | None" = field(
+        default=None,
+        metadata={
+            "help": "Route whole RL-SILENT GRPO groups, which are 29-44% of groups and "
+            "~87.5% solved. None disables it, which is bit-identical to upstream AReaL. "
+            "solved_advantage > 0 is SFT on the group's own correct samples and needs no "
+            "teacher; unsolved_advantage < 0 is unlikelihood on known-wrong samples."
+        },
     )
     token_routing: "TokenRoutingConfig | None" = field(
         default=None,

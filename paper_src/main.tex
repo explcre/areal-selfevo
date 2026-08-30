@@ -1,0 +1,46 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,bm}
+\usepackage{booktabs}
+\usepackage{microtype}
+\usepackage[table]{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric,fit,backgrounds}
+\usepackage[colorlinks=true,allcolors=blue!55!black]{hyperref}
+
+\title{Routing the Silent Half:\\
+       Per-Unit Choice of Estimator and Evolution Target in Self-Evolving LLM Agents}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Group-relative policy optimisation assigns zero advantage to any group whose samples score
+alike, so a unanimous group contributes exactly nothing to the update. We measure this
+directly: $57.4\%$ of groups in a live run are RL-silent. We show the silent half splits
+into two regimes that require opposite responses, and that the split is not symmetric ---
+on the solved half a supervised target is \emph{free}, because the group already contains a
+correct sample; on the unsolved half no target exists unless one is supplied, which makes
+harness evolution the only consumer that can use those units at all. We therefore make the
+choice of estimator and the choice of evolution target a per-unit decision rather than a
+per-run schedule, with the two as orthogonal axes so a single trajectory can feed both.
+We report the negative result that located this leverage: a token-level version of the same
+idea, reaching $1.7\%$ of tokens, moved held-out accuracy by less than the noise floor.
+Every capability is flag-gated and reduces to unmodified GRPO when disabled.
+\end{abstract}
+
+\input{method}
+\input{related}
+\input{results}
+
+\section*{Reproducibility notes}
+Every number in Sec.~\ref{sec:results} names the run that produced it. Benchmarks are scored
+with the same grader across arms; the grader's own bias was measured and corrected once (an
+earlier version discarded unbalanced final boxes, which penalised degraded checkpoints
+specifically). Intervals are reported on differences, paired by item, never as independent
+per-arm intervals.
+
+\end{document}

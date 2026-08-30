@@ -1,0 +1,187 @@
+% ---------------------------------------------------------------------------
+% Results. APPEND-ONLY: every new measurement gets a new subsection or a new row,
+% with the run id it came from. Nothing here may be edited to look better after the
+% fact; corrections are added as corrections. See paper_src/README.md.
+% ---------------------------------------------------------------------------
+\section{Results}
+\label{sec:results}
+
+All numbers below are measured end-to-end on held-out benchmarks. Train reward is never
+reported as a result: Sec.~\ref{sec:trainreward} is the demonstration that it mis-orders
+checkpoints.
+
+\subsection{Train reward mis-orders checkpoints}
+\label{sec:trainreward}
+
+Table~\ref{tab:ab} scores two recipes that differ only in optimiser aggressiveness, on the
+full MATH-500, paired by item. The aggressive (``demo'') recipe's training reward rises
+while its held-out accuracy falls by $0.194$ absolute. Any claim validated on training
+reward would have selected the collapsed checkpoint.
+
+\begin{table}[t]
+\centering\small
+\caption{MATH-500, $n=500$, paired McNemar against the scaffold arm. Runs
+\texttt{step0d} (demo, lr $6\!\times\!10^{-6}$, clip $0.4$) and \texttt{step0h}
+(scaffold, lr $1\!\times\!10^{-6}$, clip $0.2$).}
+\label{tab:ab}
+\begin{tabular}{lccc c}
+\toprule
+step & demo & scaffold & $\Delta$ & McNemar $p$ \\
+\midrule
+base & 0.528 & 0.506 & $-0.022$ & same model \\
+28   & 0.454 & 0.530 & $+0.076$ & $7.3\times10^{-4}$ \\
+57   & 0.440 & 0.530 & $+0.090$ & $1.7\times10^{-4}$ \\
+86   & 0.466 & 0.526 & $+0.060$ & $4.1\times10^{-3}$ \\
+115  & 0.364 & 0.536 & $+0.172$ & $2.1\times10^{-13}$ \\
+144  & 0.334 & 0.522 & $+0.188$ & $9.3\times10^{-15}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Noise floor, and what it disqualifies.} The base model appears in both series, so
+its difference is pure measurement noise: $0.0220$ at $n=500$. It \emph{rose} from $0.0080$
+at $n=250$ because the larger series was scored in two passes on different server processes,
+accumulating between-run variance a contiguous sweep does not have. Consequently the
+$+0.060$ at step 86 is only $2.7\times$ the floor and we do not report it standalone; the
+$+0.172$ and $+0.188$ are $\approx 8\times$ it. The claim is \emph{preservation}, not
+improvement: the scaffold arm stays within $[0.506, 0.536]$, which brackets its own base.
+
+\subsection{The collapse replicates on an independent benchmark}
+
+\begin{table}[t]
+\centering\small
+\caption{The same checkpoints on OlympiadBench (675 problems), which shares no items with
+MATH-500.}
+\label{tab:olymp}
+\begin{tabular}{lcc}
+\toprule
+checkpoint & MATH-500 & OlympiadBench \\
+\midrule
+base  & 0.528 & 0.188 \\
+gs028 & 0.454 & 0.170 \\
+gs057 & 0.440 & 0.190 \\
+gs086 & 0.466 & 0.148 \\
+gs115 & 0.364 & 0.135 \\
+gs144 & 0.334 & 0.108 \\
+gs173 & 0.358 & 0.107 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+$0.188 \to 0.107$ is a $43\%$ relative drop in the same direction as MATH-500's
+$0.528 \to 0.358$, on an independent problem set.
+
+\paragraph{Benchmark selection, stated as a measurement rather than a preference.}
+MATH-500 is saturated at the frontier tier ($0.966$ at 27B) and AIME is unusable at both
+ends ($0.000$ at 1.5B; $0.867$ at 27B with a $24$-point interval on $30$ problems).
+OlympiadBench resolves a few points on $675$ items and leaves both ends off the rails:
+$0.188$ at 1.5B and $0.716$ for Ornith-1.5-35B-A3B. The $0.716$ is a \emph{lower} bound ---
+$174/675$ generations ($26\%$) hit the token cap --- so the headroom is smaller than the
+$28$ points it suggests, and we quote it as a bound.
+
+\subsection{Negative result: token-level routing at 1.7\% reach}
+\label{sec:negative}
+
+\begin{table}[t]
+\centering\small
+\caption{MATH-500, $n=500$. \texttt{step0j} adds token-level routing to the scaffold recipe.
+$p$ is paired McNemar, scaffold vs.\ scaffold+routing.}
+\label{tab:token}
+\begin{tabular}{lccc c}
+\toprule
+step & demo & scaffold & +routing & $p$ \\
+\midrule
+base & 0.528 & 0.506 & 0.536 & 0.092 \\
+28   & 0.454 & 0.530 & 0.516 & 0.534 \\
+57   & 0.440 & 0.530 & 0.526 & 0.920 \\
+86   & 0.466 & 0.526 & 0.522 & 0.923 \\
+115  & 0.364 & 0.536 & 0.496 & 0.065 \\
+144  & 0.334 & 0.522 & 0.526 & 0.922 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Token-level routing changes nothing detectable. We report this rather than dropping it,
+because it is the measurement that located the method's leverage. The rule reaches at most
+$1.7\%$ of loss-carrying tokens, and an intervention on $1.7\%$ of the gradient cannot move
+a benchmark by more than noise; the between-arm noise floor here ($0.030$ on the shared base
+checkpoint) is itself larger than every routing difference in the table.
+
+\paragraph{Confound, stated rather than buried.} \texttt{step0j} differs from
+\texttt{step0h} in three ways --- routing, \texttt{kl\_ctl} ($0.01\!\to\!0$) and
+\texttt{adv\_norm} (batch$\to$off) --- because the rule's precondition does not hold
+otherwise. A significant difference here could not have been attributed to routing alone.
+The routing-off arm at \texttt{step0j}'s exact configuration is therefore a required
+control, and it is running (\texttt{step0l}).
+
+\subsection{Where the leverage actually is}
+\label{sec:leverage}
+
+Measured live on \texttt{step0l} at $64$ groups per batch:
+\[
+  \widehat{P}(\text{silent}) = 0.574, \qquad n_{\text{groups}} = 64 .
+\]
+More than half of every batch contributes exactly zero gradient --- $34\times$ the
+token-level channel, and the reason Sec.~\ref{sec:negative} was null is that the
+intervention was on the wrong tier, not that the idea was wrong.
+
+\paragraph{A metric bug found and fixed, reported because the affected runs are still
+cited.} The accompanying split first reported $0.000$ solved at a measured $82\%$ solve
+rate, which is impossible. It thresholded \texttt{reward\_score}, which by that point has
+had bias, scaling, clipping and normalisation applied. It now reads the raw rewards captured
+before any transformation. Runs launched before the fix carry the old code and their
+solved/unsolved split must be ignored; $\widehat{P}(\text{silent})$ is unaffected because it
+is computed from the advantages being zero.
+
+\subsection{The silent channel is 87.5\% solved, so most of it needs no teacher}
+\label{sec:split}
+
+Measured on the routing-off control (\texttt{step0l}) under the corrected metric, over $18$
+logged batches at $64$ groups each ($1152$ group observations):
+
+\begin{table}[t]
+\centering\small
+\caption{Decomposition of the RL-silent channel. \texttt{step0l}, GSM8K,
+Qwen2.5-1.5B-Instruct, first $18$ logged batches.}
+\label{tab:split}
+\begin{tabular}{lcc}
+\toprule
+quantity & mean & range \\
+\midrule
+silent groups                      & 0.3592 & $[0.2891,\ 0.4414]$ \\
+\quad silent because \emph{solved}   & 0.3145 & $[0.2461,\ 0.4219]$ \\
+\quad silent because \emph{unsolved} & 0.0447 & $[0.0117,\ 0.0703]$ \\
+\midrule
+solved share of the silent channel & \textbf{0.875} & $[0.827,\ 0.959]$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The identity $\text{solved} + \text{unsolved} = \text{silent}$ holds to a maximum residual of
+$1.0\times10^{-5}$ across all $18$ batches, which is float32 rounding. We check it because an
+earlier version of this metric failed it, reporting $0.000$ solved at a measured $82\%$ solve
+rate.
+
+\paragraph{This inverts the cost of the method.} By \eqref{eq:target}, the solved groups
+already contain a supervised target, so $31.4\%$ of \emph{all} groups are reusable with no
+teacher, no extra inference and no extra GPU. Only $4.5\%$ of groups --- the unsolved ones
+--- require an external teacher, and those are exactly the units for which the harness is the
+only available consumer. The reach of the free path is therefore about $7\times$ that of the
+teacher-dependent one, which is the opposite of the ordering we assumed before measuring.
+
+\paragraph{Scope, and what this does not claim.} This is one operating point: GSM8K,
+Qwen2.5-1.5B-Instruct, early training, high solve rate. A harder task moves mass from solved
+to unsolved and shifts the balance toward needing a teacher; $0.875$ is a property of the
+operating point, not a constant. More importantly, the table says where the reachable mass
+\emph{is}, not that training on it helps. Sharpening an already-correct distribution spends
+entropy, and entropy collapse is the failure mode Sec.~\ref{sec:trainreward} already
+documents. Until the A/B exists, the solved branch of \eqref{eq:rule} defaults to
+\textsc{skip}.
+
+\subsection{Not yet measured}
+
+Stated explicitly so the gap is not mistaken for an omission: whether training on the
+solved branch helps or costs entropy (Sec.~\ref{sec:split} locates the mass but does not
+settle this); any arm in which routed units \emph{gain} a signal
+rather than only losing one; and the harness-destination arm of \eqref{eq:action}. Until a
+target is supplied, every routed arm is a gradient-deletion ablation and is labelled as one.
