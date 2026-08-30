@@ -1,0 +1,121 @@
+% ---------------------------------------------------------------------------
+% Method. Formulas first, then the routing rule they imply, then the figure.
+% ---------------------------------------------------------------------------
+\section{Method}
+\label{sec:method}
+
+\subsection{Where the gradient is zero}
+\label{sec:silence}
+
+Let a \emph{unit} be a prompt with $G$ sampled answers and binary rewards
+$r_1,\dots,r_G\in\{0,1\}$. GRPO centres rewards within the group,
+%
+\begin{equation}
+  A_i \;=\; r_i - \bar r,
+  \qquad
+  \bar r \;=\; \frac{1}{G}\sum_{j=1}^{G} r_j ,
+  \label{eq:adv}
+\end{equation}
+%
+so if every sample in the group scores alike then $A_i=0$ for all $i$ and the unit
+contributes exactly nothing to the update --- all $G$ sequences, every token. Writing
+$p$ for the per-sample success probability, the probability that a unit carries any
+signal at all is
+%
+\begin{equation}
+  I_{\mathrm{RL}}(p,G) \;=\; 1 - p^{G} - (1-p)^{G},
+  \label{eq:irl}
+\end{equation}
+%
+which is zero exactly at $p=0$ and $p=1$ and is maximised at $p=\tfrac12$. Equation
+\eqref{eq:irl} is not an approximation: it is the probability that the group is not
+unanimous, and unanimity is precisely the condition under which \eqref{eq:adv} vanishes.
+
+Two consequences drive the method.
+
+\paragraph{The silent fraction is large and measurable.} Instrumenting a live run
+(Sec.~\ref{sec:results}) gives $\hat{P}(\text{silent}) = 0.574$ over $64$ groups per batch:
+more than half of every batch is RL-dead. This is $34\times$ the reach of the token-level
+shared-prefix channel we measured first ($1.7\%$), and it explains, without appealing to
+noise, why an intervention confined to that channel moved nothing.
+
+\paragraph{The two silent regimes need opposite responses.} A unit silent because
+$\hat p = 1$ and a unit silent because $\hat p = 0$ are both invisible to \eqref{eq:adv},
+but they are not the same object, and routing them identically wastes one of them.
+
+\subsection{A free target exists on exactly the solved half}
+\label{sec:selftarget}
+
+The asymmetry is sharper than "different regimes''. For a unit with $\hat p > 0$, at least
+one sampled answer was correct, and that answer \emph{is} a supervised target drawn from
+the model's own rollout. No external teacher is required; this is rejection-sampling
+fine-tuning. Define
+%
+\begin{equation}
+  \mathrm{selfTarget}(u) \;=\; \mathbb{1}\!\left[\hat p_u > 0\right],
+  \qquad
+  \mathrm{target}(u) \;=\; \mathrm{selfTarget}(u) \;\vee\; \mathrm{teacher}(u).
+  \label{eq:target}
+\end{equation}
+%
+The units on which $I_{\mathrm{RL}}=0$ because $\hat p = 1$ are therefore exactly the units
+on which a target is \emph{guaranteed} to exist at zero marginal cost. The units on which
+$I_{\mathrm{RL}}=0$ because $\hat p = 0$ are exactly the units on which no target exists
+unless one is supplied. The gradient-free half of the batch splits cleanly into a half that
+is free to reuse and a half that is not reusable at all.
+
+\subsection{Routing: the harness is a destination, not a schedule}
+\label{sec:routing}
+
+Prior work treats the choice of what to evolve as a property of the \emph{run}: a schedule
+or a global flag. We make it a property of the \emph{unit}, and we make it two-dimensional.
+A routing decision is a pair
+%
+\begin{equation}
+  \pi(u) \;=\; \bigl(m(u),\, h(u)\bigr),
+  \qquad
+  m \in \{\textsc{rl}, \textsc{sft}, \textsc{skip}\},
+  \qquad
+  h \in \{\textsc{none}, \textsc{propose}, \textsc{validate}\},
+  \label{eq:action}
+\end{equation}
+%
+where $m$ names the estimator applied to the unit's tokens and $h$ names what the unit
+contributes to harness evolution. The two axes are orthogonal by construction, so a single
+trajectory can feed the gradient and the harness at once. This is deliberate: the two
+consumers read different things from a trajectory --- the estimator reads the tokens, the
+harness evolver reads the failure mode --- and a partition discards one of the readings.
+Co-Harness's success$\to$model / failure$\to$harness rule is the special case in which
+$\pi$ is constrained to be a partition, and we retain it as an ablation
+(\texttt{partition=True}) rather than a rewrite.
+
+The rule implied by \eqref{eq:irl} and \eqref{eq:target} is then forced rather than chosen:
+%
+\begin{equation}
+  \pi(u) \;=\;
+  \begin{cases}
+    (\textsc{sft}_{\text{self}},\ \textsc{validate})
+      & \hat p_u = 1 \quad\text{(RL dead; target free)}\\[2pt]
+    (\textsc{sft}_{\text{teacher}},\ \textsc{propose})
+      & \hat p_u = 0 \ \wedge\ \mathrm{teacher}(u) \\[2pt]
+    (\textsc{skip},\ \textsc{propose})
+      & \hat p_u = 0 \ \wedge\ \neg\,\mathrm{teacher}(u)
+      \quad\text{(harness is the only consumer)}\\[2pt]
+    (\textsc{rl},\ \textsc{none})
+      & 0 < \hat p_u < 1 \quad\text{(RL has signal; leave it alone)}
+  \end{cases}
+  \label{eq:rule}
+\end{equation}
+%
+Note the third case. When a unit is unsolved and no teacher is available, the model arm has
+nothing to learn from it, and any method that only evolves weights must discard the unit.
+Routing it to the harness is what makes it recoverable at all, which is the concrete sense
+in which the harness axis is not a convenience.
+
+\paragraph{Rollback.} Every capability above is gated. With the harness arm disabled,
+$h(u) \equiv \textsc{none}$; with routing disabled, $\pi(u) \equiv (\textsc{rl},
+\textsc{none})$ for every unit and the update is bit-identical to unmodified GRPO. Each
+ablation in Sec.~\ref{sec:results} is one flag away from the vanilla baseline, so a
+difference cannot be attributed to an incidental change of configuration.
+
+\input{figures/routing_flow}

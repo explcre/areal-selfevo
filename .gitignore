@@ -209,3 +209,7 @@ wandb/
 outputs/
 sympy/
 !/docs/figures/*
+paper_src/*.aux
+paper_src/*.log
+paper_src/*.out
+paper_src/figures/build/

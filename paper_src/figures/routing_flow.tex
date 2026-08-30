@@ -1,0 +1,55 @@
+% Method flowchart. Standalone-compatible: the same TikZ source is exported to SVG by
+% scripts/build_figs.sh, so the figure in the paper and the figure on the web are one file.
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  font=\small,
+  node distance=6mm and 9mm,
+  box/.style   ={rectangle, rounded corners=2pt, draw=black!55, fill=black!3,
+                 minimum height=7.5mm, inner xsep=3mm, align=center},
+  test/.style  ={diamond, aspect=2.1, draw=black!55, fill=black!4,
+                 inner xsep=0.4mm, inner ysep=0mm, align=center},
+  sink/.style  ={rectangle, rounded corners=2pt, draw=black!70, fill=black!8,
+                 minimum height=7.5mm, inner xsep=3mm, align=center},
+  arr/.style   ={-{Latex[length=2mm]}, draw=black!65},
+  lbl/.style   ={font=\scriptsize, inner sep=1pt, fill=white}
+]
+
+\node[box] (roll) {rollout: $G$ samples for unit $u$};
+\node[box, below=of roll] (rate) {$\hat p_u=\frac1G\sum_i r_i$};
+\node[test, below=of rate] (sil) {$I_{\mathrm{RL}}(\hat p_u,G)=0$?\\[-1pt]\scriptsize(unanimous)};
+
+\node[sink, right=22mm of sil] (rl) {$(\textsc{rl},\ \textsc{none})$\\[-1pt]\scriptsize GRPO as usual};
+
+\node[test, below=9mm of sil] (solved) {$\hat p_u = 1$?};
+\node[sink, right=22mm of solved] (sft) {$(\textsc{sft}_{\text{self}},\ \textsc{validate})$\\[-1pt]\scriptsize target = own correct sample};
+
+\node[test, below=9mm of solved] (tea) {teacher\\available?};
+\node[sink, right=22mm of tea] (sftt) {$(\textsc{sft}_{\text{teacher}},\ \textsc{propose})$};
+\node[sink, below=9mm of tea] (skip) {$(\textsc{skip},\ \textsc{propose})$\\[-1pt]\scriptsize harness is the only consumer};
+
+\draw[arr] (roll) -- (rate);
+\draw[arr] (rate) -- (sil);
+\draw[arr] (sil)   -- node[lbl,above]{no} (rl);
+\draw[arr] (sil)   -- node[lbl,left]{yes} (solved);
+\draw[arr] (solved)-- node[lbl,above]{yes} (sft);
+\draw[arr] (solved)-- node[lbl,left]{no ($\hat p_u{=}0$)} (tea);
+\draw[arr] (tea)   -- node[lbl,above]{yes} (sftt);
+\draw[arr] (tea)   -- node[lbl,left]{no} (skip);
+
+\begin{scope}[on background layer]
+  \node[draw=black!25, dashed, rounded corners=3pt, fit=(solved)(tea)(skip)(sftt)(sft),
+        inner sep=3mm, label={[font=\scriptsize\itshape, black!55]above right:%
+        RL-silent: 57.4\% of groups, measured}] {};
+\end{scope}
+\end{tikzpicture}
+\caption{%
+  \textbf{Routing decides, per unit, both an estimator and a harness contribution.}
+  The branch on $I_{\mathrm{RL}}$ is exact, not heuristic: a unanimous group has every
+  advantage identically zero by \eqref{eq:adv}. The dashed region is the part of the batch
+  ordinary GRPO cannot learn from, measured at $57.4\%$ of groups. It splits into a half
+  where a supervised target is free (the unit's own correct sample) and a half where no
+  target exists unless supplied --- and on that second half the harness is the only
+  consumer that can use the unit at all.}
+\label{fig:routing}
+\end{figure}

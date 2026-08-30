@@ -1512,6 +1512,33 @@ class RemoteInfEngine(InferenceEngine):
 # Helper functions that run in ProcessPoolExecutor
 
 
+
+def _weight_sync_retries() -> int:
+    """HTTP retry budget for weight-sync requests to the inference servers.
+
+    Upstream hardcodes 1, which means a single transient ``ServerDisconnectedError``
+    during a weight push aborts the whole run -- and the surviving ranks then spin in
+    a dead NCCL collective, so ``nvidia-smi`` still reports 100% utilization. Reading
+    the budget from the environment lets a long run tolerate a blip.
+
+    Returns:
+        The value of ``AREAL_WEIGHT_SYNC_RETRIES`` if it is a positive integer,
+        otherwise 1 -- which reproduces upstream behaviour exactly.
+    """
+    raw = os.getenv("AREAL_WEIGHT_SYNC_RETRIES")
+    if raw is None:
+        return 1
+    try:
+        n = int(raw)
+    except ValueError:
+        logger.warning("AREAL_WEIGHT_SYNC_RETRIES=%r is not an integer; using 1", raw)
+        return 1
+    if n < 1:
+        logger.warning("AREAL_WEIGHT_SYNC_RETRIES=%d is < 1; using 1", n)
+        return 1
+    return n
+
+
 def _update_weights_from_disk(
     backend: RemoteInfBackendProtocol,
     experiment_name: str,
@@ -1612,7 +1639,7 @@ def _init_weights_update_group_remote(
                         endpoint=http_req.endpoint,
                         payload=http_req.payload,
                         method=http_req.method,
-                        max_retries=1,
+                        max_retries=_weight_sync_retries(),
                         timeout=request_timeout,
                     )
                 )
@@ -1662,7 +1689,7 @@ def _update_weights_from_distributed(
                         endpoint=http_req.endpoint,
                         payload=http_req.payload,
                         method=http_req.method,
-                        max_retries=1,
+                        max_retries=_weight_sync_retries(),
                         timeout=request_timeout,
                     )
                     for addr in addresses

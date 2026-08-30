@@ -157,6 +157,7 @@ python3 examples/math/gsm8k_rl.py \
   evaluator.freq_secs=null \
   +actor.attn_impl=sdpa +ref.attn_impl=sdpa \
   +rollout.agent.admin_api_key="$KEY" \
+  ${EXTRA_ARGS:-} \
   experiment_name=step0l trial_name=t1 2>&1 \
   | python3 "$FILTER" >> "$LOG" 2>>"$LOG"
 

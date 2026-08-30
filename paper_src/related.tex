@@ -1,0 +1,43 @@
+% ---------------------------------------------------------------------------
+% Related work, organised by what each line of work OWNS, so the contribution is
+% stated as a gap rather than as a list.
+% ---------------------------------------------------------------------------
+\section{Related work}
+\label{sec:related}
+
+We organise prior work by the claim it already owns, because our contribution is only
+meaningful as the complement of those claims.
+
+\paragraph{Choosing an algorithm per task.} SIA selects among training algorithms at the
+granularity of a \emph{task}, and demonstrates that the choice matters. That result is
+theirs and we do not re-derive it. What a task-level policy cannot express is that units
+\emph{within} one task differ in whether a gradient exists at all: by \eqref{eq:irl} the
+silent and informative units of a single task require different estimators, and no
+task-level assignment can separate them. Our claim is therefore about granularity, and the
+comparison that matters is against SIA at matched compute.
+
+\paragraph{Deciding what to evolve.} Co-Harness co-evolves harness and weights and
+establishes the success$\to$model / failure$\to$harness assignment. EvoTrainer co-evolves a
+policy with its training harness. Both fix the assignment as a rule over outcomes. We keep
+their rule as a special case (\eqref{eq:action} constrained to a partition) and relax it,
+because a trajectory read by two different consumers need not be spent on only one of them.
+
+\paragraph{Deciding \emph{when} to evolve.} \emph{Learning, Fast and Slow} separates fast
+and slow adaptation and reports the stability benefit of a two-timescale schedule. That
+bounds what a cadence claim can be worth, and we treat cadence as a control variable rather
+than a contribution.
+
+\paragraph{Clustering trajectories.} MEDS reuses layer-wise logits from the forward pass as
+lightweight representations of reasoning behaviour and clusters error patterns with HDBSCAN.
+We adopt this directly as the learned instantiation of our cluster key, against a derived
+key computed from the silence side of \eqref{eq:irl}; the two are a controlled ablation of
+\emph{how} to cluster, holding what is done with the clusters fixed.
+
+\paragraph{Evaluation practice.} Recent evaluation work documents how often agent results
+fail to survive controls that were available at the time. We adopt its checks as
+requirements rather than as discussion: paired tests on shared items, intervals reported on
+the \emph{difference} rather than on each arm, matched-permutation controls that hold the
+proportion of units in each mode fixed while shuffling which units get which mode, and a
+noise floor established from the same checkpoint scored twice. The matched control is the
+one that decides our central claim, because a routing method changes both which units are
+routed and how many, and only the permutation control separates those.

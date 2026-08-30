@@ -1531,3 +1531,52 @@ responses, and their sum hides that:
 
 Until the fixed metric runs, we know 57% of groups are silent but not how that splits. That
 number decides which signal the 57% should be routed to, and it is the next measurement.
+
+---
+
+## GPU utilization is not a liveness signal: a dead run held 4 GPUs at 100% for 46 minutes
+
+`step0l` raised at step 44 and then sat there. `nvidia-smi` reported **100% utilization on
+all four training GPUs the entire time**, which is what a routine check reads as "healthy and
+busy". It was a corpse: the log had not grown in 46 minutes.
+
+    log mtime 21:15:50, checked 22:01:49   -> 2759s stale
+    20s byte-delta on the log              -> 0
+
+**Cause.** The rollout server dropped during a weight push:
+
+    HTTPUtils WARNING: HTTP request to <addr>/update_weights_from_distributed failed with
+    ServerDisconnectedError: Server disconnected (attempt 1/1)
+    RuntimeError: Failed after 1 retries each.
+
+`attempt 1/1` is the whole story. `areal/infra/remote_inf_engine.py` hardcodes
+`max_retries=1` at both weight-sync call sites, and `DEFAULT_RETRIES = 1`. A single transient
+disconnect during weight sync therefore aborts a multi-hour run. The rank that raised exits;
+the other three stay in their collective and spin, which is what produces 100% utilization
+with zero progress.
+
+**Why this matters beyond one run.** Every "are the GPUs busy?" check in this project has
+been reading `nvidia-smi`. That check cannot distinguish training from a dead NCCL wait. The
+last 46 minutes of GPU time on this box were reported as fully utilized and produced nothing.
+
+**Three fixes, all landed.**
+
+1. `_weight_sync_retries()` reads `AREAL_WEIGHT_SYNC_RETRIES`, default **1**. The default
+   reproduces upstream exactly, so this is a rollback-clean change; runs opt in with the env
+   var. Current runs use 5.
+2. `experiments/harness/supervise.sh` watches **log growth**, not utilization: if
+   `train.log` is stale for more than `stall_seconds` (default 1200) it dumps py-spy stacks
+   for the actor ranks, kills the run, and relaunches, up to `max_restarts`.
+3. `step0l.sh` takes `$EXTRA_ARGS`, so the supervisor can add `recover.mode=auto` on a
+   restart without a second copy of the script.
+
+**One honest note on the restart.** `recover.mode=auto` did *not* resume from the saved
+`globalstep28`; the run restarted at step 0. AReaL's recover checkpoints are a different
+artefact from the saver checkpoints, and `auto` finds nothing when only the latter exist. For
+this particular run that is the better outcome anyway -- step0l is the routing-off control
+for step0j, and a contiguous fresh run is comparable to step0j's in a way a resumed run with
+reset Adam moments would not be. Recorded rather than glossed, because the flag did not do
+what its name suggests.
+
+**Standing consequence.** Liveness is log growth. Utilization is at best a secondary signal
+and at worst, as here, a confident lie.
