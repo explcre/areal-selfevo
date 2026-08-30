@@ -551,7 +551,6 @@ def grpo_loss_fn(
     vocab_max_logits: torch.Tensor | None = None,
     vocab_mean_logits: torch.Tensor | None = None,
     vocab_norm_logits: torch.Tensor | None = None,
-    token_routing: object | None = None,
 ):
     """Loss function for actor step, all inputs should be splitted into
     pipeline micro batches, returns loss and logging stats."""
@@ -578,38 +577,6 @@ def grpo_loss_fn(
     # Apply M2PO masking if threshold is set
     if m2_threshold is not None:
         loss_mask = _apply_m2po_masking(old_logp, prox_logp, loss_mask, m2_threshold)
-
-    # Per-token signal routing (selfevo). Default None == upstream AReaL exactly: rl_mask is
-    # the SAME OBJECT as loss_mask and the distillation weights stay the caller's scalars,
-    # so every downstream expression is unchanged -- including the `rl_loss_weight == 0`
-    # branch, which a weight tensor would silently break.
-    routing = None
-    if token_routing is not None and getattr(token_routing, "enabled", False):
-        from selfevo.integration.token_routing import route_token_weights
-
-        routing = route_token_weights(
-            spec=token_routing,
-            rl_loss_weight=float(input_data.get("rl_loss_weight", 1.0)),
-            distill_loss_weight=float(input_data.get("distill_loss_weight", 0.005)),
-            loss_mask=loss_mask,
-            tokens=input_data.get("input_ids"),
-            gen_mask=input_data.get("gen_mask"),
-            group_ids=input_data.get("group_ids"),
-        )
-        # Apply the per-token RL weight by SCALING ADVANTAGES, not by narrowing the mask.
-        #
-        # Narrowing was wrong twice. (F4) `loss_mask_count` in functional.py is computed
-        # from the mask it is given, while the microbatch weight uses the ORIGINAL mask, so
-        # dropping k% of tokens multiplied every surviving token's gradient by N/(N-k) --
-        # x2.0 at 50% routing. It did not zero the dead tokens, it inflated the live ones.
-        # (F5) A mask keeps only the SIGN of the weight, so `rl_loss_weight` was silently
-        # dropped and `dead_rl_weight` was inert at every value except 0.
-        #
-        # Scaling advantages is exact: the surrogate is linear in the advantage, so weight w
-        # scales that token's contribution by w, w=0 contributes nothing, and the denominator
-        # is untouched. rl_loss_weight is folded in here, so the KD branch must NOT multiply
-        # by it again.
-        advantages = advantages * routing.rl_weight.to(advantages.dtype)
 
     # Use CISPO, SAPO, or PPO loss
     if use_cispo_loss:
@@ -693,14 +660,7 @@ def grpo_loss_fn(
             rkl_penalty_per_token = (logprobs - teacher_logp) * loss_mask
             rkl_penalty = rkl_penalty_per_token.sum() / loss_mask.sum().clamp(min=1)
 
-            if routing is not None:
-                # Per-token weights must be applied INSIDE the reduction; scaling an
-                # already-reduced scalar cannot express a per-token decision.
-                rkl_penalty = ((routing.distill_weight * rkl_penalty_per_token).sum()
-                               / loss_mask.sum().clamp(min=1))
-                loss = loss + rkl_penalty
-            else:
-                loss = rl_loss_weight * loss + distill_loss_weight * rkl_penalty
+            loss = rl_loss_weight * loss + distill_loss_weight * rkl_penalty
 
             rkl_stat = rkl_penalty_per_token
 
@@ -711,12 +671,6 @@ def grpo_loss_fn(
         clipped_tokens=stat["clip_mask"],
         dual_clipped_tokens=stat["dual_clip_mask"],
     )
-
-    if routing is not None:
-        stats_tracker.scalar(
-            routed_token_fraction=routing.routed_fraction,
-            routed_token_count=float(routing.n_routed),
-        )
 
     if rkl_stat is not None:
         stats_tracker.stat(

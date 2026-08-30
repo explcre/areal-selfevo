@@ -8,12 +8,25 @@ with both weights **batch-level scalars**. This module makes them **per-token**,
 a router. That is the concrete form of this project's claim: the training signal is chosen
 per token rather than per run.
 
-The first routing rule follows from the estimator, not from taste. In a GRPO group the
-advantages sum to zero, so any token shared by every member of the group receives exactly
-cancelling gradient contributions -- its net RL gradient is zero regardless of how the group
-scored. Spending the loss budget there buys nothing. A teacher distribution, where one
-exists, is strictly more informative than zero. So RL-dead tokens are routed to
-distillation and live tokens keep RL.
+The first routing rule follows from the estimator, but it is CONDITIONAL and the conditions
+are frequently violated. In a GRPO group whose advantages sum to zero, and on-policy so every
+member's importance ratio is 1, a token shared by every member receives exactly cancelling
+gradient contributions and its net RL gradient is zero. Neither precondition is automatic:
+
+* Batch-level ``adv_norm`` (set in this repo's own ``gsm8k_grpo.yaml``) subtracts a
+  token-weighted batch mean that is not zero when generations differ in length, which
+  destroys per-group centring. Measured on the real pipeline: ``sum_i A_i = 0.98``, 87-115%
+  of mean ``|A|``, leaving 9.7% of the live gradient at a supposedly dead prefix.
+* ``kl_ctl > 0`` (step0i uses 0.01) makes each member accumulate its own future KL from the
+  shared position onward, so advantages differ beyond the centred reward: 14-43% of mean
+  ``|A|``.
+* PPO clipping breaks it, and so does merely unequal per-member ratios with no clipping at
+  all. Under GSPO the ratio is a whole-sequence geometric mean, so it differs across members
+  even where the per-token log-ratio at the prefix is identically zero.
+
+So the rule is only valid when the guards below pass, and this module CHECKS rather than
+assumes. ``assert_zero_sum_advantage`` and ``assert_on_policy`` already existed in
+``routing/token_level.py`` for exactly this and had no callers anywhere.
 
 **Rollback is the default.** With ``enabled=False`` the module returns the caller's own
 scalars unchanged, so the loss expression is bit-identical to upstream AReaL. Every feature
@@ -29,7 +42,11 @@ from typing import Any
 
 import torch
 
-from ..routing.token_level import rl_dead_mask
+from ..routing.token_level import (
+    assert_on_policy,
+    assert_zero_sum_advantage,
+    rl_dead_mask,
+)
 
 __all__ = ["TokenRoutingSpec", "TokenRoutingResult", "route_token_weights"]
 
@@ -59,6 +76,7 @@ class TokenRoutingSpec:
     dead_rl_weight: float = 0.0
     dead_distill_weight: float | None = None
     seed: int = 0
+    require_valid_preconditions: bool = True
 
     RULES = ("rl_dead_to_distill", "all_rl", "all_distill", "random")
 
@@ -101,6 +119,9 @@ def route_token_weights(
     tokens: torch.Tensor | None = None,
     gen_mask: torch.Tensor | None = None,
     group_ids: torch.Tensor | None = None,
+    advantages: torch.Tensor | None = None,
+    importance_weight: torch.Tensor | None = None,
+    clip_fraction: float | None = None,
 ) -> TokenRoutingResult:
     """Decide per-token RL and distillation weights.
 
@@ -149,8 +170,23 @@ def route_token_weights(
                 f"rule 'rl_dead_to_distill' needs {missing}; refusing to fall back to the "
                 "scalar path, which would be indistinguishable from the router being off"
             )
+        # The cancellation argument is CONDITIONAL. Check it rather than assume it: batch
+        # adv_norm and kl_ctl>0 -- both set in this repo's live configs -- were measured to
+        # leave 9.7% of the live gradient at a supposedly dead prefix. These guards already
+        # existed with no callers, which is how the violation went unnoticed.
+        if spec.require_valid_preconditions:
+            if advantages is None:
+                raise ValueError(
+                    "rl_dead_to_distill needs `advantages` to verify sum_i A_i = 0. Pass "
+                    "require_valid_preconditions=False only to deliberately measure the "
+                    "rule outside its domain."
+                )
+            assert_zero_sum_advantage(advantages, group_ids)
+            if importance_weight is not None:
+                assert_on_policy(importance_weight, clip_fraction if clip_fraction is not None else 0.0)
         dead = rl_dead_mask(tokens, gen_mask, group_ids) & mask
-        basis = "tokens inside the group's shared prefix carry zero net RL gradient"
+        basis = ("tokens inside the group's shared prefix, preconditions "
+                 + ("verified" if spec.require_valid_preconditions else "NOT CHECKED"))
     elif spec.rule == "random":
         if group_ids is None or tokens is None or gen_mask is None:
             raise ValueError("rule 'random' needs the same inputs, to match the real rate")
@@ -168,7 +204,12 @@ def route_token_weights(
     else:  # unreachable; __post_init__ validates
         raise ValueError(f"unknown rule {spec.rule!r}")
 
-    dd = spec.dead_distill_weight if spec.dead_distill_weight is not None else distill_loss_weight
+    # F8: defaulting to the caller's own weight made `distill_weight` a CONSTANT tensor, so
+    # the default rule only deleted RL and never routed anything *to* the teacher -- a
+    # provable no-op under the module's own theory. A routed token must actually gain
+    # teacher weight, so the default is now to take over the budget the RL side gave up.
+    dd = (spec.dead_distill_weight if spec.dead_distill_weight is not None
+          else distill_loss_weight + max(0.0, rl_loss_weight - spec.dead_rl_weight))
     rl_w = torch.where(dead, torch.full_like(mask, spec.dead_rl_weight, dtype=torch.float32),
                        torch.full_like(mask, float(rl_loss_weight), dtype=torch.float32))
     kd_w = torch.where(dead, torch.full_like(mask, float(dd), dtype=torch.float32),
