@@ -51,7 +51,44 @@ __all__ = [
 # Registries. Values are factories; a new component is added by registering it from
 # anywhere, with no edit to this module -- the same extension pattern as routing.base.
 SHAPERS: dict[str, Callable[..., object] | None] = {"none": None}
-ROUTERS: dict[str, Callable[..., object] | None] = {}
+def _static_router(**kw: object) -> object:
+    """Factory for :class:`selfevo.routing.routers.StaticRouter`."""
+    from .routing.routers import StaticRouter
+
+    return StaticRouter(**kw)  # type: ignore[arg-type]
+
+
+def _solve_rate_router(**kw: object) -> object:
+    """Factory for :class:`selfevo.routing.routers.SolveRateRouter` (SAMPLE granularity)."""
+    from .routing.routers import SolveRateRouter
+
+    return SolveRateRouter(**kw)  # type: ignore[arg-type]
+
+
+def _cluster_router(**kw: object) -> object:
+    """Factory for :class:`selfevo.routing.cluster.ClusterRouter` (CLUSTER granularity)."""
+    from .routing.cluster import ClusterRouter
+
+    return ClusterRouter(**kw)  # type: ignore[arg-type]
+
+
+def _random_router(**kw: object) -> object:
+    """Factory for :class:`selfevo.routing.routers.RandomRouter`, the matched control."""
+    from .routing.routers import RandomRouter
+
+    return RandomRouter(**kw)  # type: ignore[arg-type]
+
+
+# These were implemented but never registered, so no config could select them and the
+# `router` axis was unusable despite four working routers existing. Imported lazily for the
+# same reason as the critic factories: `compose` must stay importable for configuration
+# validation without pulling in the routing criteria.
+ROUTERS: dict[str, Callable[..., object] | None] = {
+    "static": _static_router,            # fixed weights, the fixed-mode baseline
+    "solve_rate": _solve_rate_router,    # SAMPLE granularity, I_RL silence split
+    "cluster": _cluster_router,          # CLUSTER granularity, one signal per cluster
+    "random": _random_router,            # matched control: same proportions, shuffled units
+}
 GATES: dict[str, Callable[..., object] | None] = {"none": None, "prefix_dead": None}
 EVOLVE_TARGETS: frozenset[str] = frozenset({"model", "harness", "reward", "both"})
 # A critic scores candidates before they are trained on. `two_level` is the BigBang-v1
