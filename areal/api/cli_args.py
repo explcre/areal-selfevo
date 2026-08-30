@@ -1669,6 +1669,37 @@ class RejectionSamplingConfig:
 
 
 @dataclass
+class TokenRoutingConfig:
+    """Per-token routing of the training signal (selfevo).
+
+    Mirrors selfevo.integration.token_routing.TokenRoutingSpec so the CLI can construct it;
+    the spec itself is not imported here to keep areal.api free of a selfevo dependency.
+    """
+
+    enabled: bool = field(
+        default=False,
+        metadata={"help": "Off by default; off is bit-identical to upstream."},
+    )
+    rule: str = field(
+        default="rl_dead_to_distill",
+        metadata={"help": "rl_dead_to_distill | all_rl | all_distill | random"},
+    )
+    dead_rl_weight: float = field(
+        default=0.0, metadata={"help": "RL weight at RL-dead positions."}
+    )
+    dead_distill_weight: float | None = field(
+        default=None,
+        metadata={"help": "Teacher weight at routed positions; None takes over the RL budget."},
+    )
+    seed: int = field(default=0, metadata={"help": "Seed for the `random` control."})
+    require_valid_preconditions: bool = field(
+        default=True,
+        metadata={"help": "Refuse to route when sum_i A_i != 0 per group. Waiving this "
+                  "measures the rule outside its domain and is recorded in the basis."},
+    )
+
+
+@dataclass
 class PPOActorConfig(TrainEngineConfig):
     """Configuration for PPO actor model, a subclass of a TrainEngine."""
 
@@ -1765,6 +1796,15 @@ class PPOActorConfig(TrainEngineConfig):
     )
     adv_norm: NormConfig | None = field(
         default=None, metadata={"help": "Normalization configuration for advantages."}
+    )
+    token_routing: "TokenRoutingConfig | None" = field(
+        default=None,
+        metadata={
+            "help": "Per-token training-signal routing (selfevo). None disables it, which "
+            "is bit-identical to upstream AReaL. Requires adv_norm.mean_level=group and "
+            "kl_ctl=0: those are the only settings under which the rule's precondition "
+            "(sum_i A_i = 0 per group) holds, and the router refuses otherwise."
+        },
     )
 
     # KL Control

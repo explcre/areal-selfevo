@@ -96,6 +96,19 @@ class PPOActor:
         self.temperature = config.temperature
 
         self.m2_threshold = config.m2_threshold
+        # Built at construction so an invalid routing config fails HERE, not hours into a
+        # run inside the first backward pass.
+        self._token_routing_spec = None
+        tr = getattr(config, "token_routing", None)
+        if tr is not None and getattr(tr, "enabled", False):
+            from selfevo.integration.token_routing import TokenRoutingSpec
+
+            self._token_routing_spec = TokenRoutingSpec(
+                enabled=True, rule=tr.rule, dead_rl_weight=tr.dead_rl_weight,
+                dead_distill_weight=tr.dead_distill_weight, seed=tr.seed,
+                require_valid_preconditions=tr.require_valid_preconditions,
+            )
+            logger.info("token routing ENABLED: %s", self._token_routing_spec)
 
         # Log critical GSPO/GRPO configuration for reproducibility
         self._log_configuration()
@@ -519,6 +532,7 @@ class PPOActor:
                         sapo_tau_neg=self.config.sapo_tau_neg,
                         use_cispo_loss=self.config.use_cispo_loss,
                         use_decoupled_loss=self.config.use_decoupled_loss,
+                        token_routing=self._token_routing_spec,
                     ),
                     loss_weight_fn=lambda x: x["loss_mask"].count_nonzero(),
                 )
