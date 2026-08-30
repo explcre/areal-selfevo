@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# step0m -- the solved-branch A/B, the experiment the silence measurement asked for.
+#
+# 31.4% of all groups are RL-silent BECAUSE THEY ARE SOLVED (1152 group observations on the
+# control arm). Those groups already contain a correct sample, so a supervised target exists
+# inside the rollout at zero teacher cost. This run asks the only question that matters
+# about them: does using that target help, or does it just spend entropy?
+#
+# The two arms differ in ONE flag. Everything else -- model, data, seed, optimiser,
+# normalisation, token budget -- is identical, and the off arm is bit-identical to vanilla
+# GRPO because group_routing defaults to None.
+#
+#   ARM=off   group_routing absent          (control)
+#   ARM=on    solved_advantage=$SOLVED_ADV  (SFT on the group's own correct samples)
+#
+# SOLVED_ADV defaults to 0.5. With reward_norm std_level=group the informative advantages
+# are standardised to |A| ~ 1, so 0.5 is half a typical advantage -- a deliberate first
+# value, not a tuned one, and it should be reported as such.
+#
+# Runs the arms SEQUENTIALLY on all 8 GPUs rather than side by side on 4 each: two AReaL
+# jobs on one node share port allocation and temp dirs, and a collision costs more hours
+# than serialising does.
+set -u -o pipefail
+
+ARM="${ARM:?set ARM=off or ARM=on}"
+SOLVED_ADV="${SOLVED_ADV:-0.5}"
+case "$ARM" in
+  off) ROUTING_ARGS=() ;;
+  on)  ROUTING_ARGS=(
+         "+actor.group_routing.enabled=true"
+         "+actor.group_routing.solved_advantage=${SOLVED_ADV}"
+       ) ;;
+  *)   echo "ARM must be 'off' or 'on', got '$ARM'"; exit 2 ;;
+esac
+
+export PATH="$HOME/.local/bin:$PATH"
+source "/venv/main/bin/activate"
+cd "$HOME/areal-selfevo" || exit 1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+ulimit -n 131072 || echo "WARNING: could not raise the file-descriptor limit"
+export PYTHONUNBUFFERED=1
+# One transient rollout disconnect during a weight push otherwise aborts the whole run,
+# and the surviving ranks then spin at 100% utilization looking healthy.
+export AREAL_WEIGHT_SYNC_RETRIES="${AREAL_WEIGHT_SYNC_RETRIES:-5}"
+
+EXP="step0m-${ARM}"
+RUN="$HOME/runs/${EXP}"; mkdir -p "$RUN"
+LOG="$RUN/train.log"
+FILTER="$HOME/areal-selfevo/experiments/harness/logfilter.py"
+
+exec 9>"$RUN/.lock"
+flock -n 9 || { echo "a ${EXP} run is already active in $RUN"; exit 3; }
+[ -s "$LOG" ] && mv "$LOG" "$LOG.$(date +%s)"
+
+KEYFILE="$HOME/.areal_admin_key"
+[ -f "$KEYFILE" ] || (umask 077; head -c 24 /dev/urandom | base64 | tr -d "/+=" > "$KEYFILE")
+KEY=$(cat "$KEYFILE")
+[ -n "$KEY" ] || { echo "no admin key found"; exit 2; }
+
+echo "=== ${EXP}: ARM=${ARM} SOLVED_ADV=${SOLVED_ADV} args=${ROUTING_ARGS[*]:-none} ===" >> "$LOG"
+
+python3 examples/math/gsm8k_rl.py \
+  --config examples/math/gsm8k_grpo.yaml \
+  scheduler.type=local \
+  cluster.fileroot="$HOME/areal-runs" \
+  gconfig.n_samples=8 \
+  actor.optimizer.lr=1.0e-6 \
+  actor.eps_clip=0.2 \
+  saver.freq_steps=25 \
+  actor.kl_ctl=0.0 \
+  ~actor.adv_norm \
+  ++actor.mb_spec.granularity=8 \
+  actor.path=Qwen/Qwen2.5-1.5B-Instruct \
+  "${ROUTING_ARGS[@]}" \
+  ${EXTRA_ARGS:-} \
+  evaluator.freq_epochs=null \
+  evaluator.freq_secs=null \
+  +actor.attn_impl=sdpa +ref.attn_impl=sdpa \
+  +rollout.agent.admin_api_key="$KEY" \
+  experiment_name="${EXP}" trial_name=t1 2>&1 \
+  | python3 "$FILTER" >> "$LOG" 2>>"$LOG"
+
+rc=${PIPESTATUS[0]}
+echo "STEP0M_${ARM}_EXIT=$rc" >> "$LOG"
+exit "$rc"
