@@ -133,9 +133,55 @@ before any transformation. Runs launched before the fix carry the old code and t
 solved/unsolved split must be ignored; $\widehat{P}(\text{silent})$ is unaffected because it
 is computed from the advantages being zero.
 
+\subsection{The silent channel is 87.5\% solved, so most of it needs no teacher}
+\label{sec:split}
+
+Measured on the routing-off control (\texttt{step0l}) under the corrected metric, over $18$
+logged batches at $64$ groups each ($1152$ group observations):
+
+\begin{table}[t]
+\centering\small
+\caption{Decomposition of the RL-silent channel. \texttt{step0l}, GSM8K,
+Qwen2.5-1.5B-Instruct, first $18$ logged batches.}
+\label{tab:split}
+\begin{tabular}{lcc}
+\toprule
+quantity & mean & range \\
+\midrule
+silent groups                      & 0.3592 & $[0.2891,\ 0.4414]$ \\
+\quad silent because \emph{solved}   & 0.3145 & $[0.2461,\ 0.4219]$ \\
+\quad silent because \emph{unsolved} & 0.0447 & $[0.0117,\ 0.0703]$ \\
+\midrule
+solved share of the silent channel & \textbf{0.875} & $[0.827,\ 0.959]$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The identity $\text{solved} + \text{unsolved} = \text{silent}$ holds to a maximum residual of
+$1.0\times10^{-5}$ across all $18$ batches, which is float32 rounding. We check it because an
+earlier version of this metric failed it, reporting $0.000$ solved at a measured $82\%$ solve
+rate.
+
+\paragraph{This inverts the cost of the method.} By \eqref{eq:target}, the solved groups
+already contain a supervised target, so $31.4\%$ of \emph{all} groups are reusable with no
+teacher, no extra inference and no extra GPU. Only $4.5\%$ of groups --- the unsolved ones
+--- require an external teacher, and those are exactly the units for which the harness is the
+only available consumer. The reach of the free path is therefore about $7\times$ that of the
+teacher-dependent one, which is the opposite of the ordering we assumed before measuring.
+
+\paragraph{Scope, and what this does not claim.} This is one operating point: GSM8K,
+Qwen2.5-1.5B-Instruct, early training, high solve rate. A harder task moves mass from solved
+to unsolved and shifts the balance toward needing a teacher; $0.875$ is a property of the
+operating point, not a constant. More importantly, the table says where the reachable mass
+\emph{is}, not that training on it helps. Sharpening an already-correct distribution spends
+entropy, and entropy collapse is the failure mode Sec.~\ref{sec:trainreward} already
+documents. Until the A/B exists, the solved branch of \eqref{eq:rule} defaults to
+\textsc{skip}.
+
 \subsection{Not yet measured}
 
-Stated explicitly so the gap is not mistaken for an omission: the solved/unsolved split of
-the $57.4\%$ under the fixed metric; any arm in which routed units \emph{gain} a signal
+Stated explicitly so the gap is not mistaken for an omission: whether training on the
+solved branch helps or costs entropy (Sec.~\ref{sec:split} locates the mass but does not
+settle this); any arm in which routed units \emph{gain} a signal
 rather than only losing one; and the harness-destination arm of \eqref{eq:action}. Until a
 target is supplied, every routed arm is a gradient-deletion ablation and is labelled as one.

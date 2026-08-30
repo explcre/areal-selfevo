@@ -34,14 +34,17 @@ unanimous, and unanimity is precisely the condition under which \eqref{eq:adv} v
 Two consequences drive the method.
 
 \paragraph{The silent fraction is large and measurable.} Instrumenting a live run
-(Sec.~\ref{sec:results}) gives $\hat{P}(\text{silent}) = 0.574$ over $64$ groups per batch:
-more than half of every batch is RL-dead. This is $34\times$ the reach of the token-level
-shared-prefix channel we measured first ($1.7\%$), and it explains, without appealing to
-noise, why an intervention confined to that channel moved nothing.
+(Sec.~\ref{sec:results}) puts $\hat{P}(\text{silent})$ between $0.29$ and $0.57$ depending on
+the training step, at $64$ groups per batch: a third to a half of every batch is RL-dead.
+Even the low end is an order of magnitude above the reach of the token-level shared-prefix
+channel we measured first ($1.7\%$), and that gap explains, without appealing to noise, why
+an intervention confined to that channel moved nothing.
 
-\paragraph{The two silent regimes need opposite responses.} A unit silent because
-$\hat p = 1$ and a unit silent because $\hat p = 0$ are both invisible to \eqref{eq:adv},
-but they are not the same object, and routing them identically wastes one of them.
+\paragraph{The two silent regimes need opposite responses, and they are not equally
+common.} A unit silent because $\hat p = 1$ and a unit silent because $\hat p = 0$ are both
+invisible to \eqref{eq:adv}, but they are not the same object, and routing them identically
+wastes one of them. Measured on the control arm, the silent channel is $87.5\%$ solved
+(Table~\ref{tab:split}), which decides which of the two branches carries the method.
 
 \subsection{A free target exists on exactly the solved half}
 \label{sec:selftarget}

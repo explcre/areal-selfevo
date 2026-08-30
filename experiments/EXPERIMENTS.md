@@ -1580,3 +1580,52 @@ what its name suggests.
 
 **Standing consequence.** Liveness is log growth. Utilization is at best a secondary signal
 and at worst, as here, a confident lie.
+
+---
+
+## The silent channel is 87.5% SOLVED -- so most of it needs no teacher at all
+
+The measurement the critical path was waiting on. `step0l` (routing OFF, the control arm)
+relaunched on the corrected metric, 18 logged batches at 64 groups each = 1152 group
+observations:
+
+| quantity | mean | range |
+|---|---|---|
+| `silent_group_fraction`   | 0.3592 | [0.2891, 0.4414] |
+| `solved_group_fraction`   | 0.3145 | [0.2461, 0.4219] |
+| `unsolved_group_fraction` | 0.0447 | [0.0117, 0.0703] |
+| **solved share of the silent channel** | **0.875** | [0.827, 0.959] |
+
+**Internal consistency, checked rather than assumed.** `solved + unsolved == silent` holds
+with a maximum residual of `1.0e-05` across all 18 batches, which is float32 rounding. The
+earlier version of this metric failed exactly this check (it reported 0.000 solved at an 82%
+solve rate), so the check is the first thing that runs on it now.
+
+**This re-orders the critical path.** The standing plan had "supply a teacher" as item 1, on
+the reasoning that without a teacher every routed arm is gradient deletion. That reasoning
+was right about the mechanism and wrong about the magnitude:
+
+* **31.4% of all groups are silent because they are SOLVED.** Those groups contain at least
+  one correct sample, so a supervised target already exists inside the rollout. This is
+  rejection-sampling fine-tuning and it costs no teacher, no extra inference, and no extra
+  GPU. It is 87.5% of the silent channel.
+* **4.5% of all groups are silent because they are UNSOLVED.** Only these need an external
+  teacher -- and they are precisely the units the harness arm is for, since with no target
+  and no gradient the harness is the only consumer that can use them at all.
+
+So the external teacher is a lever on ~4.5% of groups, not on the whole silent channel. It
+drops from critical-path item 1 to a smaller, later one, and the self-target path takes its
+place. That is a 7x difference in reach between the two options, and we had it backwards.
+
+**Scope, stated because it limits the claim.** This is GSM8K, Qwen2.5-1.5B-Instruct, early
+training (the first ~18 logged batches), where the solve rate is high. A harder task or a
+weaker model moves mass from solved to unsolved and the balance shifts toward needing a
+teacher. The 87.5% is a property of this operating point, not a constant, and the split
+should be re-measured on OlympiadBench before any claim leans on it.
+
+**What it does not say.** Nothing here shows that training on the solved half helps. There is
+a real argument that it hurts: SFT on a policy's own correct output sharpens an
+already-correct distribution and spends entropy, and entropy collapse is the failure mode
+this project has already measured twice. The measurement says where the reachable mass is,
+not what to do with it. The A/B that answers that is the next run, and until it exists the
+solved branch should default to SKIP rather than SFT.

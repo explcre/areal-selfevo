@@ -178,10 +178,28 @@ result 5 is a null.
 
 ## 6. Critical path
 
-1. **M7 — supply a teacher.** Until routed units *gain* a signal, every arm is gradient
-   deletion, and no positive result would mean what the paper claims.
-2. **Measure the 57% split** (solved vs unsolved) with the fixed metric — decides what that
-   channel routes *to*.
-3. **Give `route_batch` a caller** — otherwise M2 is dead code.
-4. **M9 rule evolve-policy** — cold start *and* the baseline the learned one must beat.
-5. Then M8 learned controller, then B2/B3 benchmarks.
+**Re-ordered on 2026-08-30 by measurement, not by preference.** The silent channel was
+measured to be **87.5% solved** (1152 group observations on the routing-off control), so the
+external teacher reaches ~4.5% of groups while the free self-target reaches ~31.4% -- a 7x
+difference, and the reverse of the previous ordering.
+
+1. **A/B the solved branch.** `SFT` on a unit's own correct sample versus `SKIP`, at matched
+   compute. This is the method's main lever and its main risk: sharpening an already-correct
+   policy spends entropy, and entropy collapse is the failure mode already measured twice
+   here. Until this runs, the solved branch defaults to SKIP.
+2. **Give `route_batch` a caller** -- otherwise M2 and the new harness axis are dead code.
+3. **Re-measure the split on OlympiadBench.** 0.875 is a property of GSM8K at a high solve
+   rate, not a constant; a harder task moves mass to the unsolved branch.
+4. **M9 rule evolve-policy** -- cold start *and* the baseline the learned one must beat.
+5. **A teacher (M7)** -- now a lever on ~4.5% of groups, so it follows rather than leads.
+6. Then M8 learned controller, then the named benchmarks in Sec. 2.
+
+## 7. Standing operating rules learned the hard way
+
+* **Liveness is log growth, never `nvidia-smi`.** A dead run held 4 GPUs at 100% for 46
+  minutes after a 1-retry weight-sync disconnect. Every run goes under
+  `experiments/harness/supervise.sh`, which watches the log and py-spy-dumps before killing.
+* **Checkpoints mirror to HF as they are produced**, newest first, via
+  `experiments/harness/hf_mirror.py` -- both boxes are rented and may be reclaimed at short
+  notice. Skipping is per-file by size; folder-level checks accept partial uploads.
+* **Every capability is flag-gated and rolls back to vanilla AReaL bit-identically.**

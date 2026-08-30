@@ -40,16 +40,17 @@
 \begin{scope}[on background layer]
   \node[draw=black!25, dashed, rounded corners=3pt, fit=(solved)(tea)(skip)(sftt)(sft),
         inner sep=3mm, label={[font=\scriptsize\itshape, black!55]above right:%
-        RL-silent: 57.4\% of groups, measured}] {};
+        RL-silent: 29--57\% of groups, measured}] {};
 \end{scope}
 \end{tikzpicture}
 \caption{%
   \textbf{Routing decides, per unit, both an estimator and a harness contribution.}
   The branch on $I_{\mathrm{RL}}$ is exact, not heuristic: a unanimous group has every
   advantage identically zero by \eqref{eq:adv}. The dashed region is the part of the batch
-  ordinary GRPO cannot learn from, measured at $57.4\%$ of groups. It splits into a half
-  where a supervised target is free (the unit's own correct sample) and a half where no
-  target exists unless supplied --- and on that second half the harness is the only
-  consumer that can use the unit at all.}
+  ordinary GRPO cannot learn from, measured at $29$--$57\%$ of groups depending on training
+  step. It does not split evenly: $87.5\%$ of it is solved, where a supervised target is
+  free (the unit's own correct sample), and the remainder has no target unless one is
+  supplied --- and on that remainder the harness is the only consumer that can use the unit
+  at all.}
 \label{fig:routing}
 \end{figure}
