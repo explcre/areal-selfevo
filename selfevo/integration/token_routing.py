@@ -42,6 +42,7 @@ from typing import Any
 
 import torch
 
+from .packed import PackedLayoutError, is_packed, repack, unpack
 from ..routing.token_level import (
     assert_on_policy,
     assert_zero_sum_advantage,
@@ -122,6 +123,7 @@ def route_token_weights(
     advantages: torch.Tensor | None = None,
     importance_weight: torch.Tensor | None = None,
     clip_fraction: float | None = None,
+    cu_seqlens: torch.Tensor | None = None,
 ) -> TokenRoutingResult:
     """Decide per-token RL and distillation weights.
 
@@ -152,6 +154,31 @@ def route_token_weights(
             n_routed=0,
             basis="disabled: upstream scalar weights returned unchanged",
         )
+
+    # AReaL hands the loss a PACKED microbatch: 1-D [total_length] with cu_seqlens marking
+    # sequence boundaries. The routing functions want (B, T). Reshaping a packed tensor to
+    # (1, total) reads the whole microbatch as ONE group and marks 100% of tokens RL-dead --
+    # a confident wrong answer rather than a crash, which is why this is handled explicitly.
+    packed = is_packed(loss_mask, cu_seqlens)
+    if loss_mask.ndim == 1 and not packed:
+        raise ValueError(
+            "loss_mask is 1-D but no cu_seqlens was given. Sequence boundaries cannot be "
+            "recovered from a packed tensor alone, and assuming one sequence would mark "
+            "every token RL-dead. Pass cu_seqlens, or route on an unpacked batch."
+        )
+    if packed:
+        original_shape_1d = True
+        loss_mask = unpack(loss_mask, cu_seqlens)
+        if tokens is not None and tokens.ndim == 1:
+            tokens = unpack(tokens, cu_seqlens)
+        if gen_mask is not None and gen_mask.ndim == 1:
+            gen_mask = unpack(gen_mask, cu_seqlens)
+        if advantages is not None and advantages.ndim == 1:
+            advantages = unpack(advantages, cu_seqlens)
+        if importance_weight is not None and importance_weight.ndim == 1:
+            importance_weight = unpack(importance_weight, cu_seqlens)
+    else:
+        original_shape_1d = False
 
     mask = loss_mask.bool()
     n_live = int(mask.sum().item())
@@ -215,6 +242,11 @@ def route_token_weights(
     kd_w = torch.where(dead, torch.full_like(mask, float(dd), dtype=torch.float32),
                        torch.full_like(mask, float(distill_loss_weight), dtype=torch.float32))
     n_routed = int(dead.sum().item())
+    if original_shape_1d:
+        # Hand back the layout the caller gave us; a padded (n_seq, max_len) weight tensor
+        # cannot multiply a packed 1-D advantage.
+        rl_w = repack(rl_w, cu_seqlens)
+        kd_w = repack(kd_w, cu_seqlens)
     return TokenRoutingResult(
         rl_weight=rl_w,
         distill_weight=kd_w,
