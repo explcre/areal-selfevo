@@ -551,6 +551,7 @@ def grpo_loss_fn(
     vocab_max_logits: torch.Tensor | None = None,
     vocab_mean_logits: torch.Tensor | None = None,
     vocab_norm_logits: torch.Tensor | None = None,
+    token_routing: object | None = None,
 ):
     """Loss function for actor step, all inputs should be splitted into
     pipeline micro batches, returns loss and logging stats."""
@@ -578,6 +579,29 @@ def grpo_loss_fn(
     if m2_threshold is not None:
         loss_mask = _apply_m2po_masking(old_logp, prox_logp, loss_mask, m2_threshold)
 
+    # Per-token signal routing (selfevo). Default None == upstream AReaL exactly: rl_mask is
+    # the SAME OBJECT as loss_mask and the distillation weights stay the caller's scalars,
+    # so every downstream expression is unchanged -- including the `rl_loss_weight == 0`
+    # branch, which a weight tensor would silently break.
+    rl_mask = loss_mask
+    routing = None
+    if token_routing is not None and getattr(token_routing, "enabled", False):
+        from selfevo.integration.token_routing import route_token_weights
+
+        routing = route_token_weights(
+            spec=token_routing,
+            rl_loss_weight=float(input_data.get("rl_loss_weight", 1.0)),
+            distill_loss_weight=float(input_data.get("distill_loss_weight", 0.005)),
+            loss_mask=loss_mask,
+            tokens=input_data.get("input_ids"),
+            gen_mask=input_data.get("gen_mask"),
+            group_ids=input_data.get("group_ids"),
+        )
+        # A token routed away from RL is exactly a token removed from the RL mask. Going
+        # through the mask keeps all three surrogates (PPO, SAPO, CISPO) untouched: each
+        # already accepts a mask and none of them accepts per-token weights.
+        rl_mask = loss_mask & (routing.rl_weight > 0)
+
     # Use CISPO, SAPO, or PPO loss
     if use_cispo_loss:
         if use_sapo_loss:
@@ -596,7 +620,7 @@ def grpo_loss_fn(
             advantages=advantages,
             eps_clip=eps_clip,
             eps_clip_higher=eps_clip_higher,
-            loss_mask=loss_mask,
+            loss_mask=rl_mask,
             old_logprobs=old_logp,
             rejection_sampling=rejection_sampling,
             cu_seqlens=input_data.get("cu_seqlens"),
@@ -613,7 +637,7 @@ def grpo_loss_fn(
             advantages=advantages,
             tau_pos=sapo_tau_pos,
             tau_neg=sapo_tau_neg,
-            loss_mask=loss_mask,
+            loss_mask=rl_mask,
             importance_sampling_level=importance_sampling_level,
             cu_seqlens=input_data.get("cu_seqlens"),
         )
@@ -624,7 +648,7 @@ def grpo_loss_fn(
             advantages=advantages,
             eps_clip=eps_clip,
             eps_clip_higher=eps_clip_higher,
-            loss_mask=loss_mask,
+            loss_mask=rl_mask,
             c_clip=c_clip,
             proximal_logprobs=prox_logp,
             rejection_sampling=rejection_sampling,
@@ -660,7 +684,14 @@ def grpo_loss_fn(
             rkl_penalty_per_token = (logprobs - teacher_logp) * loss_mask
             rkl_penalty = rkl_penalty_per_token.sum() / loss_mask.sum().clamp(min=1)
 
-            loss = rl_loss_weight * loss + distill_loss_weight * rkl_penalty
+            if routing is not None:
+                # Per-token weights must be applied INSIDE the reduction; scaling an
+                # already-reduced scalar cannot express a per-token decision.
+                rkl_penalty = ((routing.distill_weight * rkl_penalty_per_token).sum()
+                               / loss_mask.sum().clamp(min=1))
+                loss = loss + rkl_penalty
+            else:
+                loss = rl_loss_weight * loss + distill_loss_weight * rkl_penalty
 
             rkl_stat = rkl_penalty_per_token
 
@@ -671,6 +702,12 @@ def grpo_loss_fn(
         clipped_tokens=stat["clip_mask"],
         dual_clipped_tokens=stat["dual_clip_mask"],
     )
+
+    if routing is not None:
+        stats_tracker.scalar(
+            routed_token_fraction=routing.routed_fraction,
+            routed_token_count=float(routing.n_routed),
+        )
 
     if rkl_stat is not None:
         stats_tracker.stat(
