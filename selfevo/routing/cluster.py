@@ -14,7 +14,7 @@ are RL-silent -- every advantage identically zero -- against the token rule's 1.
 The three clusters need OPPOSITE responses, which is why their sum is never reported alone:
 
 * ``INFORMATIVE``  the group disagrees, RL carries signal.
-* ``UNSOLVED``     every sample failed. RL has nothing to push on; a teacher would help.
+* ``UNSOLVED``     every sample failed. RL has nothing to push on; a teacher target would.
 * ``SOLVED``       every sample succeeded. Nothing left to learn; spend the budget elsewhere.
 
 This module deliberately does NOT learn the partition. A learned or embedding-based
@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Mapping, Sequence
 
 from .base import RoutingContext, RoutingDecision, TrainingMode, known_modes
-from .criteria import SilenceSide, rl_informativeness, silence_side
+from .criteria import SilenceSide, silence_side, threshold_is_inert
 
 __all__ = ["ClusterAssignment", "ClusterRouter", "silence_cluster_key"]
 
@@ -62,6 +62,8 @@ class ClusterAssignment:
     sizes: Mapping[str, int]
     fractions: Mapping[str, float]
     basis: str
+    mode_counts: Mapping[str, int] = field(default_factory=dict)
+    refused_teacher: int = 0
     granularity: str = "cluster"
 
     def __post_init__(self) -> None:
@@ -70,7 +72,23 @@ class ClusterAssignment:
                 f"{len(self.decisions)} decisions but {len(self.cluster_of)} cluster labels; "
                 "every unit must be assigned exactly one cluster"
             )
-        if self.sizes and sum(self.sizes.values()) != len(self.decisions):
+        if set(self.fractions) != set(self.sizes):
+            raise ValueError(
+                f"fractions keys {sorted(self.fractions)} != sizes keys {sorted(self.sizes)}"
+            )
+        if any(v < 0 for v in self.sizes.values()):
+            raise ValueError(f"negative cluster size in {self.sizes}")
+        if self.fractions and abs(sum(self.fractions.values()) - 1.0) > 1e-9:
+            raise ValueError(
+                f"fractions sum to {sum(self.fractions.values())}, not 1. They are reported "
+                "per cluster precisely so they can be checked; an unchecked share is how a "
+                "dropped cluster goes unnoticed."
+            )
+        if not self.basis:
+            raise ValueError("basis must not be empty")
+        # No `if self.sizes` guard: empty sizes with non-empty decisions is the bug, not an
+        # exemption from the check.
+        if sum(self.sizes.values()) != len(self.decisions):
             raise ValueError(
                 f"cluster sizes sum to {sum(self.sizes.values())} but {len(self.decisions)} "
                 "units were routed; a unit was dropped or double-counted"
@@ -100,7 +118,13 @@ class ClusterRouter:
     policy: Mapping[str, str] = field(
         default_factory=lambda: {
             SilenceSide.INFORMATIVE.value: TrainingMode.RL,
-            SilenceSide.UNSOLVED.value: TrainingMode.DISTILL,
+            # SFT, not DISTILL. base.py states hard distillation is deliberately absent
+            # and that SFT with a teacher-sourced target is the supported path;
+            # BanditRouter excludes DISTILL because its transport is not built, and
+            # sim_routing matches neither branch for it, so a unit routed to DISTILL
+            # pays full cost and never learns. An audit measured 400/1000 units in
+            # exactly that state on the motivating batch.
+            SilenceSide.UNSOLVED.value: TrainingMode.SFT,
             SilenceSide.SOLVED.value: TrainingMode.SKIP,
         }
     )
@@ -109,8 +133,15 @@ class ClusterRouter:
     default_mode: str = TrainingMode.SKIP
 
     def __post_init__(self) -> None:
-        if not 0.0 <= self.threshold <= 1.0:
-            raise ValueError(f"threshold must be in [0, 1], got {self.threshold}")
+        if not 0.0 < self.threshold <= 1.0:
+            # 0.0 is rejected, not merely out of taste. criteria tests `I_RL >= threshold`
+            # and I_RL is exactly 0 for a unanimous group, so 0 >= 0 makes EVERY unit
+            # "informative": 100% routed to RL while the basis still reads "derived silence
+            # split". That is the first value a threshold sweep tries.
+            raise ValueError(
+                f"threshold must be in (0, 1]; got {self.threshold}. At 0.0 every unanimous "
+                "group is classified informative and the split silently disappears."
+            )
         modes = known_modes()
         for cluster, mode in self.policy.items():
             if mode not in modes:
@@ -140,6 +171,7 @@ class ClusterRouter:
         keys = [self._key(c) for c in contexts]
         decisions = []
         fell_back = 0
+        refused = 0
         for ctx, key in zip(contexts, keys):
             mode = self.policy.get(key)
             if mode is None:
@@ -152,16 +184,35 @@ class ClusterRouter:
                 why = (f"cluster {key!r} routes to {mode}, which needs a teacher and none is "
                        f"available; skipping instead of training on an absent target")
                 mode = TrainingMode.SKIP
+                refused += 1
             # RoutingDecision takes weights positionally and carries no granularity field,
             # so the tier is recorded on the assignment rather than on each decision.
             decisions.append(RoutingDecision({mode: 1.0}, reason=why))
         counts = Counter(keys)
         n = len(contexts)
-        basis = (f"derived silence split at threshold {self.threshold}"
-                 if self.key_fn is None else "caller-supplied partition")
+        if self.key_fn is not None:
+            basis = "caller-supplied partition"
+        else:
+            # Report inertness instead of implying the threshold separated anything. At
+            # every usable G the smallest non-zero I_RL is 0.64-0.68, so any threshold below
+            # that -- including the 0.1 default -- makes the split exactly "was the group
+            # unanimous?". Above that band it MISLABELS genuinely informative groups, so the
+            # parameter has no safe non-inert setting and the honest thing is to say so.
+            gs = {c.group_size for c in contexts}
+            inert = all(threshold_is_inert(g, self.threshold) for g in gs) if gs else True
+            basis = (f"derived silence split; threshold {self.threshold} is "
+                     + ("INERT at these group sizes, so the split is exactly "
+                        "'was the group unanimous?'" if inert
+                        else "ACTIVE and therefore mislabelling non-unanimous groups"))
         if fell_back:
             basis += f"; {fell_back} unit(s) hit the {self.default_mode} fallback"
         return ClusterAssignment(
+            # The mode histogram is what a caller should read: the cluster sizes say how the
+            # batch PARTITIONED, not what it was TRAINED on. With no teacher those differ
+            # completely -- an audit measured an assignment reporting half the batch routed
+            # to the teacher while zero units actually were.
+            mode_counts=dict(Counter(next(iter(d.weights)) for d in decisions)),
+            refused_teacher=refused,
             decisions=tuple(decisions),
             cluster_of=tuple(keys),
             sizes=dict(counts),
