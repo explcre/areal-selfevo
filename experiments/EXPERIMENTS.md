@@ -1447,3 +1447,46 @@ not the RL-to-teacher redirect the method claims. The full claim needs a teacher
 certainly the conservative recipe (lr 1e-6, eps_clip 0.2, kl_ctl 0, adv_norm off) rather
 than the 1.7% routing channel, and the three-arm design exists precisely so the two cannot
 be confused.
+
+---
+
+## NEGATIVE RESULT: token-level routing has no measurable effect at 1.7% reach
+
+The first held-out measurement of a routed run. step0j (routing ON) scored on full MATH-500
+at the steps it shares with the other two arms, paired McNemar against the routing-off arm:
+
+| step | demo (0d) | scaffold (0h) | scaffold+routing (0j) | 0h vs 0j p |
+|------|-----------|---------------|------------------------|------------|
+| base | 0.528     | 0.506         | 0.536                  | 0.092 |
+| 28   | 0.454     | 0.530         | 0.516                  | 0.534 |
+| 57   | 0.440     | 0.530         | 0.526                  | 0.920 |
+| 86   | 0.466     | 0.526         | 0.522                  | 0.923 |
+| 115  | 0.364     | 0.536         | 0.496                  | 0.065 |
+| 144  | 0.334     | 0.522         | 0.526                  | 0.922 |
+
+**Routing changes nothing detectable.** Every p is >= 0.065 and most sit near 0.92. The
+entire distance from the demo recipe is explained by the conservative optimiser settings,
+which the scaffold arm already has without any routing.
+
+**This was predicted and should be read as consistent, not disappointing.** The rule reaches
+at most 1.7% of loss-carrying tokens, and an intervention on 1.7% of the gradient cannot
+move a benchmark by more than noise. The measurement confirms the ceiling rather than
+discovering a new problem. It also means any future arm claiming a routing effect larger
+than this must first explain what changed about the reach.
+
+**The between-arm noise floor is larger than the effect.** The base model appears in both
+the 0h and 0j series and scores 0.506 and 0.536 -- a 0.030 gap on the same checkpoint, wider
+than any routing difference in the table. No conclusion at this reach can survive that.
+
+**Confound, stated rather than buried.** step0j differs from step0h in THREE ways, not one:
+routing, `kl_ctl` (0.01 -> 0) and `adv_norm` (batch -> off). Those had to move together
+because the rule's precondition does not hold otherwise. So even a significant difference
+here could not have been attributed to routing alone. The clean control is a routing-OFF arm
+at step0j's exact config, and it does not exist yet -- that is the single most useful run to
+add next, and it costs one training run.
+
+**What would make the token tier worth keeping.** Either raise the reach (route on the
+group-silence channel, where whole unanimous groups contribute zero gradient rather than 1.7%
+of tokens), or supply a teacher so routed tokens gain a signal instead of merely losing one.
+The present arm deletes 19.5% of gradient norm and adds nothing back, which is a
+gradient-deletion ablation, not the method.
