@@ -316,6 +316,41 @@ class PPOActor:
 
         # Store data in the dict.
         data["advantages"] = advantages
+
+        # Group membership and generated-token positions, for per-token signal routing.
+        #
+        # Written HERE because this is the only place the group structure is known:
+        # meta.traj_group_sizes partitions the batch rows into GRPO groups (it is used with
+        # .split(sizes, dim=0) for reward normalisation just above), and by the time the
+        # loss runs the batch has been packed and split into microbatches with that
+        # structure gone.
+        #
+        # Purely ADDITIVE: nothing reads these keys unless actor.token_routing is enabled,
+        # so the rollback is unchanged -- no existing tensor is modified and no branch is
+        # taken differently. Two int/bool tensors of batch length cost nothing next to the
+        # logits they travel with.
+        if group_sizes is not None:
+            # An int means a UNIFORM group size, so it expands over the number of
+            # GROUPS (bs // g), not over the rows -- [g] * bs would sum to g * bs.
+            sizes = ([group_sizes] * (bs // group_sizes)
+                     if isinstance(group_sizes, int) and group_sizes > 0
+                     else list(group_sizes) if not isinstance(group_sizes, int) else [])
+            if sum(sizes) == bs:
+                data["group_ids"] = torch.repeat_interleave(
+                    torch.arange(len(sizes), device=advantages.device),
+                    torch.tensor(sizes, device=advantages.device),
+                )
+            else:
+                # A mismatch means the rows were regrouped somewhere between rollout and
+                # here. Emitting a wrong grouping is worse than emitting none: the router
+                # would compute a shared prefix over unrelated sequences.
+                logger.warning(
+                    "traj_group_sizes sums to %d but the batch has %d rows; omitting "
+                    "group_ids rather than guessing", sum(sizes), bs
+                )
+        # loss_mask marks the positions the loss is taken over, which are exactly the
+        # generated tokens; the prompt is masked out.
+        data["gen_mask"] = data["loss_mask"].bool()
         data["kl_rewards"] = kl_rewards
         data["tot_rewards"] = gae_kl_rewards + gae_outcome_rewards
         data["loss_mask"] = loss_mask
