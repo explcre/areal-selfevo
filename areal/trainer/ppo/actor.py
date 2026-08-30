@@ -360,6 +360,42 @@ class PPOActor:
                 # to (B, T) and it is split, packed and unpacked identically to the tensors
                 # beside it, so whatever the engine does to advantages it does to this.
                 data["group_ids"] = gid.unsqueeze(1).expand_as(data["loss_mask"]).contiguous()
+
+                # How much of the batch is RL-SILENT at GROUP level.
+                #
+                # This is the channel that matters. The token-level shared-prefix rule
+                # reaches ~1.7% of tokens; a group whose members all score the same has
+                # every advantage exactly 0, so the WHOLE group contributes no gradient --
+                # a far larger share of the batch, and the one an evolve-policy should be
+                # deciding about. Measured here because it is the only place group
+                # membership and advantages coexist.
+                #
+                # p_hat is the group's solve rate. silent means p_hat in {0, 1}: unsolved
+                # (nothing to push on, needs a teacher) or solved (nothing left to learn).
+                # The two are recorded separately because they call for OPPOSITE responses
+                # and reporting only their sum would hide that.
+                with torch.no_grad():
+                    seq_adv = (advantages * data["loss_mask"]).sum(-1)
+                    n_groups = len(sizes)
+                    per_group = seq_adv.split(sizes)
+                    silent = torch.tensor(
+                        [float(g.abs().max() < 1e-6) for g in per_group],
+                        device=advantages.device,
+                    )
+                    rw = reward_score.detach().float()
+                    per_group_r = rw.split(sizes)
+                    solved = torch.tensor(
+                        [float(g.min() > 0.5) for g in per_group_r], device=advantages.device
+                    )
+                    unsolved = torch.tensor(
+                        [float(g.max() <= 0.5) for g in per_group_r], device=advantages.device
+                    )
+                    stats_tracker.scalar(
+                        silent_group_fraction=float(silent.mean()),
+                        solved_group_fraction=float((silent * solved).mean()),
+                        unsolved_group_fraction=float((silent * unsolved).mean()),
+                        n_groups=float(n_groups),
+                    )
             else:
                 # A mismatch means the rows were regrouped somewhere between rollout and
                 # here. Emitting a wrong grouping is worse than emitting none: the router
