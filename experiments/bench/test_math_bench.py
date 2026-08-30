@@ -142,8 +142,83 @@ def test_load_rejects_missing_benchmark():
 def test_load_real_benchmark_schema():
     rows = load("aime24")
     assert len(rows) >= 29
-    assert all(set(r) == {"problem", "answer"} for r in rows)
+    # `idx` was added so a scored row traces back to its position in the source file,
+    # which is what the committed search/report split addresses.
+    assert all(set(r) == {"problem", "answer", "idx"} for r in rows)
     assert all(isinstance(r["answer"], str) for r in rows)
+    assert [r["idx"] for r in rows] == list(range(len(rows))), "idx must be file order"
+
+
+def test_split_halves_are_disjoint_and_cover_the_benchmark():
+    """A split that overlapped would let a problem be searched on and reported on."""
+    allp = load("math500", "all")
+    si = {r["idx"] for r in load("math500", "search")}
+    ri = {r["idx"] for r in load("math500", "report")}
+    assert len(allp) == 500 and len(si) == 250 and len(ri) == 250
+    assert not (si & ri), "halves overlap"
+    assert si | ri == {r["idx"] for r in allp}, "halves do not cover the benchmark"
+
+
+def test_split_is_stable_across_calls():
+    """Re-rolling the split per run would let a half be chosen to flatter the method."""
+    a = [r["idx"] for r in load("math500", "search")]
+    b = [r["idx"] for r in load("math500", "search")]
+    assert a == b
+
+
+def test_split_refuses_when_the_dataset_checksum_moves():
+    """Indices address rows by position, so a changed file silently rescopes the split."""
+    import json as _json
+    import math_bench
+    sf = Path(math_bench.__file__).resolve().parent / "math500_split.json"
+    orig = sf.read_text()
+    d = _json.loads(orig)
+    d["dataset_md5"] = "0" * 32
+    sf.write_text(_json.dumps(d))
+    try:
+        with pytest.raises(ValueError, match="md5"):
+            load("math500", "search")
+    finally:
+        sf.write_text(orig)
+    assert len(load("math500", "search")) == 250
+
+
+def test_unknown_split_name_is_rejected():
+    with pytest.raises(ValueError):
+        load("math500", "trainish")
+
+
+def test_split_identity_is_pinned_not_merely_structural():
+    """Size, disjointness and coverage ALL survive exchanging the two halves.
+
+    A mutation test showed exactly that: swapping search and report, and inverting the
+    filter, both passed every structural check. Every number would then have been computed
+    on the wrong half with nothing to notice. So the halves are pinned by content.
+    """
+    search = [r["idx"] for r in load("math500", "search")]
+    report = [r["idx"] for r in load("math500", "report")]
+    assert search[:8] == [3, 4, 5, 7, 8, 10, 13, 14]
+    assert report[:8] == [0, 1, 2, 6, 9, 11, 12, 15]
+    assert sum(search) == 63286 and sum(report) == 61464
+    assert 3 in search and 3 not in report
+    assert 0 in report and 0 not in search
+
+
+def test_missing_split_file_refuses_rather_than_scoring_everything():
+    """Absent the file, silently scoring all 500 would report a search-set number as held out."""
+    import math_bench
+    sf = Path(math_bench.__file__).resolve().parent / "math500_split.json"
+    orig = sf.read_text()
+    sf.unlink()
+    try:
+        # Match the MESSAGE, not just the type: without the explicit guard, read_text()
+        # raises the same FileNotFoundError, so a type-only assertion passes with the
+        # guard deleted and the explanation of why splits are committed silently lost.
+        with pytest.raises(FileNotFoundError, match="committed"):
+            load("math500", "search")
+    finally:
+        sf.write_text(orig)
+    assert len(load("math500", "search")) == 250
 
 
 # -------------------------------------------------------------- run_bench, end to end

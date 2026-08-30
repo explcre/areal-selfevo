@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import math
 import re
@@ -56,7 +57,7 @@ PROMPT = (
 )
 
 
-def load(bench: str) -> list[dict]:
+def load(bench: str, split: str = "all") -> list[dict]:
     """Load a benchmark's problems.
 
     Raises:
@@ -67,15 +68,51 @@ def load(bench: str) -> list[dict]:
     f = DATA / bench / "test.jsonl"
     if not f.exists():
         raise FileNotFoundError(f"{bench}: {f} not found")
-    rows = [json.loads(l) for l in f.open() if l.strip()]
+    raw = f.read_bytes()
+    rows = [json.loads(l) for l in raw.decode().splitlines() if l.strip()]
+    keep = _split_indices(bench, split, raw)
     out = []
     for i, r in enumerate(rows):
         if "problem" not in r or "answer" not in r:
             raise ValueError(f"{bench} row {i}: expected problem/answer, got {sorted(r)}")
-        out.append({"problem": r["problem"], "answer": str(r["answer"])})
+        if keep is not None and i not in keep:
+            continue
+        out.append({"problem": r["problem"], "answer": str(r["answer"]), "idx": i})
     if not out:
         raise ValueError(f"{bench}: no problems loaded")
     return out
+
+
+def _split_indices(bench: str, split: str, raw: bytes) -> set[int] | None:
+    """Indices to keep for `split`, or None for the whole benchmark.
+
+    Searching and reporting on the same task set overstates a method`s gain (arXiv
+    2607.12227), so evolution claims must search on one half and report on the other.
+
+    The split addresses problems BY INDEX, so it is only meaningful against the exact file
+    it was built from. The checksum is therefore verified on every load and a mismatch is
+    fatal: silently scoring a different 250 problems would be undetectable in the output.
+    """
+    if split == "all":
+        return None
+    sf = Path(__file__).resolve().parent / f"{bench}_split.json"
+    if not sf.exists():
+        raise FileNotFoundError(
+            f"--split {split} requested but {sf.name} does not exist. Splits are committed, "
+            f"not generated per run: regenerating one lets a half be re-rolled until it "
+            f"flatters the method. Create it once with make_split.py --write."
+        )
+    d = json.loads(sf.read_text())
+    if split not in d:
+        raise ValueError(f"{sf.name} has no '{split}' half; keys are {sorted(d)}")
+    actual = hashlib.md5(raw).hexdigest()
+    if actual != d["dataset_md5"]:
+        raise ValueError(
+            f"{bench}: dataset md5 is {actual} but {sf.name} was built against "
+            f"{d['dataset_md5']}. The split addresses rows by index, so these indices now "
+            f"identify different problems. Refusing to score."
+        )
+    return set(d[split])
 
 
 _BOXED = re.compile(r"\\boxed\{")
@@ -207,7 +244,7 @@ async def generate(session, url: str, model: str, prompt: str, args) -> dict:
 async def run_bench(bench: str, args, gen_fh=None) -> dict:
     import aiohttp
 
-    probs = load(bench)
+    probs = load(bench, getattr(args, "split", "all"))
     if args.limit:
         probs = probs[: args.limit]
     url = args.base_url.rstrip("/") + "/chat/completions"
@@ -269,6 +306,9 @@ def main() -> None:
     ap.add_argument("--model", default="evalmodel")
     ap.add_argument("--benchmarks", default=",".join(SUITE))
     ap.add_argument("--limit", type=int, default=0, help="problems per benchmark, 0 = all")
+    ap.add_argument("--split", default="all", choices=["all", "search", "report"],
+                    help="committed half to score; 'all' is the whole benchmark. Evolution "
+                         "claims must search on one half and report on the other.")
     ap.add_argument("--n", type=int, default=1, help="samples per problem")
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--top-p", type=float, default=1.0)
