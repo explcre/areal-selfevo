@@ -86,6 +86,10 @@ def shared_prefix_lengths(
 ) -> torch.Tensor:
     """Length of the longest common prefix of generated tokens within each group.
 
+    Measured in GENERATED-TOKEN RANK, not column index: the members agree on their
+    first ``k`` generated tokens, wherever those sit in the padded row. This is the
+    coordinate system ``rl_dead_mask`` indexes with, and the two disagreed before.
+
     Only *generated* positions count. The prompt is shared by construction and is masked
     out of the loss anyway, so including it would inflate every prefix and make the gate
     look far more useful than it is.
@@ -123,14 +127,24 @@ def shared_prefix_lengths(
             continue
         member_tokens = tokens[rows]
         member_gen = gen_mask[rows].bool()
-        # Compare only where every member still has a generated token.
-        all_gen = member_gen.all(dim=0)
-        agree = (member_tokens == member_tokens[0]).all(dim=0) & all_gen
-        # Longest run of agreement starting at the first generated position.
-        first_gen = int(all_gen.float().argmax().item()) if all_gen.any() else 0
+        # Compare the k-th GENERATED token of each member, not the k-th column.
+        #
+        # The previous version counted consecutive columns from the first column where every
+        # member generates, while rl_dead_mask indexes by gen_rank (rank within the row).
+        # Those coincide only when all members start generating at the same column with a
+        # contiguous mask. When they do not -- different prompt lengths, or a multi-turn mask
+        # with tool results interleaved -- the count was applied in the wrong coordinate
+        # system: an audit case with row 0 generating at columns 2-4 and row 1 at 1-4 routed
+        # a token no other member emitted while leaving a genuinely shared one on RL.
+        #
+        # Rank space is also the correct reading of "shared prefix": the members agree on
+        # their first k generated tokens, wherever those sit in the padded row.
+        seqs = [member_tokens[i][member_gen[i]] for i in range(rows.numel())]
+        shortest = min(int(x.numel()) for x in seqs)
         length = 0
-        for t in range(first_gen, tokens.shape[1]):
-            if not agree[t]:
+        for k in range(shortest):
+            first = seqs[0][k]
+            if not all(bool(x[k] == first) for x in seqs[1:]):
                 break
             length += 1
         out[rows] = length
