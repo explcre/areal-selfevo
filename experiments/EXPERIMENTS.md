@@ -1356,3 +1356,48 @@ after a higher-budget rerun, not this one.
 **Reading across the three scales**, and this is what makes the benchmark usable: base 1.5B
 0.188, Ornith-35B-A3B 0.716. Both ends are far from the ceiling and far from the floor, which
 is the property MATH-500 (0.966 at 27B) and AIME (0.000 at 1.5B) each lack at one end.
+
+---
+
+## The routing rule requires adv_norm.mean_level=group, and raw GRPO is not enough
+
+The token-level rule needs `sum_i A_i = 0` within each GRPO group. An audit measured that
+the repo's live setting breaks it; this measures every available setting to find one that
+does not. Two groups of two with UNEQUAL generation lengths -- the case that breaks
+token-weighted centring -- run through AReaL's own `Normalization`:
+
+| mean_level | std_level | max per-group \|sum A_i\| |
+|------------|-----------|---------------------------|
+| (raw GRPO, no adv_norm) | -- | **2.0000** |
+| batch | batch / group / None | 0.8102 / 1.1379 / 1.2308 |
+| **group** | batch / group / None | **0.0000 / 0.0000 / 0.0000** |
+| None | batch / group / None | 1.3093 / 0.8944 / 2.0000 |
+
+**Only `mean_level=group` works, and it works exactly, at every `std_level`.** That is a
+supported AReaL setting, not a hack, so the rule has a valid configuration to run in.
+
+**The result that matters more: raw GRPO does NOT satisfy the precondition.** With
+`adv_norm` disabled entirely the group sum is 2.0000, not 0. GRPO centres the per-sequence
+REWARD, which gives `sum_i A_i = 0` counted per sequence; the prefix-cancellation argument
+needs it counted per TOKEN, and those differ whenever members generate different numbers of
+tokens -- which is always. The rule was therefore never valid under the plain recipe, and
+the framing "GRPO advantages sum to zero, so shared prefixes are dead" is wrong as stated
+for any real batch.
+
+Restated correctly: shared-prefix tokens are RL-dead when the advantages sum to zero **in
+the token-weighted sense**, which requires group-level mean normalisation. Anything else --
+batch normalisation, or none at all -- leaves a live gradient there.
+
+**Consequences.**
+
+* Any run that enables token routing must set `actor.adv_norm.mean_level=group`. The guards
+  already refuse otherwise, so this cannot be forgotten silently.
+* That is itself a deviation from the demo recipe and must be measured, not assumed
+  harmless: a `mean_level=group` arm with routing OFF is the control the routed arm needs.
+  Without it, any gain would be attributable to the normalisation change rather than to
+  routing.
+* `kl_ctl` must also be 0. It was measured to break the sum independently by 14-43%, and
+  the reference default is 0.0 -- our 0.01 was our own addition.
+
+The cheapest useful next run is therefore three arms, not two: demo baseline,
+`mean_level=group` with routing off, and `mean_level=group` with routing on.
