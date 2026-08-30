@@ -1138,3 +1138,49 @@ confound the comparison, but the methods text must not say "greedy, temperature 
 it. (b) **No replicate of this sweep exists**, so the series carries no run-to-run error
 bar -- and the harness's own docstring notes that error dominates problem-sampling error.
 The two inversions above are exactly the size that a replicate would settle.
+
+---
+
+## The in-training evaluator deadlocks the run -- and it was our addition, not the reference's
+
+step0g hung at step 59/290 with every process alive, 37 GB held on GPUs 0-3 and 68 GB on
+4-7, and **0% utilisation on all eight**. Not a crash: a deadlock. `py-spy dump` on the
+trainer names the exact site:
+
+    wait            (threading.py:359)
+    wait_results    (areal/infra/workflow_executor.py:615)
+    wait            (areal/infra/controller/rollout_controller.py:996)
+    _evaluate_fn    (areal/trainer/rl_trainer.py:1447)
+    evaluate        (areal/utils/evaluator.py:62)
+    _evaluate       (areal/trainer/rl_trainer.py:1505)
+    train           (areal/trainer/rl_trainer.py:931)
+
+The main thread is blocked inside **evaluation**, waiting on rollouts that never arrive.
+The log agrees: `openai.APITimeoutError`, `httpx.ReadTimeout` and `ProxyRolloutServer
+WARNING: Removing stale session` each suppressed 2000x by the logfilter.
+
+**The evaluator is ours.** The reference `gsm8k_grpo.yaml` sets `evaluator.freq_steps:
+null`. step0e, step0f and step0g each add `evaluator.freq_steps=20`, and the script header
+justifies it as *"one addition, which changes measurement and not training."* That
+statement is false. It changes training by hanging it.
+
+This retro-explains the whole run of failures. step0e and step0f were previously recorded
+as "killed abruptly, cause not in the logs" -- both stopped mid-line with no traceback,
+which reads as SIGKILL. The more likely account now is that they hit the same deadlock and
+their watchdogs killed them, truncating the log mid-write exactly as observed. Three
+consecutive runs died and the only thing all three shared that the reference lacks is the
+evaluator. Recorded as the leading explanation, not as proven: no py-spy dump was taken
+while step0e or step0f was hung, and that evidence is gone.
+
+**The fix is not to make the evaluator work.** Its signal is GSM8K eval reward -- the exact
+quantity measured above to be directionless and mis-ordering with respect to held-out
+capability. Repairing it would buy a signal already shown to be useless. step0h therefore
+restores the reference default (`evaluator.freq_steps: null`) and keeps
+`saver.freq_steps=25`, so progress is measured the way the sweep measures it: checkpoints
+scored offline on held-out MATH-500, on GPUs the trainer is not using.
+
+**A second-order lesson.** The watchdog was doing its job -- it had recorded
+`progress=59 prev=57 strikes=1` and would have killed the run within the hour. What it
+could not do is say *why*, and without a cause the obvious response is to relaunch, which
+would have deadlocked again. A stall watchdog needs a stack dump on strike 1, not just a
+kill on strike N.

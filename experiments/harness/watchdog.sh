@@ -26,6 +26,33 @@ shift 2
 LOGS=("$@")
 STRIKES="${STRIKES:-2}"
 
+# A kill without a cause invites an identical relaunch. step0g deadlocked in the evaluator
+# and the watchdog recorded only "no progress" -- the stack that named _evaluate had to be
+# taken by hand before the kill landed. Dump once, on the first strike, while the process
+# is still hung.
+DUMP_DIR="${DUMP_DIR:-$(dirname "$PGIDF")}"
+_dumped=0
+dump_stacks() {
+    [ "$_dumped" -eq 0 ] || return 0
+    command -v py-spy >/dev/null 2>&1 || return 0
+    local pg out
+    pg=$(cat "$PGIDF" 2>/dev/null) || return 0
+    out="$DUMP_DIR/stall_stacks_$(date +%s).txt"
+    # The trainer is the python process in the group with the largest RSS.
+    for p in $(pgrep -g "$pg" -f python 2>/dev/null | head -4); do
+        # py-spy needs ptrace rights this host does not grant unprivileged; without the
+        # sudo attempt the dump writes "Permission Denied" instead of a stack, which is a
+        # guard that looks armed and is not. Fall back to the plain call where sudo is
+        # available passwordless-less or unnecessary.
+        { echo "===== pid $p ====="
+          ( sudo -n env "PATH=$PATH" py-spy dump --pid "$p" 2>/dev/null \
+            || timeout 60 py-spy dump --pid "$p" 2>&1 ) | head -60
+        } >> "$out"
+    done
+    [ -s "$out" ] && echo "[watchdog] stall stacks written to $out"
+    _dumped=1
+}
+
 # Highest step counter across all logs. Quoting the pattern matters: unquoted, grep takes
 # the bracket expression as a second FILE operand, prefixes output with the filename and
 # returns a constant forever (audit D1). Only the tail of each log is scanned (D15).
@@ -63,7 +90,7 @@ while :; do
 
     if [ "$seen_one" = 1 ] && [ "$now" = "$last" ]; then
         strikes=$((strikes + 1))
-        echo "[watchdog] NO PROGRESS across $((strikes + 1)) samples ($(((strikes + 1) * STALL))s)"
+        dump_stacks; echo "[watchdog] NO PROGRESS across $((strikes + 1)) samples ($(((strikes + 1) * STALL))s)"
         if [ "$strikes" -ge "$STRIKES" ]; then
             echo "[watchdog] STALLED at ${now}; killing PGID $pgid"
             kill -TERM "-$pgid" 2>/dev/null
