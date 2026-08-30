@@ -258,7 +258,12 @@ async def run_bench(bench: str, args, gen_fh=None) -> dict:
             boxed = extract_boxed(r["text"])
             correct = grade(r["text"], p["answer"]) if r["status"] == "ok" else None
             return {
-                "benchmark": bench, "idx": idx, "sample": k,
+                # p["idx"] is the row's position in the SOURCE FILE; `idx` is only its
+                # position in this (possibly split-filtered) run. Writing the latter made
+                # a --split report run emit 0..249 while a full run emitted 0..499, so a
+                # paired comparison silently matched different problems to each other and
+                # reported a confident, meaningless gap.
+                "benchmark": bench, "idx": p["idx"], "run_pos": idx, "sample": k,
                 "gold": p["answer"], "boxed": boxed,
                 "finish_reason": r["finish_reason"], "status": r["status"],
                 "correct": correct, "text": r["text"],

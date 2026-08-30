@@ -39,10 +39,19 @@ if [ "${#CKPTS[@]}" -eq 0 ]; then
   echo "NO CHECKPOINTS under $CKPT_ROOT -- refusing to run a base-only sweep"; exit 1
 fi
 
+# CKPT_STEPS restricts the series to given global steps, comma-separated. Needed for a
+# PAIRED comparison against another run: only steps present in BOTH runs can be compared,
+# and scoring the union would silently mix paired and unpaired points in one table.
+WANT="${CKPT_STEPS:-}"
 JOBS=("base:$BASE")
 for d in "${CKPTS[@]}"; do
-  JOBS+=("gs$(printf '%03d' "$(basename "$d" | sed 's/.*globalstep//')"):$d")
+  n=$(basename "$d" | sed 's/.*globalstep//')
+  if [ -n "$WANT" ] && ! echo ",$WANT," | grep -q ",$n,"; then continue; fi
+  JOBS+=("gs$(printf '%03d' "$n"):$d")
 done
+if [ -n "$WANT" ] && [ "${#JOBS[@]}" -eq 1 ]; then
+  echo "CKPT_STEPS=$WANT matched no checkpoint under $CKPT_ROOT"; exit 1
+fi
 
 if [ -n "${LIST:-}" ]; then
   echo "CKPT_ROOT=$CKPT_ROOT"
@@ -57,7 +66,7 @@ if [ "${#JOBS[@]}" -gt "$NGPU" ]; then
 fi
 
 mkdir -p "$SUITE"
-echo "sweep -> $SUITE  (limit=$LIMIT, root=$CKPT_ROOT)"
+echo "sweep -> $SUITE  (limit=$LIMIT, split=${SPLIT:-all}, root=$CKPT_ROOT)"
 gpu=0
 for j in "${JOBS[@]}"; do
   tag="${j%%:*}"; model="${j#*:}"
@@ -67,6 +76,7 @@ for j in "${JOBS[@]}"; do
   fi
   port=$((8410 + gpu))
   ( BENCHES=math500 MAXTOK="${MAXTOK:-8192}" CONC=48 LIMIT="$LIMIT" MEMFRAC=0.82 \
+    SPLIT="${SPLIT:-all}" \
     timeout "${JOB_TIMEOUT:-5400}" bash "$RUN" "$model" "sweep_$STAMP/$tag" "$gpu" "$port" \
       > "$SUITE/$tag.log" 2>&1
     echo "$? $tag" >> "$SUITE/exit_codes.txt" ) &

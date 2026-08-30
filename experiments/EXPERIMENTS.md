@@ -1184,3 +1184,58 @@ scored offline on held-out MATH-500, on GPUs the trainer is not using.
 could not do is say *why*, and without a cause the obvious response is to relaunch, which
 would have deadlocked again. A stall watchdog needs a stack dump on strike 1, not just a
 kill on strike N.
+
+---
+
+## The scaffolding recipe preserves held-out capability; the demo recipe destroys it
+
+First paired A/B on a committed held-out half. Both runs train Qwen2.5-1.5B-Instruct with
+GRPO on GSM8K and differ only in optimisation aggressiveness: step0d uses AReaL's demo
+values (lr 6e-6, eps_clip 0.4), step0h uses AReaL's own scaffolding values (lr 1e-6,
+eps_clip 0.2). Scored on the `report` half of MATH-500 (250 problems), at the five global
+steps present in BOTH runs, with paired McNemar.
+
+| step | demo (lr 6e-6, clip 0.4) | scaffold (lr 1e-6, clip 0.2) | diff | McNemar p |
+|------|--------------------------|------------------------------|--------|-----------|
+| base | 0.532                    | 0.540                        | --     | --        |
+| 28   | 0.468                    | 0.540                        | +0.072 | 2.8e-02   |
+| 57   | 0.440                    | 0.536                        | +0.096 | 5.3e-03   |
+| 86   | 0.484                    | 0.524                        | +0.040 | 1.9e-01   |
+| 115  | 0.380                    | 0.568                        | +0.188 | 1.2e-08   |
+| 144  | 0.356                    | 0.556                        | +0.200 | 1.2e-08   |
+
+Scaffold is higher at 5/5 steps, significantly at 4/5, and the gap widens with training.
+
+**The claim is preservation, not improvement.** Scaffold moves 0.540 -> 0.556 across 144
+steps, which is +0.016 and inside the noise established below. The honest statement is that
+144 steps of the scaffolding recipe leave held-out capability where it started, while the
+same number of steps of the demo recipe cost 0.176. RL here is not yet buying capability on
+this benchmark; it is a question of whether it destroys it.
+
+**A replicate, finally, and it was free.** The base model appears in both sweeps -- same
+checkpoint, same 250 problems, two independent runs. It scores 0.5320 and 0.5400, so
+run-to-run noise is 0.0080, and the step-115/144 effect is 24x that. Per-PROBLEM the picture
+is noisier: 34 of 250 problems (13.6%) flip between the two identical runs, from batching
+nondeterminism at temperature 0. Those flips are symmetric, so they inflate both McNemar
+discordant cells roughly equally and make the test conservative rather than optimistic --
+but any future claim resting on a handful of problems must account for them.
+
+**A wrong table was published to the session before this one, and this is how it happened.**
+`math_bench.py` wrote each generation's `idx` as its position in the CURRENT run rather than
+its row in the source file. A full run therefore emitted 0..499 and a `--split report` run
+emitted 0..249, so the paired comparison matched step0d's problem k against step0h's problem
+k where those are different problems. It produced a confident, plausible table
+(mean 0.426 vs 0.550, 5/5 wins) that was meaningless. It was caught only because a sanity
+check on the shared base model reported 129 paired problems where 250 were expected, and
+44.2% of them disagreeing -- a per-problem flip rate far too high for one model against
+itself.
+
+Fixed at the writer (`idx` is now the source row, `run_pos` the position within the run) and
+the existing artifacts were remapped, with the remap ASSERTED rather than assumed: for every
+row the gold answer at the remapped index had to equal the gold recorded in the artifact,
+and the file was to be left untouched on a single mismatch. All 1500 rows matched.
+
+The corrected numbers happen to tell the same story as the wrong ones, which is the
+uncomfortable part: a broken pairing produced a table close enough to the truth that nothing
+in it looked wrong. The check that caught it was not the result's plausibility but an
+invariant that had to hold regardless of the result.
