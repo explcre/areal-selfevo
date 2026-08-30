@@ -1490,3 +1490,44 @@ group-silence channel, where whole unanimous groups contribute zero gradient rat
 of tokens), or supply a teacher so routed tokens gain a signal instead of merely losing one.
 The present arm deletes 19.5% of gradient norm and adds nothing back, which is a
 gradient-deletion ablation, not the method.
+
+---
+
+## 57% of groups are RL-silent -- 34x the token-level channel
+
+Measured live on step0l, 64 groups per batch:
+
+    silent_group_fraction   = 0.574
+    n_groups                = 64
+
+**More than half of every batch contributes exactly zero gradient.** A group whose members
+all score alike has every advantage identically zero, so the entire group -- all eight
+sequences, every token -- is RL-dead. Against the token-level shared-prefix rule's 1.7%,
+this channel is **34 times larger**.
+
+That reframes where the method's leverage is. The token tier was measured to have no
+detectable effect on held-out capability, and the 1.7% reach explains why: an intervention on
+1.7% of the gradient cannot move a benchmark. A 57% channel can.
+
+**It also explains the negative result without appealing to noise.** Nothing was wrong with
+the token rule; it was simply operating on the wrong tier.
+
+**A bug in the accompanying split, found and fixed.** The metric also reported
+`solved_group_fraction = 0.000` and `unsolved_group_fraction = 0.574` -- 0% solved at a
+measured 82% solve rate, which is impossible. Cause: the split thresholded `reward_score`,
+which by that point has had bias, scaling, clipping AND reward_norm applied, so a 0.5
+threshold classifies nothing. It now uses the raw `data["rewards"]` captured before any
+transformation. The runs in flight carry the old code, so their solved/unsolved numbers
+should be ignored; `silent_group_fraction` is unaffected because it is computed from the
+advantages being zero, which is correct either way.
+
+**Why the split matters and is not bookkeeping.** The two silent regimes need OPPOSITE
+responses, and their sum hides that:
+
+* silent because SOLVED (p_hat = 1): the model already answers it. Spend less compute here;
+  adding SFT would sharpen an already-correct policy and burn entropy for nothing.
+* silent because UNSOLVED (p_hat = 0): the model cannot answer it. RL has nothing to push
+  on, but a teacher would -- this is precisely the case distillation exists for.
+
+Until the fixed metric runs, we know 57% of groups are silent but not how that splits. That
+number decides which signal the 57% should be routed to, and it is the next measurement.

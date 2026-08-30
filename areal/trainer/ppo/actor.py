@@ -214,6 +214,10 @@ class PPOActor:
 
         # Reward Scaling
         reward_score = data["rewards"]
+        # Kept for the group-silence split below: by the time reward_score reaches
+        # it, bias, scaling, clipping and reward_norm have all been applied, so a
+        # 0.5 threshold on it classifies nothing meaningful.
+        raw_reward = data["rewards"].detach().float().clone()
         reward_score = (reward_score + self.reward_bias) * self.reward_scaling
         reward_score = torch.clip(
             reward_score, max=self.reward_clip, min=-self.reward_clip
@@ -382,8 +386,11 @@ class PPOActor:
                         [float(g.abs().max() < 1e-6) for g in per_group],
                         device=advantages.device,
                     )
-                    rw = reward_score.detach().float()
-                    per_group_r = rw.split(sizes)
+                    # RAW reward, not reward_score: solved/unsolved is a statement about
+                    # whether the model answered correctly, and only the untransformed
+                    # reward carries that. An earlier version thresholded the normalised
+                    # value and reported 0% solved at an 82% solve rate.
+                    per_group_r = raw_reward.split(sizes)
                     solved = torch.tensor(
                         [float(g.min() > 0.5) for g in per_group_r], device=advantages.device
                     )
