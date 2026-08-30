@@ -378,6 +378,14 @@ def main() -> None:
                   "cap and were graded as wrong; raise --max-tokens to test sensitivity",
                   file=sys.stderr)
 
+    # A benchmark that graded nothing is a FAILURE, not a score of nan. The warning above
+    # already said so, but main() returned None and was called bare, so the process exited
+    # 0 and every caller recorded success. A headroom sweep did exactly that: 1100 problems
+    # errored instantly because max_tokens equalled the model's context length, and the
+    # driver logged "0 qwen2.5-1.5b" as a clean run.
+    dead = [r for r in rows if r["n_graded"] == 0]
+    return 1 if dead else 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
