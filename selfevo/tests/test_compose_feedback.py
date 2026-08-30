@@ -398,13 +398,33 @@ def test_unknown_meta_critic_is_rejected():
     assert any(p.axes == ("meta_critic",) for p in problems)
 
 
-def test_meta_critic_stub_is_caught_like_any_other():
+def test_a_stub_component_is_caught_like_any_other():
+    """Retargeted 2026-08-30: outcome_calibrated is implemented, two_level is not.
+
+    The guard under test is that validate() refuses a config naming an unbuilt component,
+    so it has to point at something still unbuilt. Retargeted rather than deleted, because
+    deleting it would remove the only check that stubs are caught at all.
+    """
     problems = validate(
         PipelineConfig(meta_critic="outcome_calibrated", critic="two_level",
                        frozen_eval_reward=True)
     )
-    assert any(p.axes == ("meta_critic",) and "no implementation" in p.reason
+    assert any(p.axes == ("critic",) and "no implementation" in p.reason
                for p in problems), problems
+
+
+def test_implemented_meta_critic_is_no_longer_flagged_as_a_stub():
+    """The other half: once built, a component must stop being reported as missing.
+
+    Without this, wiring a factory and forgetting the registry entry would leave validate()
+    rejecting a config that is in fact runnable, and nothing would notice.
+    """
+    problems = validate(
+        PipelineConfig(meta_critic="outcome_calibrated", critic="scalar",
+                       frozen_eval_reward=True)
+    )
+    assert not any(p.axes == ("meta_critic",) and "no implementation" in p.reason
+                   for p in problems), problems
 
 
 # ------------------------------------------- cadence: two-timescale separation

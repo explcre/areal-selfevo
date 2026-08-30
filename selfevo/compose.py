@@ -75,9 +75,22 @@ CRITICS: frozenset[str] = frozenset({"none", "scalar", "two_level"})
 CADENCES: frozenset[str] = frozenset({"frozen", "alternating", "simultaneous"})
 
 META_CRITICS: frozenset[str] = frozenset({"none", "outcome_calibrated"})
+def _outcome_calibrated_meta_critic(**kw: object) -> object:
+    """Factory for :class:`selfevo.meta_critics.OutcomeCalibratedMetaCritic`.
+
+    Imported lazily for the same reason as the critic factories: `compose` must stay
+    importable for configuration validation without dragging in the routing criteria.
+    """
+    from .meta_critics import OutcomeCalibratedMetaCritic
+
+    return OutcomeCalibratedMetaCritic(**kw)  # type: ignore[arg-type]
+
+
 META_CRITIC_FACTORIES: dict[str, Callable[..., object] | None] = {
     "none": None,
-    "outcome_calibrated": None,  # not implemented
+    # IMPLEMENTED: judges a critic by whether its ordering beats chance, which is the only
+    # statistic that separates an uninformative critic from an actively inverted one.
+    "outcome_calibrated": _outcome_calibrated_meta_critic,
 }
 def _scalar_critic(**kw: object) -> object:
     """Factory for :class:`selfevo.critics.ScalarCritic`.
