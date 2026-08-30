@@ -36,25 +36,35 @@ meta-controller, with a **validity condition** saying when each choice is legiti
 Legend: **DONE** built + tested + audited · **PARTIAL** exists but incomplete or unproven ·
 **NOT BUILT** declared only.
 
+**Scoreboard (2026-08-30, after the group-routing work).** Method **8 DONE / 2 PARTIAL /
+10 NOT BUILT**; Engineering **6 DONE / 2 PARTIAL**; Benchmarks **4 DONE / 1 PARTIAL /
+10 NOT BUILT**. So: **no, the goal is not implemented.** What IS complete is one vertical
+slice -- measure the silent channel, decompose it, act on it, verify end-to-end -- and that
+slice is the paper's spine. Most remaining NOT BUILT rows are breadth (other benchmarks,
+other axes), not depth on the central claim.
+
 ### Method
 
 | # | requirement | status | evidence / gap |
 |---|---|---|---|
 | M1 | Per-**token** routing | **DONE** | wired into `grpo_loss_fn`; 3 audits; measured reach **1.7%** |
-| M2 | Per-**cluster** routing | **PARTIAL** | `ClusterRouter` built + audited, but makes **0 decisions** `SolveRateRouter` doesn't, and `route_batch` has no caller |
+| M2 | Per-**cluster** routing | **PARTIAL** | `ClusterRouter` built + audited; `route_batch` still has no caller. MEDS layer-logit key not wired |
 | M3 | Per-**sample** routing | **DONE** | `SolveRateRouter`, registered |
 | M4 | Per-**task** routing | **NOT BUILT** | and it is SIA's, so low value |
 | M5 | RL/reverse-KL mix per token | **DONE** | extends AReaL's own `rl_loss_weight`/`distill_loss_weight` |
-| M6 | SFT / forward-KL modes | **PARTIAL** | registered as names; only RL↔reverse-KL reaches the loss |
-| M7 | **Teacher** supplying routed units | **NOT BUILT** | ← blocks the whole claim; without it routing only *deletes* gradient |
+| M6 | SFT / forward-KL modes | **PARTIAL** | SFT now REACHES the update for solved groups (a constant on their zero advantages IS the supervised step). Forward-KL still a name |
+| M7 | **Teacher** supplying routed units | **NOT BUILT** | DEMOTED by measurement: reaches only ~4.5% of groups. The free self-target covers 31.4% and is built |
 | M8 | Learned meta-controller | **NOT BUILT** | `EVOLVE_POLICIES` = bare strings |
 | M9 | Rule evolve-policy (cold start + baseline) | **NOT BUILT** | needed before "learned" is falsifiable |
-| M10 | Evolve model / harness / reward | **NOT BUILT** | `EVOLVE_TARGETS` = bare strings |
+| M10 | Evolve model / harness / reward | **PARTIAL** | `HarnessAction` axis built, audited, 18/18 mutants. **No consumer**: nothing writes `can_evolve_harness`, nothing reads the action. Reward axis still a name |
 | M11 | Cadence: frozen / alternating / simultaneous | **NOT BUILT** | `CADENCES` = bare strings |
 | M12 | Evolvable reward formula | **NOT BUILT** | |
 | M13 | MEDS reward shaping | **NOT BUILT** | `SHAPERS = {"none": None}` |
 | M14 | BigBang two-level critic | **NOT BUILT** | `"two_level": None` |
 | M15 | Trajectory observability → policy inputs | **NOT BUILT** | |
+| M18 | Per-**group** routing (the silent channel) | **DONE** | in `_compute_advantages`; 17 tests on the REAL path, 7/7 mutants; verified firing live (`routed == solved`, diff 0.00e+00) |
+| M19 | Free self-target (RFT on solved groups) | **DONE** | `solved_advantage`; needs no teacher; reach 31.4% and RISING to 60% |
+| M20 | Unlikelihood on unsolved groups | **DONE** | `unsolved_advantage`, sign-guarded; reach only ~3.7% at this operating point |
 | M16 | ScalarCritic | **DONE** | 30/30 mutants |
 | M17 | Outcome-calibrated meta-critic | **DONE** | 19/20, survivor equivalent |
 
@@ -67,7 +77,7 @@ Legend: **DONE** built + tested + audited · **PARTIAL** exists but incomplete o
 | E3 | Subagent audit per feature | **DONE** — 4 audits, all findings fixed or recorded |
 | E4 | Mutation-test every guard | **DONE** — routing 30/30, meta-critic 19/20, split 9/9, packed 3/3, cluster 9 regressions added |
 | E5 | Clean, organised, extendable | **PARTIAL** — good in `selfevo/`; `experiments/` has accumulated one-offs |
-| E6 | Both boxes busy | **PARTIAL** — repeatedly idle; now structurally fixed with long training jobs |
+| E6 | Both boxes busy | **DONE** — supervisor watches LOG GROWTH, not utilization; a dead run held 4 GPUs at 100% for 46 min undetected before this |
 | E7 | Save progress promptly | **DONE** — HF verified 288 artifacts + 67.75 GB checkpoints |
 | E8 | Per-server branches | **DONE** — `selfevo/a100`, `selfevo/h200` |
 

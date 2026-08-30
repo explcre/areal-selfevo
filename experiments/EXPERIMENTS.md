@@ -1679,3 +1679,95 @@ pattern the demo-vs-scaffold comparison already caught once.
 split is a property of that operating point; a harder task moves mass to the unsolved branch
 where no free target exists. A positive result here does NOT transfer to the frontier tier
 without re-measuring the split there.
+
+---
+
+## The silent channel GROWS as training proceeds -- on both arms, so it is not our doing
+
+Both live runs, same 1.5B model and config, differing only in `group_routing`:
+
+| run | arm | batches | silent (mean / last) | solved (mean / last) | unsolved (mean / last) |
+|---|---|---|---|---|---|
+| step0l (A100)    | OFF | 87 | 0.518 / 0.609 | 0.481 / 0.598 | 0.037 / 0.012 |
+| step0m-on (H200) | ON  | 45 | -- / --       | 0.450 / 0.602 | 0.037 / 0.020 |
+
+**The solved fraction rises from ~0.27 to ~0.60 within 60-90 batches on the OFF arm.** That
+matters more than the level. As the policy improves, more groups become unanimous, so a
+larger share of every batch has identically-zero advantages. GRPO's *effective* batch shrinks
+as the model gets better.
+
+**Checked before claiming it.** The obvious alternative explanation was that self-SFT on
+solved groups sharpens the policy and manufactures its own unanimity -- a self-reinforcing
+loop that would look like progress and be an entropy-collapse warning instead. The OFF arm
+rules that out: it rises just as much with no routing at all. The growth is a property of RL
+training, not of the intervention.
+
+**Why this is the motivation rather than a curiosity.** The channel the method acts on is
+*largest exactly where RL is weakest*, and it widens over a run. Extrapolated to the regime
+frontier models occupy -- high solve rates -- vanilla GRPO spends most of its batch computing
+zeros. That is the opposite of the usual trick, which helps most on weak models and washes
+out at scale.
+
+**One difference NOT to read as a result.** At comparable batch index the ON arm sits higher
+than the OFF arm (~0.60 vs ~0.49 at batch 45). That is confounded -- different box, different
+data order, different step count -- and the matched OFF arm on the same H200 is the run that
+settles it. Recorded as a hypothesis to test, not a finding.
+
+**What still decides the paper.** Composition, not size. Here the channel is solved-dominated
+(87.5%), where targets are free. On a harder training set the same channel would be
+unsolved-dominated, where no target exists without a teacher or a harness. A router that keys
+on the SIDE of silence adapts automatically across that shift; that claim is untested and is
+the next experiment worth designing.
+
+---
+
+## The right baseline is DAPO, and its cost on our own measurements is 1.5x-2.4x and rising
+
+**DAPO acts on exactly the set this method acts on.** Its dynamic sampling keeps a prompt
+only when the group's reward standard deviation is positive (verl,
+`recipe/dapo` / `meds_ray_trainer.py`):
+
+    kept_prompt_uids = [uid for uid, std in prompt_uid2metric_std.items()
+                        if std > 0 or len(prompt_uid2metric_vals[uid]) == 1]
+
+`std == 0` is unanimity, which is precisely the zero-advantage condition. So DAPO *detects*
+the silent channel and **discards** it, oversampling until the batch refills. We *reuse* it.
+Same phenomenon, opposite response -- which makes DAPO the baseline the claim must be
+measured against, not a related method to cite.
+
+**Its cost, computed from our own silent fractions on the control arm (98 batches):**
+
+| point in run | silent fraction s | groups DAPO must generate per accepted group, 1/(1-s) |
+|---|---|---|
+| first 10 batches | 0.327 | **1.49x** |
+| whole run so far | 0.525 | **2.10x** |
+| last 10 batches  | 0.583 | **2.40x** |
+| max observed     | 0.633 | **2.72x** |
+
+Ours is **1.00x at every point**. Late in the run DAPO pays ~140 extra generations per 100
+accepted groups.
+
+**And the gap widens with training,** because the silent fraction grows as the policy
+improves (0.33 -> 0.58 within 98 batches, measured on the arm with no routing at all, so the
+growth is not our doing). A method whose overhead *increases* as the model gets better is
+exactly the wrong shape for the frontier regime, where solve rates are high.
+
+**Stated as a prediction, not a result.** 1/(1-s) is the expectation under the assumption
+that regenerated groups are unanimous at the same rate. That assumption is testable and the
+instrumentation for it already exists -- AReaL emits `rollout/accepted` and
+`rollout/rejected` -- so the DAPO arm will measure the true multiplier rather than inherit
+this estimate. If regenerated groups are *less* unanimous the real cost is lower, and this
+table is an upper bound; if the sampler is biased toward the same easy prompts it is a lower
+bound. Recorded before running so the number cannot be chosen afterwards.
+
+**The comparison axis is matched compute, not matched steps.** DAPO's kept batch is all
+informative, so per-step its gradient is denser; ours trains on the informative groups
+normally and additionally converts the silent ones. Comparing at equal step counts would
+flatter whichever arm sees more tokens. Equal generation budget is the honest axis, and it
+is the axis on which the 1.49-2.40x matters.
+
+**Implementation.** `selfevo/baselines/dapo.py` implements the rule against verl's own code,
+using population standard deviation to match `np.std` and keeping the singleton carve-out.
+It plugs into AReaL's existing `should_accept_fn` hook -- AReaL already ships `dynamic_bs`
+and a DAPO config, but NOT the dynamic-sampling criterion itself, so the hook was there with
+nothing in it. Default `dynamic_filter_fn=None` leaves upstream behaviour untouched.
