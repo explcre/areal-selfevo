@@ -65,6 +65,7 @@ wiring step is what turns six PARTIAL rows into a running experiment.
 | M13 | MEDS clustering | **PARTIAL** | `_cluster_with_hdbscan` + `_classify_with_knn` vendored VERBATIM; verified to recover 2 modes. Deps not installed on training boxes; not yet a controller feature |
 | M14 | BigBang two-level critic | **NOT BUILT** | `"two_level": None` |
 | M15 | Trajectory observability → policy inputs | **PARTIAL** | `observability.py`, 7 features at zero extra compute, 27/29 mutants (2 equivalent). **No caller in training** |
+| M23 | **LLM-as-router**: an LLM reads a unit's rollouts (failure modes, solve rate, observability metrics) and decides evolve-model vs evolve-harness | **NOT BUILT** | See the positioning note below -- the idea is a combination of existing lines, so the contribution has to be the comparison, not the idea |
 | M21 | Code-as-policy (`learned_code`) | **DONE** | AST allowlist + subprocess cost-vetting; ~150 adversarial policies, 26/26 mutants. 2 escape families documented as unclosable by any AST rule |
 | M22 | Decision→advantage seam | **PARTIAL** | `group_apply.py` built; actor still hardcodes the rule, so routers decide nothing in training |
 | M18 | Per-**group** routing (the silent channel) | **DONE** | in `_compute_advantages`; 17 tests on the REAL path, 7/7 mutants; verified firing live (`routed == solved`, diff 0.00e+00) |
@@ -114,6 +115,46 @@ averaged; Terminal-Bench 2.1 via Harbor/Terminus-2 with `parser=json`, `temperat
 `top_p=1.0`, 128K context, 4h timeout / 32 CPU / 48 GB; DeepSWE via the Claude Code harness
 at `temperature=1.0`, `top_p=0.95`, 256K context. Five-run averaging matters — our own
 measured noise floor is 0.008-0.027 depending on the benchmark.
+
+### Note on M23 (LLM-as-router): what would and would not be novel
+
+Asked directly: is an LLM that analyses rollouts and decides "evolve the harness or the
+model" innovative, or already done? Honestly, **the pieces are all published and the
+combination is not obviously claimed**, so the novelty cannot rest on the idea.
+
+Already owned by prior work:
+
+* **LLM reads its own failures and proposes a fix** -- Reflexion / Self-Refine, and the
+  large self-improvement literature. Reading trajectories to decide *something* is standard.
+* **LLM writes the policy as code** -- FunSearch, OPRO, ADAS. This is our `learned_code` arm.
+* **Which target to evolve, decided from outcomes** -- Co-Harness (success to model, failure
+  to harness) and EvoTrainer. They decide it with a FIXED RULE, not a language model.
+* **Clustering failure modes to act on them** -- MEDS, with HDBSCAN over layer logits rather
+  than an LLM.
+
+What is not obviously done is the specific composition: routing the **evolve-target axis**
+per unit, with an LLM reading the actual trajectories rather than a threshold reading one
+scalar. So M23 is worth building as a **fourth controller in the existing ablation** --
+rule / learned-weights / learned-code / **LLM** -- where what is defensible is the measured
+comparison at matched cost, not the mechanism.
+
+**Two reasons from our own measurements to be sceptical before spending on it:**
+
+1. **The credit-assignment problem does not go away.** We measured that a contextual
+   controller learns during cold start and then stops, because a converged policy produces
+   single-mode batches and a batch-level scalar over those carries no comparative
+   information. An LLM router faces exactly the same channel. It may make better *initial*
+   decisions from richer input; it does not get better *feedback*.
+2. **The cheap controllers must be beaten first.** The solved branch was measured inert, and
+   the noise floor on our benchmark is 0.02 systematic. An arm costing an LLM call per group
+   per batch has to clear that floor against a free threshold. If a threshold on
+   `truncated_fraction` captures most of the signal, the LLM is an expensive way to
+   rediscover it -- and the honest paper reports that.
+
+**Therefore the build order is: LLM router LAST**, after the free controllers have set the
+bar, and it is measured against the matched-proportion control like every other arm. Its
+best outcome is not "the LLM wins" but "here is what reading the trajectory buys over reading
+a scalar, priced".
 
 ### Models
 
