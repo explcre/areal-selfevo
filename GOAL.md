@@ -648,6 +648,36 @@ per round, attached to the action that produced them.
 So the auditor's verdicts can BE the credit signal for a model-versus-harness router. That is
 not a wish: it is our measured requirement met by a released mechanism.
 
+### STANDING RULE: every per-task config comes from a SOTA source, not from us
+
+Raised 2026-08-31 and adopted. For each task, the configuration should be taken FIRST from the
+strongest published result on that task and its repo, and only invented where no source exists.
+
+Why this is a rule and not a preference: we have twice set a value ourselves and been wrong in
+a way that invalidated measurements. Token caps calibrated on a 1.5B truncated 50% of MATH-500
+on a 30B. A `cap_limited` threshold chosen against 1.5B rates fired on rows where the right
+reading was not "edge case" but "measurement invalid". Both would have been avoided by reading
+the source first.
+
+Applied so far:
+
+| setting | value | source |
+|---|---|---|
+| eval max response length | **32768** | OpenRSI `run_openmle_rl_*.sh`, `--eval-max-response-len` default |
+| repeats per task | **3** | Terminal-Bench 2.1 leaderboard: pass@1 averaged over 3 repeats |
+| TB baseline harness | **Terminus 2** | the leaderboard's own harness; ships in harbor, import verified |
+| per-role caps | 16000 / 10000 / 8192 / 4096 | LongHorizon-Harness role configs |
+
+The LHH pattern is the more important import: caps are **per role**, not one global value,
+because a manager summarising state and an executor writing code have different length
+distributions. Our suite still uses one cap per benchmark, which is the same error one level up.
+
+**How to apply it going forward:** before running any new benchmark, find the strongest
+published number on it, open that work's repo, and copy the generation and protocol settings.
+Record the source in the config file itself, as
+`experiments/harness/tb21_baseline_terminus2.yaml` does. A config with no cited source is a
+config we will later discover was wrong.
+
 ### Generation caps, taken from THEIR configs rather than guessed (2026-08-31)
 
 Our per-task caps were measured on a 1.5B and are wrong for a reasoning model -- MATH-500

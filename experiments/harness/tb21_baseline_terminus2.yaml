@@ -1,0 +1,42 @@
+# Terminal-Bench 2.1 BASELINE arm (A) — official Terminus 2 harness, same model as arm B.
+#
+# Why Terminus 2 and not something hand-rolled: the Terminal-Bench 2.1 leaderboard runs
+# Terminus 2 in an e2b sandbox and reports pass@1 averaged over 3 repeats. Using it as the
+# baseline makes "LHH MEA loop vs the official harness" the comparison the leaderboard itself
+# implies, rather than a comparison against a scaffold we invented. It also ships inside
+# harbor (verified: harbor.agents.terminus_2.terminus_2:Terminus2 imports in harbor 0.18.0),
+# so no extra install.
+#
+# EVERYTHING except the agent must match arm B
+# (Scripts/tbench21_full_cua_harness_claudecode_qwen37_enable_thinking.yaml):
+#   n_attempts, n_concurrent_trials, retry, environment, model_name, and the endpoint the
+#   model is served from. If you change any of those, the swap no longer isolates the harness
+#   and the result cannot be interpreted.
+job_name: tb21-baseline-terminus2
+jobs_dir: jobs
+
+# Matches arm B and the published protocol: 3 repeats, averaged.
+n_attempts: 3
+
+n_concurrent_trials: 16
+
+retry:
+  max_retries: 3
+
+environment:
+  type: docker
+
+agents:
+  - import_path: harbor.agents.terminus_2.terminus_2:Terminus2
+
+    # MUST equal arm B's model_name. The whole experiment is that only the harness differs.
+    model_name: qwen3.7-plus
+
+    override_timeout_sec: 18000
+    override_setup_timeout_sec: 18000
+
+    env:
+      # Terminus 2 reaches the model through the same endpoint arm B uses. Point
+      # ANTHROPIC_BASE_URL at YOUR served model so both arms share one policy.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL}

@@ -29,6 +29,10 @@ TB_DIR="$LHH_DIR/eval/TB-harness"
 VENV="${TB_VENV:-$HOME/tb-env}"
 PY="${TB_PYTHON:-python3.12}"
 ARM="${ARM:-}"
+# Default to EVERY visible GPU. Only used under SERVE=1 (the harness itself talks to a remote
+# endpoint and uses no GPU), so defaulting wide is safe and matches an 8-GPU box out of the box.
+GPUS="${GPUS:-$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | paste -sd, -)}"
+GPUS="${GPUS:-0}"
 FAILED=0
 ok(){   printf '  \033[32mok\033[0m    %s\n' "$1"; }
 bad(){  printf '  \033[31mFAIL\033[0m  %s\n' "$1"; printf '        -> %s\n' "$2"; FAILED=$((FAILED+1)); }
@@ -83,10 +87,21 @@ fi
 
 # 4. Credentials. The shipped script exits 2 without BOTH of these: it drives Claude Code as
 #    the agent harness against an Anthropic-compatible endpoint.
-[ -n "${ANTHROPIC_API_KEY:-}" ] && ok "ANTHROPIC_API_KEY set" \
-  || bad "ANTHROPIC_API_KEY unset" "The shipped LHH config drives Claude Code; it exits 2 without this."
+# The key must be NON-EMPTY because the shipped script exits 2 on an empty one, but its VALUE
+# is only checked by whatever serves ANTHROPIC_BASE_URL. Serving your own model behind a local
+# proxy usually means any placeholder works, so default one in rather than block the run.
+if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+  export ANTHROPIC_API_KEY="placeholder-local-endpoint"
+  warn "ANTHROPIC_API_KEY was empty; using a placeholder. Fine for a self-hosted endpoint that"
+  warn "does not check it. If your endpoint DOES authenticate, set the real key or every task fails."
+else
+  ok "ANTHROPIC_API_KEY set"
+fi
+# This one cannot be defaulted: it decides WHICH MODEL both arms talk to, and the entire
+# experiment is that both arms share one policy. A wrong or absent value silently changes the
+# thing being held fixed.
 [ -n "${ANTHROPIC_BASE_URL:-}" ] && ok "ANTHROPIC_BASE_URL set ($ANTHROPIC_BASE_URL)" \
-  || bad "ANTHROPIC_BASE_URL unset" "Point this at the endpoint serving YOUR model, so the swap holds the model fixed."
+  || bad "ANTHROPIC_BASE_URL unset" "REQUIRED. Point it at the endpoint serving YOUR model; both arms must use the same one or the swap does not hold the model fixed."
 
 # 5. Tasks. Not shipped with the repo.
 TASKS="$TB_DIR/datasets/terminal-bench-2-1/tasks"
@@ -104,8 +119,16 @@ LHH_CFG="$TB_DIR/Scripts/tbench21_full_cua_harness_claudecode_qwen37_enable_thin
 if [ -n "${BASELINE_CFG:-}" ] && [ -f "$BASELINE_CFG" ]; then
   ok "arm A (baseline) config: $BASELINE_CFG"
 else
-  warn "arm A (baseline) NOT defined. Upstream ships no baseline; set BASELINE_CFG=<yaml>."
-  warn "A swap without its baseline measures nothing - this is the real work of the task."
+  SHIPPED_BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/tb21_baseline_terminus2.yaml"
+  if [ -f "$SHIPPED_BASE" ]; then
+    BASELINE_CFG="$SHIPPED_BASE"
+    ok "arm A (baseline) defaulting to shipped Terminus 2 config: $BASELINE_CFG"
+    warn "Terminus 2 is the OFFICIAL leaderboard harness, so this baseline is the comparison"
+    warn "the leaderboard implies. Verify model_name matches arm B before trusting the delta."
+  else
+    warn "arm A (baseline) NOT defined and no shipped config found; set BASELINE_CFG=<yaml>."
+    warn "A swap without its baseline measures nothing."
+  fi
 fi
 
 echo

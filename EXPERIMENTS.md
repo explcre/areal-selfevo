@@ -30,8 +30,23 @@ objective, and then staying there. Those imply different fixes: the first wants 
 constant, the second wants a termination term in the objective regardless of constant size.
 **Which of the two it is, is not yet established.**
 
-**Being narrowed now:** checkpoints 173 and 199, to cut the 75-step window down and see whether
-it coincides with anything visible in the routing metrics.
+**NARROWED to a 25-step window.** Full sweep, same slice and path:
+
+| checkpoint | accuracy | truncated |
+|------------|----------|-----------|
+| 49 | 0.6000 | 1/60 |
+| 149 | 0.5833 | 1/60 |
+| 173 | 0.5833 | 3/60 |
+| 199 | 0.5667 | 4/60 |
+| **224** | 0.3667 | **59/60** |
+| 289 | 0.3500 | 60/60 |
+
+So it is BOTH: a slow drift (1 -> 3 -> 4 in 60 across 50 steps) and then a switch (4 -> 59 in
+25 steps). The drift is real but tiny and would never have been noticed on its own; the switch
+is catastrophic. That pattern -- a slowly rising quantity that then runs away -- is what a
+positive feedback loop looks like, and it means the earlier checkpoints were NOT healthy, they
+were pre-critical. Any monitor that only alarms on a large truncation rate would have caught
+this at 224, far too late; alarming on the DERIVATIVE at 173 would have caught it in time.
 
 **Still open, and it matters for how general this is:** whether `credit="batch"` collapses the
 same way at full length. `ctx2` ran 290 steps on the same config apart from the credit signal
