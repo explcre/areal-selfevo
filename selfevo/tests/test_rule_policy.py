@@ -25,10 +25,12 @@ from selfevo.compose import EVOLVE_POLICY_FACTORIES, PipelineConfig, ROUTERS, va
 from selfevo.observability import FEATURE_NAMES, group_features
 from selfevo.routing.base import Granularity, HarnessAction, RoutingContext, TrainingMode
 from selfevo.routing.contextual import MissingFeatures
+from selfevo.routing.routers import SolveRateRouter
 from selfevo.routing.rule_policy import (
     READ_FEATURES,
     InconsistentFeatures,
     RulePolicyRouter,
+    _UNANIMITY_EPS,
 )
 
 # Imported rather than re-derived: two definitions of "an actor configured like the live
@@ -187,8 +189,12 @@ def test_a_group_unanimous_in_outcome_but_not_in_reward_still_goes_to_rl():
     Rewards ``[1.0, 0.8, 1.0, 0.8]`` grade as all-correct (``solve_rate == 1.0``) while the
     advantages ``r_i - rbar`` are +-0.1 and the gradient is live -- the exact group
     ``test_reward_std_is_zero_exactly_when_the_group_is_unanimous`` pins in the observability
-    suite. A rule that read ``solve_rate`` would delete that gradient, and one that compared
-    ``reward_std`` against any threshold at or above 0.1 would too.
+    suite. A rule that read ``solve_rate`` would delete that gradient.
+
+    This case alone only rules out thresholds >= 0.1, which is what the first version of this
+    suite tested and why ``std > 0.05`` survived its mutation harness. The sharper bound is
+    established by ``test_a_small_but_real_dispersion_still_goes_to_rl`` and by the epsilon
+    property test below.
     """
     extra = _features_from_rewards([1.0, 0.8, 1.0, 0.8])
     assert extra["solve_rate"] == 1.0 and extra["reward_std"] > 0.0
@@ -284,9 +290,16 @@ def test_no_harness_action_when_the_run_has_no_harness_arm():
     assert "dropped" in d.reason
 
 
-def test_a_truncated_group_that_still_solved_something_does_not_propose():
+def test_a_truncated_informative_group_carries_no_harness_action():
     """A group with a correct sample has a demonstrated path to success, so its truncated
-    siblings are not evidence that the scaffold is at fault."""
+    siblings are not evidence that the scaffold is at fault.
+
+    Named for what it actually pins, after the audit pointed out the old name over-claimed:
+    this group takes the RL branch and returns before ``propose`` is ever computed, so it
+    passes under ``propose = True`` and constrains nothing about the truncation gate. That
+    gate is constrained by ``test_an_untruncated_unsolved_group_does_not_propose``. What this
+    one pins is that the RL branch emits no harness action at all, however truncated.
+    """
     d = ROUTERS["rule"]().route(
         _ctx(solve_rate=0.5, reward_std=0.5, truncated_fraction=1.0, can_evolve_harness=True)
     )
@@ -532,3 +545,177 @@ def test_the_solved_branch_ab_actually_reaches_the_loss_when_switched_on():
     assert torch.allclose(solved[:, PROMPT:], torch.full_like(solved[:, PROMPT:], 0.5))
     assert solved[:, :PROMPT].abs().max() == 0.0   # never write into the prompt
     assert unsolved.abs().max() == 0.0             # no target of any kind -> still SKIP
+
+
+# ------------------------------------- the silence tolerance (audit F2 / F3) ----------
+
+
+@pytest.mark.parametrize(
+    "rewards, std",
+    [
+        ([1.0, 0.96, 1.0, 0.96], 2.0e-02),
+        ([0.5, 0.55], 2.5e-02),
+        ([1.0, 0.99], 5.0e-03),
+    ],
+)
+def test_a_small_but_real_dispersion_still_goes_to_rl(rewards, std):
+    """The bound the first version of this suite left open, and a mutant walked through.
+
+    ``std > 0.05`` survived 41 tests and the full 961-test suite while flipping exactly these
+    groups -- the live gradient the ``reward_std`` keying exists to preserve. The tested
+    boundary was 0.1; everything in (0, 0.1] was unconstrained. These three pin it down to
+    5.0e-03, which is the smallest genuine dispersion found by adversarial probing.
+    """
+    extra = _features_from_rewards(rewards)
+    assert extra["reward_std"] == pytest.approx(std, rel=1e-3), extra
+    d = ROUTERS["rule"]().route(_ctx(solve_rate=extra["solve_rate"], extra=extra))
+    assert d.argmax() == TrainingMode.RL, (extra, d.reason)
+
+
+@pytest.mark.parametrize("value", [0.8, 0.99, 0.3])
+@pytest.mark.parametrize("group_size", [8, 16, 32])
+def test_float32_residue_on_a_unanimous_group_does_not_read_as_signal(value, group_size):
+    """``reward_std > 0`` is NOT an identity in float32, which the first version claimed.
+
+    A unanimous group of eight 0.8s reduces to ``reward_std = 5.96e-08``; the shipped router
+    routed it to **rl** with the reason "reward_std=0.0000 > 0". Latent rather than active
+    -- every grader here is binary and binary is exact at every G -- but it is exactly the
+    "an rl group that changes no weight" failure ``__post_init__`` raises to prevent for
+    ``solved_mode='rl'``, and it would corrupt the mode proportions the matched-proportion
+    control is built on.
+    """
+    extra = _features_from_rewards([value] * group_size)
+    assert extra["solve_rate"] in (0.0, 1.0)
+    d = ROUTERS["rule"]().route(_ctx(solve_rate=extra["solve_rate"], extra=extra))
+    assert d.argmax() == TrainingMode.SKIP, (extra, d.reason)
+
+
+def test_the_unanimity_epsilon_sits_between_the_measured_noise_floor_and_real_signal():
+    """Constrain the NUMBER, not just the decisions it happens to produce.
+
+    A behavioural test can only rule out thresholds that flip a case it happens to contain,
+    which is how (0, 0.1] stayed unconstrained through a 25-mutant harness. This measures
+    both bounds instead -- the largest dispersion float32 puts on a unanimous group, and the
+    smallest dispersion this project would be wrong to delete -- and asserts the constant
+    lies between them with margin. Any mutation of the constant outside that band fails here
+    whether or not any behavioural case notices.
+
+    Both bounds are RECOMPUTED here rather than hardcoded, so the constant cannot drift out
+    of the band when the feature producer changes.
+    """
+    noise = max(
+        _features_from_rewards([v] * g)["reward_std"]
+        for g in (2, 4, 8, 16, 32, 64)
+        for v in (0.05, 0.3, 0.5, 0.8, 0.95, 0.99, 1.0, 1 / 3)
+    )
+    assert noise > 0.0, "the residue is the thing being guarded against; it must exist"
+    signal = min(
+        [
+            _features_from_rewards([1.0, 0.99])["reward_std"],          # partial credit
+            _features_from_rewards([1.0] + [0.0] * 63)["reward_std"],   # binary, G=64
+        ]
+    )
+    assert noise * 4 < _UNANIMITY_EPS, (noise, _UNANIMITY_EPS)
+    assert _UNANIMITY_EPS * 100 < signal, (_UNANIMITY_EPS, signal)
+
+
+# --------------------------------- the equivalence this router does NOT escape --------
+
+
+def test_the_rule_is_equivalent_to_solve_rate_on_binary_rewards():
+    """The audit's F1, pinned as an invariant instead of left as a retracted claim.
+
+    Under this repo's graders -- ``areal/reward/gsm8k.py`` and ``boba_grpo.py`` both return
+    exactly 1.0 or 0.0 -- this router and ``SolveRateRouter`` make the SAME decision on every
+    binary group composition, because "reward_std above the noise floor" and "the group was
+    not unanimous" are then the same predicate. 102 contexts per teacher setting, zero
+    disagreements.
+
+    Asserted rather than merely documented for two reasons. It stops the equivalence being
+    rediscovered by a reader, and it makes a future divergence a test failure: if either
+    router changes, someone has to decide deliberately whether the two arms are still the
+    same arm, rather than silently reporting a duplicate as a comparison.
+    """
+    rule, solve_rate = ROUTERS["rule"](), SolveRateRouter()
+    disagreements, n = [], 0
+    for has_teacher in (False, True):
+        for group_size in (2, 4, 8, 16):
+            for k in range(group_size + 1):
+                for trunc in (0.0, 0.5, 1.0):
+                    extra = _features_from_rewards([1.0] * k + [0.0] * (group_size - k))
+                    extra["truncated_fraction"] = trunc
+                    ctx = _ctx(
+                        solve_rate=extra["solve_rate"],
+                        group_size=group_size,
+                        has_teacher=has_teacher,
+                        extra=extra,
+                    )
+                    n += 1
+                    if rule.route(ctx).argmax() != solve_rate.route(ctx).argmax():
+                        disagreements.append((has_teacher, group_size, k, trunc))
+    assert n == 204
+    assert disagreements == [], disagreements
+
+
+def test_the_two_routers_diverge_exactly_where_the_grader_is_not_binary():
+    """The equivalence above is CONDITIONAL, and the condition is worth pinning too.
+
+    Otherwise "they are the same router" would be over-read into "this router adds nothing
+    under any grader". It adds something under a partial-credit grader -- it keeps a live
+    gradient that ``SolveRateRouter`` deletes -- and no grader here is partial-credit.
+    """
+    rule, solve_rate = ROUTERS["rule"](), SolveRateRouter()
+    extra = _features_from_rewards([1.0, 0.8, 1.0, 0.8])
+    ctx = _ctx(solve_rate=1.0, group_size=4, extra=extra)
+    assert rule.route(ctx).argmax() == TrainingMode.RL
+    assert solve_rate.route(ctx).argmax() == TrainingMode.SKIP
+
+
+def test_only_reward_std_can_change_the_mode_under_the_shipped_configuration():
+    """The honest statement of what "consumes seven features" means here: presence, not use.
+
+    Each feature is swept over the values that are LEGAL for it given the rest of the
+    context -- ``solve_rate`` only over {0, 1} on the silent branch, because a silent group
+    with an intermediate solve rate is the arithmetically impossible unit ``_features``
+    refuses -- and the modes it produces are collected. Exactly one feature moves the mode.
+
+    ``solve_rate`` does not, because both silent branches are SKIP by default;
+    ``truncated_fraction`` does not, because it gates a harness action with no consumer. If a
+    future branch is grounded in a measurement, this is the test that should fail.
+    """
+    r = ROUTERS["rule"]()
+    movers = set()
+
+    silent = {r.route(_ctx(solve_rate=p, reward_std=0.0)).argmax() for p in (0.0, 1.0)}
+    informative = {
+        r.route(_ctx(solve_rate=p, reward_std=0.5)).argmax() for p in (0.0, 0.5, 1.0)
+    }
+    if len(silent) > 1 or len(informative) > 1:
+        movers.add("solve_rate")
+
+    if {
+        r.route(_ctx(solve_rate=1.0, reward_std=v)).argmax() for v in (0.0, 0.5)
+    } != {r.route(_ctx(solve_rate=1.0, reward_std=0.0)).argmax()}:
+        movers.add("reward_std")
+
+    for name in FEATURE_NAMES:
+        if name in ("solve_rate", "reward_std"):
+            continue
+        modes = set()
+        for value in (0.0, 0.5, 1.0, 42.0):
+            for base_p, base_std in ((0.0, 0.0), (1.0, 0.0), (0.5, 0.5)):
+                extra = _extra(solve_rate=base_p, reward_std=base_std, **{name: value})
+                modes.add(
+                    r.route(_ctx(solve_rate=base_p, extra=extra)).argmax()
+                )
+        # A feature that MOVES the mode changes it while the other two are held fixed; here
+        # the three bases legitimately differ, so compare against the same sweep at the
+        # feature's default instead.
+        baseline = {
+            r.route(_ctx(solve_rate=p, reward_std=v)).argmax()
+            for p, v in ((0.0, 0.0), (1.0, 0.0), (0.5, 0.5))
+        }
+        if modes != baseline:
+            movers.add(name)
+
+    assert movers == {"reward_std"}, movers

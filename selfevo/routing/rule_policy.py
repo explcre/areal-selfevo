@@ -1,87 +1,107 @@
-"""M9: the rule evolve-policy -- a hand-written cold start, and the baseline to beat.
+"""M9: the rule evolve-policy -- a hand-written baseline, and what building it revealed.
 
-GOAL.md carries this as "Rule evolve-policy (cold start + baseline)", with the note
-*needed before "learned" is falsifiable*. That note is the whole justification for this
-module. The learned controller has been measured against the matched RANDOM control and
-come out null (2026-08-31: MATH-500 **-0.0020**, OlympiadBench **+0.0000** on 675
-problems), which establishes that its per-unit decision buys nothing over a coin at matched
-proportions. It says nothing about whether the per-unit decision buys anything over
-*thinking*, because there was no written-down rule to compare against. This is that rule.
+**RETRACTION, 2026-08-31, after an adversarial audit of the first version.** That version
+claimed this router removed a confound: that by deciding from the SAME seven observability
+features the learned controller reads, it separated "written vs learned" from
+"1 feature vs 7". **The claim is false and is withdrawn.** Under this project's graders this
+router is behaviourally IDENTICAL to the :class:`~selfevo.routing.routers.SolveRateRouter`
+it was meant to replace.
 
-**Why this is not** :class:`~selfevo.routing.routers.SolveRateRouter`, which the ``rule``
-slot on the ``evolve_policy`` axis pointed at before M9:
+Measured, not argued. Over every binary group composition -- ``G`` in {2, 4, 8, 16} x ``k``
+solved in 0..G x ``truncated_fraction`` in {0, 0.5, 1} -- the two routers agree on
+**102/102** contexts with no teacher and **102/102** with one. The mechanism is this
+module's own inertness argument turned around: for a BINARY reward, ``reward_std > 0`` and
+"the group was not unanimous" are the same predicate, and every reward function in this repo
+(``areal/reward/gsm8k.py``, ``boba_grpo.py``) returns exactly 1.0 or 0.0. The equivalence is
+pinned by :func:`selfevo.tests.test_rule_policy.test_the_rule_is_equivalent_to_solve_rate_on_binary_rewards`
+so that it is a checked invariant rather than a claim, and so that either router drifting
+from the other is a test failure rather than a silent second arm.
 
-* It decides from **one** scalar; :class:`~selfevo.routing.contextual.ContextualBanditRouter`
-  decides from **seven**. A baseline on a strictly smaller input is not a like-for-like
-  comparison -- the arm difference would confound "written vs learned" with "1 feature vs 7".
-  This router therefore *consumes* all seven (see :meth:`RulePolicyRouter._features`), and
-  documents exactly which of them it reads.
-* Its criterion is provably **inert** at this granularity.
-  :func:`selfevo.routing.criteria.threshold_is_inert` proves that with ``p_hat = k / G``
-  every threshold in ``(0, I_RL(1/G, G)]`` induces the identical partition, and
-  SolveRateRouter's default 0.1 is inside that interval at every group size run here
-  (``I_RL(1/G, G)`` is 0.68 at G=4, 0.66 at G=8, 0.64 at G=16, and
-  ``threshold_is_inert`` returns True at all three). So its one tunable number cannot
-  change a decision: the rule is really "was this group unanimous?", re-encoded through a
-  plug-in estimate that is additionally biased by Jensen.
+"Consumes all seven features" therefore survives only in the weak sense of REQUIRING their
+presence. Sweeping the other six leaves the mode at ``rl``; only ``reward_std`` moves it.
 
-This rule asks that question directly, of the quantity that answers it **exactly**.
+**Why this was not repaired by adding branches, and why that is the actual finding.** The
+obvious repair is a second branch keyed on ``mean_logprob`` or ``len_dispersion``. This
+project's standard is that every threshold cites a measurement, and no measurement here
+grounds one -- GOAL.md M15 records precisely that gap ("no ablation showing which features
+carry the decision"). Inventing a number so the baseline looks richer is the failure this
+repo has caught in other guises. So the honest result is:
+
+    A defensible hand-written policy over these seven features collapses to ONE predicate,
+    because only one of the seven has a measurement behind it. The "1 feature vs 7" confound
+    in a rule-vs-learned comparison is **not removable by writing a better rule**. It is a
+    property of the evidence available, and any such comparison has to be reported carrying
+    it.
+
+**Where the two routers DO diverge, and why neither divergence is live today.**
+
+* A non-binary grader. Rewards ``[1.0, 0.8, 1.0, 0.8]`` grade all-correct while the
+  advantages are +-0.1 and the gradient is real: this router sends them to RL,
+  ``SolveRateRouter`` (whose ``I_RL`` is computed from ``solve_rate == 1.0``) skips them.
+  No grader in this repo is non-binary, so the divergence is latent.
+* The harness axis. ``SolveRateRouter`` has none. This one emits
+  :class:`~selfevo.routing.base.HarnessAction.PROPOSE` -- but **that action cannot fire in
+  any current run and cannot be observed if it did**: nothing writes
+  ``ctx.can_evolve_harness``, and ``actor._route_groups`` keeps only ``.argmax()``, dropping
+  ``.harness`` on the floor. This is the same "no consumer" gap GOAL.md's M10 row states,
+  and it is stated here rather than left for a reader to discover.
+
+What remains genuinely different, and the reason this ships rather than reverting the slot
+to ``SolveRateRouter``, is narrow and worth naming precisely: each branch here is cited to
+the measurement that justifies it and is individually mutation-covered, the decision
+boundary is the silence condition itself rather than an ``I_RL`` threshold that
+:func:`selfevo.routing.criteria.threshold_is_inert` proves cannot change a decision
+(0.68 at G=4, 0.66 at G=8, 0.64 at G=16, ``threshold_is_inert`` True at all three), the
+context contract is the learned router's (a missing feature raises rather than defaults),
+and ``solved_mode`` is the seam for GOAL.md's critical-path item 1. None of that is a
+behavioural difference under today's config, and it must not be reported as one.
 
 The rule, one branch at a time, with the measurement each rests on:
 
-``reward_std > 0``  ->  ``RL``
-    An identity, not a threshold. GRPO's centred advantage is ``A_i = r_i - rbar``, so a
-    group whose raw rewards are not all equal has at least one non-zero advantage and RL
-    carries signal (``selfevo.routing.criteria`` module docstring). Keying on ``reward_std``
-    rather than on ``solve_rate`` also keeps a group that is unanimous in *outcome* but not
-    in *reward* -- e.g. rewards ``[1.0, 0.8, 1.0, 0.8]``, the case
-    ``test_reward_std_is_zero_exactly_when_the_group_is_unanimous`` pins -- on the RL branch
-    where it belongs, instead of deleting a live gradient because ``solve_rate == 1.0``.
+silent test: ``reward_std > _UNANIMITY_EPS``
+    GRPO's centred advantage is ``A_i = r_i - rbar``, so in exact arithmetic a group whose
+    raw rewards are not all equal has a non-zero advantage somewhere. In **float32 it is not
+    an identity**, which the first version of this module wrongly claimed it was: a
+    unanimous group of 8 rewards of 0.8 reduces to ``reward_std = 5.96e-08``, and a bare
+    ``> 0`` test routed it to RL while printing "reward_std=0.0000 > 0".
+    :data:`_UNANIMITY_EPS` is the measured fix.
+
+``reward_std`` above that  ->  ``RL``
+    The group disagrees; RL carries signal.
 
 silent and ``solve_rate == 1``  ->  ``SKIP`` (configurable)
-    RL is provably dead and the group carries its own SFT target. The branch is still
-    skipped by default because the free self-target was **measured inert at 0.5 and harmful
-    at 2.0** (EXPERIMENTS.md 2026-08-31; GOAL.md M24 "the solved branch is abandoned"). Those
-    are the only two operating points ever measured for it, and neither is a reason to spend
-    it. GOAL.md critical-path item 1 is the A/B that would revise this, and
-    ``solved_mode="sft"`` is how to run that A/B through this same object.
+    RL is dead and the group carries its own SFT target. Still skipped by default because
+    the free self-target was **measured inert at 0.5 and harmful at 2.0** (EXPERIMENTS.md
+    2026-08-31; GOAL.md M24). Those are the only operating points ever measured for it.
+    GOAL.md critical-path item 1 is the A/B that would revise this, and ``solved_mode="sft"``
+    runs it through this same object.
 
 silent and ``solve_rate == 0``  ->  teacher mode if one exists, else ``SKIP``
-    RL is dead and there is no self-target by construction: every sample was wrong, so
-    nothing in the rollout can serve as a target (GOAL.md M24). No run in this project wires
-    an external teacher, so in practice this branch is ``SKIP`` -- which is the honest state
-    of M7/M24, not a design preference.
+    No self-target by construction: every sample was wrong (GOAL.md M24). No run wires an
+    external teacher, so in practice this branch is ``SKIP``.
 
 ``truncated_fraction >= 1``, on the unsolved branch  ->  ``HarnessAction.PROPOSE``
-    The one place this rule uses a feature no solve-rate router can see, and the concrete
-    prediction GOAL.md already stakes on ``truncated_fraction``. Measured on OlympiadBench,
-    same checkpoint, cap 8192 -> 16384: truncated went 79 -> 78 for ``ctx`` and 61 -> 64 for
-    ``rnd``, and on MATH/AMC/AIME ``n_truncated == n_no_box`` in every row. So a truncated
-    sample is a generation that **never terminates usefully**, not one cut off mid-solution;
-    more budget does not fix it. That is a scaffold failure, whose consumer is the harness,
-    not a knowledge failure, whose consumer would be a teacher.
+    Grounded in a real measurement -- OlympiadBench, same checkpoint, cap 8192 -> 16384 moved
+    truncation 79 -> 78 for ``ctx`` and 61 -> 64 for ``rnd``, and ``n_truncated ==
+    n_no_box`` in every MATH/AMC/AIME row, so a truncated sample never terminates usefully
+    rather than being cut off -- but **unreachable today**, per the harness-axis note above.
+    It is a wired prediction awaiting a consumer, not shipped behaviour.
 
-**Cold start.** Used as the opening policy for a learned router, a rule has one hard
-requirement beyond being sensible: it must not hand ``batch_outcomes`` a single-mode batch,
-because such a batch is refused as :class:`~selfevo.routing.feedback.ConfoundedUpdate` and
-the learner goes blind (GOAL.md, "Feedback for a learned router is only defined when the
-batch has mode diversity"; measured as the ``cold_start_rounds=0`` deadlock). This rule
-clears that on the measured data rather than by assumption: on the matched GSM8K pair
-``silent_group_fraction`` is **0.5906** at G=8 and **0.4553** at G=16 (GOAL.md quotes 57.4%
-group-level silence), so both branches are populated in a real batch and a batch routed by
-this rule contains both ``rl`` and ``skip``. It is not a
-*guarantee* -- an all-informative batch would still be refused -- and
-``feedback/confounded_skips`` remains the diagnostic.
+**Cold start.** A rule seeding a learned router must not hand ``batch_outcomes`` a
+single-mode batch, which is refused as
+:class:`~selfevo.routing.feedback.ConfoundedUpdate` (GOAL.md, "Feedback for a learned router
+is only defined when the batch has mode diversity"). On the matched GSM8K pair
+``silent_group_fraction`` is 0.5906 at G=8 and 0.4553 at G=16, so both branches are
+populated and a real batch carries both ``rl`` and ``skip``. Not a guarantee -- an
+all-informative batch is still refused -- and ``feedback/confounded_skips`` is the
+diagnostic.
 
-**Determinism.** Frozen dataclass, no RNG, no state carried between calls, no dependence on
-call order. Same context, same decision, always -- which is what makes it usable as a
-baseline at all.
+**Determinism.** Frozen dataclass, no RNG, no state between calls, no order dependence. Same
+context, same decision, always.
 
-**What this rule is NOT, stated so a comparison is not over-read.** Under the shipped
-configuration (no external teacher, ``solved_mode="skip"``) it emits only ``rl`` and
-``skip``, while the contextual arm was measured at rl 0.295 / sft 0.353 / skip 0.353. So
-rule-vs-learned is **not** a matched-proportion comparison, and neither arm's number means
-anything without its own ``router=random`` control at its own measured proportions.
+**Not a matched-proportion comparison.** Under the shipped configuration it emits only
+``rl`` and ``skip``, against the contextual arm's measured rl 0.295 / sft 0.353 / skip 0.353.
+Each arm still needs its own ``router=random`` control at its own measured proportions.
 """
 
 from __future__ import annotations
@@ -107,11 +127,35 @@ __all__ = [
     "READ_FEATURES",
 ]
 
-# The features this rule actually READS, as opposed to the ones it requires to be present.
-# Exposed rather than left implicit because GOAL.md M15's open gap is "no ablation showing
-# which features carry the decision" -- for this router the answer is not an experiment, it
-# is a constant, and a reader should be able to check that claim without reading `route`.
+# The features this rule READS, as opposed to the ones it requires to be present. Of these
+# three, only `reward_std` can change the MODE under the shipped configuration: `solve_rate`
+# picks between the two silent branches (both SKIP by default), and `truncated_fraction`
+# gates a harness action that has no consumer. Stated as a constant so the claim can be
+# checked without reading `route`, and so the audit finding it encodes -- a defensible rule
+# here needs one predicate -- is visible at the top of the file rather than buried.
 READ_FEATURES: tuple[str, ...] = ("solve_rate", "reward_std", "truncated_fraction")
+
+# Below this, a group's reward dispersion is float32 rounding rather than signal.
+#
+# MEASURED, both bounds, because "measure the correct implementation's drift against the
+# smallest real error" is the only way to choose a tolerance that is not a guess:
+#
+#   noise floor  -- the largest ``reward_std`` a UNANIMOUS group produces. Swept over G in
+#                   {2, 4, 8, 16, 32, 64} and 27 reward values in [0, 1]: **1.192e-07**
+#                   (one ULP at 1.0), worst at G=8, value 0.99. G=2 and G=4 leak nothing;
+#                   21 of 27 values leak at every G >= 8. So the residue is not exotic --
+#                   it is the common case at the production group sizes.
+#   real signal  -- the smallest dispersion this project would be wrong to delete. For a
+#                   BINARY group that is ``sqrt((1/G)(1-1/G))``: 0.43 at G=4, 0.33 at G=8,
+#                   0.24 at G=16. For a partial-credit group the adversarial case found in
+#                   audit is ``[1.0, 0.99]`` at **5.0e-03**.
+#
+# Any value in (1.192e-07, 5.0e-03) therefore decides identically on every group the
+# graders in this repo can produce. 1e-6 is chosen inside it with ~8x margin above the
+# noise and ~5000x below the signal, and
+# ``test_the_unanimity_epsilon_sits_between_the_measured_noise_floor_and_real_signal``
+# recomputes both bounds so the constant cannot drift out of the band unnoticed.
+_UNANIMITY_EPS: float = 1e-6
 
 # How far ``ctx.extra["solve_rate"]`` may sit from ``ctx.solve_rate`` before the context is
 # refused. Both are produced by the same float32 reduction in
@@ -120,6 +164,25 @@ READ_FEATURES: tuple[str, ...] = ("solve_rate", "reward_std", "truncated_fractio
 # which is exact. Any real gap means the features describe a DIFFERENT group than the
 # context does -- the mis-attribution ``group_features`` calls "unrecoverable downstream".
 _SOLVE_RATE_TOLERANCE: float = 1e-6
+
+
+def _is_silent(reward_std: float) -> bool:
+    """Whether a group's rewards are unanimous to within float32 rounding.
+
+    Args:
+        reward_std: The group's population reward standard deviation, from
+            :class:`selfevo.observability.GroupFeatures`.
+
+    Returns:
+        True when the dispersion is at or below :data:`_UNANIMITY_EPS`, i.e. when RL's
+        centred advantage is zero or indistinguishable from zero.
+
+    Why a function rather than an inline comparison: the same predicate decides the routing
+    branch AND the impossible-group guard in :meth:`RulePolicyRouter._features`. Written
+    twice they would drift, and the drift would put a group on a branch whose precondition
+    the guard had already rejected.
+    """
+    return reward_std <= _UNANIMITY_EPS
 
 
 class InconsistentFeatures(ValueError):
@@ -135,14 +198,20 @@ class InconsistentFeatures(ValueError):
 
 @dataclass(frozen=True)
 class RulePolicyRouter:
-    """The M9 hand-written policy: deterministic, feature-consuming, measurement-grounded.
+    """The M9 hand-written policy: deterministic, and grounded branch by branch.
+
+    Behaviourally identical to :class:`~selfevo.routing.routers.SolveRateRouter` under this
+    repo's binary graders (102/102 contexts, measured) -- see the module docstring, which
+    retracts the "decides from seven features" framing the first version claimed.
 
     Args:
-        feature_names: Features required to be present in ``ctx.extra``, defaulting to the
-            full :data:`selfevo.observability.FEATURE_NAMES`. Required, not merely offered:
-            this router is the baseline for a controller that reads all seven, so it must
-            fail on exactly the contexts that controller fails on. A run whose observability
-            never arrived must not be able to silently produce a "rule" arm.
+        feature_names: Features required to be PRESENT in ``ctx.extra``, defaulting to the
+            full :data:`selfevo.observability.FEATURE_NAMES`. Presence, not use: only
+            :data:`READ_FEATURES` are read, and of those only ``reward_std`` ever changes a
+            mode under the shipped configuration. They are required anyway so this router
+            fails on exactly the contexts the learned controller fails on -- a run whose
+            observability never arrived must not be able to produce a quiet "rule" arm --
+            but that is an input-contract guarantee, not evidence of a richer policy.
         solved_mode: Mode for a silent group that solved every sample. Defaults to
             ``SKIP`` because the free self-target was measured **inert at 0.5 and harmful at
             2.0** -- the only two operating points measured. Set to ``sft`` to run GOAL.md's
@@ -152,7 +221,9 @@ class RulePolicyRouter:
             Must be a mode that actually requires a teacher, or routing the unsolved side to
             it would not supply the target that side is missing.
         truncated_threshold: Fraction of a group's samples that must have hit the token
-            budget before the group is proposed to the harness. Defaults to 1.0.
+            budget before the group is proposed to the harness. Defaults to 1.0. Note the
+            harness action it gates **cannot fire in any current run**: nothing writes
+            ``ctx.can_evolve_harness`` and ``actor._route_groups`` discards ``.harness``.
             **This number is not pinned by a measurement and the docstring says so rather
             than inventing one.** 1.0 is the only value at which *every* sample in the group
             failed to terminate, so the group's failure mode is unambiguous -- the same
@@ -260,7 +331,7 @@ class RulePolicyRouter:
                 "than the context does, and one group's decision would be taken on "
                 "another group's evidence"
             )
-        if out["reward_std"] == 0.0 and out["solve_rate"] not in (0.0, 1.0):
+        if _is_silent(out["reward_std"]) and out["solve_rate"] not in (0.0, 1.0):
             raise InconsistentFeatures(
                 f"reward_std is 0 but solve_rate is {out['solve_rate']}: a group whose raw "
                 "rewards are all equal is graded all-correct or all-wrong, never partly. "
@@ -301,12 +372,14 @@ class RulePolicyRouter:
         feats = self._features(ctx)
 
         std = feats["reward_std"]
-        if std > 0.0:
-            # Identity, not a threshold: A_i = r_i - rbar is non-zero somewhere iff the raw
-            # rewards differ. See the module docstring on why this is keyed on reward_std
-            # and not on solve_rate.
+        if not _is_silent(std):
+            # In exact arithmetic this is the identity A_i = r_i - rbar != 0; in float32 it
+            # is that identity plus a MEASURED rounding tolerance, because a unanimous group
+            # of eight 0.8s reduces to 5.96e-08 and a bare `> 0` sent it to RL. See
+            # _UNANIMITY_EPS.
             return RoutingDecision(
-                {TrainingMode.RL: 1.0}, reason=f"informative: reward_std={std:.4f} > 0"
+                {TrainingMode.RL: 1.0},
+                reason=f"informative: reward_std={std:.3e} > {_UNANIMITY_EPS:.0e}",
             )
 
         if ctx.has_self_target:

@@ -3,7 +3,92 @@
 Measured results and negative results, newest first. A claim only belongs here once it has
 been observed end to end; a prediction belongs in GOAL.md until then.
 
+## 2026-08-31 — AUDIT: the M9 rule is behaviourally IDENTICAL to the router it replaced
+
+An adversarial audit of `c30d27eb` found that the claim M9 was built to support does not
+hold. Reproduced independently before acting on it, and the reproduction agrees exactly.
+
+**F1 (the claim). `RulePolicyRouter` and `SolveRateRouter` make the same decision on every
+binary group composition.** Swept G in {2,4,8,16} x k solved in 0..G x truncated_fraction in
+{0, 0.5, 1}: **102/102 agreement with no teacher, 102/102 with one**. The mechanism is my own
+inertness argument turned around -- for a BINARY reward, `reward_std > 0` and "the group was
+not unanimous" are the same predicate, and `areal/reward/gsm8k.py` and `boba_grpo.py` both
+return exactly 1.0 or 0.0. A feature sweep on the shipped object confirms only `reward_std`
+ever moves the mode.
+
+So the stated purpose -- de-confounding "written vs learned" from "1 feature vs 7" -- is NOT
+achieved, and "consumes all seven features" is true only in the sense of requiring their
+presence.
+
+**The resolution was to fix the claim, not to invent branches.** Keying a second branch on
+`mean_logprob` or `len_dispersion` would need a threshold, and this project's standard is
+that a threshold cites a measurement. There is none -- GOAL.md M15 records exactly that gap.
+So the honest result, and the actual finding of M9:
+
+> A defensible hand-written policy over these seven features collapses to ONE predicate,
+> because only one of the seven has a measurement behind it. The "1 feature vs 7" confound in
+> a rule-vs-learned comparison is **not removable by writing a better rule**. It is a property
+> of the evidence available, and any such comparison must be reported carrying it.
+
+The equivalence is now a TEST rather than a retracted claim, so a future divergence in either
+router is a failure rather than a silent duplicate arm, plus a second test pinning the
+condition (a partial-credit grader, where the rule keeps a live gradient `SolveRateRouter`
+deletes -- no grader here is partial-credit).
+
+**F2 (a real defect, now fixed). `reward_std > 0` is not an identity in float32.** A
+unanimous group of eight rewards of 0.8 reduces to `reward_std = 5.96e-08`, and the shipped
+router sent it to **rl** with the reason "reward_std=0.0000 > 0". Swept: the residue tops out
+at **1.192e-07** (one ULP at 1.0, G=8, value 0.99); G=2 and G=4 leak nothing, and 21 of 27
+reward values leak at every G >= 8, so it is the common case at production group sizes.
+Latent rather than active -- binary rewards are exact at every G -- but it is precisely the
+"an rl group that changes no weight" failure `__post_init__` raises to prevent for
+`solved_mode='rl'`, and it would corrupt the mode proportions the matched-proportion control
+rests on.
+
+Fixed with a MEASURED tolerance rather than a guessed one, both bounds recomputed in a test
+so the constant cannot drift out of the band: noise floor **1.192e-07**, smallest real
+dispersion **5.0e-03** (`[1.0, 0.99]`), constant `_UNANIMITY_EPS = 1e-6`, roughly 8x above
+the noise and 5000x below the signal.
+
+**F3 (a real gap, now closed). One of my two "provably equivalent" mutation exclusions was
+not equivalent.** `std > 0.05` survived all 41 tests and the full 961-test suite while
+flipping the decision on realistic partial-credit groups (`[1.0,0.96,1.0,0.96]` 2.0e-02,
+`[0.5,0.55]` 2.5e-02, `[1.0,0.99]` 5.0e-03) -- the live gradient the `reward_std` keying
+exists to preserve. The exclusion was self-refuting on its own terms: 0.1 lies inside the
+class I declared equivalent and was itself listed and killed. The real tested boundary was
+0.1, and (0, 0.1] was unconstrained.
+
+The general lesson, and it is the one this log already records in another guise: a
+behavioural test can only rule out a threshold that flips a case it happens to contain, so a
+constant needs a test on the CONSTANT -- measure the correct implementation's drift, measure
+the smallest real effect, assert the constant lies between them. Five threshold mutations now
+span the band and the property test kills all of them.
+
+**Lower severity, corrected in place.** `HarnessAction.PROPOSE` cannot fire in any current
+run and could not be observed if it did (nothing writes `can_evolve_harness`;
+`actor._route_groups` keeps only `.argmax()`), so listing it as shipped behaviour without the
+caveat M10 states honestly was wrong -- the caveat is now in the docstring, the GOAL row and
+the table below. `EVOLVE_POLICY_FACTORIES["rule"]` is declarative only: that registry is read
+by `_stub_problems`, never to build anything.
+
+**Judgement on whether it should ship.** Kept, with the claim demoted from DONE to PARTIAL,
+because what remains different is real but narrow and must not be reported as a behavioural
+difference: each branch is cited to its measurement and individually mutation-covered, the
+boundary is the silence condition rather than an `I_RL` threshold that `threshold_is_inert`
+proves cannot change a decision, the context contract is the learned router's, and
+`solved_mode` is the seam for the solved-branch A/B. Under today's config it is the same arm
+as `router=solve_rate`, and running both as if they were two arms would be double-reporting.
+
 ## 2026-08-31 — M9 built: the rule the learned controller now has to beat
+
+> **PARTIALLY RETRACTED by the audit entry above.** The headline claim of this entry --
+> that deciding from the same seven features separates "written vs learned" from
+> "1 feature vs 7" -- is **false**. The router is behaviourally identical to
+> `SolveRateRouter` under this repo's binary graders. The branch groundings, the
+> registry discipline and the mutation method below stand; the de-confounding claim
+> does not. Two defects it reported as verified were also wrong: `reward_std > 0` is
+> not a float32 identity, and one of its two "provably equivalent" mutation exclusions
+> was not equivalent.
 
 A build-and-verification record, not a result -- no arm has trained with it yet, and that is
 stated in GOAL.md's M9 row rather than implied away.
@@ -32,7 +117,7 @@ cannot change a decision. `SolveRateRouter` stays reachable as `router=solve_rat
 | `reward_std > 0` | RL | identity: `A_i = r_i - rbar` is non-zero somewhere iff the raw rewards differ. No threshold at all |
 | silent, `solve_rate == 1` | SKIP | the free self-target measured **inert at 0.5, harmful at 2.0** -- the only two operating points ever measured |
 | silent, `solve_rate == 0` | teacher mode if one exists, else SKIP | no self-target by construction; no run wires a teacher, so in practice SKIP |
-| unsolved and `truncated_fraction >= 1` | `HarnessAction.PROPOSE` | truncation is non-termination, not budget: 8192 -> 16384 moved it 79 -> 78 (ctx) and 61 -> 64 (rnd), and `n_truncated == n_no_box` in every MATH/AMC/AIME row |
+| unsolved and `truncated_fraction >= 1` | `HarnessAction.PROPOSE` (**cannot fire today** -- nothing writes `can_evolve_harness` and `_route_groups` discards `.harness`; same gap as M10) | truncation is non-termination, not budget: 8192 -> 16384 moved it 79 -> 78 (ctx) and 61 -> 64 (rnd), and `n_truncated == n_no_box` in every MATH/AMC/AIME row |
 
 **One number is NOT measurement-pinned and the docstring says so** rather than inventing a
 justification: the truncation threshold's 1.0 is the only value at which *every* sample in
