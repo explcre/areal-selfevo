@@ -2673,3 +2673,47 @@ a shared box" is exactly the kind of change that is invisible in a git log.
    killed from inside, so that memory is unreclaimable without a container restart. The
    GPU-free guard added earlier caught this correctly and refused to launch on top of it --
    which is the first time that guard has paid for itself.
+
+---
+
+## 27B LoRA, continued: torchao FIXED, then two further blockers -- and a correction
+
+**1. The torchao blocker is solved, surgically.** The version check lives in
+`peft/import_utils.py` and RAISES rather than returning False -- and only because torchao was
+present but old. Uninstalling was not an option (`Required-by: sglang`) and the latest 0.18.0
+needs a torch newer than 2.9.1. `torchao==0.16.0` is the oldest that satisfies peft and keeps
+everything working:
+
+    torch 2.9.1+cu128  cuda True 8 devices
+    torchao 0.16.0     (skips cpp extensions -- benign; we need bf16 LoRA, not torchao kernels)
+    peft is_torchao_available: True
+    sglang 0.5.10.post1 imports OK
+
+**2. A CORRECTION.** I wrote that the stuck GPU memory was "unreclaimable host-level zombies"
+because `nvidia-smi` reported PIDs that `ps` could not resolve inside the container. That
+inference was wrong. The processes WERE visible under patterns I had not matched: **132
+orphaned torch-inductor compile workers**, 93 AReaL workers under `/venv/main/bin/python3`, and
+`sglang::` children. Killing those freed all 8 GPUs. I generalised from "ps cannot resolve the
+host PID nvidia-smi prints" to "nothing can reach these processes", which does not follow, and
+it nearly cost a box.
+
+**3. 27B does NOT fit on an 80 GB A100.** It OOMed at `79.25 GiB total, 44.94 MiB free`. AReaL
+materialises full weights per rank before sharding, so the preflight's "12.6 GiB/GPU sharded"
+was the POST-shard steady state, not the load peak. That is a real gap in the check I wrote:
+it should model the peak. On the H200's 141 GiB cards the same model loads to 110-135 GiB per
+GPU, which is why it works there and not here.
+
+**4. The next blocker, and it is architectural.**
+
+    RuntimeError: Failed to load LoRA adapter default_lora-v0:
+    'Qwen3_5Config' object has no attribute 'vocab_size'
+
+sglang's LoRA loader does not understand Qwen3.8's config layout. This is not a version
+mismatch to paper over -- it is sglang not supporting that architecture's LoRA path. The right
+move is to change the MODEL, not patch sglang: Qwen2.5-32B-Instruct is the same family as the
+1.5B and 7B that already work end-to-end here, so its config layout is one sglang handles, and
+32B still meets the "27B-class" goal. Download started.
+
+**Standing conclusion for the collaborator:** still do not ship a large-model LoRA job. Two of
+the three blockers are now fixed and understood, but the run has never completed a step, and
+"the dependency error is gone" is not the same claim as "it trains".
