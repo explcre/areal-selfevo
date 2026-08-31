@@ -233,6 +233,35 @@ class PPOActor:
         )
         step = getattr(self, "_selfevo_batch", 0)
         self._selfevo_batch = step + 1
+
+        # Close the loop on the PREVIOUS batch before deciding this one. The outcome of a
+        # decision is not observable until after the update it took part in, so the earliest
+        # a router can learn from batch N is at batch N+1.
+        #
+        # The scalar credited is the change in mean RAW reward between consecutive batches.
+        # It is confounded -- different prompts, one number for every decision in the batch --
+        # and selfevo.routing.outcomes refuses the cases where the attribution is provably
+        # vacuous rather than pretending otherwise. A run records how attributable its own
+        # updates were, so a result can be discounted by it instead of assumed clean.
+        mean_reward = float(raw_reward.detach().float().mean())
+        pending = getattr(self, "_selfevo_pending", None)
+        if pending is not None and hasattr(router, "observe"):
+            from selfevo.routing.feedback import ConfoundedUpdate
+            from selfevo.routing.outcomes import batch_outcomes
+
+            prev_modes, prev_batch_id, prev_mean = pending
+            try:
+                outcomes, strength = batch_outcomes(
+                    prev_modes, batch_id=prev_batch_id, value=mean_reward - prev_mean
+                )
+                router.observe(outcomes)
+                stats_tracker.scalar(**strength.as_metrics())
+            except ConfoundedUpdate:
+                # Expected whenever a batch happened to take one mode throughout; counted so
+                # a router that never learns is visibly starved rather than silently inert.
+                stats_tracker.scalar(**{"feedback/confounded_skips": 1.0})
+        self._selfevo_pending = None
+
         modes = []
         for i, (f, g) in enumerate(zip(feats, sizes)):
             ctx = RoutingContext(
@@ -254,6 +283,12 @@ class PPOActor:
             sft_weight=float(gr.solved_advantage),
         )
         stats_tracker.scalar(**stats.as_metrics())
+        if hasattr(router, "observe"):
+            self._selfevo_pending = (
+                {f"{step}:{i}": m for i, m in enumerate(modes)},
+                str(step),
+                mean_reward,
+            )
         return routed
 
     def _compute_advantages(

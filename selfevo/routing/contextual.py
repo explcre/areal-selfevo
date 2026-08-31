@@ -57,6 +57,22 @@ class ContextualBanditRouter:
             failure this project keeps finding in other guises.
         pending_cap: How many un-observed decisions to remember. Bounded because a unit that
             is never observed would otherwise leak; evictions are counted, not silent.
+        cold_start_rounds: Number of initial routing calls that cycle through ``modes``
+            round-robin instead of scoring them.
+
+            This exists because without it the router provably never learns. Every arm starts
+            at ``theta = 0`` with the same ``A``, so every UCB score is identical, the tie
+            breaks deterministically by mode name, and every unit in the batch takes the SAME
+            mode. A batch-level outcome over a single-mode batch carries no comparative
+            information and is refused by
+            :func:`selfevo.routing.outcomes.batch_outcomes`, so no update ever arrives and the
+            arms stay tied forever. Detected by driving the real actor loop, where the
+            router's update count stayed at zero indefinitely.
+
+            Round-robin rather than a random tie-break so a run stays reproducible: the
+            existing tests pin first-by-name tie-breaking, and randomising it would make a
+            routing ablation irreproducible. Defaults to 0, which preserves that behaviour
+            exactly; a run with a learning router must set it to at least ``len(modes)``.
 
     Attributes:
         evicted: Pending decisions dropped because the cache was full.
@@ -83,12 +99,14 @@ class ContextualBanditRouter:
     ridge: float = 1.0
     require_features: bool = True
     pending_cap: int = 4096
+    cold_start_rounds: int = 0
 
     _A: dict[str, np.ndarray] = field(default_factory=dict, init=False, repr=False)
     _b: dict[str, np.ndarray] = field(default_factory=dict, init=False, repr=False)
     _pending: OrderedDict = field(default_factory=OrderedDict, init=False, repr=False)
     evicted: int = field(default=0, init=False)
     updates: int = field(default=0, init=False)
+    routed: int = field(default=0, init=False)
     rejected: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
@@ -105,6 +123,10 @@ class ContextualBanditRouter:
             raise ValueError(f"ridge must be > 0, got {self.ridge}")
         if self.pending_cap < 1:
             raise ValueError(f"pending_cap must be >= 1, got {self.pending_cap}")
+        if self.cold_start_rounds < 0:
+            raise ValueError(
+                f"cold_start_rounds must be >= 0, got {self.cold_start_rounds}"
+            )
         d = len(self.feature_names) + 1
         for m in self.modes:
             self._A[m] = np.eye(d) * self.ridge
@@ -162,6 +184,16 @@ class ContextualBanditRouter:
             return RoutingDecision(
                 {TrainingMode.SKIP: 1.0}, reason="contextual: no mode has a target"
             )
+        n = self.routed
+        self.routed = n + 1
+        if n < self.cold_start_rounds:
+            # Cycle the arms so the first batches are mixed and an outcome is attributable.
+            forced = sorted(usable)[n % len(usable)]
+            if ctx.unit_id is not None:
+                self._remember(ctx.unit_id, forced, x)
+            return RoutingDecision(
+                {forced: 1.0}, reason=f"contextual: cold start {n + 1}/{self.cold_start_rounds}"
+            )
         best, best_score = None, -np.inf
         for m in sorted(usable):
             A_inv = np.linalg.inv(self._A[m])
@@ -171,15 +203,21 @@ class ContextualBanditRouter:
                 best, best_score = m, score
         assert best is not None
         if ctx.unit_id is not None:
-            # Drop any earlier decision for this unit FIRST: re-routing a unit already held
-            # is a refresh, and evicting a bystander to make room for a key the cache
-            # already has would lose a live decision and overcount ``evicted`` as well.
-            self._pending.pop(ctx.unit_id, None)
-            if len(self._pending) >= self.pending_cap:
-                self._pending.popitem(last=False)
-                self.evicted += 1
-            self._pending[ctx.unit_id] = (best, x)
+            self._remember(ctx.unit_id, best, x)
         return RoutingDecision({best: 1.0}, reason=f"contextual: ucb {best_score:.4f}")
+
+    def _remember(self, unit_id: str, mode: str, x: np.ndarray) -> None:
+        """Hold a decision until its outcome arrives, evicting the oldest past the cap.
+
+        Drops any earlier decision for this unit FIRST: re-routing a unit already held is a
+        refresh, and evicting a bystander to make room for a key the cache already has would
+        lose a live decision and overcount ``evicted``.
+        """
+        self._pending.pop(unit_id, None)
+        if len(self._pending) >= self.pending_cap:
+            self._pending.popitem(last=False)
+            self.evicted += 1
+        self._pending[unit_id] = (mode, x)
 
     # -------------------------------------------------------------------- learning ----
 

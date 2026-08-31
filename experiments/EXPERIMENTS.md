@@ -2122,3 +2122,54 @@ satisfiable.
 That makes the ordering explicit: the outcome producer is now the single blocking step, as
 the actor call was before it. Until it exists, the learned arms are not runnable as learned
 arms, and no result may describe them that way.
+
+---
+
+## The learned controller now learns in the real loop -- and then stops, for a structural reason
+
+The feedback channel had a consumer and no producer. `selfevo/routing/outcomes.py` is the
+producer, and the actor now closes the loop: it observes the previous batch before routing
+the next one, because a decision's outcome is not observable until after the update it took
+part in.
+
+Driven through the real `PPOActor._compute_advantages`, 8 batches:
+
+    batch 0: routed=2  updates=0  modes=[rl, sft]
+    batch 1: routed=4  updates=2  modes=[rl, skip]
+    ...
+    batch 5: routed=12 updates=10 modes=[rl, skip]
+    batch 6: routed=14 updates=12 modes=[sft]        <- cold start ends, UCB takes over
+    batch 7: routed=16 updates=12 modes=[sft]        <- updates STOP
+
+**Two findings, and the second is the important one.**
+
+**1. Without a cold start the controller provably never learns.** Every arm begins at
+`theta = 0` with the same `A`, so every UCB score is identical, the tie breaks
+deterministically by mode name, and every unit in the batch takes the SAME mode. A
+batch-level scalar over a single-mode batch carries no comparative information and is refused
+by `batch_outcomes`, so no update arrives and the arms stay tied forever. This is not a
+theoretical worry: driven through the actor loop, the update count sat at zero indefinitely.
+`cold_start_rounds` cycles the arms round-robin for the first N calls, which makes the early
+batches mixed and attributable. Round-robin rather than a random tie-break so a routing
+ablation stays reproducible; the default is 0, which preserves the previously pinned
+behaviour exactly.
+
+**2. Once the controller converges, it stops receiving information.** At batch 6 UCB takes
+over, picks the same mode for every unit, and the batch becomes single-mode again -- so
+`batch_outcomes` refuses it and `updates` freezes at 12. This is not a bug in any component:
+it is what batch-level attribution *is*. A controller learns only from batches in which its
+own decisions disagreed, and a converged controller stops producing those.
+
+**Consequence for the design, stated before running the arm rather than after.** With
+batch-level credit, a learned controller needs *within-batch* mode diversity indefinitely,
+not just at the start. Two ways out, and they are not equivalent:
+
+* keep forcing a fraction of units per batch onto a non-argmax mode -- cheap, keeps the
+  channel open, and costs whatever those units would have gained from the better mode;
+* attribute per unit instead of per batch -- strictly better information, and it needs a
+  counterfactual the pipeline does not currently produce.
+
+Until one of them exists, a `router=contextual` run learns during cold start and is a fixed
+policy afterwards. `feedback/confounded_skips` counts the refused batches, so this is visible
+in a run rather than inferred -- a controller that has silently stopped learning looks exactly
+like one that has finished learning, and the counter is what separates them.
