@@ -23,6 +23,10 @@ BASE = [
     "experiment_name=preflight", "trial_name=t0",
 ]
 ON = ["+actor.group_routing.enabled=true", "+actor.group_routing.solved_advantage=0.5"]
+# The mixture arm needs a router as well as the flag: the fixed solved/unsolved rule emits
+# no weights, so decision=mixture without one is refused rather than silently ignored.
+MIXTURE = ["+actor.group_routing.router=solve_rate",
+           "+actor.group_routing.decision=mixture"]
 DAPO = ["+dynamic_filter_fn=selfevo.baselines.dapo.dapo_dynamic_sampling"]
 
 
@@ -38,21 +42,27 @@ def load(argv: list[str]):
 def _check_router_modes(name: str) -> bool:
     """Route synthetic units through a router and confirm the seam can apply every mode.
 
-    ``_route_groups`` passes ``decision.argmax()` straight to ``apply_decisions``, which
-    implements RL/SFT/SKIP and REFUSES a teacher-requiring mode -- deliberately, because
-    treating DISTILL as SKIP would report a distillation arm that never ran. That refusal is
-    a ValueError raised inside ``_compute_advantages``, i.e. it kills the run. A router that
-    can emit such a mode should therefore be rejected here, before any GPU is allocated,
-    rather than at whatever batch first happens to trigger it.
+Under ``decision=argmax`` ``_route_groups`` passes ``decision.argmax()`` to
+    ``apply_decisions``; under ``decision=mixture`` it passes ``decision.normalised()`` to
+    ``apply_mixtures``. Both implement RL/SFT/SKIP and REFUSE a teacher-requiring mode --
+    deliberately, because treating DISTILL as SKIP would report a distillation arm that
+    never ran. That refusal is a ValueError raised inside ``_compute_advantages``, i.e. it
+    kills the run. A router that can emit such a mode should therefore be rejected here,
+    before any GPU is allocated, rather than at whatever batch first happens to trigger it.
+
+    BOTH paths are probed, because they are not the same test. A decision like
+    ``{rl: 0.6, distill: 0.4}`` has an applicable ARGMAX and an inapplicable COMPONENT, so a
+    router that is safe for the argmax arm can still kill a mixture run on its first batch.
 
     Args:
         name: A key in ``selfevo.compose.ROUTERS``.
 
     Returns:
-        True if every mode the router produced over the probe grid is applicable.
+        True if every mode AND every whole weight mapping the router produced over the probe
+        grid is applicable.
     """
     from selfevo.compose import ROUTERS
-    from selfevo.integration.group_apply import apply_decisions
+    from selfevo.integration.group_apply import apply_decisions, apply_mixtures
     from selfevo.observability import FEATURE_NAMES
     from selfevo.routing.base import RoutingContext
     import torch
@@ -62,7 +72,7 @@ def _check_router_modes(name: str) -> bool:
         print(f"FAIL: router {name!r} is not registered"); return False
     router = factory()
 
-    seen, ok = set(), True
+    seen, mixes, ok = set(), [], True
     for rate in (0.0, 0.25, 0.5, 0.75, 1.0):
         for teacher in (False, True):
             extra = {k: 0.5 for k in FEATURE_NAMES}
@@ -71,7 +81,11 @@ def _check_router_modes(name: str) -> bool:
                 solve_rate=rate, group_size=8, has_teacher=teacher,
                 unit_id=f"probe-{rate}-{teacher}", extra=extra,
             )
-            seen.add(router.route(ctx).argmax())
+            # ONE call per probe: a learned router carries state, and asking twice to read
+            # the label and then the weights would probe a router that has already moved.
+            decision = router.route(ctx)
+            seen.add(decision.argmax())
+            mixes.append((ctx.unit_id, decision.normalised()))
     for mode in sorted(seen):
         try:
             apply_decisions(
@@ -82,8 +96,21 @@ def _check_router_modes(name: str) -> bool:
                   f"-- this would raise inside _compute_advantages and kill the run: "
                   f"{str(exc)[:90]}")
             ok = False
+    for unit_id, mix in mixes:
+        try:
+            apply_mixtures(
+                torch.zeros(2, 3), torch.ones(2, 3), [2], [mix], sft_weight=0.5
+            )
+        except ValueError as exc:
+            print(f"FAIL: router {name!r} emitted mixture {mix} at {unit_id}, which the "
+                  f"seam cannot apply under decision=mixture -- this would raise inside "
+                  f"_compute_advantages and kill the run: {str(exc)[:90]}")
+            ok = False
+            break
     if ok:
-        print(f"router {name!r} emits {sorted(seen)}; all applicable")
+        n_mixed = sum(1 for _, m in mixes if max(m.values()) < 1.0)
+        print(f"router {name!r} emits {sorted(seen)}; all applicable "
+              f"({n_mixed}/{len(mixes)} probes were genuine mixtures)")
     return ok
 
 
@@ -110,6 +137,35 @@ def main() -> int:
         if type(gr).__name__ != "GroupRoutingConfig":
             print(f"FAIL: wrong type {type(gr).__name__}; the actor's getattr would still "
                   f"work but the sign guards in __post_init__ would not have run"); ok = False
+
+    # --- the mixture arm --------------------------------------------------------------
+    #
+    # Same question as the ON arm, for the axis that decides whether the router's WEIGHTS
+    # reach the tensor: an override that parses but lands on an unread key would run the
+    # argmax path and report itself as a mixture arm.
+    mixture = load(BASE + ON + MIXTURE)
+    mgr = mixture.actor.group_routing
+    print(f"ARM mixture -> decision = {getattr(mgr, 'decision', None)!r}, "
+          f"router = {getattr(mgr, 'router', None)!r}")
+    if getattr(mgr, "decision", None) != "mixture":
+        print("FAIL: decision=mixture did not travel"); ok = False
+    if getattr(gr, "decision", None) != "argmax":
+        print(f"FAIL: the routed arm's default decision is "
+              f"{getattr(gr, 'decision', None)!r}, not 'argmax'; the ablation pair would "
+              f"differ on more than one axis"); ok = False
+    try:
+        load(BASE + ON + ["+actor.group_routing.decision=mixture"])
+        print("FAIL: decision=mixture with no router was accepted through the CLI; that arm "
+              "would run the hardcoded solved/unsolved constants and report as a mixture")
+        ok = False
+    except Exception as exc:
+        print(f"mixture guard held through the CLI: {type(exc).__name__}: {str(exc)[:90]}")
+    try:
+        load(BASE + ON + ["+actor.group_routing.router=solve_rate",
+                          "+actor.group_routing.decision=mixtures"])
+        print("FAIL: an unknown decision value was accepted through the CLI"); ok = False
+    except Exception as exc:
+        print(f"decision guard held through the CLI: {type(exc).__name__}: {str(exc)[:90]}")
 
     # --- the DAPO baseline arm -------------------------------------------------------
     dapo = load(BASE + DAPO)

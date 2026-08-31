@@ -206,10 +206,12 @@ class PPOActor:
             sizes: Row counts per group.
 
         Returns:
-            The advantage tensor after applying one decision per group.
+            The advantage tensor after applying one decision per group. Under
+            ``gr.decision == "mixture"`` the decision is the router's whole weight mapping
+            rather than its argmax, and the two coincide exactly on one-hot decisions.
         """
         from selfevo.compose import ROUTERS
-        from selfevo.integration.group_apply import apply_decisions
+        from selfevo.integration.group_apply import apply_decisions, apply_mixtures
         from selfevo.observability import group_features
         from selfevo.routing.base import RoutingContext
 
@@ -269,7 +271,15 @@ class PPOActor:
                 stats_tracker.scalar(**{"feedback/confounded_skips": 1.0})
         self._selfevo_pending = None
 
+        # What is done with the weights the router returns. "argmax" is the shipped default
+        # and what every run before this flag existed did: keep the top mode, discard the
+        # rest. "mixture" carries the weights to the tensor. They differ on exactly one axis,
+        # so they are an ablation pair rather than two features.
+        _decision = getattr(gr, "decision", "argmax")
+        use_mixture = _decision == "mixture"
+
         modes = []
+        mixtures = []
         for i, (f, g) in enumerate(zip(feats, sizes)):
             ctx = RoutingContext(
                 solve_rate=f.solve_rate,
@@ -280,7 +290,24 @@ class PPOActor:
                 unit_id=f"{step}:{i}",
                 extra=f.as_extra(),
             )
-            modes.append(router.route(ctx).argmax())
+            # ONE call per unit: a router may be stateful, and routing twice to read the
+            # weights and then the label would double every update it makes.
+            decision = router.route(ctx)
+            # The RAW weights. apply_mixtures normalises, and normalising here as well would
+            # round twice and, worse, make every rejection message quote weights the router
+            # never emitted: a mixture whose components overflow to an infinite sum
+            # normalises to {rl: 0.0, sft: 0.0} and would be reported as an all-zero mixture.
+            mixtures.append(dict(decision.weights))
+            # Kept whichever path runs. Feedback credits a single mode name -- see
+            # GroupRoutingConfig.decision -- so a mixture is credited under its argmax, and
+            # that coarsening damages the attribution INSTRUMENT in both directions, not just
+            # the router's signal. Two different mixtures that share an argmax make the batch
+            # look uniform, and batch_outcomes then refuses the whole update as confounded;
+            # two nearly identical mixtures whose argmaxes differ make it look maximally
+            # attributable (dominant_share 0.5) for groups that received almost the same
+            # gradient. The second direction is the dangerous one: the number whose job is to
+            # say how attributable an update was errs OPTIMISTICALLY.
+            modes.append(decision.argmax())
 
         if use_prompt_credit and hasattr(router, "observe"):
             # Credit each PRIOR decision with the change in ITS OWN prompt's solve rate,
@@ -344,14 +371,29 @@ class PPOActor:
                 **{"prompt_credit/observed_units": float(len(outcomes))}
             )
 
-        routed, stats = apply_decisions(
-            advantages,
-            data["loss_mask"],
-            list(sizes),
-            modes,
-            sft_weight=float(gr.solved_advantage),
-        )
+        if use_mixture:
+            routed, stats = apply_mixtures(
+                advantages,
+                data["loss_mask"],
+                list(sizes),
+                mixtures,
+                sft_weight=float(gr.solved_advantage),
+            )
+        else:
+            routed, stats = apply_decisions(
+                advantages,
+                data["loss_mask"],
+                list(sizes),
+                modes,
+                sft_weight=float(gr.solved_advantage),
+            )
         stats_tracker.scalar(**stats.as_metrics())
+        # How many decisions were genuinely mixed. Logged on BOTH branches -- it is 0 by
+        # construction on the argmax one -- so the two arms emit the SAME key set and stay
+        # comparable on one panel. A "mixture" run whose router only ever emits one-hot
+        # decisions is an argmax run wearing a mixture label, and this is the only number
+        # that says so.
+        stats_tracker.scalar(**{"route/mixed_groups": float(stats.mixed_groups)})
         if not use_prompt_credit and hasattr(router, "observe"):
             self._selfevo_pending = (
                 {f"{step}:{i}": m for i, m in enumerate(modes)},

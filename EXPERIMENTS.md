@@ -939,3 +939,90 @@ as designed.
 No code change was needed. Recorded because "the tests do not constrain this" was written
 down once and was wrong -- a mutation harness is only as trustworthy as the checkout it
 mutates, and it should be run against the same tree the tests import.
+
+## 2026-08-31 — Weighted mixtures land, and four things an adversarial audit found in them
+
+`RoutingDecision.weights` has always been a `Mapping[str, float]`, so a router could always
+say "60% SFT, 40% RL". Nothing downstream could hear it: the actor called `.argmax()` and
+the seam took `modes: list[str]`. `apply_mixtures` + `group_routing.decision` close that.
+On response tokens, for normalised `{rl: a, sft: b, skip: c}`:
+
+    new = a * original_advantage + b * (sft_weight * loss_mask) + c * 0
+
+The pure cases are computed by CALLING `apply_decisions` for the extremes and blending, so
+the reduction to today's behaviour is structural rather than an agreement between two copies
+of the same arithmetic. An independent adversarial audit could not break it: 0 tensor-bit
+mismatches over a specials grid (`+/-0.0, NaN, +/-inf, denormals, +/-3.4e38`), seven
+spellings of each one-hot, four partitions, zero-length batches, and 4000 randomised trials
+across fp32/fp64/fp16/bf16, compared as int views so `-0.0 != 0.0`. What it did break is
+below, and all four are now fixed.
+
+**1. Per-weight finiteness is not enough; the SUM overflows.** `_normalised_mixture` checked
+each weight finite and then `if total <= 0`. `{rl: 1e308, sft: 1e308}` has two finite weights
+and an infinite sum; every `w / inf` is `0.0`, so the mixture normalised to all-zeros, no
+term was assembled, and the group trained as SKIP with `counts` logging no mass at all — a
+mixture arm applying a decision nobody chose and reporting neither. Exactly the failure class
+the guards were written to prevent, reached by a value the guards did not model. Fixed as
+`if total <= 0 or not math.isfinite(total)`. **Guard:** when validating a reduction, validate
+the reduction, not only its inputs.
+
+**2. A bit-identity justification that was false, protecting code that was redundant.** The
+pure-RL `continue` carried a comment saying it existed because `1.0 * x + 0.0` is not
+identical to `x` for `x = -0.0`. The code never computed that expression — zero-weighted
+terms were already dropped, so the alternative was exactly `1.0 * x`, which is
+bit-preserving. The auditor deleted the short circuit and got 174 passed and 0 bit
+mismatches. The line was quoted in a commit message as load-bearing; it was not. It IS
+load-bearing, for a different reason found while fixing (3): `changed_rows`. **Guard:** a
+justification in a comment is a claim. If no test fails when the code it defends is removed,
+either the claim or the test is wrong — and a mutation harness that never mutates the line
+will not tell you which.
+
+**3. The reduction was bit-identical in the tensor and NOT in the statistic.** `changed_rows`
+was diffed once at the end as `out != advantages`. `NaN != NaN` is True, so on a NaN batch a
+pure-RL mixture counted every NaN row as reached while the argmax path — which never writes
+an RL group and never compares it — counted zero: 700/700 divergences in the auditor's sweep.
+The tensors matched throughout. Fixed by accumulating per group and BEFORE the write, which
+is also what `apply_decisions` does. This is what makes the (2) short circuit real: a
+written-but-unchanged NaN group would self-report as changed. **Guard:** "bit-identical"
+covers everything the function returns. Ours returns `(tensor, stats)`, and only the tensor
+was being checked.
+
+**4. The argmax-credit coarsening corrupts the attribution instrument, optimistically.** It
+was documented that a mixture arm "learns from a coarser signal than it acts on". Not
+documented, and worse: two materially different mixtures sharing an argmax make a batch look
+uniform, and `batch_outcomes` refuses the whole update as confounded — the router is starved
+by decisions that genuinely differed. And two nearly identical mixtures with different
+argmaxes report `dominant_share=0.5, weak_attribution=0.0`, i.e. MAXIMALLY attributable, for
+groups that got almost the same gradient. The number whose job is to say how attributable an
+update was errs in the direction that makes a run look better than it is, so it cannot be
+used to discount a mixture result the way it discounts a `credit="batch"` one. Documented on
+`GroupRoutingConfig.decision`; no code change, because splitting a scalar reward across a
+mixture's components is not something we can currently measure.
+
+**Also.** `apply_mixtures` built the all-SFT extreme eagerly and so RAISED where
+`apply_decisions` succeeds (`sft_weight > 65504` overflows `full_like` on a float16 batch)
+for mixtures that never read it; now built lazily. The actor normalised weights before
+handing them over, so the overflow in (1) was reported as `{rl: 0.0, sft: 0.0}` — a
+diagnosis naming weights no router emitted; it now forwards `decision.weights` raw and lets
+the seam normalise once. `route/mixed_groups` was logged on the mixture branch only, so the
+two arms did not emit the same key set; now logged on both.
+
+**KNOWN GAP, and it is the important one.** No registered router emits a soft decision.
+Measured over 200 randomised probes each (independently reproduced at 2000): `static`,
+`solve_rate`, `cluster`, `coharness`, `random`, `contextual` all returned one-hot weights
+0/200. `StaticRouter` accepts an arbitrary mapping, but `_route_groups` builds routers with
+`factory()` and no kwargs, so nothing reaches them from config — which is why the `random`
+router reads `SELFEVO_RANDOM_PROPORTIONS` from the environment instead. **So
+`decision=mixture` today produces a run bit-identical to `decision=argmax`, with
+`route/mixed_groups` at 0.0.** The plumbing is real, tested end to end through
+`PPOActor._compute_advantages`, and mutation-covered; the router that would exercise it is
+not written. `experiments/harness/preflight_group_routing.py` now prints the genuine-mixture
+count per router, so this cannot be discovered after a GPU-week.
+
+**Harness finding.** `mutate_group_mixture.py` claimed to print a digest check as its last
+line on interrupt. It did not: `SystemExit` raised from the signal handler unwound past the
+verification block, so the restore happened but was never proven — and the pytest child,
+launched in its own session, kept running against a checkout being restored under it. The
+handler now kills the child's process group, restores, prints the INTACT/MUTATED table, and
+`os._exit`s. Extends the 2026-08-31 entry on killed mutation harnesses: it is not enough for
+the restore to happen, the run has to be able to show that it did.
