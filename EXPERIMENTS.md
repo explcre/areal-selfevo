@@ -3,6 +3,68 @@
 Measured results and negative results, newest first. A claim only belongs here once it has
 been observed end to end; a prediction belongs in GOAL.md until then.
 
+## 2026-08-31 — RESULT: the learned router is indistinguishable from its matched control
+
+The first real arm comparison. Both checkpoints at `globalstep149`, both scored greedily at
+`max_tokens=3072`, and the control ran at the contextual arm's MEASURED mode proportions
+(rl 0.295 / sft 0.353 / skip 0.353), so the two arms differ only in WHICH unit gets which
+mode -- not in the mixture.
+
+| benchmark | ctx | rnd | diff | ctx CI | rnd CI |
+|-----------|-----|-----|------|--------|--------|
+| **MATH-500** | 0.5240 | 0.5260 | **-0.0020** | [0.480, 0.567] | [0.482, 0.569] |
+| AMC23 | 0.1750 | 0.1250 | +0.0500 | [0.087, 0.320] | [0.055, 0.261] |
+| AIME24 | 0.0000 | 0.0000 | 0.0000 | [0.000, 0.114] | [0.000, 0.114] |
+| AIME25 | 0.0000 | 0.0333 | -0.0333 | [0.000, 0.114] | [0.006, 0.167] |
+
+**MATH-500 is the only row with resolution, and it reads -0.0020** -- one fifth of the 0.020
+systematic noise floor measured for greedy scoring here. AMC23 and AIME have 40 and 30
+problems, so their intervals span 20+ points and cannot separate anything.
+
+**This is the null the credit-assignment finding predicted**, and it is worth stating as a
+positive claim rather than an absence: at matched mode proportions, choosing WHICH unit gets
+which mode -- as this router chooses it -- buys nothing over assigning modes at random. What
+the routing arm does is set the MIXTURE; the per-unit decision carries no measurable value.
+
+It is consistent with the mechanism, not merely with bad luck: the same router was separately
+measured to develop no preference over 129 steps because a single per-batch scalar credited to
+64 decisions cannot separate the arms. A router that has learned nothing SHOULD score like
+random at the same proportions, and it does.
+
+**Scope, stated so this is not over-read.** One seed, one checkpoint, one task (GSM8K
+training), one model scale (1.5B). It falsifies "this learned router, with this credit
+signal, beats its matched control" -- not "routing cannot help". The per-prompt credit ledger
+built earlier is the designed test of the second question and is not yet wired.
+
+## 2026-08-31 — Token cap: measured, and my budget-artifact claim was WRONG
+
+Same checkpoint, same benchmarks, only `--max-tokens` changed:
+
+| benchmark | acc @3072 | acc @8192 | trunc @3072 | trunc @8192 |
+|-----------|-----------|-----------|-------------|-------------|
+| MATH-500 | 0.5240 | 0.5260 | 39 | 36 |
+| AMC23 | 0.1750 | 0.1500 | 3 | 4 |
+| AIME24 | 0.0000 | 0.0000 | 11 | 8 |
+| AIME25 | 0.0000 | 0.0333* | 3 | 2 |
+
+Raising the cap 2.7x moved accuracy by less than the noise floor and barely moved truncation.
+**In every row `n_truncated` equals `n_no_box`**: these generations never emit `\boxed{}` at
+all rather than being cut off mid-solution. So they are genuine failures, and the earlier
+claim in this log that "the AIME zero is partly a budget artifact" is **refuted** -- it was a
+hypothesis stated with more confidence than the evidence supported.
+
+Per-benchmark generation config was still built, for two reasons that survive the refutation:
+a uniform cap is wrong in principle (7.8% truncation on MATH-500 versus 15.3% on
+OlympiadBench at the same value), and the results row previously recorded only `seed` and
+`temperature`, so two runs generated at different budgets looked comparable. Every generation
+parameter is now resolved per benchmark and RECORDED in the row, and a `cap_limited` flag
+fires above 10% truncation so a budget-bound score cannot be silently compared against one at
+a different cap.
+
+OlympiadBench remains the open case: 15.3% truncation at 3072, the highest in the suite, and
+never re-measured at a higher cap. Its 8192 override is a hypothesis, and `cap_limited` is
+what will confirm or refute it.
+
 ## 2026-08-31 — First benchmark scores for a routed arm: `ctx` @ globalstep149
 
 The gating measurement, finally taken. `router=contextual`, GSM8K training,

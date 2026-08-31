@@ -95,6 +95,71 @@ def require_dataset(name: str) -> Path:
 SUITE = ["aime24", "aime25", "amc23", "math500", "hmmt_2024", "hmmt_2025",
          "livemathbench", "olympiadbench"]
 
+# --------------------------------------------------------- per-benchmark generation ----
+#
+# Generation parameters are a property of the BENCHMARK, not of the run. A single global
+# value is wrong in both directions: it over-budgets short benchmarks and under-budgets long
+# ones, and because the parameters land in the results row it makes two runs look comparable
+# when they were generated differently.
+#
+# MEASURED 2026-08-31, same checkpoint at 3072 vs 8192 max_tokens:
+#   math500 0.5240 -> 0.5260 (trunc 39 -> 36), amc23 0.1750 -> 0.1500 (trunc 3 -> 4),
+#   aime24 0.0000 -> 0.0000 (trunc 11 -> 8), aime25 0.0000 -> 0.0000 (trunc 3 -> 2).
+# So raising the cap 2.7x moved accuracy by less than the 0.020 greedy noise floor. In every
+# row n_truncated equals n_no_box, i.e. these generations never emit \boxed{} at all rather
+# than being cut off mid-solution -- they are genuine failures, not budget artifacts. The
+# caps below are therefore chosen for HEADROOM and PROVENANCE, not because they raise scores.
+#
+# olympiadbench is the exception worth watching: 15.3% truncation at 3072 (103/675), the
+# highest in the suite, and it has NOT been re-measured at a higher cap. Its 8192 is a
+# hypothesis, and `cap_limited` in the results row is what will confirm or refute it.
+#
+# Anything absent falls back to the CLI value, so this table states only what differs.
+BENCH_OVERRIDES: dict[str, dict[str, object]] = {
+    "aime24": {"max_tokens": 8192},
+    "aime25": {"max_tokens": 8192},
+    "hmmt_2024": {"max_tokens": 8192},
+    "hmmt_2025": {"max_tokens": 8192},
+    "livemathbench": {"max_tokens": 8192},
+    "olympiadbench": {"max_tokens": 8192},
+}
+
+# Every knob that changes what the model produces or how it is sampled. Recorded per
+# benchmark in the results row so a comparison can VERIFY the two runs matched instead of
+# assuming it.
+GEN_KEYS = ("max_tokens", "temperature", "top_p", "n", "concurrency", "timeout", "seed")
+
+# Above this share of truncated generations the score is measuring the token budget rather
+# than the model, and must not be compared against a run at a different cap.
+CAP_LIMITED_RATE = 0.10
+
+
+def resolve_params(bench: str, args) -> dict:
+    """Generation parameters for one benchmark: CLI values with per-benchmark overrides.
+
+    Args:
+        bench: Benchmark name.
+        args: Parsed CLI namespace supplying the defaults.
+
+    Returns:
+        A dict with exactly :data:`GEN_KEYS`.
+
+    Raises:
+        ValueError: If the table names a key that is not a generation parameter. A typo
+            there would otherwise be silently ignored and the benchmark would run at the
+            default while the results row claimed the override.
+    """
+    over = BENCH_OVERRIDES.get(bench, {})
+    unknown = sorted(set(over) - set(GEN_KEYS))
+    if unknown:
+        raise ValueError(
+            f"BENCH_OVERRIDES[{bench!r}] names unknown generation parameter(s) {unknown}; "
+            f"known: {list(GEN_KEYS)}"
+        )
+    out = {k: getattr(args, k) for k in GEN_KEYS}
+    out.update(over)
+    return out
+
 PROMPT = (
     "Solve the following math problem. Reason step by step, and put your final answer "
     "within \\boxed{{}}.\n\n{problem}"
@@ -271,7 +336,7 @@ def wilson(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
     return (max(0.0, c - h), min(1.0, c + h))
 
 
-async def generate(session, url: str, model: str, prompt: str, args) -> dict:
+async def generate(session, url: str, model: str, prompt: str, params: dict) -> dict:
     """One completion.
 
     Returns:
@@ -284,15 +349,15 @@ async def generate(session, url: str, model: str, prompt: str, args) -> dict:
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": args.temperature,
-        "top_p": args.top_p,
-        "max_tokens": args.max_tokens,
+        "temperature": params["temperature"],
+        "top_p": params["top_p"],
+        "max_tokens": params["max_tokens"],
     }
-    if args.seed is not None:
-        payload["seed"] = args.seed
+    if params["seed"] is not None:
+        payload["seed"] = params["seed"]
     for attempt in range(3):
         try:
-            async with session.post(url, json=payload, timeout=args.timeout) as r:
+            async with session.post(url, json=payload, timeout=params["timeout"]) as r:
                 if r.status != 200:
                     await asyncio.sleep(1 + attempt)
                     continue
@@ -314,14 +379,17 @@ async def run_bench(bench: str, args, gen_fh=None) -> dict:
     probs = load(bench, getattr(args, "split", "all"))
     if args.limit:
         probs = probs[: args.limit]
+    # Resolved ONCE per benchmark and threaded through, so every completion in this
+    # benchmark provably used the same parameters and the results row can report them.
+    params = resolve_params(bench, args)
     url = args.base_url.rstrip("/") + "/chat/completions"
-    sem = asyncio.Semaphore(args.concurrency)
-    conn = aiohttp.TCPConnector(limit=args.concurrency)
+    sem = asyncio.Semaphore(params["concurrency"])
+    conn = aiohttp.TCPConnector(limit=params["concurrency"])
 
     async with aiohttp.ClientSession(connector=conn) as session:
         async def one(idx: int, p: dict, k: int) -> dict:
             async with sem:
-                r = await generate(session, url, args.model, PROMPT.format(problem=p["problem"]), args)
+                r = await generate(session, url, args.model, PROMPT.format(problem=p["problem"]), params)
             boxed = extract_boxed(r["text"])
             correct = grade(r["text"], p["answer"]) if r["status"] == "ok" else None
             return {
@@ -337,7 +405,7 @@ async def run_bench(bench: str, args, gen_fh=None) -> dict:
             }
 
         recs = await asyncio.gather(
-            *[one(i, p, k) for i, p in enumerate(probs) for k in range(args.n)]
+            *[one(i, p, k) for i, p in enumerate(probs) for k in range(params["n"])]
         )
 
     if gen_fh is not None:
@@ -352,7 +420,8 @@ async def run_bench(bench: str, args, gen_fh=None) -> dict:
     # Per-problem mean over its OK samples, then mean over problems (avg@n; pass@1 at n=1).
     per: list[float] = []
     for i in range(len(probs)):
-        chunk = [r["correct"] for r in recs[i * args.n : (i + 1) * args.n] if r["correct"] is not None]
+        nn = params["n"]
+        chunk = [r["correct"] for r in recs[i * nn : (i + 1) * nn] if r["correct"] is not None]
         if chunk:
             per.append(sum(chunk) / len(chunk))
     acc = statistics.mean(per) if per else float("nan")
@@ -367,8 +436,15 @@ async def run_bench(bench: str, args, gen_fh=None) -> dict:
         "accuracy": acc,
         "wilson_lo": lo,
         "wilson_hi": hi,
-        "seed": args.seed,
-        "temperature": args.temperature,
+        # Provenance: the parameters this benchmark ACTUALLY ran with, not the CLI defaults.
+        # Two rows are comparable only if these match, and recording them is what lets a
+        # comparison check that instead of assuming it.
+        "params": dict(params),
+        "truncation_rate": (n_trunc / len(recs)) if recs else float("nan"),
+        # True when the token budget, not the model, is plausibly setting the score.
+        "cap_limited": bool(recs) and (n_trunc / len(recs)) > CAP_LIMITED_RATE,
+        "seed": params["seed"],
+        "temperature": params["temperature"],
     }
 
 
@@ -440,9 +516,15 @@ def main() -> None:
             print(f"WARNING {r['benchmark']}: only {r['n_graded']}/{r['n_problems']} "
                   f"graded ({r['n_failed']} failed); accuracy is over survivors and is "
                   "biased upward", file=sys.stderr)
-        if r["n_truncated"]:
+        if r.get("cap_limited"):
+            print(f"CAP-LIMITED {r['benchmark']}: {r['n_truncated']}/{r['n_problems']} "
+                  f"({r['truncation_rate']:.1%}) hit max_tokens="
+                  f"{r['params']['max_tokens']} and were graded wrong. This score is "
+                  "partly a property of the token budget; do NOT compare it against a run "
+                  "at a different cap.", file=sys.stderr)
+        elif r["n_truncated"]:
             print(f"NOTE {r['benchmark']}: {r['n_truncated']} generation(s) hit the token "
-                  "cap and were graded as wrong; raise --max-tokens to test sensitivity",
+                  f"cap (max_tokens={r['params']['max_tokens']}) and were graded as wrong",
                   file=sys.stderr)
 
     # A benchmark that graded nothing is a FAILURE, not a score of nan. The warning above
