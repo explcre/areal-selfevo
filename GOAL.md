@@ -64,7 +64,7 @@ training. That needs a GPU arm, and it is now the top item on the critical path.
 | M5 | RL/reverse-KL mix per token | **DONE** | extends AReaL's own `rl_loss_weight`/`distill_loss_weight` |
 | M6 | SFT / forward-KL modes | **PARTIAL** | SFT now REACHES the update for solved groups (a constant on their zero advantages IS the supervised step). Forward-KL still a name |
 | M7 | **Teacher** supplying routed units | **NOT BUILT** | DEMOTED by measurement: reaches only ~4.5% of groups. The free self-target covers 31.4% and is built |
-| M8 | Learned meta-controller | **PARTIAL** | `ContextualBanditRouter` (LinUCB over 7 features) built, audited, 29/29 mutants, demonstrably learns on a clean reward. **Now called in training** via `_route_groups`. Gap: no evidence it out-decides the fixed rule on a real task |
+| M8 | Learned meta-controller | **PARTIAL — negative so far** | Built, audited, called in training, explores, and receives clean feedback (128 updates, `weak_attribution=0.0`, 1 confounded skip). **Still develops no preference**: mode mix stays at uniform thirds through 129 steps and gets FLATTER, not sharper (L1 vs uniform 0.056→0.027 by quarter). Isolated to CREDIT ASSIGNMENT, not the bandit -- with a shared per-batch scalar the arms provably converge to the same `theta`; the same router separates arms and picks the rewarded mode when credit depends on the mode (measured, 3/3 mutants). Fix is per-prompt credit across time, not a bigger bandit |
 | M9 | Rule evolve-policy (cold start + baseline) | **NOT BUILT** | needed before "learned" is falsifiable |
 | M10 | Evolve model / harness / reward | **PARTIAL** | `HarnessAction` axis built, audited, 18/18 mutants. **No consumer**: nothing writes `can_evolve_harness`, nothing reads the action. Reward axis still a name |
 | M11 | Cadence: frozen / alternating / simultaneous | **NOT BUILT** | `CADENCES` = bare strings |
@@ -441,9 +441,15 @@ difference, and the reverse of the previous ordering.
    compute. This is the method's main lever and its main risk: sharpening an already-correct
    policy spends entropy, and entropy collapse is the failure mode already measured twice
    here. Until this runs, the solved branch defaults to SKIP.
-1b. **Run `router=contextual` as an arm** against the fixed rule at matched compute. The seam
-   is now tested end-to-end (M22), so this is a launch, not a build. It is what turns the
-   learned controller from "reachable" into a result -- or into an honest null.
+1b. **RUNNING, and trending null.** `router=contextual` (A100) against `router=random` at the
+   contextual arm's MEASURED proportions (H200). At 129 steps the learned router shows no
+   preference, and the cause is measured: a single per-batch scalar credited to all 64
+   decisions carries no information separating the arms. Expect a null against the matched
+   control, and report it as one.
+1c. **Per-prompt credit assignment** -- the concrete fix implied by 1b, and the first thing
+   that could make a learned controller work here. Credit a prompt's change in solve rate
+   between the batch where it was routed to mode m and its next appearance. Needs prompt
+   identity carried through the pipeline; today's `unit_id` is batch-local by construction.
 2. **Give `route_batch` a caller** -- otherwise M2 and the new harness axis are dead code.
    NOTE this is now the ONLY remaining "no caller" gap; the group-level seam is closed.
 3. **Re-measure the split on OlympiadBench.** 0.875 is a property of GSM8K at a high solve

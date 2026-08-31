@@ -3,6 +3,62 @@
 Measured results and negative results, newest first. A claim only belongs here once it has
 been observed end to end; a prediction belongs in GOAL.md until then.
 
+## 2026-08-31 — NEGATIVE: the learned router receives feedback and still develops no preference
+
+Measured on the live `ctx` run at 129 steps, GSM8K / Qwen2.5-1.5B, `router=contextual` with
+the cold start fixed. Mode mix by quarter, as a fraction of 64 groups per step:
+
+| window | rl | sft | skip | L1(mean vs uniform) | mean per-step L1 |
+|--------|------|------|------|---------------------|------------------|
+| Q1 | 0.305 | 0.341 | 0.354 | 0.056 | 0.238 |
+| Q2 | 0.299 | 0.338 | 0.363 | 0.069 | 0.335 |
+| Q3 | 0.351 | 0.303 | 0.346 | 0.061 | 0.248 |
+| Q4 | 0.344 | 0.320 | 0.336 | **0.027** | 0.277 |
+| all | 0.325 | 0.325 | 0.350 | 0.033 | 0.275 |
+
+**The aggregate mix is indistinguishable from uniform thirds and the trend is flat to
+DECREASING** -- the last quarter is the most uniform of the four. A learner should move away
+from uniform as its arm estimates separate; this does the opposite. Per-step L1 stays around
+0.27, so the router does make different decisions step to step, but they average out instead
+of accumulating into a preference.
+
+**This is not the earlier exploration bug, and not a plumbing failure.** Feedback is flowing:
+128 feedback records, `n_modes=3` in every batch (so attribution is never vacuous),
+`n_units=64`, `weak_attribution=0.0` throughout, and exactly ONE `confounded_skips` in the
+whole run (the first batch, which has no predecessor). The router got 128 clean updates and
+learned nothing.
+
+**Mechanism, and it is structural rather than a tuning problem.** `batch_outcomes` credits a
+single scalar -- the change in mean raw reward between consecutive batches -- to every
+decision in the batch. LinUCB updates `A_m += x x^T` and `b_m += r x`. When `r` is shared
+across all units in the batch and the mode assignment is (initially, by round-robin cold
+start) independent of the context `x`, then for every arm
+
+    b_m ~ r * n_m * xbar,   A_m ~ n_m * E[x x^T],
+    theta_m = A_m^-1 b_m ~ E[x x^T]^-1 * r * xbar,
+
+which is **the same vector for every arm**, and the `n_m` cancels. The arms therefore start
+identical and stay near-identical, selection is driven by the UCB bonus alone, and the mix
+stays uniform. The credit signal contains no information that distinguishes one arm from
+another, so no amount of it will separate them.
+
+**What this rules out and what it implies.** It rules out "the router needs more steps" -- an
+uninformative signal does not become informative with repetition. It implies the fix is
+credit ASSIGNMENT, not the bandit: a per-batch scalar cannot train a per-group policy.
+
+The naive within-batch contrast does NOT fix it: comparing the rewards of groups routed to
+different modes inside one batch measures which PROMPTS were easy, not which mode was better,
+because the decision affects the next policy rather than the reward already observed. A
+correct signal has to hold the prompt fixed and vary the mode across time -- credit a prompt's
+change in solve rate between the batch where it was routed to mode m and its next appearance.
+That needs prompt identity carried through the pipeline, which the current
+`unit_id = f"{step}:{i}"` deliberately does not provide (it is batch-local by construction, to
+stop cross-batch collisions).
+
+Recorded as a NEGATIVE result for M8. The learned meta-controller is reachable, explores, and
+receives clean feedback -- and is still, on this evidence, not learning. The `rnd` control at
+matched proportions is running so the comparison is measured rather than assumed.
+
 ## 2026-08-31 — The matched control was also inert, for two independent reasons
 
 Same defect class as the contextual router's zero cold start, in the same registry, found the
