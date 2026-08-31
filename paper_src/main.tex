@@ -27,9 +27,13 @@ correct sample; on the unsolved half no target exists unless one is supplied, wh
 harness evolution the only consumer that can use those units at all. We therefore make the
 choice of estimator and the choice of evolution target a per-unit decision rather than a
 per-run schedule, with the two as orthogonal axes so a single trajectory can feed both.
-We report the negative result that located this leverage: a token-level version of the same
-idea, reaching $1.7\%$ of tokens, moved held-out accuracy by less than the noise floor.
-Every capability is flag-gated and reduces to unmodified GRPO when disabled.
+The closest prior work, DAPO's dynamic sampling, acts on exactly this set and responds in the
+opposite way --- it discards the silent groups and oversamples to refill --- which on our own
+measurements costs $1.5$--$2.4\times$ the rollouts, a multiplier that \emph{grows} with
+training because the silent fraction itself grows from $0.33$ to $0.58$ on an arm with no
+routing at all. We report the negative result that located this leverage: a token-level
+version of the same idea, reaching $1.7\%$ of tokens, moved held-out accuracy by less than
+the noise floor. Every capability is flag-gated and reduces to unmodified GRPO when disabled.
 \end{abstract}
 
 \input{method}

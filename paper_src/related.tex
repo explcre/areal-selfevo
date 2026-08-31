@@ -8,6 +8,15 @@
 We organise prior work by the claim it already owns, because our contribution is only
 meaningful as the complement of those claims.
 
+\paragraph{Discarding the silent groups.} DAPO's dynamic sampling is the closest prior
+work, and it is close in the strongest sense: it acts on exactly the set we act on. Its rule
+keeps a prompt only when the group's reward standard deviation is positive, and a zero
+standard deviation is unanimity, which by \eqref{eq:adv} is precisely the zero-advantage
+condition. DAPO therefore \emph{detects} the silent channel and \emph{discards} it,
+oversampling until the batch refills. We reuse it. Same phenomenon, opposite response --- so
+DAPO is the baseline this claim must be measured against rather than a method to cite in
+passing, and Sec.~\ref{sec:cost} reports what its response costs.
+
 \paragraph{Choosing an algorithm per task.} SIA selects among training algorithms at the
 granularity of a \emph{task}, and demonstrates that the choice matters. That result is
 theirs and we do not re-derive it. What a task-level policy cannot express is that units
