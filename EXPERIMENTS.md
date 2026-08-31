@@ -3,6 +3,36 @@
 Measured results and negative results, newest first. A claim only belongs here once it has
 been observed end to end; a prediction belongs in GOAL.md until then.
 
+## 2026-08-31 — First benchmark scores for a routed arm: `ctx` @ globalstep149
+
+The gating measurement, finally taken. `router=contextual`, GSM8K training,
+Qwen2.5-1.5B-Instruct, scored greedily on the frozen suite via
+`experiments/bench/run_math.sh` (sglang server, repo copy of `math_bench.py`).
+
+| benchmark | n | accuracy | Wilson 95% | truncated |
+|-----------|---|----------|------------|-----------|
+| MATH-500 | 500 | **0.5240** | [0.480, 0.567] | 39 |
+| AMC23 | 40 | 0.1750 | [0.087, 0.320] | 3 |
+| AIME24 | 30 | 0.0000 | [0.000, 0.114] | 11 |
+| AIME25 | 30 | 0.0000 | [0.000, 0.114] | 3 |
+
+**Read MATH-500 only.** AIME reads 0.000 at this scale, which is already recorded as B2's
+status -- it cannot separate any two arms here. AMC23's 40 problems give a 23-point interval,
+so it cannot either. MATH-500 is the only row with enough resolution to compare arms, and even
+it carries a 0.020 systematic noise floor from greedy-scoring irreproducibility.
+
+**Truncation is not negligible and biases DOWNWARD.** 39/500 MATH-500 generations hit the
+3072-token cap and were graded wrong, as did 11/30 on AIME24 -- so the AIME zero is partly a
+budget artifact rather than pure inability. Every number here is a lower bound at this token
+budget, and arm comparisons are only fair at the SAME budget.
+
+**No comparison yet.** This is one arm. The matched control `rnd` at the same
+`globalstep149`, run at the contextual arm's measured proportions, is being scored next; until
+that lands this is a number, not a result. The `ctx` run stalled at step 162 so the arms cannot
+be compared at 290; a full-length contextual run (`ctx2`) was launched on the H200 to recover
+that, with the cold-start fix applied there first -- that box did NOT have it, so a contextual
+run started there before this hour would have been inert.
+
 ## 2026-08-31 — The `ctx` run stalled at step 162, and the orphan check could not see it
 
 The watchdog worked and the cleanup did not. `supervise.sh` logged
