@@ -1751,8 +1751,17 @@ class GroupRoutingConfig:
             steps at the live config (10 epochs over ~7.4k GSM8K prompts), so a paired
             observation is available roughly ten times per prompt.
 
-            The default is ``"batch"`` so this changes nothing unless asked for, and the two
-            are an ablation pair on exactly one axis: what the router is told about its own
+            ``"prompt_centered"`` is ``"prompt"`` with the batch's MEAN delta subtracted
+            from every credit. Measured 2026-08-31: with raw ``"prompt"`` the router abandoned
+            RL entirely at exactly the step credit began flowing. A prompt's solve rate is
+            compared across ~29 steps of training, over which the policy improves generally,
+            so most prompts improve whatever mode was applied -- the signal conflates "the
+            model got better" with "this mode helped this prompt". Centring removes that
+            common component, leaving only how a decision fared RELATIVE to the rest of the
+            batch, which is the quantity the router is supposed to be choosing on.
+
+            The default is ``"batch"`` so this changes nothing unless asked for, and the three
+            form an ablation ladder on exactly one axis: what the router is told about its own
             decisions.
 
     Raises:
@@ -1767,11 +1776,11 @@ class GroupRoutingConfig:
     credit: str = "batch"
 
     def __post_init__(self):
-        if self.credit not in ("batch", "prompt"):
+        if self.credit not in ("batch", "prompt", "prompt_centered"):
             raise ValueError(
-                f"credit must be 'batch' or 'prompt', got {self.credit!r}. An unknown value "
-                f"silently falling back to 'batch' would report a per-prompt-credit arm that "
-                f"never ran."
+                f"credit must be 'batch', 'prompt' or 'prompt_centered', got "
+                f"{self.credit!r}. An unknown value silently falling back to 'batch' would "
+                f"report a per-prompt-credit arm that never ran."
             )
         if self.solved_advantage < 0:
             raise ValueError(

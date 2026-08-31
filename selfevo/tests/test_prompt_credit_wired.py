@@ -158,3 +158,61 @@ def test_an_unknown_credit_mode_is_refused():
     """A silent fallback would report a per-prompt arm that never ran."""
     with pytest.raises(ValueError, match="credit must be"):
         GroupRoutingConfig(enabled=True, credit="sometimes")
+
+
+# ------------------------------------------------------------------ centring -----------
+
+
+def _deltas(rec):
+    """Every credited value from a recorder's most recent observe() call."""
+    assert rec.observed, "no credit emitted"
+    return [o.value for o in rec.observed[-1].values()]
+
+
+def test_centring_removes_the_common_component(stub):
+    """The confound this mode exists for.
+
+    Both groups improve by the SAME amount, which is what general training progress looks
+    like. Raw "prompt" credits both positively and so rewards whichever mode happened to be
+    used; centred credit must report zero, because neither decision did better than the other.
+
+    Each `_actor(...)` call builds a fresh router through the registry, so the fixture list
+    holds one recorder per arm and they can be compared directly.
+    """
+    ids = _same_prompts()
+    a_raw = _actor("prompt")
+    _run(a_raw, [0] * 8, ids, response_tag=0)
+    _run(a_raw, [1] * 8, ids, response_tag=3)
+    raw = _deltas(stub[0])
+    assert raw and all(v > 0 for v in raw), raw
+
+    a_ctr = _actor("prompt_centered")
+    _run(a_ctr, [0] * 8, ids, response_tag=0)
+    _run(a_ctr, [1] * 8, ids, response_tag=3)
+    centred = _deltas(stub[1])
+    assert centred and all(abs(v) < 1e-6 for v in centred), centred
+
+
+def test_centring_preserves_relative_differences(stub):
+    """It must remove the common trend, not the signal.
+
+    One prompt improves more than the other. Centred credit must keep them on OPPOSITE
+    sides of zero, because that is the comparison the router is supposed to make.
+    """
+    ids = _same_prompts()
+    a = _actor("prompt_centered")
+    _run(a, [0, 0, 0, 0, 0, 0, 0, 0], ids, response_tag=0)
+    # group 0 -> solve_rate 1.0, group 1 -> solve_rate 0.5: different improvements
+    _run(a, [1, 1, 1, 1, 1, 1, 0, 0], ids, response_tag=5)
+    vals = sorted(_deltas(stub[0]))
+    assert len(vals) == 2, vals
+    assert vals[0] < 0 < vals[1], vals
+    assert abs(sum(vals)) < 1e-6, f"centred credits must sum to zero: {vals}"
+
+
+def test_prompt_centered_is_accepted_by_config():
+    """A typo here would silently fall back and report an arm that never ran."""
+    from areal.api.cli_args import GroupRoutingConfig as G
+    assert G(enabled=True, credit="prompt_centered").credit == "prompt_centered"
+    with pytest.raises(ValueError, match="credit must be"):
+        G(enabled=True, credit="prompt_centred")   # British spelling is not a mode

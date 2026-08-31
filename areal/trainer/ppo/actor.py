@@ -238,7 +238,8 @@ class PPOActor:
         # what every run before 2026-08-31 used; "prompt" credits each decision with its own
         # prompt's change in solve rate. They differ on exactly one axis, so they are an
         # ablation pair rather than two features.
-        use_prompt_credit = getattr(gr, "credit", "batch") == "prompt"
+        _credit = getattr(gr, "credit", "batch")
+        use_prompt_credit = _credit in ("prompt", "prompt_centered")
 
         # Close the loop on the PREVIOUS batch before deciding this one. The outcome of a
         # decision is not observable until after the update it took part in, so the earliest
@@ -299,6 +300,7 @@ class PPOActor:
             ids_cpu = data["input_ids"].detach().cpu().tolist()
             mask_cpu = data["loss_mask"].detach().cpu().tolist()
             outcomes: dict[str, DecisionOutcome] = {}
+            pairs: list[tuple] = []
             start = 0
             for i, (f, g) in enumerate(zip(feats, sizes)):
                 row = start
@@ -315,9 +317,23 @@ class PPOActor:
                 if paired is None:
                     continue
                 prior, delta = paired
+                pairs.append((prior, delta))
+
+            # Centring removes the component of every delta that is common to the batch --
+            # general training progress -- so what reaches the router is how a decision fared
+            # RELATIVE to the rest of the batch. Without it the router sees mostly-positive
+            # deltas whatever it chose, and rewards whichever mode it happened to use most.
+            shift = 0.0
+            if _credit == "prompt_centered" and pairs:
+                shift = sum(d for _, d in pairs) / len(pairs)
+            for prior, delta in pairs:
                 outcomes[prior.unit_id] = DecisionOutcome(
-                    mode=prior.mode, value=delta, batch_id=str(prior.step)
+                    mode=prior.mode, value=delta - shift, batch_id=str(prior.step)
                 )
+            # The size of the common trend that centring removes. If this is large relative
+            # to the spread of deltas, the raw "prompt" signal was mostly measuring training
+            # progress rather than the decision.
+            stats_tracker.scalar(**{"prompt_credit/mean_delta": float(shift)})
             if outcomes:
                 router.observe(outcomes)
             stats_tracker.scalar(**ledger.as_metrics())

@@ -10,24 +10,32 @@ MUTATIONS = [
      '        if use_prompt_credit and hasattr(router, "observe"):',
      '        if False and hasattr(router, "observe"):'),
     ("credit mode ignored, so both arms take the prompt path",
-     '        use_prompt_credit = getattr(gr, "credit", "batch") == "prompt"',
+     '        use_prompt_credit = _credit in ("prompt", "prompt_centered")',
      '        use_prompt_credit = True'),
     ("credit mode ignored the other way, so the arm never exists",
-     '        use_prompt_credit = getattr(gr, "credit", "batch") == "prompt"',
+     '        use_prompt_credit = _credit in ("prompt", "prompt_centered")',
      '        use_prompt_credit = False'),
     ("ledger rebuilt every batch, so no prompt ever pairs",
      '            ledger = getattr(self, "_selfevo_ledger", None)',
      '            ledger = None'),
-    ("outcomes credited to the CURRENT unit instead of the prior one",
-     '                outcomes[prior.unit_id] = DecisionOutcome(\n'
-     '                    mode=prior.mode, value=delta, batch_id=str(prior.step)\n'
-     '                )',
-     '                outcomes[f"{step}:{i}"] = DecisionOutcome(\n'
-     '                    mode=modes[i], value=delta, batch_id=str(step)\n'
-     '                )'),
+    ("outcomes keyed by batch instead of by the prior unit, so credit lands on no arm",
+     '                outcomes[prior.unit_id] = DecisionOutcome(',
+     '                outcomes[str(prior.step)] = DecisionOutcome('),
     ("the prompt key uses the whole row, so a prompt never matches itself",
      '                    key = prompt_key(ids_cpu[row], mask_cpu[row])',
      '                    key = str(ids_cpu[row])'),
+    ("centring never applied, so the common training trend stays in every credit",
+     '            if _credit == "prompt_centered" and pairs:',
+     '            if False:'),
+    ("centring applied to the raw prompt arm too, erasing the ablation",
+     '            if _credit == "prompt_centered" and pairs:',
+     '            if pairs:'),
+    ("shift uses the max instead of the mean, so credits are all non-positive",
+     '                shift = sum(d for _, d in pairs) / len(pairs)',
+     '                shift = max(d for _, d in pairs)'),
+    ("shift added instead of subtracted, doubling the common trend",
+     '                    mode=prior.mode, value=delta - shift, batch_id=str(prior.step)',
+     '                    mode=prior.mode, value=delta + shift, batch_id=str(prior.step)'),
 ]
 
 
