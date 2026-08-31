@@ -216,6 +216,62 @@ true multiplier from the accept/reject counts rather than inheriting this estima
 the comparison axis in advance as \emph{matched generation budget}, not matched steps: DAPO's
 kept batch is denser per step, so an equal-step comparison would flatter it.
 
+\subsection{The solved branch is inert, and then harmful}
+\label{sec:solvedbranch}
+
+Acting on the free self-target does not help. At $c_+=0.5$ the effect is null at every
+checkpoint and the difference-in-differences after removing the base offset is $0.000$--$0.002$
+at four of five steps. At $c_+=2.0$ it becomes negative: $-0.054$ at step 144
+($p=0.014$, $2.5\times$ the noise floor). We report it as suggestive rather than conclusive
+--- one hit in five paired tests does not survive a Bonferroni threshold of $0.01$ --- but the
+\emph{shape} argues it is real: negative or zero at four of five steps with the largest effect
+at the \emph{last} checkpoint, which is what cumulative over-sharpening looks like and is not
+what a random hit looks like. It agrees with an independently measured entropy trace in which
+the routed arm descends faster mid-run.
+
+The mechanism is unflattering and simple: a group is solved \emph{because} the policy already
+places high probability on the correct answers, so supervising on them teaches what the model
+already knows.
+
+\subsection{The composition of the silent channel inverts with task difficulty}
+\label{sec:flip}
+
+If that were the whole story the channel would be worthless, because on GSM8K it is $87.5\%$
+solved. It is not the whole story. Holding the model and configuration fixed and changing only
+the training task:
+
+\begin{table}[t]
+\centering\small
+\caption{The silent channel does not shrink on a harder task --- it inverts.
+Qwen2.5-1.5B-Instruct in both columns.}
+\label{tab:flip}
+\begin{tabular}{lcc}
+\toprule
+ & GSM8K & MATH \\
+\midrule
+silent groups                    & 0.359 & 0.419 \\
+\quad silent because solved      & 0.315 & 0.164 \\
+\quad silent because unsolved    & 0.045 & \textbf{0.255} \\
+\midrule
+solved share of the channel      & \textbf{87.5\%} & \textbf{39.1\%} \\
+unsolved share                   & 12.5\% & \textbf{60.9\%} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The unsolved fraction of \emph{all} groups rises from $4.5\%$ to $25.5\%$, a $5.7\times$
+increase, while the solved fraction roughly halves. So the branch we measured to be worthless
+shrinks to a minority exactly where the task gets hard, and the branch for which no
+self-target exists --- and for which a teacher or the harness is the only possible consumer
+--- becomes the majority.
+
+This is what the routing rule of \eqref{eq:rule} is for. A fixed threshold tuned on GSM8K
+would spend its effort on the solved side, which is where the effort is wasted; keying on the
+\emph{side} of silence rather than on a tuned constant is what survives the shift. We state
+the limits plainly: $n=11$ batches for the MATH column against $98$ for GSM8K, one model at
+one scale, and --- the lesson of Sec.~\ref{sec:solvedbranch} --- locating mass is not the same
+as showing that acting on it helps.
+
 \subsection{Not yet measured}
 
 Stated explicitly so the gap is not mistaken for an omission: whether training on the
