@@ -3,6 +3,65 @@
 Measured results and negative results, newest first. A claim only belongs here once it has
 been observed end to end; a prediction belongs in GOAL.md until then.
 
+## 2026-08-31 — M9 built: the rule the learned controller now has to beat
+
+A build-and-verification record, not a result -- no arm has trained with it yet, and that is
+stated in GOAL.md's M9 row rather than implied away.
+
+**Why it was worth building before anything else on the critical path.** The learned router
+has already been measured null against its matched RANDOM control (MATH-500 -0.0020,
+OlympiadBench +0.0000). That falsifies "the per-unit decision beats a coin at matched
+proportions". It cannot falsify "the per-unit decision beats THINKING", because nothing
+written down was decided from the same inputs. `selfevo/routing/rule_policy.py` is that
+something.
+
+**The `rule` slot on the `evolve_policy` axis was not a baseline before.** It pointed at
+`SolveRateRouter`, which (a) decides from one scalar where `learned_weights` decides from
+seven, so an arm difference would confound "written vs learned" with "1 feature vs 7", and
+(b) is provably inert at this granularity -- `criteria.threshold_is_inert` shows every
+threshold in `(0, I_RL(1/G, G)]` induces the identical partition, and its default 0.1 is
+inside that interval at every G run here: `I_RL(1/G, G)` is 0.68 at G=4, 0.66 at G=8 and
+0.64 at G=16, and `criteria.threshold_is_inert` returns True at all three. Its one tunable
+number
+cannot change a decision. `SolveRateRouter` stays reachable as `router=solve_rate`.
+
+**The rule, and the measurement each branch rests on.**
+
+| branch | action | grounded in |
+|---|---|---|
+| `reward_std > 0` | RL | identity: `A_i = r_i - rbar` is non-zero somewhere iff the raw rewards differ. No threshold at all |
+| silent, `solve_rate == 1` | SKIP | the free self-target measured **inert at 0.5, harmful at 2.0** -- the only two operating points ever measured |
+| silent, `solve_rate == 0` | teacher mode if one exists, else SKIP | no self-target by construction; no run wires a teacher, so in practice SKIP |
+| unsolved and `truncated_fraction >= 1` | `HarnessAction.PROPOSE` | truncation is non-termination, not budget: 8192 -> 16384 moved it 79 -> 78 (ctx) and 61 -> 64 (rnd), and `n_truncated == n_no_box` in every MATH/AMC/AIME row |
+
+**One number is NOT measurement-pinned and the docstring says so** rather than inventing a
+justification: the truncation threshold's 1.0 is the only value at which *every* sample in
+the group failed to terminate, which is the same guarantee-preserving reasoning
+`CoHarnessRouter` documents for its own 1.0/0.0 defaults. What is measured is the branch's
+premise, not the cut point.
+
+**Keying on `reward_std` instead of `solve_rate` is not cosmetic.** A group with rewards
+`[1.0, 0.8, 1.0, 0.8]` grades as all-correct while its advantages are +-0.1 and its gradient
+is live. A solve-rate rule deletes that gradient; this one does not. That case is one of the
+25 mutants -- "identity keyed on the OUTCOME split instead of the reward split" -- and it is
+killed by the group the observability suite already pins as the realistic non-binary one.
+
+**Verification.** 41 tests, every behavioural one through `ROUTERS["rule"]()` with NO
+arguments, because the last two arm failures in this project were both dataclass defaults
+reaching training through `factory()` (`random`'s `{rl: 1.0}`, `contextual`'s
+`cold_start_rounds=0`). Three tests go through the real `PPOActor._compute_advantages`: on a
+fully silent batch the rule arm is **bit-identical** to the off arm, which is the sharp form
+of "SKIP spends nothing", and with `solved_mode="sft"` the constant reaches the response
+tokens and not the prompt. **25/25 mutants killed**; two further mutations are omitted as
+provably equivalent and named in the harness docstring (`has_target` -> `has_teacher` on a
+branch where `solve_rate == 0` makes them equal; a `reward_std` threshold below the smallest
+attainable non-zero std of a binary group). Target files verified intact after the run.
+
+**What is NOT established.** That the rule is any good. It has not been run, and when it is,
+it is not a matched-proportion comparison against `ctx` -- with no teacher it emits only
+`rl`/`skip` against the contextual arm's rl 0.295 / sft 0.353 / skip 0.353, so each arm still
+needs its own `router=random` control at its own measured proportions.
+
 ## 2026-08-31 — RETRACTION: the "silent-channel identity violation" was my own regex bug
 
 Two entries below -- "MEASUREMENT INTEGRITY: the decomposition violates its own identity",

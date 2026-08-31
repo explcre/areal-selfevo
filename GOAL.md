@@ -36,8 +36,8 @@ meta-controller, with a **validity condition** saying when each choice is legiti
 Legend: **DONE** built + tested + audited · **PARTIAL** exists but incomplete or unproven ·
 **NOT BUILT** declared only.
 
-**Scoreboard (2026-08-31, after the seam was tested).** Method **10 DONE / 5 PARTIAL /
-7 NOT BUILT**; Engineering **6 DONE / 2 PARTIAL**; Benchmarks **4 DONE / 1 PARTIAL /
+**Scoreboard (2026-08-31, after the seam was tested and M9 was built).** Method **11 DONE / 5 PARTIAL /
+6 NOT BUILT**; Engineering **6 DONE / 2 PARTIAL**; Benchmarks **4 DONE / 1 PARTIAL /
 10 NOT BUILT**. So: **no, the goal is not implemented.** What IS complete is one vertical
 slice -- measure the silent channel, decompose it, act on it, verify end-to-end -- and that
 slice is the paper's spine.
@@ -65,7 +65,7 @@ training. That needs a GPU arm, and it is now the top item on the critical path.
 | M6 | SFT / forward-KL modes | **PARTIAL** | SFT now REACHES the update for solved groups (a constant on their zero advantages IS the supervised step). Forward-KL still a name |
 | M7 | **Teacher** supplying routed units | **NOT BUILT** | DEMOTED by measurement: reaches only ~4.5% of groups. The free self-target covers 31.4% and is built |
 | M8 | Learned meta-controller | **PARTIAL — negative so far** | Built, audited, called in training, explores, and receives clean feedback (128 updates, `weak_attribution=0.0`, 1 confounded skip). **Still develops no preference**: mode mix stays at uniform thirds through 129 steps and gets FLATTER, not sharper (L1 vs uniform 0.056→0.027 by quarter). Isolated to CREDIT ASSIGNMENT, not the bandit -- with a shared per-batch scalar the arms provably converge to the same `theta`; the same router separates arms and picks the rewarded mode when credit depends on the mode (measured, 3/3 mutants). Fix is per-prompt credit across time, not a bigger bandit |
-| M9 | Rule evolve-policy (cold start + baseline) | **NOT BUILT** | needed before "learned" is falsifiable |
+| M9 | Rule evolve-policy (cold start + baseline) | **DONE — built, not yet RUN** | `selfevo/routing/rule_policy.py`, registered as `router=rule` AND `evolve_policy=rule` (which pointed at the one-scalar `SolveRateRouter` before). Deterministic, and consumes the SAME 7 observability features the learned arm does, so the comparison is like-for-like rather than 1-feature-vs-7. Branches: `reward_std > 0` -> RL (an identity, no threshold); solved+silent -> SKIP (measured inert at 0.5, harmful at 2.0); unsolved+silent -> teacher if one exists, else SKIP (no self-target by construction); fully-truncated unsolved -> `HarnessAction.PROPOSE` (truncation is non-termination: 79->78 at twice the cap). 41 tests through the registry, 3 of them through the real `_compute_advantages`; **25/25 mutants**. **Gaps: no arm has trained with it** -- it is a built baseline, not yet a measured one -- and it has had no separate subagent audit (E3), so the evidence here is the tests and the mutation score, nothing more |
 | M10 | Evolve model / harness / reward | **PARTIAL** | `HarnessAction` axis built, audited, 18/18 mutants. **No consumer**: nothing writes `can_evolve_harness`, nothing reads the action. Reward axis still a name |
 | M11 | Cadence: frozen / alternating / simultaneous | **NOT BUILT** | `CADENCES` = bare strings |
 | M12 | Evolvable reward formula | **NOT BUILT** | |
@@ -455,6 +455,11 @@ difference, and the reverse of the previous ordering.
 3. **Re-measure the split on OlympiadBench.** 0.875 is a property of GSM8K at a high solve
    rate, not a constant; a harder task moves mass to the unsolved branch.
 4. **M9 rule evolve-policy** -- cold start *and* the baseline the learned one must beat.
+   **BUILT 2026-08-31** (`selfevo/routing/rule_policy.py`, `router=rule`); what remains is
+   RUNNING it as an arm. Note it is not a matched-proportion comparison against `ctx`: with
+   no teacher wired the rule emits only `rl`/`skip`, against the contextual arm's measured
+   rl 0.295 / sft 0.353 / skip 0.353, so each arm still needs its own `router=random`
+   control at its own measured proportions.
 5. **A teacher (M7)** -- now a lever on ~4.5% of groups, so it follows rather than leads.
 6. Then M8 learned controller, then the named benchmarks in Sec. 2.
 

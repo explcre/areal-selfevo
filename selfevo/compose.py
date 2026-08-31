@@ -189,6 +189,23 @@ def _code_policy_router(**kw: object) -> object:
     return CodePolicyRouter(**kw)  # type: ignore[arg-type]
 
 
+def _rule_router(**kw: object) -> object:
+    """Factory for :class:`selfevo.routing.rule_policy.RulePolicyRouter` -- M9.
+
+    Deliberately supplies NO defaults of its own. Every default that decides an experiment
+    lives on the dataclass, next to the measurement that grounds it, because this seam is
+    where the last two arm failures happened: `_route_groups` builds routers with
+    ``factory()`` and no arguments, so a default set here (or missing here) IS the arm.
+    ``random`` shipped with an unusable class default and ran bit-identical to the off arm;
+    ``contextual`` shipped with ``cold_start_rounds=0`` and did the same. A factory that
+    adds nothing cannot repeat either failure, and the dataclass defaults are what a test
+    constructing ``RulePolicyRouter()`` directly already checks.
+    """
+    from .routing.rule_policy import RulePolicyRouter
+
+    return RulePolicyRouter(**kw)  # type: ignore[arg-type]
+
+
 ROUTERS: dict[str, Callable[..., object] | None] = {
     "static": _static_router,            # fixed weights, the fixed-mode baseline
     "solve_rate": _solve_rate_router,    # SAMPLE granularity, I_RL silence split
@@ -197,6 +214,7 @@ ROUTERS: dict[str, Callable[..., object] | None] = {
     "coharness": _coharness_router,      # model AND/OR harness; validate() demands a harness
     "contextual": _contextual_router,    # LinUCB over observability features; learns via observe()
     "code_policy": _code_policy_router,  # the rule is generated source; requires source=
+    "rule": _rule_router,                # M9: hand-written, deterministic, same 7 features
 }
 GATES: dict[str, Callable[..., object] | None] = {"none": None, "prefix_dead": None}
 EVOLVE_TARGETS: frozenset[str] = frozenset({"model", "harness", "reward", "both"})
@@ -261,11 +279,20 @@ EVOLVE_POLICIES: frozenset[str] = frozenset({"rule", "learned_weights", "learned
 # BUT NOT IMPLEMENTED and validate() rejects it unless allow_stubs=True. Without this, naming
 # a policy validated cleanly and ran nothing -- the exact failure this registry pattern
 # exists to prevent, left open on this axis alone.
-#   rule            a hand-written decision rule over the solve rate.
+#   rule            a hand-written decision rule over the SAME observability features
+#                   the learned policies read; the baseline they have to beat.
 #   learned_weights LinUCB over observability features; the weights ARE the policy.
 #   learned_code    the policy is generated source, validated and cost-vetted before use.
 EVOLVE_POLICY_FACTORIES: dict[str, Callable[..., object] | None] = {
-    "rule": _solve_rate_router,
+    # M9. This slot pointed at `_solve_rate_router` until 2026-08-31, and that was not a
+    # baseline for the learned arms sharing this axis: SolveRateRouter decides from ONE
+    # scalar where `learned_weights` decides from seven, so the comparison confounded
+    # "written vs learned" with "1 feature vs 7". It is also inert -- criteria.
+    # threshold_is_inert proves its threshold cannot change a decision at single-group
+    # granularity. `rule_policy.RulePolicyRouter` requires the same seven features and
+    # keys on the exact silence identity instead. SolveRateRouter stays reachable as
+    # `router=solve_rate`.
+    "rule": _rule_router,
     "learned_weights": _contextual_router,
     "learned_code": _code_policy_router,
 }
