@@ -2229,3 +2229,56 @@ abandoned on evidence rather than on taste.
 250-problem report half, and that is legitimate HERE only because this A/B searched nothing:
 the arms differ in one flag fixed before either ran. The protocol number on the report half is
 also null (0/5 significant, base gap 0.036), and is in `compare_runs.py` output.
+
+---
+
+## Greedy scoring is only 17% reproducible, and that is the floor under every comparison here
+
+Chasing the A/B's noise floor produced a result that bounds every number this project reports.
+
+The base checkpoint -- **identical weights** -- was scored twice, greedy (`--temperature 0.0`,
+`--n 1`), same box, same harness, same code. Comparing the two runs problem by problem:
+
+| quantity | agreement |
+|---|---|
+| identical generated TEXT | **87 / 500 (17.4%)** |
+| identical boxed answer | 304 / 500 (60.8%) |
+| identical grade | 440 / 500 (88.0%) |
+| accuracy | 0.5360 vs 0.5160, gap **0.0200** |
+
+**The grader is not the problem, and I checked rather than assumed.** It is deterministic:
+500/500 self-consistent on identical input, and 500/500 of the stored flags agree with a
+fresh regrade of their own text. Of the 60 problems graded differently, **all 60 also had
+different text**; zero cases of same-text-different-grade.
+
+**So the generation is nondeterministic at temperature 0.** Four of five completions differ
+between two greedy runs of the same weights. `math_bench.py` already warns about this in a
+comment -- "avg@n at temperature 0 measures batching nondeterminism, not model uncertainty" --
+but the size of it was not measured until now. Batch composition and scheduling change the
+floating-point reduction order in the sglang kernels, which flips an argmax somewhere, and the
+completion diverges from that token on.
+
+**Consequences, in order of how much they matter:**
+
+1. **Every single-run accuracy in this project carries roughly ±0.02 of systematic
+   uncertainty that is not binomial and does not shrink with more problems.** A reported
+   0.536 could have been 0.516 on a rerun of the same weights.
+2. **Unpaired comparisons of two scorings are close to worthless at this effect size**, and
+   several earlier entries in this file compare arms scored in separate sweeps. Their paired
+   McNemar numbers survive; any difference-of-two-accuracies reading of them does not.
+3. **The A/B null stands and is in fact strengthened.** Paired McNemar is the right test
+   precisely because it conditions on the problem: the base pairing was 35/25 discordant,
+   p=0.245, i.e. the churn is symmetric. Every arm difference matched the base offset to
+   within 0.002, which is what "no effect" looks like once this floor is understood.
+4. **What would actually reduce it**: score each checkpoint more than once and average, fix
+   the server's batch composition, or compare only paired. Averaging over 5 runs is what
+   Ornith-1.5's own protocol does, and this is the reason it does it -- a detail worth
+   copying rather than treating as ceremony.
+
+**A correction to my own reading an hour earlier.** A first pass at this comparison reported
+"100% identical completions, 12% graded differently", which would have meant a nondeterministic
+GRADER -- a much worse bug. That was wrong: the script read `completion`/`answer`/`bench`,
+while the schema is `text`/`gold`/`benchmark`, so it compared empty strings to empty strings
+and every field defaulted. The real numbers are above. The lesson is the same one this file
+keeps recording: a comparison that reads a field name that does not exist returns a clean,
+confident, meaningless answer.
