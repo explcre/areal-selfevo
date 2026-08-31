@@ -36,8 +36,8 @@ meta-controller, with a **validity condition** saying when each choice is legiti
 Legend: **DONE** built + tested + audited · **PARTIAL** exists but incomplete or unproven ·
 **NOT BUILT** declared only.
 
-**Scoreboard (2026-08-31, after the seam was tested).** Method **10 DONE / 5 PARTIAL /
-7 NOT BUILT**; Engineering **6 DONE / 2 PARTIAL**; Benchmarks **4 DONE / 1 PARTIAL /
+**Scoreboard (2026-08-31, after the seam was tested and M9 was built and audited).** Method **10 DONE / 6 PARTIAL /
+6 NOT BUILT**; Engineering **6 DONE / 2 PARTIAL**; Benchmarks **4 DONE / 1 PARTIAL /
 10 NOT BUILT**. So: **no, the goal is not implemented.** What IS complete is one vertical
 slice -- measure the silent channel, decompose it, act on it, verify end-to-end -- and that
 slice is the paper's spine.
@@ -65,7 +65,7 @@ training. That needs a GPU arm, and it is now the top item on the critical path.
 | M6 | SFT / forward-KL modes | **PARTIAL** | SFT now REACHES the update for solved groups (a constant on their zero advantages IS the supervised step). Forward-KL still a name |
 | M7 | **Teacher** supplying routed units | **NOT BUILT** | DEMOTED by measurement: reaches only ~4.5% of groups. The free self-target covers 31.4% and is built |
 | M8 | Learned meta-controller | **PARTIAL — negative so far** | Built, audited, called in training, explores, and receives clean feedback (128 updates, `weak_attribution=0.0`, 1 confounded skip). **Still develops no preference**: mode mix stays at uniform thirds through 129 steps and gets FLATTER, not sharper (L1 vs uniform 0.056→0.027 by quarter). Isolated to CREDIT ASSIGNMENT, not the bandit -- with a shared per-batch scalar the arms provably converge to the same `theta`; the same router separates arms and picks the rewarded mode when credit depends on the mode (measured, 3/3 mutants). Fix is per-prompt credit across time, not a bigger bandit |
-| M9 | Rule evolve-policy (cold start + baseline) | **NOT BUILT** | needed before "learned" is falsifiable |
+| M9 | Rule evolve-policy (cold start + baseline) | **PARTIAL — built, and it does NOT de-confound the comparison** | `selfevo/routing/rule_policy.py`, registered as `router=rule`. **Audited 2026-08-31 and the headline claim retracted**: under this repo's binary graders it is behaviourally IDENTICAL to `SolveRateRouter` (102/102 contexts, both teacher settings), so it does not separate "written vs learned" from "1 feature vs 7". That is not fixable by writing a better rule -- only `reward_std` has a measurement behind it, and inventing thresholds for the other six would violate the standard this repo holds. **The finding IS that**: a defensible hand-written policy here collapses to one predicate, and the confound has to be reported, not engineered away. What the router does add is narrow: branches cited to their measurements (`reward_std` above a MEASURED float32 tolerance -> RL; solved+silent -> SKIP, inert at 0.5 and harmful at 2.0; unsolved+silent -> teacher else SKIP), the learned router's input contract, and `solved_mode` as the seam for critical-path item 1. Its `HarnessAction.PROPOSE` **cannot fire** — nothing writes `can_evolve_harness` and `_route_groups` discards `.harness` (same gap as M10). 57 tests, 3 through the real `_compute_advantages`; 31/31 mutants. Gaps: no arm has trained with it; no subagent audit of the code beyond the adversarial claims audit |
 | M10 | Evolve model / harness / reward | **PARTIAL** | `HarnessAction` axis built, audited, 18/18 mutants. **No consumer**: nothing writes `can_evolve_harness`, nothing reads the action. Reward axis still a name |
 | M11 | Cadence: frozen / alternating / simultaneous | **NOT BUILT** | `CADENCES` = bare strings |
 | M12 | Evolvable reward formula | **NOT BUILT** | |
@@ -523,6 +523,16 @@ difference, and the reverse of the previous ordering.
 3. **Re-measure the split on OlympiadBench.** 0.875 is a property of GSM8K at a high solve
    rate, not a constant; a harder task moves mass to the unsolved branch.
 4. **M9 rule evolve-policy** -- cold start *and* the baseline the learned one must beat.
+   **BUILT and AUDITED 2026-08-31** (`selfevo/routing/rule_policy.py`, `router=rule`), and the
+   audit changed what this item can deliver. The rule is behaviourally identical to
+   `router=solve_rate` under binary graders, so running both is double-reporting, not two
+   arms. Running the rule against `ctx` is still worth doing, but it CANNOT be reported as
+   "learned beats written at matched inputs": the 1-feature-vs-7 confound survives, because
+   only `reward_std` has a measurement behind it. Nor is it matched in proportions -- with no
+   teacher the rule emits only `rl`/`skip` against `ctx`'s rl 0.295 / sft 0.353 / skip 0.353,
+   so each arm still needs its own `router=random` control at its own measured proportions.
+   The cheapest thing that would actually move this item is a measurement grounding a SECOND
+   predicate -- the M15 feature ablation -- not another controller.
 5. **A teacher (M7)** -- now a lever on ~4.5% of groups, so it follows rather than leads.
 6. Then M8 learned controller, then the named benchmarks in Sec. 2.
 
