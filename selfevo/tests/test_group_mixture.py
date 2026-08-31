@@ -239,6 +239,11 @@ def test_an_unnormalised_one_hot_mixture_still_reduces_exactly():
     """A router emitting scores rather than probabilities must land on the same tensor.
 
     ``w / w`` is exact in IEEE754, so this is a real bit-identity claim and not a tolerance.
+
+    This really does exercise ``_normalised_mixture``'s un-normalised path: the actor
+    forwards ``decision.weights`` RAW and lets the seam normalise once. An earlier version
+    normalised in the actor as well, which made this test -- and the one below -- assert
+    nothing about un-normalised input.
     """
     a, _ = routed({RL: 7.5})
     assert torch.equal(bits(a), bits(vanilla()))
@@ -641,3 +646,175 @@ def test_random_mixtures_match_the_stated_formula(seed):
     assert (stats.n_rows, stats.n_groups) == (b, len(sizes))
     assert sum(stats.counts.values()) == pytest.approx(len(sizes))
     assert stats.mixed_groups == sum(1 for m in mixes if len(m) > 1)
+
+
+# =========================================== the values a float can actually hold ========
+#
+# Everything above runs on ordinary advantages. The claims being made are bit-identity
+# claims, and bit-identity is decided at the values where float arithmetic stops being
+# ordinary: signed zero, NaN, the infinities, subnormals and the fp32 extremes. Three
+# separate defects in this seam live only here, so they are swept rather than spot-checked.
+
+SPECIALS = [
+    0.0, -0.0, float("nan"), float("inf"), float("-inf"),
+    1.4e-45, -1.4e-45, 3.4e38, -3.4e38, 1.0, -1.0, 0.5,
+]
+
+
+def specials_batch(b: int = 4, t: int = 6, prompt: int = 2):
+    """An advantage tensor tiled with :data:`SPECIALS`, plus a prompted mask.
+
+    Args:
+        b: Rows.
+        t: Sequence length.
+        prompt: Columns that are prompt, i.e. outside the mask.
+
+    Returns:
+        ``(advantages, loss_mask)``, float32 so the bit views below are well defined. The
+        values are tiled with a stride that is coprime with the row length, so no column is
+        constant and a defect that only bites one special cannot hide behind a mask shape.
+    """
+    adv = torch.tensor(
+        [[SPECIALS[(i * t + j) % len(SPECIALS)] for j in range(t)] for i in range(b)],
+        dtype=torch.float32,
+    )
+    lm = torch.zeros(b, t)
+    lm[:, prompt:] = 1.0
+    return adv, lm
+
+
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("w", [0.0, 0.5, 7.5])
+def test_a_one_hot_mixture_matches_the_hard_decision_on_the_specials_grid(mode, w):
+    """The reduction, tensor AND stats, where float arithmetic is not ordinary.
+
+    ``changed_rows`` is the field this catches. It used to be computed by diffing the whole
+    output against the input once at the end; ``NaN != NaN`` is True, so a pure-RL mixture
+    counted every NaN row as reached while the argmax path -- which never writes an RL group
+    and never compares it -- counted zero. The tensors agreed; the instrument did not, and
+    the reduction claim covers both.
+    """
+    adv, lm = specials_batch()
+    hard, hs = apply_decisions(adv, lm, [2, 2], [mode] * 2, sft_weight=w)
+    soft, ss = apply_mixtures(adv, lm, [2, 2], [{mode: 1.0}] * 2, sft_weight=w)
+    assert torch.equal(bits(soft), bits(hard)), (soft - hard)
+    assert ss.changed_rows == hs.changed_rows, (ss, hs)
+    assert (ss.n_rows, ss.n_groups) == (hs.n_rows, hs.n_groups)
+
+
+def test_a_zero_weighted_sft_component_does_not_flip_a_negative_zero():
+    """``{rl: 0.5, skip: 0.5}`` must leave ``-0.0`` negative.
+
+    The SFT term is ABSENT at ``b == 0``, not ``0.0 * sft_only``. That product is ``+0.0``,
+    and ``-0.0 + 0.0`` is ``+0.0``: including the term would flip the sign bit of every
+    advantage that arrived as a negative zero. Invisible to ``torch.equal``, which is why
+    this is asserted on bit patterns.
+    """
+    adv = torch.full((2, 4), -0.0)
+    out, _ = apply_mixtures(adv, torch.ones(2, 4), [2], [{RL: 0.5, SKIP: 0.5}], sft_weight=0.5)
+    assert torch.equal(bits(out), bits(torch.full((2, 4), -0.0))), out
+
+
+def test_a_zero_weighted_rl_component_does_not_poison_a_non_finite_advantage():
+    """``{sft: 1.0}`` on a NaN batch must write the weight, not NaN.
+
+    The mirror of the test above and the more serious half: ``advantages`` is caller data,
+    so ``0.0 * x`` is NaN wherever x is non-finite. A group the decision routed entirely away
+    from RL would come back poisoned by the advantages it was routed away from.
+    """
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        adv = torch.full((2, 4), bad)
+        out, _ = apply_mixtures(adv, torch.ones(2, 4), [2], [{SFT: 1.0}], sft_weight=0.5)
+        assert torch.equal(out, torch.full((2, 4), 0.5)), (bad, out)
+
+
+# ------------------------------------------------------- weights that break arithmetic ---
+
+
+def test_a_mixture_whose_weights_overflow_the_sum_is_refused():
+    """Per-weight finiteness is not enough: two weights of 1e308 are each finite.
+
+    Their sum is ``inf``, every ``w / inf`` is ``0.0``, and the group would then train as
+    SKIP with ``counts`` logging no mass at all -- a mixture arm applying a decision nobody
+    asked for and reporting neither. This is the exact failure the module docstring says the
+    guards exist to prevent, so it is refused rather than normalised into silence.
+    """
+    with pytest.raises(ValueError, match="cannot be normalised"):
+        apply_mixtures(
+            torch.zeros(2, 3), torch.ones(2, 3), [2],
+            [{RL: 1e308, SFT: 1e308}], sft_weight=0.5,
+        )
+
+
+def test_the_overflow_refusal_names_the_weights_the_router_actually_emitted():
+    """Through the REAL actor, and the message must quote 1e308 rather than a ghost.
+
+    The actor forwards ``decision.weights`` raw. Normalising in the actor as well would make
+    this mixture arrive as ``{rl: 0.0, sft: 0.0}``, and the run would die naming an all-zero
+    mixture no router ever produced -- a diagnosis pointing at the wrong component.
+    """
+    with routing_to({RL: 1e308, SFT: 1e308}):
+        with pytest.raises(ValueError) as exc:
+            advantages(
+                make_actor(
+                    GroupRoutingConfig(
+                        enabled=True, solved_advantage=W, router=STUB, decision="mixture"
+                    )
+                ),
+                MIXED,
+            )
+    assert "1e+308" in str(exc.value), str(exc.value)
+
+
+def test_a_mixture_that_never_asks_for_sft_does_not_raise_where_the_hard_path_succeeds():
+    """The SFT extreme is built LAZILY, and that is correctness rather than economy.
+
+    ``sft_weight`` beyond float16's range overflows inside ``full_like``. Building the
+    all-SFT tensor eagerly therefore made ``apply_mixtures`` raise on a pure-RL mixture --
+    a tensor it would never have read -- while ``apply_decisions`` with the same arguments
+    returned fine. Where the SFT component IS asked for, both must fail identically.
+    """
+    adv = torch.zeros(2, 4, dtype=torch.float16)
+    lm = torch.ones(2, 4)
+    big = 70000.0
+    hard, _ = apply_decisions(adv, lm, [2], [RL], sft_weight=big)
+    soft, _ = apply_mixtures(adv, lm, [2], [{RL: 1.0}], sft_weight=big)
+    assert torch.equal(soft, hard)
+    with pytest.raises(RuntimeError):
+        apply_decisions(adv, lm, [2], [SFT], sft_weight=big)
+    with pytest.raises(RuntimeError):
+        apply_mixtures(adv, lm, [2], [{SFT: 1.0}], sft_weight=big)
+
+
+# ------------------------------------------------------------ what the run actually logs -
+
+
+def test_both_arms_emit_exactly_the_same_metric_keys(monkeypatch):
+    """A panel that exists in one arm and not the other makes the ablation unreadable.
+
+    ``route/mixed_groups`` is the number that distinguishes a real mixture run from an
+    argmax run wearing its label, so it is logged on BOTH branches -- 0.0 on the argmax one
+    by construction. Asserted by capturing what the actor actually hands the tracker, not by
+    reading the source, because the branch is the thing under test.
+    """
+    from areal.utils import stats_tracker
+
+    seen: dict[str, set[str]] = {}
+
+    for arm in ("argmax", "mixture"):
+        keys: set[str] = set()
+        monkeypatch.setattr(stats_tracker, "scalar", lambda **kw: keys.update(kw))
+        with routing_to({RL: 0.6, SFT: 0.4}):
+            torch.manual_seed(0)
+            advantages(
+                make_actor(
+                    GroupRoutingConfig(
+                        enabled=True, solved_advantage=W, router=STUB, decision=arm
+                    )
+                ),
+                MIXED,
+            )
+        seen[arm] = keys
+
+    assert "route/mixed_groups" in seen["argmax"], seen["argmax"]
+    assert seen["argmax"] == seen["mixture"], seen["argmax"] ^ seen["mixture"]

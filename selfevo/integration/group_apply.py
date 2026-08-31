@@ -61,9 +61,11 @@ class ApplyStats:
             already-silent group changes nothing, and reporting it as an intervention would
             overstate the method's reach.
         n_groups: Groups seen.
-        n_rows: Rows seen, i.e. the batch size. Carried because ``counts`` counts GROUPS, and
-            a count of rows divided by a count of groups is not a fraction -- at the live
-            group size of 8 it read eight times too high, and above 1.0.
+        n_rows: Rows seen, i.e. the batch size. Carried because ``counts`` is a per-GROUP
+            quantity -- a group count for hard decisions, the same thing measured in
+            group-equivalents of mass for mixtures -- and a count of rows divided by it is
+            not a fraction: at the live group size of 8 it read eight times too high, and
+            above 1.0.
         mixed_groups: Groups whose decision was a genuine mixture, i.e. no single mode held
             all the weight. Always 0 on the hard-decision path. It is reported separately
             from ``counts`` because a mixture run in which every decision happened to come
@@ -79,7 +81,18 @@ class ApplyStats:
     mixed_groups: int = 0
 
     def as_metrics(self) -> dict[str, float]:
-        """Flat metrics, prefixed so they do not collide with the actor's own keys."""
+        """Flat metrics, prefixed so they do not collide with the actor's own keys.
+
+        ``route/{mode}_groups`` reports :attr:`counts`, which is mode MASS. For hard
+        decisions that is exactly the number of groups taking each mode -- what the key has
+        always meant and what every existing panel reads -- and for mixtures it is the
+        fractional equivalent. The key is deliberately NOT renamed: the two arms have to
+        stay readable on one panel, and renaming would silently orphan the history.
+
+        :attr:`mixed_groups` is NOT emitted here. Adding a key would make an argmax run's
+        key set differ from a mixture run's, so the actor logs it separately and logs it on
+        BOTH branches.
+        """
         out = {f"route/{m}_groups": float(n) for m, n in self.counts.items()}
         out["route/changed_row_fraction"] = self.changed_rows / max(self.n_rows, 1)
         out["route/n_groups"] = float(self.n_groups)
@@ -215,11 +228,13 @@ def _normalised_mixture(mixture: Mapping[str, float], index: int) -> dict[str, f
 
     Raises:
         ValueError: If the mixture is empty, names a mode this seam cannot apply, or
-            carries a non-finite, negative or all-zero set of weights. Each is refused
-            rather than repaired. Clamping a negative weight, dropping an unknown mode or
-            treating an all-zero mixture as SKIP would each let a run report a mixture arm
-            whose decisions were not the ones it logged -- the same failure the unknown-mode
-            guard in :func:`apply_decisions` exists to prevent.
+            carries a non-finite, negative, all-zero, or OVERFLOWING set of weights. Each is
+            refused rather than repaired. Clamping a negative weight, dropping an unknown
+            mode, or treating an all-zero or inf-summing mixture as SKIP would each let a run
+            report a mixture arm whose decisions were not the ones it logged -- the same
+            failure the unknown-mode guard in :func:`apply_decisions` exists to prevent.
+            Per-weight finiteness is not enough for the last of these: two weights of 1e308
+            are each finite and sum to inf.
     """
     if not mixture:
         raise ValueError(
@@ -252,11 +267,14 @@ def _normalised_mixture(mixture: Mapping[str, float], index: int) -> dict[str, f
                 "a fourth mode nobody asked for rather than a proportion"
             )
         total += value
-    if total <= 0:
+    if total <= 0 or not math.isfinite(total):
         raise ValueError(
             f"group {index} mixture {dict(mixture)} sums to {total}, which cannot be "
-            f"normalised; an all-zero mixture is SKIP, so spell it "
-            f"{{{TrainingMode.SKIP!r}: 1.0}} and let the log say so"
+            f"normalised. An all-zero mixture is SKIP, so spell it "
+            f"{{{TrainingMode.SKIP!r}: 1.0}} and let the log say so. A sum that OVERFLOWS "
+            f"to inf is refused for the same reason and not a different one: every "
+            f"w / inf is 0.0, so the group would silently train as SKIP while its weights "
+            f"said otherwise -- a mixture arm reporting decisions it did not apply."
         )
     return {m: float(w) / total for m, w in mixture.items()}
 
@@ -310,14 +328,21 @@ def apply_mixtures(
     Returns:
         ``(advantages, stats)``. The caller's tensor is not modified in place. In the
         returned :class:`ApplyStats`, ``counts`` holds mode MASS rather than a group count,
-        and ``mixed_groups`` counts the decisions that were genuinely mixed.
+        and ``mixed_groups`` counts the decisions that were genuinely mixed. The reduction
+        claim covers the STATS as well as the tensor: for a one-hot mixture every field
+        matches what :func:`apply_decisions` returns for the corresponding label, including
+        on a batch containing NaN, which is why ``changed_rows`` is accumulated per group
+        rather than diffed once at the end.
 
     Raises:
         ValueError: On everything :func:`apply_decisions` refuses -- shape, rank, dtype,
             partition and ``sft_weight`` are checked by delegating to it, so the two entry
             points cannot disagree about what a valid batch is -- plus a mixture count that
             does not match the group count, and any mixture rejected by
-            :func:`_normalised_mixture`.
+            :func:`_normalised_mixture`. The SFT extreme is built only when some group has
+            SFT mass, so a mixture that never asks for it cannot fail on it; that is not
+            merely an optimisation, it is what keeps this function from raising on inputs
+            :func:`apply_decisions` accepts.
     """
     if len(mixtures) != len(group_sizes):
         raise ValueError(
@@ -325,18 +350,19 @@ def apply_mixtures(
         )
     weights = [_normalised_mixture(mix, i) for i, mix in enumerate(mixtures)]
 
-    # The two extremes of the blend, each produced by the hard seam. This is what makes the
-    # pure cases exact, and it also routes every shape/dtype/partition/sft_weight guard
-    # through the single place those are written.
+    # The RL extreme, produced by the hard seam. This is what makes the pure cases exact,
+    # and it also routes every shape/dtype/partition/sft_weight guard through the single
+    # place those are written.
     n_decisions = len(group_sizes)
     base, _ = apply_decisions(
         advantages, loss_mask, group_sizes,
         [TrainingMode.RL] * n_decisions, sft_weight=sft_weight,
     )
-    sft_only, _ = apply_decisions(
-        advantages, loss_mask, group_sizes,
-        [TrainingMode.SFT] * n_decisions, sft_weight=sft_weight,
-    )
+    # The SFT extreme is built LAZILY, on the first group that actually carries SFT mass.
+    # Building it eagerly made this function RAISE where apply_decisions succeeds: an all-SFT
+    # write of sft_weight > 65504 into a float16 batch overflows inside ``full_like``, so a
+    # pure-RL mixture died on a tensor it would never have read.
+    sft_only = None
 
     # `base` is apply_decisions' own freshly cloned, RL-routed copy: equal to `advantages`
     # value for value and reachable by nobody else, so writing into it is safe and saves a
@@ -345,6 +371,7 @@ def apply_mixtures(
     mask = loss_mask.to(out.dtype)
     mass = {m: 0.0 for m in _APPLIED}
     mixed = 0
+    changed = 0
     start = 0
     for g, w in zip(group_sizes, weights):
         rows = slice(start, start + g)
@@ -358,21 +385,36 @@ def apply_mixtures(
         a = w.get(TrainingMode.RL, 0.0)
         b = w.get(TrainingMode.SFT, 0.0)
         if a == 1.0:
-            # Pure RL. Leaving the rows alone is not an optimisation: `1.0 * x + 0.0` equals
-            # x but is not identical to it for x = -0.0, and the rollback claim on this path
-            # is made bit for bit.
+            # Pure RL: not written at all, exactly as apply_decisions does not write an RL
+            # group. This is load-bearing for the STATISTIC, not for the tensor. Writing
+            # `1.0 * block` back would be bit-preserving, including for -0.0 -- an earlier
+            # version of this comment claimed otherwise and was simply wrong, and the claim
+            # is corrected here rather than deleted because it was quoted in a commit
+            # message. What the skip buys is `changed_rows`: that is counted by comparing a
+            # group's block before and after its write, `NaN != NaN` is True, so a
+            # written-but-unchanged group holding a NaN advantage would count itself as
+            # reached while the argmax path counts it as zero.
             continue
         block = out[rows]
         m = mask[rows]
-        # Only the terms actually present are summed. A zero-weighted term is ABSENT, not
-        # `0.0 * x` -- that expression is NaN for a non-finite advantage and -0.0 for a
-        # negative one, which is the difference between "reduces exactly" and "reduces to
-        # within a rounding".
+        # A zero-weighted term is ABSENT, not `0.0 * x`, and the reason differs by term.
+        # For RL it is load-bearing twice: `advantages` is caller data, so `0.0 * x` is NaN
+        # where x is non-finite and `+0.0` where x is `-0.0`. For SFT only the second reason
+        # applies -- `sft_only` inside the mask is `sft_weight * loss_mask` with sft_weight
+        # already validated finite, so it can never introduce a NaN -- but `-0.0` is enough:
+        # adding `+0.0` to a `-0.0` RL term flips its sign bit.
         terms = []
         if a != 0.0:
             terms.append(a * block)
         if b != 0.0:
-            terms.append(sft_only[rows] if b == 1.0 else b * sft_only[rows])
+            if sft_only is None:
+                sft_only, _ = apply_decisions(
+                    advantages, loss_mask, group_sizes,
+                    [TrainingMode.SFT] * n_decisions, sft_weight=sft_weight,
+                )
+            # No `b == 1.0` special case: `1.0 * x` is bit-preserving for every value a
+            # float can hold, so a shortcut here would be code no test could distinguish.
+            terms.append(b * sft_only[rows])
         if not terms:
             blended = torch.zeros_like(block)          # pure SKIP: c * 0
         elif len(terms) == 1:
@@ -381,10 +423,17 @@ def apply_mixtures(
             blended = terms[0] + terms[1]
         # Same masking rule as apply_decisions, for the same reason: the mask bounds the
         # WRITE, not merely its non-zero part.
-        out[rows] = torch.where(m != 0, blended, block)
+        new_block = torch.where(m != 0, blended, block)
+        # Counted per group and BEFORE the write. `block` is a VIEW into `out`, so after the
+        # assignment it holds the new values and the comparison is vacuous. Counting instead
+        # by diffing the whole output against the input at the end is not equivalent either:
+        # it diverges from apply_decisions on a NaN batch, where an untouched row compares
+        # unequal to itself.
+        changed = changed + int((block != new_block).any(dim=-1).sum())
+        out[rows] = new_block
     return out, ApplyStats(
         counts=mass,
-        changed_rows=int((out != advantages).any(dim=-1).sum()),
+        changed_rows=changed,
         n_groups=len(group_sizes),
         n_rows=int(advantages.shape[0]),
         mixed_groups=mixed,

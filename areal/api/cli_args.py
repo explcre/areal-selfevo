@@ -1782,7 +1782,29 @@ class GroupRoutingConfig:
             under its argmax label, because ``DecisionOutcome`` carries one mode name and
             there is no measured way to divide one prompt's change in solve rate among the
             components of a mixture. A mixture arm therefore learns from a coarser signal
-            than it acts on. That is a stated limitation of this axis, not an oversight.
+            than it acts on. That is a stated limitation of this axis, not an oversight, and
+            it damages the attribution INSTRUMENT as well as the signal, in both directions:
+
+            * Two materially different mixtures that share an argmax -- ``{rl: .9, sft: .1}``
+              and ``{rl: .6, sft: .4}`` -- make the batch look uniform, and ``batch_outcomes``
+              then refuses the whole update as confounded. The router is starved by decisions
+              that actually differed.
+            * Two nearly identical mixtures whose argmaxes differ -- ``{rl: .51, sft: .49}``
+              and ``{rl: .49, sft: .51}`` -- report ``dominant_share=0.5`` and
+              ``weak_attribution=0.0``, i.e. maximally attributable, for groups that received
+              almost the same gradient. This is the dangerous direction: the number whose job
+              is to say how attributable an update was errs OPTIMISTICALLY, so a run cannot be
+              discounted by it the way ``credit="batch"`` runs are.
+
+            NOTHING CURRENTLY EMITS A MIXTURE. Measured 2026-08-31 over 200 randomised probes
+            each: ``static``, ``solve_rate``, ``cluster``, ``coharness``, ``random`` and
+            ``contextual`` returned one-hot weights on 0/200. ``StaticRouter`` does accept an
+            arbitrary mapping, but ``_route_groups`` builds routers with ``factory()`` and no
+            kwargs, so nothing can be passed from config -- which is why the ``random`` router
+            reads its proportions from ``SELFEVO_RANDOM_PROPORTIONS`` instead. So setting this
+            to ``"mixture"`` today produces a run bit-identical to ``"argmax"``, with
+            ``route/mixed_groups`` at 0.0. The plumbing is real and tested; a router that uses
+            it is not yet written.
 
     Raises:
         ValueError: If either weight has the wrong sign, which is a footgun rather than a
