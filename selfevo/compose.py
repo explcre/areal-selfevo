@@ -91,10 +91,28 @@ def _coharness_router(**kw: object) -> object:
 # `router` axis was unusable despite four working routers existing. Imported lazily for the
 # same reason as the critic factories: `compose` must stay importable for configuration
 # validation without pulling in the routing criteria.
+# Enough forced round-robin calls to span roughly three batches at the live group count of
+# 64 groups per batch. The value matters because of HOW feedback is defined, not because of
+# bandit convergence: batch_outcomes refuses to attribute a batch whose decisions were all
+# identical, so a router that opens by picking one mode for every group produces no learning
+# signal, keeps its arm estimates at their initial values, keeps tying, and keeps picking the
+# same mode. Measured on 2026-08-31 with the shipped default of 0: rl_groups=64 and
+# sft_groups=0 at every step, changed_row_fraction=0.0, feedback/confounded_skips=1.0 -- the
+# learned arm was bit-identical to the off arm while reporting as a learned run.
+_CONTEXTUAL_COLD_START = 192
+
+
 def _contextual_router(**kw: object) -> object:
-    """Factory for :class:`selfevo.routing.contextual.ContextualBanditRouter`."""
+    """Factory for :class:`selfevo.routing.contextual.ContextualBanditRouter`.
+
+    Supplies a non-zero ``cold_start_rounds`` because ``_route_groups`` constructs routers
+    with no arguments, so the dataclass default of 0 is what a training run actually gets --
+    and 0 is not a valid operating point for this router (see ``_CONTEXTUAL_COLD_START``).
+    An explicit value in ``kw`` still wins, so tests and ablations can set their own.
+    """
     from .routing.contextual import ContextualBanditRouter
 
+    kw.setdefault("cold_start_rounds", _CONTEXTUAL_COLD_START)
     return ContextualBanditRouter(**kw)  # type: ignore[arg-type]
 
 
