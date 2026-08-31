@@ -409,15 +409,24 @@ changed".
 **Nothing yet demonstrates the method works.** Results 1–4 are evaluation contributions;
 result 5 is a null; result 6 is a property of the problem, not of the method.
 
-> **PROVISIONAL — composition numbers are under review (2026-08-31).** The silent-channel
-> decomposition violates the identity it must satisfy by construction:
-> `silent == solved + unsolved` fails at 104 of 116 steps in `g16`, with a second-half mean
-> residual of +0.277 and an excursion to **-0.109**, which is impossible for a partition into
-> subsets. Every "X% of the silent channel is solved" figure below and in Sec. 6 is a ratio of
-> the two implicated metrics, so those figures -- including the 87.5% that re-ordered the
-> critical path -- are provisional until the violation is explained. `silent_group_fraction`
-> is computed directly and is not implicated. See EXPERIMENTS.md for the measurement and for
-> the CPU identity test that should have preceded the claims.
+> **CORRECTED — the composition RATIO was inflated ~1.8x; the REACH argument survives
+> (2026-08-31).** The decomposition was missing a bucket: `silent` is read from
+> `(advantages * loss_mask).sum(-1)`, so a fully-truncated group counts as silent while its
+> rewards are mixed, making it neither all-solved nor all-unsolved. Reproduced on the real
+> path, fixed with `unclassified_group_fraction`, 4/5 mutants (1 equivalent).
+>
+> * **"87.5% of the silent channel is solved" was `solved/(solved+unsolved)`.** With the
+>   unclassified mass in the denominator the solved share is **0.34-0.54** across seven runs.
+>   The channel is roughly half solved, and on GSM8K nearly as much *neither* -- truncation,
+>   which no self-target or teacher argument addresses.
+> * **The 7x reach comparison stands.** "31.4% self-target vs ~4.5% teacher" uses
+>   `solved_group_fraction`, a direct mean over ALL groups (measured 0.288-0.331 here). It
+>   never used the contaminated denominator, so the critical-path re-ordering it justified is
+>   unaffected.
+> * **Still open:** negative residuals appear in every run and dominate `math-off` (57/87
+>   steps). A missing bucket cannot produce one, so a second mechanism exists and the
+>   retroactive magnitudes above are approximate. Runs after `2c3a5b1a` log the bucket
+>   directly and will settle it.
 
 ---
 

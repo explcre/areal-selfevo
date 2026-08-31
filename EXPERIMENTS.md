@@ -3,6 +3,46 @@
 Measured results and negative results, newest first. A claim only belongs here once it has
 been observed end to end; a prediction belongs in GOAL.md until then.
 
+## 2026-08-31 — Sizing the unclassified bucket retroactively: one headline halves, one survives
+
+The residual `silent - (solved + unsolved)` is exactly what the new
+`unclassified_group_fraction` counts, so it is recoverable from every completed run without
+rerunning anything. Second-half means across seven runs:
+
+| run | task | arm | silent | solved | unclass | %unclass | **quoted** s/(s+u) | **correct** s/silent | neg steps |
+|-----|------|-----|--------|--------|---------|----------|--------------------|----------------------|-----------|
+| g16 | GSM8K | off | 0.4553 | 0.1541 | 0.2767 | 60.8% | 0.8627 | **0.3385** | 8/116 |
+| step0m-off | GSM8K | off | 0.5906 | 0.2880 | 0.2688 | 45.5% | 0.8949 | **0.4876** | 13/145 |
+| step0m-on | GSM8K | on | 0.6144 | 0.3099 | 0.2623 | 42.7% | 0.8802 | **0.5044** | 29/178 |
+| sa2 | GSM8K | on@2.0 | 0.5745 | 0.3087 | 0.2207 | 38.4% | 0.8725 | **0.5374** | 27/145 |
+| math7b | MATH | off | 0.5632 | 0.3285 | 0.1080 | 19.2% | 0.7218 | **0.5834** | 18/58 |
+| math7b-on | MATH | on | 0.6950 | 0.3311 | 0.2412 | 34.7% | 0.7296 | **0.4764** | 12/58 |
+| math-off | MATH | off | 0.4389 | 0.2038 | -0.0173 | -3.9% | 0.4468 | 0.4644 | 57/87 |
+
+**The composition claim was inflated by roughly 1.8x.** "87.5% of the silent channel is
+solved" is the `solved/(solved+unsolved)` ratio, and it reproduces here (0.87-0.89 on GSM8K).
+With the unclassified mass in the denominator where it belongs, the solved share is
+**0.34-0.54**. The channel is not overwhelmingly solved; it is roughly half solved and, on
+GSM8K, nearly as much *neither* -- truncated groups that the correctness split cannot
+describe at all.
+
+**The reach argument survives, and this matters for the critical path.** The "31.4% self-target
+vs ~4.5% teacher, a 7x difference" comparison uses `solved_group_fraction`, which is a direct
+mean over ALL groups (0.288-0.331 on GSM8K here, matching the quoted 31.4%). It never divided
+by the contaminated denominator, so the re-ordering it justified stands. Only the composition
+RATIO was wrong, not the reach.
+
+**A second mechanism is still unexplained and is not small.** Negative residuals appear in
+every run, and in `math-off` they are the majority (57 of 87 steps), which is why its
+"unclassified" reads negative. A missing bucket cannot produce a negative residual, so the
+retroactive numbers above are contaminated by whatever does: treat the magnitudes as
+approximate and the direction as solid. Runs launched after 2c3a5b1a log the bucket directly
+and will settle it.
+
+**Incidental, and confounded:** `math7b-on` shows a HIGHER silent fraction than `math7b`
+(0.695 vs 0.563) and more than double the unclassified mass. These are separate runs rather
+than an arm-matched pair, so it is recorded as an observation to check, not an effect.
+
 ## 2026-08-31 — DIAGNOSED: the decomposition violation is truncation, and the metric was incomplete
 
 Follow-up to the integrity finding below, resolved on the real path rather than by argument.
