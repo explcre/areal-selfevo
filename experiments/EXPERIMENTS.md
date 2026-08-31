@@ -1884,3 +1884,39 @@ without choosing a reading for it.
 **Confound, stated.** Different boxes (A100 vs H200), different data order, different step
 counts. The matched OFF arm on the same H200 is the run that settles it, and it is queued
 behind the ON arm. Until then this is an indication, not a comparison.
+
+---
+
+## PROTOCOL DECISION: the A/B arms run 5 epochs, and the ON arm was stopped at 177
+
+Recorded because changing run lengths mid-experiment is the kind of thing that must be
+written down rather than remembered, and because it could otherwise look like a run was
+stopped once its numbers were known.
+
+**What changed.** `step0m-on` was launched for the config default of 10 epochs (290 steps).
+It was stopped at step 177, and the remaining arms (`step0m-off`, then the DAPO arm) run
+`total_train_epochs=5` (~145 steps).
+
+**Why 145 and not 290.** The established comparison protocol in this project scores steps
+**28, 57, 86, 115, 144** -- it is `compare_runs.py`'s default and the step set used for every
+prior arm (step0d, step0h, step0j). 5 epochs reaches 145, which covers all five. Steps beyond
+144 are not used by any comparison, so running to 290 would have cost roughly 11 more GPU-hours
+-- the DAPO arm especially, since it must generate ~2.4x the rollouts -- for points nothing
+reads.
+
+**Why this is not stopping a run once its numbers are known.** No held-out score existed for
+any `step0m` checkpoint at the time of the decision, and none exists now; nothing has been
+graded. The stop point was chosen from the checkpoint LIST, verified to contain all five
+comparison steps before anything was killed:
+
+    24 28 49 57 74 86 99 115 124 144 149 173 174     <- step0m-on, gs28/57/86/115/144 all present
+
+**What it costs.** The ON arm has data past 144 that the other arms will not have, so any
+claim about longer-horizon behaviour is unavailable and will not be made. The entropy
+comparison already reported is at matched batch index within the shared range, so it is
+unaffected.
+
+**What it buys.** Three arms on identical hardware, contemporaneous within a few hours,
+instead of one arm with a long tail and two arms that might not finish before the box is
+reclaimed. Given both machines are rented and can be taken back at short notice, an
+incomplete three-arm comparison would have been worth less than a complete one.
