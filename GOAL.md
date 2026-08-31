@@ -156,6 +156,46 @@ bar, and it is measured against the matched-proportion control like every other 
 best outcome is not "the LLM wins" but "here is what reading the trajectory buys over reading
 a scalar, priced".
 
+### The granularity of harness evolution is NOT the granularity of model evolution
+
+A question worth settling explicitly, because the current design quietly conflates two things.
+
+**Model evolution is fine-grained all the way down.** The gradient acts per TOKEN, aggregates
+per SAMPLE, and is centred per GROUP. Token-level routing is meaningful there -- we built it,
+measured its 1.7% reach, and reported it null. Nothing about a per-token model decision is
+incoherent.
+
+**Harness evolution is not, because the harness is a SHARED ARTEFACT.** A scaffold, prompt
+template or tool configuration applies to every future rollout. So the two granularities come
+apart, and they have to be named separately:
+
+| | evidence granularity | action granularity |
+|---|---|---|
+| **token** | meaningless -- a token does not identify a failure mode a scaffold could fix | **meaningless** |
+| **sample** | natural -- one trajectory exhibits one failure | degenerate -- a per-sample harness is not a harness |
+| **cluster** | natural | **natural, and the interesting one** |
+| **task** | natural | natural; this is Co-Harness / SIA territory |
+
+**The consequence: CLUSTER is the natural unit for the harness axis**, and that raises the
+stakes on the clustering work. A single trajectory failing says little; twenty trajectories
+failing the *same way* justify one scaffold change and give it something to be validated
+against. This is where MEDS' layer-logit clustering stops being an ablation about the MODEL
+axis and becomes load-bearing for the HARNESS axis -- the clusters ARE the units a harness
+edit is scoped to.
+
+**A gap in what is built, stated plainly.** `HarnessAction` is currently emitted PER GROUP,
+which makes it evidence, not action -- and there is no aggregation step between "these units
+proposed" and "here is one harness change". The design as it stands would let a caller
+mistake a stream of per-group PROPOSE flags for harness evolution, when what it actually has
+is an unaggregated evidence queue. Naming the two granularities separately is the fix:
+propose per unit, aggregate per cluster, act once.
+
+**Scope is therefore a config axis** (`harness_scope` in {global, per_task, per_cluster}),
+not a constant, and `per_cluster` requires the cluster key to be stable across steps -- which
+is exactly why `MEDSClusterer` fits once and assigns thereafter rather than re-fitting per
+batch.
+
+
 ### Models
 
 | model | status |
