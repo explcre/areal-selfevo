@@ -3,6 +3,52 @@
 Measured results and negative results, newest first. A claim only belongs here once it has
 been observed end to end; a prediction belongs in GOAL.md until then.
 
+## 2026-08-31 — The centred-credit arm COLLAPSED into non-termination, and the control proves it is the model
+
+`ctxpcc` (`router=contextual`, `credit="prompt_centered"`) ran to full length, 290/290 -- the
+only arm that ever did. Its checkpoint at `globalstep289`, scored on the frozen suite:
+
+| benchmark | accuracy | truncated | cap |
+|-----------|----------|-----------|-----|
+| MATH-500 | 0.2560 | **500/500 (100%)** | 3072 |
+| AMC23 | 0.0500 | **40/40 (100%)** | 3072 |
+| AIME24 | 0.0000 | **30/30 (100%)** | 8192 |
+| AIME25 | 0.0000 | **30/30 (100%)** | 8192 |
+
+**Every single generation ran to the cap.** Not a high rate -- all of them.
+
+**Control first, because the scoring path on this box was built an hour earlier and untested
+tooling is exactly how the last false finding happened.** The untouched base model,
+Qwen2.5-1.5B-Instruct, scored through the SAME path on the SAME box: `math500 acc=0.4000
+n=30/30 trunc=1`. One truncation in thirty. The path is fine; the model is not.
+
+**So this is a real capability result, and it is the FIRST time any arm in this project moved
+the benchmark at all.** Every routing intervention until now moved MATH-500 by less than the
+0.020 noise floor. This one moved it from ~0.52 (the other 1.5B arms at step 149) to 0.2560 --
+a catastrophic *negative* effect, produced by destroying the model's ability to stop.
+
+**Why that matters more than a null.** It falsifies the comfortable reading of the earlier
+nulls, which was that the routing seam is inert. It is not inert -- it has enough leverage to
+wreck a model. The earlier arms did not move the benchmark because they did not push hard
+enough or long enough, not because the mechanism cannot reach capability. That is a materially
+different conclusion and it changes what the negative results mean.
+
+**Mechanism, hypothesised and NOT yet established.** The arm suppressed RL to near zero for
+~70 steps and ran at roughly half SFT / half SKIP thereafter. SFT here writes a positive
+constant onto a solved group's response tokens, which raises the likelihood of the tokens that
+were produced -- with no term anywhere that rewards emitting EOS. Trained long enough with the
+policy-gradient signal largely removed, "never stop" is consistent with what was optimised. The
+solved branch was already measured inert at 0.5 and *harmful* at 2.0; this looks like the same
+direction taken much further.
+
+**Being localised now:** MATH-500 truncation rate at checkpoints 49, 149, 224 and 289, to find
+whether the collapse is progressive or abrupt, and whether it coincides with the step where
+per-prompt credit began (29) or with the RL suppression phase.
+
+**Not yet known:** whether the raw `prompt` arm does the same (it stalled at 152 and its 149
+checkpoint scored 0.5160 with normal truncation, so at that step it had NOT collapsed), and
+whether `credit="batch"` at full length collapses too (`ctx2` ran 290 steps and is unscored).
+
 ## 2026-08-31 — The base model is worth 3.5x what every routing intervention was worth
 
 OlympiadBench, 675 problems, cap 16384, identical harness and grader:
