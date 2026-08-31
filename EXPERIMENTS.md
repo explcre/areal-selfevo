@@ -3,6 +3,55 @@
 Measured results and negative results, newest first. A claim only belongs here once it has
 been observed end to end; a prediction belongs in GOAL.md until then.
 
+## 2026-08-31 — Per-prompt credit makes the router LEARN, and the first thing it learns is to stop doing RL
+
+`ctxpc` (`router=contextual`, `credit="prompt"`), 46 steps, GSM8K / Qwen2.5-1.5B. Mode mix as
+a fraction of 64 groups per step:
+
+| window | rl | sft | skip | L1 vs uniform |
+|--------|-----|-----|------|----------------|
+| Q1 (steps 0-11) | 0.819 | 0.087 | 0.093 | 0.972 |
+| Q2 | **1.000** | 0.000 | 0.000 | 1.333 |
+| Q3 | 0.636 | 0.275 | 0.089 | 0.606 |
+| Q4 | **0.000** | 0.566 | 0.434 | 0.667 |
+
+**The signal, not the bandit, was the problem.** The batch-credit arm's L1 from uniform never
+left 0.027-0.069 over 129 steps and trended FLATTER. This arm swings between 0.61 and 1.33 and
+revises its preference. That is the prediction from the credit-assignment analysis, confirmed:
+the same LinUCB router, the same features, the same exploration -- only the credit changed,
+and it went from developing no preference to developing strong ones.
+
+**The timing is the evidence, not a coincidence.** `prompt_credit/observed_units` is 0 for
+steps 0-28 (no prompt has recurred yet) and first goes non-zero at step 29. The first step
+with `rl_groups == 0` is **step 29**. Before credit arrives the arm sits at ~100% RL, which is
+the documented tie-break behaviour: with no `observe()` calls the arms' parameters stay at
+their initial values, the scores tie, and `argmax` resolves alphabetically to `rl`. The moment
+real credit arrives the router abandons RL entirely.
+
+**A CONFOUND that probably explains the direction, and it was predicted in the module
+docstring.** The credited value is a prompt's change in solve rate across ~29 steps of
+training. The policy improves generally over that window, so most prompts' solve rates rise
+whatever mode was applied to them -- the signal conflates "the model got better" with "this
+mode helped this prompt". Every arm gets rewarded, and the arm that was applied most during
+the improving window accumulates the most positive evidence. So the swing away from RL is not
+yet evidence that RL is worse; it may be evidence that the credit is dominated by a common
+trend.
+
+**The implied fix, and it is cheap:** centre the per-prompt delta by subtracting the batch's
+mean delta, so the common training-progress component cancels and only mode-relative effect
+survives. That is one line in the wiring plus a test, and it should be run as its own arm
+rather than folded in silently.
+
+**What this arm is NOT.** With `rl_groups == 0` no group receives an ordinary policy gradient
+-- every group is either SFT on its own correct sample or skipped. That is a drastic regime,
+and the solved branch was already measured inert at 0.5 and harmful at 2.0. Whether it costs
+capability is a benchmark question, not a metric question, and this arm has not been scored.
+
+**Pairing rate, for the record.** `observed_units` plateaus around 16 of 64 groups (~25%), not
+the ~100% expected from a clean epoch boundary -- consistent with sampling that does not
+partition the dataset into exact epochs. `evicted` stays 0, so nothing is lost to capacity;
+the router simply receives ~16 informative credits per batch instead of 64 uninformative ones.
+
 ## 2026-08-31 — The null holds on the frontier target, and the +1pt gap was jitter
 
 OlympiadBench, both arms at `globalstep149`, re-run at two caps so the comparison could be
