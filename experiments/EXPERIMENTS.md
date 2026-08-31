@@ -2282,3 +2282,49 @@ while the schema is `text`/`gold`/`benchmark`, so it compared empty strings to e
 and every field defaulted. The real numbers are above. The lesson is the same one this file
 keeps recording: a comparison that reads a field name that does not exist returns a clean,
 confident, meaningless answer.
+
+---
+
+## Smoke test of run_portable.sh: the refusal path works, and two defects only a run would show
+
+Run on the A100 box with all 8 GPUs held by the `sa2` arm -- i.e. the exact shared-box
+condition the script exists for. `MIN_GPUS=4`, `WAIT_FOR_GPUS_S=0`.
+
+**What worked, end to end and unattended:**
+
+* cloned/updated the repo at the pinned branch;
+* found a usable Python environment rather than building one;
+* prefetched the model (7 files) and GSM8K (7473 train / 1319 test) into its own `HF_HOME`;
+* detected that no GPU was below the free-memory threshold and **refused with exit 4** instead
+  of launching into contention with the neighbouring job;
+* wrote the structured manifest **on the failure path**, with `status: "failed"` and the
+  reason -- which is the property that matters, since a manifest that only appears on success
+  cannot report a failure.
+
+**Defect 1: the manifest silently records empty strings for anything not exported.**
+
+    "solved_advantage": "",   "model": "",   "wandb": {"project": ""}
+
+The manifest heredoc reads `os.environ`, but those values are set as ordinary shell variables
+inside the script and never exported. `mode`, `arm` and `run_name` were populated only because
+the smoke test happened to export them on the command line. So a collaborator running with
+defaults gets a manifest whose most useful fields are blank, and nothing anywhere says so.
+This is the same silent-empty shape this file keeps recording: the field exists, the value
+does not, and the artefact looks complete.
+
+**Defect 2: `die()` appends the exit code to the human-readable note.**
+
+    "note": "fewer than MIN_GPUS=4 free (raise WAIT_FOR_GPUS_S to wait) 4"
+
+`die` is `die "msg" 4` and passes `"$*"`, which is both arguments. Cosmetic, but the note is
+the field a human reads first.
+
+**Why this entry exists.** I had already written that the script "should not be handed over
+until it has been run end to end". Both defects are invisible to `bash -n`, invisible to
+review, and would have reached a collaborator as a manifest full of blanks. Running it once,
+against a genuinely busy box, cost about a minute.
+
+**Still unverified:** the training path itself, the eval path, the retry/re-claim loop, and
+`cleanup_ours` sparing a neighbour's sglang server. Those need free GPUs and, for the last
+one, a second job to not kill. They are the parts most likely to hurt someone else's work, so
+they are the parts that must not be assumed.

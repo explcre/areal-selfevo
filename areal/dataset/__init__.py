@@ -43,6 +43,18 @@ def _get_custom_dataset(
             max_length=max_length,
             **kwargs,
         )
+    elif ("MATH" in path or "math" in path.lower()) and "gsm8k" not in path and type == "rl":
+        # Matched BEFORE gsm8k so a path containing both cannot fall through to the wrong
+        # adapter; the gsm8k exclusion keeps that ordering harmless.
+        from .competition_math import get_math_rl_dataset
+
+        return get_math_rl_dataset(
+            path=path,
+            split=split,
+            tokenizer=tokenizer,
+            max_length=max_length,
+            **kwargs,
+        )
     elif "gsm8k" in path and type == "rl":
         from .gsm8k import get_gsm8k_rl_dataset
 
