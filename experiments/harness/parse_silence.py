@@ -13,7 +13,7 @@ import statistics as st
 import subprocess
 import sys
 
-KEYS = (
+DEFAULT_KEYS = (
     "silent_group_fraction",
     "solved_group_fraction",
     "unsolved_group_fraction",
@@ -23,8 +23,18 @@ KEYS = (
 NUM = re.compile(r"^[0-9]\.[0-9]{4}e[+-][0-9]{2}$")
 
 
-def parse(path: str) -> dict[str, list[float]]:
-    """Pair each metric name with the numeric token that immediately follows it."""
+def parse(path: str, keys: tuple[str, ...] = DEFAULT_KEYS) -> dict[str, list[float]]:
+    """Pair each metric name with the numeric token that immediately follows it.
+
+    Args:
+        path: An AReaL ``train.log``.
+        keys: Metric names to extract. Any name printed in the box table works, e.g.
+            ``ppo_actor/update/entropy/avg``.
+
+    Returns:
+        ``{metric_name: [value_per_batch]}``, in log order.
+    """
+    KEYS = keys
     raw = subprocess.run(["sed", "s/│/\\n/g", path], capture_output=True, text=True).stdout
     toks = [t.strip() for t in raw.split("\n") if t.strip()]
     # Keep only names and numbers so an intervening label cannot break adjacency.
@@ -37,20 +47,24 @@ def parse(path: str) -> dict[str, list[float]]:
 
 
 def main() -> int:
-    d = parse(sys.argv[1])
-    for k in KEYS:
+    """Print each requested metric's summary, plus the two consistency checks."""
+    keys = tuple(sys.argv[2].split(",")) if len(sys.argv) > 2 else DEFAULT_KEYS
+    d = parse(sys.argv[1], keys)
+    for k in keys:
         v = d[k]
         if not v:
             print(f"{k:26s} ABSENT")
             continue
         print(f"{k:26s} n={len(v):3d}  mean {st.mean(v):.4f}  last {v[-1]:.4f}  "
               f"range [{min(v):.4f}, {max(v):.4f}]")
-    sil, sol, uns = d["silent_group_fraction"], d["solved_group_fraction"], d["unsolved_group_fraction"]
+    sil = d.get("silent_group_fraction", [])
+    sol = d.get("solved_group_fraction", [])
+    uns = d.get("unsolved_group_fraction", [])
     m = min(len(sil), len(sol), len(uns))
     if m:
         resid = max(abs(sol[i] + uns[i] - sil[i]) for i in range(m))
         print(f"\nidentity solved+unsolved==silent: max residual {resid:.2e} over {m} batches")
-    rt, so = d["routed_group_fraction"], d["solved_group_fraction"]
+    rt, so = d.get("routed_group_fraction", []), d.get("solved_group_fraction", [])
     if rt:
         m2 = min(len(rt), len(so))
         gap = max(abs(rt[i] - so[i]) for i in range(m2)) if m2 else float("nan")

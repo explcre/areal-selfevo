@@ -1848,3 +1848,39 @@ anything, and the ratio 1.0/1.0 would have looked like a measurement.
 **Test state:** `selfevo/tests/test_dapo_baseline.py`, 48 tests; suite 293 -> 341 passing;
 9/9 mutations killed with no survivors, run against a copy of the repo rather than the live
 checkout so a mutated file could never be imported by the running job.
+
+---
+
+## INTERIM (not a result): the ON arm sharpens faster mid-run, then lands on the same floor
+
+Predeclared as a co-primary readout, so it is reported while the runs are still going rather
+than after the accuracy is known. Entropy (`ppo_actor/update/entropy/avg`) compared at
+MATCHED BATCH INDEX -- the series decays steeply, so comparing run means would have been an
+artefact of the arms having different batch counts (149 vs 129), and the first version of
+this comparison did exactly that before being redone.
+
+| batch window | OFF (step0l) | ON (step0m-on) | ON - OFF |
+|---|---|---|---|
+| 1-20   | 4.0997 | 3.5938 | -0.5059 |
+| 21-50  | 3.1099 | 1.0616 | **-2.0483** |
+| 51-80  | 1.6503 | 0.3744 | **-1.2759** |
+| 81-129 | 0.2228 | 0.2460 | +0.0231 |
+| all    | 1.8273 | 0.9846 | -0.8427 |
+
+ON is below OFF in 88/129 matched batches (68.2%). At the final matched batch the two are
+level: OFF 0.1940, ON 0.2272.
+
+**Reading, with the ambiguity left in.** Training on a group's own correct samples makes the
+policy sharpen faster in the middle of the run -- which is what the mechanism predicts and
+what the entropy-collapse worry is about. But the effect is transient: both arms reach the
+same floor near 0.22, and by the end the ON arm sits marginally *higher*. So this is not
+differential collapse.
+
+Faster entropy decay is consistent with BOTH readings -- a policy that is learning faster
+and one that is collapsing faster -- and entropy alone cannot separate them. Held-out
+accuracy is what disambiguates, and that is the A/B's job. Recording the observation now
+without choosing a reading for it.
+
+**Confound, stated.** Different boxes (A100 vs H200), different data order, different step
+counts. The matched OFF arm on the same H200 is the run that settles it, and it is queued
+behind the ON arm. Until then this is an indication, not a comparison.
