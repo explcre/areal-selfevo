@@ -3,6 +3,37 @@
 Measured results and negative results, newest first. A claim only belongs here once it has
 been observed end to end; a prediction belongs in GOAL.md until then.
 
+## 2026-08-31 — The `ctx` run stalled at step 162, and the orphan check could not see it
+
+The watchdog worked and the cleanup did not. `supervise.sh` logged
+``WATCHDOG: train.log stalled 1824s (> 1800s); dumping stacks then killing`` at 15:29:31,
+dumped ``/proc/<pid>/status`` for the workers, and then the supervisor itself exited -- while
+nine training processes stayed alive holding all 8 GPUs at 0% utilisation. The train log ends
+mid-metrics-table, so the stall happened while writing a step summary rather than during
+generation.
+
+**Why STEP 1 of the hourly loop could not catch this.** The orphan check compares the
+experiment name on GPU-holding processes against the run that is supposed to be live. Here the
+orphans ARE `ctx` -- the same experiment -- so the check reported eight healthy `ctx`
+processes on a box that had made no progress for 40 minutes. Name matching cannot distinguish
+a live run from its own corpse. **Log age is the only signal that catches this**, which is
+what STEP 2 exists for, and it is why STEP 2 must never be skipped when STEP 1 looks clean.
+
+**Cause of the stall itself: not yet diagnosed.** The supervisor's stack dump is in
+`~/runs/ctx/supervisor.log`. Recorded as unexplained rather than guessed at; what is
+established is only that the process group survived the watchdog's kill attempt, which is the
+same orphan-survives-cleanup pattern seen twice already today.
+
+**Recovered rather than restarted.** The run had written 11 checkpoints (`saver.freq_steps=25`),
+the newest at `globalstep149`, a complete HF model directory. Rather than relaunch and lose the
+box for hours, the checkpoint went straight to the gating measurement that has been blocked all
+day by both boxes being busy: scoring on the frozen math suite. A matched comparison against
+`rnd` is available because that arm has a checkpoint at a comparable step.
+
+**Consequence for the arm comparison.** `ctx` stopped at 162/290 and `rnd` is at 245/290, so
+the two arms cannot be compared at their final steps. They CAN be compared at a matched
+checkpoint (~149), which is the honest comparison and is the one to report.
+
 ## 2026-08-31 — NEGATIVE: the learned router receives feedback and still develops no preference
 
 Measured on the live `ctx` run at 129 steps, GSM8K / Qwen2.5-1.5B, `router=contextual` with
