@@ -39,6 +39,46 @@ training. The 30B is post-trained for agentic MLE work by Frontis, which plausib
 competition math too. And both 30B and 1.5B numbers remain cap-limited at different rates, so
 the gap is bounded below rather than pinned.
 
+## 2026-08-31 — The base model is worth 3.5x what every routing intervention was worth
+
+OlympiadBench, 675 problems, `max_tokens=16384`, identical protocol and identical cap for all
+three:
+
+| model / arm | accuracy | Wilson 95% | truncated |
+|-------------|----------|------------|-----------|
+| 1.5B `ctx149` (batch credit) | 0.1837 | [0.156, 0.215] | 78 (11.6%) |
+| 1.5B `rnd149` (random control) | 0.1837 | [0.156, 0.215] | 64 (9.5%) |
+| **Frontis-MA1-30B** | **0.6400** | [0.603, 0.675] | 222 (32.9%) |
+
+**+0.456, and the 30B number is still a lower bound** -- `cap_limited` fires at 32.9%
+truncation, so its true score is higher again.
+
+**This is the number that should reframe the paper.** Every routing intervention measured here
+moved OlympiadBench by **0.0000 to 0.0015** at 1.5B. Swapping the base model moved it by
+**0.456**. The interventions this project spent GPU-weeks on are worth roughly **1/300th** of
+the base model on the same benchmark, under the same harness, at the same cap.
+
+Three consequences, stated plainly:
+
+1. **The scale confound was real and is now measured, not argued.** "The model is too small for
+   the intervention to matter" was untestable for the whole project. At 1.5B, `ctx` and `rnd`
+   are identical to four decimal places; at 30B the same benchmark reads 0.64. Any future
+   routing claim has to be made at a scale where the base is competent, or it is measuring
+   noise around a floor.
+2. **A method result must be a delta at FIXED base.** This is exactly why the paper decision
+   (Sec. 2d of GOAL.md) fixes the model and varies only the routing or the harness. A number
+   obtained by swapping in a better base is a scaling result and a reviewer will discount it,
+   correctly -- as this table shows, it can be 300x larger than the method effect and says
+   nothing about the method.
+3. **It raises the bar for what counts as a real effect.** On OlympiadBench at 30B, a method
+   would need to move ~0.05 to be worth reporting next to a base-model swap worth 0.456. Every
+   effect this project has measured is two orders of magnitude below that.
+
+**Caveat that matters:** the 30B is a different model family (`Qwen3MoeForCausalLM`), differently
+post-trained (on MLE operators, per 2607.28568), at a different active-parameter count. This is
+not a controlled scaling study and must not be reported as one. It is a demonstration that the
+base dominates, which is all it needs to be.
+
 ## 2026-08-31 — First 30B numbers, and our token caps are calibrated for the WRONG model class
 
 Frontis-MA1-30B on the frozen suite, versus the 1.5B `ctx149` checkpoint:
