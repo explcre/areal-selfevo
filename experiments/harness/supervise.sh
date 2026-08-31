@@ -31,12 +31,27 @@ for attempt in $(seq 0 "$MAX_RESTARTS"); do
       if [ "$mt" -gt 0 ] && [ "$age" -gt "$STALL_S" ]; then
         say "WATCHDOG: $LOG stalled ${age}s (> ${STALL_S}s); dumping stacks then killing"
         for pid in $(pgrep -u "$USER" -f "rpc_server.*--role actor" | head -4); do
-          say "--- py-spy $pid ---"
-          (py-spy dump --pid "$pid" 2>&1 | head -30) >> "$SUP" 2>&1 || say "py-spy unavailable"
+          say "--- stacks for $pid ---"
+          # py-spy needs ptrace permission and is silently useless without it, so record the
+          # kernel wait-channel too: it is always readable and distinguishes a process
+          # blocked in a collective from one blocked on I/O.
+          (py-spy dump --pid "$pid" 2>&1 | head -30) >> "$SUP" 2>&1 || say "py-spy failed"
+          say "wchan=$(cat /proc/$pid/wchan 2>/dev/null || echo unreadable) state=$(awk '"'"'/^State:/{print $2}'"'"' /proc/$pid/status 2>/dev/null || echo ?)"
         done
-        pkill -u "$USER" -f "experiment-name ${TAG}" 2>/dev/null
+        # The trainer is launched with `experiment_name=<tag>` -- an UNDERSCORE and an EQUALS.
+        # This previously matched "experiment-name ${TAG}", which appears nowhere on any
+        # command line, so the watchdog detected the stall, logged it, and killed nothing:
+        # the dead run kept its GPUs and the next attempt collided with it in name_resolve.
+        pkill -u "$USER" -f "experiment_name=${TAG}" 2>/dev/null
+        pkill -u "$USER" -f "${TAG}\.sh" 2>/dev/null
         sleep 15
-        pkill -9 -u "$USER" -f "experiment-name ${TAG}" 2>/dev/null
+        pkill -9 -u "$USER" -f "experiment_name=${TAG}" 2>/dev/null
+        # sglang servers do not carry the experiment name on their command line, so they
+        # survive the pattern above and hold their GPU memory into the next attempt.
+        pkill -9 -u "$USER" -f "inference_service.sglang.launch_server" 2>/dev/null
+        sleep 5
+        left=$(pgrep -u "$USER" -f "experiment_name=${TAG}" | wc -l)
+        say "after kill: $left processes still match experiment_name=${TAG}"
         break
       fi
     done ) &

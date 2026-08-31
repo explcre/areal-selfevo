@@ -1991,3 +1991,49 @@ reported `async def route` as "1 top-level statements".
 609 tests passing. 26/26 mutants killed, after a first pass left one survivor -- sharing a
 single `_SAFE_BUILTINS` dict between policies instead of copying it, so one policy could
 poison another's builtins.
+
+---
+
+## The stall watchdog detected a dead run and then killed nothing, for two independent reasons
+
+`step0l` stalled at step 213. The watchdog fired correctly on log-stall -- the mechanism
+added earlier this session worked -- and then failed at both of the things it does next.
+
+**1. The kill pattern matched nothing.** `supervise.sh` ran
+
+    pkill -u "$USER" -f "experiment-name ${TAG}"        # hyphen, space
+
+against processes whose command line reads
+
+    experiment_name=step0l                              # underscore, equals
+
+so it killed nothing at all. Four and a half hours later the original trainer was still
+alive, the supervisor had started a second attempt beside it, and the two collided in
+`/tmp/areal/name_resolve/ubuntu/step0l` -- which is why the relaunch produced 16 minutes of
+startup warnings and no step. A watchdog that logs `WATCHDOG: stalled` and then leaves the
+run running is worse than no watchdog: the log says the situation was handled.
+
+Fixed to `experiment_name=${TAG}`, plus the launch script name, plus an explicit sweep for
+`inference_service.sglang.launch_server` -- sglang servers carry no experiment name on their
+command line, so they survive any experiment-scoped pattern and hold ~118 GB of GPU memory
+into the next attempt. The watchdog now logs how many processes still match after the kill,
+so a future mismatch is visible instead of silent.
+
+**2. py-spy could not attach.** Every dump returned
+
+    Permission Denied: Try running again with elevated permissions
+
+so the stall was killed with no stack trace, and the cause of THIS stall is unrecoverable --
+recorded as unknown rather than guessed at. `/proc/<pid>/wchan` and `/proc/<pid>/status` are
+always readable and distinguish a process blocked in a collective from one blocked on I/O, so
+they are captured alongside py-spy now.
+
+**Why this matters beyond one run.** The earlier entry in this file records the opposite
+failure -- a watchdog that would have killed a HEALTHY run. Together they are the same
+lesson: the guard was never exercised against the case it exists for. The detection half was
+verified when it was written (a stale log does fire it); the kill half never was, because
+verifying it requires actually killing something.
+
+**Cost.** ~4.5 hours of A100 time on a run that was dead, and step0l ends at step 213 of 290.
+Its comparison points (28/57/86/115/144) are all present, so nothing the analysis needs is
+lost -- but that is luck, not design.
