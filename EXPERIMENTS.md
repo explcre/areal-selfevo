@@ -3,6 +3,51 @@
 Measured results and negative results, newest first. A claim only belongs here once it has
 been observed end to end; a prediction belongs in GOAL.md until then.
 
+## 2026-08-31 — The null holds on the frontier target, and the +1pt gap was jitter
+
+OlympiadBench, both arms at `globalstep149`, re-run at two caps so the comparison could be
+made where neither arm is budget-bound:
+
+| cap | ctx | rnd | ctx - rnd | ctx trunc | rnd trunc |
+|-----|-----|-----|-----------|-----------|-----------|
+| 8192 | 0.1941 | 0.1837 | **+0.0104** | 79/675 (11.7%) | 61/675 (9.0%) |
+| **16384** | **0.1837** | **0.1837** | **+0.0000** | 78/675 (11.6%) | 64/675 (9.5%) |
+
+**The gap vanished.** ctx fell 0.1941 -> 0.1837 on the same checkpoint and the same 675
+problems with nothing changed but the token budget, while rnd did not move at all. So the
++0.0104 at 8192 was measurement jitter, and `cap_limited` flagged the comparison as unfair
+before it was reported -- which is what it was built for.
+
+Two things worth taking from the second row. First, **the null now holds on the frontier
+target as well as MATH-500**: -0.0020 there, +0.0000 here on 675 problems with a ~5.7pt
+interval. Second, a single greedy score at this n carries about a 1-point jitter, so any
+future arm difference below ~2 points on OlympiadBench is not evidence.
+
+**The truncation is NOT a budget problem, and that revises the flag's meaning.** Doubling
+8192 -> 16384 barely moved it (79 -> 78 for ctx, 61 -> 64 for rnd). These generations run away
+and never emit `\boxed{}` at any budget. So `cap_limited` should be read as "this many
+generations never terminate usefully", not "this score would rise with more tokens".
+
+**A real behavioural difference between the arms, which is not an accuracy difference.** ctx
+produces consistently more non-terminating generations than rnd -- 79 vs 61 at 8192, 78 vs 64
+at 16384 -- across both caps. It does not translate into accuracy, and it is one seed, so it
+is recorded as an observation to check rather than an effect.
+
+## 2026-08-31 — Launched: the first arm trained on per-prompt credit
+
+`ctxpc` = `router=contextual` with `group_routing.credit="prompt"`, otherwise identical to
+`ctx`. This is the designed test of whether the measured null is the ROUTER or the SIGNAL: at
+`credit="batch"` one scalar is credited to all 64 decisions and every arm provably converges
+to the same parameter vector, which is why the mode mix stayed uniform for 129 steps and the
+arm scored like random. The prompt path credits each decision with its own prompt's change in
+solve rate between appearances.
+
+What to watch, and what would falsify the fix rather than confirm it:
+`prompt_credit/observed_units` per batch (zero means the router's `pending_cap` evicted the
+prior context before the prompt returned, and the arm is silently a no-op),
+`prompt_credit/same_batch_skips` (duplicate prompts halving the pairing rate), and the mode
+mix's L1 distance from uniform, which stayed flat-to-decreasing for the batch-credit arm.
+
 ## 2026-08-31 — A killed mutation harness left the target MUTATED, and the next run made it the baseline
 
 Worth recording because the second failure is worse than the first, and both were silent.

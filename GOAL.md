@@ -406,8 +406,19 @@ changed".
    against a predicted 41%, so a large share of the channel is prompts that are silent at ANY
    group size. Between-run comparison, one run per G -- directional, not a coefficient.
 
+7. **NULL: the learned router does not beat its matched control.** `router=contextual` vs
+   `router=random` at the contextual arm's MEASURED proportions, both at `globalstep149`:
+   MATH-500 **-0.0020**, OlympiadBench **+0.0000** (675 problems, both at a cap where neither
+   arm is budget-bound). The arms differ only in WHICH unit gets which mode, so at matched
+   proportions the per-unit decision buys nothing. Mechanism measured, not guessed: a single
+   per-batch scalar credited to all 64 decisions converges every LinUCB arm to the same
+   parameter vector, and the router's mode mix stayed at uniform thirds for 129 steps.
+
 **Nothing yet demonstrates the method works.** Results 1–4 are evaluation contributions;
-result 5 is a null; result 6 is a property of the problem, not of the method.
+results 5 and 7 are nulls; result 6 is a property of the problem, not of the method. Result 7
+is the important one: it falsifies "this router with this credit signal beats its control",
+and it localises the failure to credit assignment rather than to routing. The `ctxpc` arm
+(`credit="prompt"`) is the designed test of that localisation and is running.
 
 > **CORRECTED — the composition RATIO was inflated ~1.8x; the REACH argument survives
 > (2026-08-31).** The decomposition was missing a bucket: `silent` is read from
