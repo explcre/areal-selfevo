@@ -60,6 +60,9 @@ cd "$HOME/areal-selfevo" || exit 1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 ulimit -n 131072 || echo "WARNING: could not raise the file-descriptor limit"
 export PYTHONUNBUFFERED=1
+# Online by default: a run whose curve is only on the box is a run nobody can check,
+# and these boxes are rented. WANDB_MODE=offline or disabled opts out.
+export WANDB_MODE="${WANDB_MODE:-online}"
 # One transient rollout disconnect during a weight push otherwise aborts the whole run,
 # and the surviving ranks then spin at 100% utilization looking healthy.
 export AREAL_WEIGHT_SYNC_RETRIES="${AREAL_WEIGHT_SYNC_RETRIES:-5}"
@@ -111,6 +114,9 @@ python3 examples/math/gsm8k_rl.py \
   ++actor.mb_spec.granularity=8 \
   actor.path=Qwen/Qwen2.5-1.5B-Instruct \
   "${ROUTING_ARGS[@]}" \
+  stats_logger.wandb.mode="${WANDB_MODE:-online}" \
+  +stats_logger.wandb.project="${WANDB_PROJECT:-selfevo-routing}" \
+  +stats_logger.wandb.name="${EXP}" \
   ${EXTRA_ARGS:-} \
   evaluator.freq_epochs=null \
   evaluator.freq_secs=null \

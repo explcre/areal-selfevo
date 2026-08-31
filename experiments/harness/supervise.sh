@@ -5,10 +5,15 @@
 # during a weight push the surviving training ranks spin in a dead NCCL collective and
 # nvidia-smi keeps reporting 100%. Log growth is the signal that actually tracks progress.
 #
-# Usage: supervise.sh <launch-script> <run-dir> [max_restarts] [stall_seconds]
+# Usage: supervise.sh <launch-script> <run-dir> [max_restarts] [stall_seconds] [startup_seconds]
+#
+# Two fuses, because the two failures look different. A steady-state stall shows a log that
+# stops growing. A startup failure shows a log that grows steadily -- server boot chatter --
+# while no training step ever appears, so the stall check never fires and the run waits
+# forever. One rollout server failing to bind is enough to produce it.
 set -u -o pipefail
 LAUNCH="${1:?launch script}"; RUN="${2:?run dir}"
-MAX_RESTARTS="${3:-6}"; STALL_S="${4:-1200}"
+MAX_RESTARTS="${3:-6}"; STALL_S="${4:-1200}"; STARTUP_S="${5:-900}"
 LOG="$RUN/train.log"; SUP="$RUN/supervisor.log"
 TAG=$(basename "$LAUNCH" .sh)
 mkdir -p "$RUN"
@@ -24,8 +29,24 @@ for attempt in $(seq 0 "$MAX_RESTARTS"); do
   RUN_PID=$!
 
   # Stall watchdog for this attempt.
-  ( while kill -0 "$RUN_PID" 2>/dev/null; do
+  ( started=$(date +%s)
+    while kill -0 "$RUN_PID" 2>/dev/null; do
       sleep 120
+      # Startup fuse: the log may be growing with server boot chatter while no training step
+      # has ever appeared, in which case the stall check below never fires.
+      if ! grep -qE "step [0-9]+/" "$LOG" 2>/dev/null; then
+        boot=$(( $(date +%s) - started ))
+        if [ "$boot" -gt "$STARTUP_S" ]; then
+          say "WATCHDOG: no training step after ${boot}s (> ${STARTUP_S}s startup budget)"
+          nvidia-smi --query-gpu=index,memory.used --format=csv,noheader >> "$SUP" 2>&1
+          pkill -u "$USER" -f "experiment_name=${TAG}" 2>/dev/null
+          pkill -9 -u "$USER" -f "inference_service.sglang.launch_server" 2>/dev/null
+          sleep 10
+          pkill -9 -u "$USER" -f "experiment_name=${TAG}" 2>/dev/null
+          break
+        fi
+        continue
+      fi
       mt=$(stat -c %Y "$LOG" 2>/dev/null || echo 0)
       age=$(( $(date +%s) - mt ))
       if [ "$mt" -gt 0 ] && [ "$age" -gt "$STALL_S" ]; then
