@@ -1920,3 +1920,74 @@ unaffected.
 instead of one arm with a long tail and two arms that might not finish before the box is
 reclaimed. Given both machines are rented and can be taken back at short notice, an
 incomplete three-arm comparison would have been worth less than a complete one.
+
+---
+
+## Code-as-policy: what the AST allowlist cannot do, and what closes it instead
+
+`evolve_policy="learned_code"` means a generated Python function decides the routing. An
+adversarial audit ran ~150 hostile policies against the validator. Recorded because the
+result is a bound on what static validation can achieve, not a bug list.
+
+**Closed by the allowlist** (all pinned by tests, so widening the list fails one): imports by
+any route; `__builtins__` / `__globals__` / `__class__` / `__subclasses__` recovery;
+attribute access; `eval`/`exec`/`compile`/`open`/`getattr`/`type`; f-strings, walrus, lambda,
+comprehensions, generators, `global`/`nonlocal`, `del`, `assert`, `raise`, `try`, `with`,
+`yield`, `await`, `match`, class definitions. No `BaseException` is reachable, so nothing can
+slip past the `except Exception` on the call path. NFKC identifier normalisation is caught --
+`_＿builtins＿_` arrives already normalised and hits the dunder check.
+
+**Closed during the audit**, four of them, each an evaluation site the checks did not cover:
+decorators (`@len` above `def route`, which raised out of the *constructor* rather than as
+`PolicyRejected`); nested function definitions; **nested defaults** -- `def inner(x=9 ** 9 ** 9)`
+was accepted AND fired; and deep expression nesting, where a `RecursionError` escaped a
+validator that only caught `SyntaxError`.
+
+One of those four was inert only by accident: an annotation `def route(features: 9 ** 9 ** 9)`
+did not evaluate because `compile()` inherited `from __future__ import annotations` from this
+module's own frame. Recompiled with `dont_inherit=True` the identical source hangs at
+construction. The flag is now passed explicitly rather than inherited, which is the
+difference between a property and a coincidence.
+
+**NOT closable by an AST rule, and stated as a limit:**
+
+    def route(features): return "rl" if 9 ** 9 ** 9 else "skip"             # one opcode
+    def route(features): return "rl" if len("%999999999d" % 1) else "skip"  # ~1 GB from 30 chars
+    def route(features): return "rl" if len([0] * 10 ** 9) else "skip"      # 8 GB
+
+None uses a loop, so rejecting loops does not help, and all three need only `Pow`/`Mult`/`Mod`,
+which ordinary policies use. An in-process timeout cannot help either: a signal handler runs
+*between* bytecodes and `9 ** 9 ** 9` is a single one.
+
+**What closes it: vetting in a subprocess, and measuring rather than surviving.**
+`selfevo/routing/policy_vetting.py` runs a candidate under kernel-enforced `RLIMIT_CPU` and
+`RLIMIT_AS`, once, before a run adopts it. The accepted policy then runs in-process at full
+speed, so the cost is one subprocess per candidate, not per decision.
+
+The first version only asked "did it survive the limit", and that was not enough --
+`"%999999999d" % 1` allocates ~0.93 GiB and PASSED under a 1 GiB cap. A policy that fits just
+under the cap then pays that cost on every group of every batch. The child now measures its
+own peak RSS and CPU after imports, so cost is a number rather than a verdict:
+
+    good           ok=True   rss=  0.0 MiB   cpu=0.00s
+    9**9**9        ok=False  killed by signal 9 (RLIMIT_CPU)
+    "%999999999d"  ok=False  MemoryError
+    [0]*10**9      ok=False  MemoryError
+    "x"*10**8      ok=False  rss= 95.6 MiB   -- COMPLETED, rejected on measured cost
+
+The last row is the point. It is the only one a pass/fail limit lets through.
+
+**A defect of mine the audit found, worth recording separately.** The teacher guard did not
+apply to the fallback. `CodePolicyRouter(fallback="sft")` on a unit with no target emitted
+`sft` on all three rejection paths -- including the path that logs `"code policy chose sft
+with no target"`, increments `teacher_blocked`, and then emitted `sft` anyway. The guard
+defeated itself and said so in the log while doing it. It now degrades to SKIP.
+
+Also fixed: a `reason` string carrying an unbounded repr (a policy returning `"x" * 10 ** 7`
+produced a 10,000,044-character reason that `RoutingDecision` documents as going into logs);
+`allowed_modes=()` silently meaning "every mode" via `or`; and a rejection message that
+reported `async def route` as "1 top-level statements".
+
+609 tests passing. 26/26 mutants killed, after a first pass left one survivor -- sharing a
+single `_SAFE_BUILTINS` dict between policies instead of copying it, so one policy could
+poison another's builtins.
