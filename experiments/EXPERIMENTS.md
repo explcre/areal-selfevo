@@ -2394,3 +2394,47 @@ them one at a time: 11 caught, 0 survivors.
 `GPU_FREE_MIB=4096` is high enough, since a neighbour still loading weights can sit under
 4 GiB and look free. Reading `--query-compute-apps` would close that last one and is a design
 change I did not make unasked.
+
+---
+
+## run_portable.sh passes end to end on 8 GPUs; the partial-box path does not
+
+Run exactly as a collaborator would: fresh `git clone` of the public branch on the H200, then
+the script. Nothing pre-staged, no human intervention.
+
+    status         succeeded
+    step           29/29
+    gpus_claimed   0,1,2,3,4,5,6,7
+    checkpoints    2, with full paths
+    commit         bf5e30a7
+    wandb          {"mode": "offline", "degraded_from_online": true, ...}
+    GPUs after     all 8 at 0 MiB
+
+Every field populated -- no empty strings, which is what the pre-audit version produced. The
+W&B entry is the honest one: online was requested, no key existed on that box, it degraded to
+offline and **said so in the artefact**.
+
+**What the run proved that no amount of reading could:**
+
+* the whole unattended path works from a clean clone -- setup, prefetch, claim, train,
+  checkpoint, manifest;
+* GPUs are RELEASED on exit. An earlier run of the same script left 113 processes and 4 GPUs
+  holding ~131 GB each after giving up, because neither `die` nor `on_exit` called cleanup;
+* a second concurrent launch was REFUSED by the flock and wrote
+  `collab8.manifest.lockbusy.json` without touching the holder;
+* online W&B with no API key does not warn -- it raises inside PPOTrainer construction and
+  kills the run before step 1. A collaborator would have hit this first, on a machine we
+  cannot debug.
+
+**The partial-box path is NOT verified, and that is the case this script exists for.** With
+`MAX_GPUS=4` on the same H200 the run reached `_update_weights_from_distributed` and died in
+`dist.broadcast`, with rollout servers at ~140 GB of 141 GB -- no headroom for the broadcast
+buffers. The 8-GPU run puts them at 118 GB, so the difference is how AReaL splits train and
+rollout when fewer GPUs are claimed, not the script's arithmetic. `MEM_FRACTION` is now passed
+explicitly (default 0.8, matching the yaml) so a partial claim can be given less; that
+mitigation is untested.
+
+So: usable on a whole box today, and to be handed over for a partial box only after the
+4-GPU path is either fixed or the script is made to refuse a claim it cannot serve. Stating
+which of the two configurations was actually exercised matters more than the summary
+"it works".

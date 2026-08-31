@@ -44,6 +44,12 @@ WAIT_FOR_GPUS_S="${WAIT_FOR_GPUS_S:-0}"   # >0 waits for a neighbour's job to fi
 # Resilience.
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-4}"
 GPU_BUSY_ON_EXIT_MIB="${GPU_BUSY_ON_EXIT_MIB:-2048}"
+# Static KV-cache fraction for each rollout server. Passed EXPLICITLY rather than
+# inherited from the yaml, because a partial-box claim splits train and rollout
+# differently and a measured 4-GPU run on an H200 put rollout servers at ~140 GB of
+# 141 GB, leaving no headroom for the weight-sync broadcast -- the run then died in
+# dist.broadcast tens of minutes in. Lower this if a partial claim OOMs.
+MEM_FRACTION="${MEM_FRACTION:-0.8}"
 STALL_S="${STALL_S:-1800}"
 STARTUP_S="${STARTUP_S:-1200}"
 
@@ -319,6 +325,7 @@ run_once() {
     scheduler.type=local \
     cluster.fileroot="$OUTDIR" \
     cluster.n_gpus_per_node="$n" \
+    sglang.mem_fraction_static="$MEM_FRACTION" \
     actor.path="$MODEL" \
     gconfig.n_samples=8 \
     actor.optimizer.lr=1.0e-6 actor.eps_clip=0.2 actor.kl_ctl=0.0 \
