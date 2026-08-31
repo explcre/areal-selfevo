@@ -23,6 +23,7 @@ BASE = [
     "experiment_name=preflight", "trial_name=t0",
 ]
 ON = ["+actor.group_routing.enabled=true", "+actor.group_routing.solved_advantage=0.5"]
+DAPO = ["+dynamic_filter_fn=selfevo.baselines.dapo.dapo_dynamic_sampling"]
 
 
 def load(argv: list[str]):
@@ -55,6 +56,37 @@ def main() -> int:
         if type(gr).__name__ != "GroupRoutingConfig":
             print(f"FAIL: wrong type {type(gr).__name__}; the actor's getattr would still "
                   f"work but the sign guards in __post_init__ would not have run"); ok = False
+
+    # --- the DAPO baseline arm -------------------------------------------------------
+    dapo = load(BASE + DAPO)
+    print(f"ARM dapo -> dynamic_filter_fn = {dapo.dynamic_filter_fn!r}")
+    print(f"ARM dapo -> dynamic_bs        = {dapo.dynamic_bs!r}")
+    if off.dynamic_filter_fn is not None:
+        print("FAIL: the control arm has a filter"); ok = False
+    if dapo.dynamic_filter_fn is None:
+        print("FAIL: the DAPO override did not land"); ok = False
+    else:
+        from areal.utils.dynamic_import import import_from_string
+        import torch
+
+        fn = import_from_string(dapo.dynamic_filter_fn)
+        # Decisions, not just importability: a filter that accepts everything is vanilla GRPO
+        # wearing DAPO's name, and nothing in the log would say so.
+        checks = [
+            ("all-correct group", torch.tensor([1.0, 1.0, 1.0, 1.0]), False),
+            ("all-wrong group", torch.tensor([0.0, 0.0, 0.0, 0.0]), False),
+            ("mixed group", torch.tensor([0.0, 1.0, 0.0, 1.0]), True),
+        ]
+        for label, r, want in checks:
+            got = fn({"rewards": r})
+            if got != want:
+                print(f"FAIL: {label} -> accept={got}, expected {want}"); ok = False
+        print(f"DAPO filter decisions correct on {len(checks)} shapes")
+    if dapo.dynamic_bs:
+        print("FAIL: dynamic_bs is true for the DAPO arm. It reads as the oversampling "
+              "switch and is the OPPOSITE: true stops after batch_size ATTEMPTS and returns "
+              "a shrunken batch. DAPO needs it FALSE so collection continues until "
+              "batch_size are ACCEPTED."); ok = False
 
     # The sign guard must survive the CLI path too, or a typo becomes a silent bad run.
     try:

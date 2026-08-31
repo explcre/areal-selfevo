@@ -10,8 +10,23 @@
 # normalisation, token budget -- is identical, and the off arm is bit-identical to vanilla
 # GRPO because group_routing defaults to None.
 #
-#   ARM=off   group_routing absent          (control)
-#   ARM=on    solved_advantage=$SOLVED_ADV  (SFT on the group's own correct samples)
+#   ARM=off    group_routing absent           vanilla GRPO: the silent groups are computed
+#                                             and contribute exactly zero
+#   ARM=on     solved_advantage=$SOLVED_ADV   ours: reuse them, SFT on the group's own
+#                                             correct samples, no extra generation
+#   ARM=dapo   dapo_dynamic_sampling          DAPO (2503.14476): DISCARD them and oversample
+#                                             until the batch refills
+#
+# The three arms act on the SAME set -- a group with zero reward variance -- which is what
+# makes DAPO the baseline rather than related work. Comparison axis is matched GENERATION
+# BUDGET, not matched steps: DAPO's kept batch is denser per step, so equal-step comparison
+# would flatter it. Read rollout/accepted__count and rollout/rejected__count for the real
+# multiplier (those counts only reach the trainer after the export_stats fix; before it the
+# trainer saw a constant 1.0 and the cost was unmeasurable).
+#
+# dynamic_bs stays FALSE for the DAPO arm. It reads as the oversampling switch and is the
+# opposite: dynamic_bs=true stops after batch_size ATTEMPTS and returns a shrunken batch,
+# while false keeps generating until batch_size are ACCEPTED, which is DAPO's oversampling.
 #
 # SOLVED_ADV defaults to 0.5. With reward_norm std_level=group the informative advantages
 # are standardised to |A| ~ 1, so 0.5 is half a typical advantage -- a deliberate first
@@ -25,12 +40,15 @@ set -u -o pipefail
 ARM="${ARM:?set ARM=off or ARM=on}"
 SOLVED_ADV="${SOLVED_ADV:-0.5}"
 case "$ARM" in
-  off) ROUTING_ARGS=() ;;
-  on)  ROUTING_ARGS=(
-         "+actor.group_routing.enabled=true"
-         "+actor.group_routing.solved_advantage=${SOLVED_ADV}"
-       ) ;;
-  *)   echo "ARM must be 'off' or 'on', got '$ARM'"; exit 2 ;;
+  off)  ROUTING_ARGS=() ;;
+  on)   ROUTING_ARGS=(
+          "+actor.group_routing.enabled=true"
+          "+actor.group_routing.solved_advantage=${SOLVED_ADV}"
+        ) ;;
+  dapo) ROUTING_ARGS=(
+          "+dynamic_filter_fn=selfevo.baselines.dapo.dapo_dynamic_sampling"
+        ) ;;
+  *)    echo "ARM must be 'off', 'on' or 'dapo', got '$ARM'"; exit 2 ;;
 esac
 
 export PATH="$HOME/.local/bin:$PATH"
