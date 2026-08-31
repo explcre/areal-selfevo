@@ -3,6 +3,53 @@
 Measured results and negative results, newest first. A claim only belongs here once it has
 been observed end to end; a prediction belongs in GOAL.md until then.
 
+## 2026-08-31 — RETRACTION: the "silent-channel identity violation" was my own regex bug
+
+Two entries below -- "MEASUREMENT INTEGRITY: the decomposition violates its own identity",
+"DIAGNOSED: the violation is truncation", and "Sizing the unclassified bucket retroactively"
+-- are **WRONG and are retracted**. So is the PROVISIONAL warning they put on GOAL.md's
+composition numbers.
+
+**The bug.** `solved_group_fraction` is a SUBSTRING of `unsolved_group_fraction`, so
+
+    re.findall(rf"{key}\s*│\s*([0-9.eE+-]+)", txt)
+
+for the solved key also matched every unsolved row. The two series were interleaved, which is
+why "unsolved" came out exactly equal to "silent" in one run and why residuals appeared to
+swing positive and negative. Fixed with a left boundary, `(?<![A-Za-z0-9_])`.
+
+**What the corrected extraction says.** The identity
+`silent == solved + unsolved` holds to a maximum residual of **1e-5** -- float32 rounding --
+across every run checked (step0l 273 batches, g16 116, sa2 145, math-off 87). There is no
+violation. The apparent negative residuals were all at the 1e-5 level.
+
+**The paper was right.** `results.tex` reports silent 0.3592, solved 0.3145, unsolved 0.0447,
+solved share 0.875 on step0l over "18 logged batches". Reproduced exactly: batches 44-61, the
+first 18 after the metric starts reporting (`solved` is identically 0 before batch 44, which
+is the earlier metric bug the paper itself documents). Measured means over that window:
+silent 0.3592, solved 0.3145, unsolved 0.0447, share **0.8755**. L1 error against the
+published table: 0.0001.
+
+**Consequences.**
+
+* The composition ratios stand as published. "87.5% of the silent channel is solved" is
+  correct for its stated operating point; my "inflated 1.8x, really 0.34-0.54" claim was an
+  artifact and is withdrawn.
+* The reach argument stands, as it always did.
+* `unclassified_group_fraction` was added on a false premise. It is KEPT, because the case it
+  counts is genuinely reachable -- a group whose every row has an empty loss mask reads as
+  silent while its rewards are mixed, which `test_silence_identity.py` demonstrates on the
+  real path -- but it is a guard for a case that does NOT occur in these runs, not the
+  explanation of an observed anomaly. Its comment has been corrected to say so.
+
+**How this got past me.** I measured a residual, found a mechanism that could produce a
+positive residual, wrote a test that reproduced that mechanism synthetically, and treated the
+agreement as confirmation. The test genuinely passes and the mechanism is genuinely real --
+it just was not what the logs were showing. A synthetic reproduction of a plausible cause is
+not evidence that the cause is the one operating. The check I skipped was the cheap one:
+verifying the extractor against a case with a known answer before trusting 7 runs of output
+from it.
+
 ## 2026-08-31 — Per-prompt credit makes the router LEARN, and the first thing it learns is to stop doing RL
 
 `ctxpc` (`router=contextual`, `credit="prompt"`), 46 steps, GSM8K / Qwen2.5-1.5B. Mode mix as

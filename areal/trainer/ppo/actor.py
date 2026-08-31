@@ -571,12 +571,15 @@ class PPOActor:
                     # seq_adv = (advantages * loss_mask).sum(-1), so a sequence with NO
                     # response tokens contributes exactly 0 whatever its advantage. A group
                     # of fully-truncated sequences therefore reads as silent while its RAW
-                    # rewards are mixed -- neither all-solved (min > 0.5) nor all-unsolved
-                    # (max <= 0.5). Without this bucket those groups vanished from the
-                    # decomposition, so silent > solved + unsolved and every ratio taken
-                    # against solved+unsolved as the denominator was wrong. Measured in g16:
-                    # the residual exceeded 0.01 at 104 of 116 steps, mean +0.277.
-                    # Reproduced on the real path in selfevo/tests/test_silence_identity.py.
+                    # (max <= 0.5). This is a GUARD, not the explanation of an observed
+                    # anomaly: the case is reachable and test_silence_identity.py shows
+                    # it on the real path, but it does NOT occur in any run measured so
+                    # far -- with a correct, non-aliasing extraction the identity
+                    # silent == solved + unsolved holds to 1e-5 across step0l, g16, sa2
+                    # and math-off. An earlier comment cited a +0.277 residual in g16;
+                    # that was an artifact of a regex whose solved_group_fraction pattern
+                    # also matched unsolved_group_fraction. Retracted. The bucket stays
+                    # so a fully-truncated group cannot vanish silently.
                     other = silent * (1.0 - solved) * (1.0 - unsolved)
                     stats_tracker.scalar(
                         silent_group_fraction=float(silent.mean()),

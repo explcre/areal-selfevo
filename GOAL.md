@@ -420,24 +420,13 @@ is the important one: it falsifies "this router with this credit signal beats it
 and it localises the failure to credit assignment rather than to routing. The `ctxpc` arm
 (`credit="prompt"`) is the designed test of that localisation and is running.
 
-> **CORRECTED — the composition RATIO was inflated ~1.8x; the REACH argument survives
-> (2026-08-31).** The decomposition was missing a bucket: `silent` is read from
-> `(advantages * loss_mask).sum(-1)`, so a fully-truncated group counts as silent while its
-> rewards are mixed, making it neither all-solved nor all-unsolved. Reproduced on the real
-> path, fixed with `unclassified_group_fraction`, 4/5 mutants (1 equivalent).
->
-> * **"87.5% of the silent channel is solved" was `solved/(solved+unsolved)`.** With the
->   unclassified mass in the denominator the solved share is **0.34-0.54** across seven runs.
->   The channel is roughly half solved, and on GSM8K nearly as much *neither* -- truncation,
->   which no self-target or teacher argument addresses.
-> * **The 7x reach comparison stands.** "31.4% self-target vs ~4.5% teacher" uses
->   `solved_group_fraction`, a direct mean over ALL groups (measured 0.288-0.331 here). It
->   never used the contaminated denominator, so the critical-path re-ordering it justified is
->   unaffected.
-> * **Still open:** negative residuals appear in every run and dominate `math-off` (57/87
->   steps). A missing bucket cannot produce one, so a second mechanism exists and the
->   retroactive magnitudes above are approximate. Runs after `2c3a5b1a` log the bucket
->   directly and will settle it.
+> **The composition numbers are CORRECT as published (retraction, 2026-08-31).** An earlier
+> note here claimed the solved share was inflated ~1.8x. That was an artifact of a regex whose
+> `solved_group_fraction` pattern also matched `unsolved_group_fraction`, interleaving the two
+> series. With a non-aliasing match the identity `silent == solved + unsolved` holds to 1e-5
+> across every run checked, and `results.tex`'s table reproduces exactly (step0l batches
+> 44-61: silent 0.3592, solved 0.3145, unsolved 0.0447, share 0.8755). Both the 87.5% figure
+> and the 7x reach argument stand.
 
 ---
 
