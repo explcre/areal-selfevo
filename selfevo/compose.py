@@ -41,6 +41,7 @@ __all__ = [
     "GATES",
     "EVOLVE_TARGETS",
     "EVOLVE_POLICIES",
+    "EVOLVE_POLICY_FACTORIES",
     "CRITICS",
     "META_CRITICS",
     "CADENCES",
@@ -90,12 +91,37 @@ def _coharness_router(**kw: object) -> object:
 # `router` axis was unusable despite four working routers existing. Imported lazily for the
 # same reason as the critic factories: `compose` must stay importable for configuration
 # validation without pulling in the routing criteria.
+def _contextual_router(**kw: object) -> object:
+    """Factory for :class:`selfevo.routing.contextual.ContextualBanditRouter`."""
+    from .routing.contextual import ContextualBanditRouter
+
+    return ContextualBanditRouter(**kw)  # type: ignore[arg-type]
+
+
+def _code_policy_router(**kw: object) -> object:
+    """Factory for :class:`selfevo.routing.code_policy.CodePolicyRouter`.
+
+    Requires ``source``; there is no default policy, because a default would silently
+    decide the experiment.
+    """
+    from .routing.code_policy import CodePolicyRouter
+
+    if "source" not in kw:
+        raise ValueError(
+            "code_policy needs source=<policy text>; there is no default policy because a "
+            "default would silently decide the experiment"
+        )
+    return CodePolicyRouter(**kw)  # type: ignore[arg-type]
+
+
 ROUTERS: dict[str, Callable[..., object] | None] = {
     "static": _static_router,            # fixed weights, the fixed-mode baseline
     "solve_rate": _solve_rate_router,    # SAMPLE granularity, I_RL silence split
     "cluster": _cluster_router,          # CLUSTER granularity, one signal per cluster
     "random": _random_router,            # matched control: same proportions, shuffled units
     "coharness": _coharness_router,      # model AND/OR harness; validate() demands a harness
+    "contextual": _contextual_router,    # LinUCB over observability features; learns via observe()
+    "code_policy": _code_policy_router,  # the rule is generated source; requires source=
 }
 GATES: dict[str, Callable[..., object] | None] = {"none": None, "prefix_dead": None}
 EVOLVE_TARGETS: frozenset[str] = frozenset({"model", "harness", "reward", "both"})
@@ -156,6 +182,18 @@ CRITIC_FACTORIES: dict[str, Callable[..., object] | None] = {
 # Components whose None factory means "nothing to build", not "not built yet".
 _LEGITIMATELY_EMPTY: frozenset[str] = frozenset({"none"})
 EVOLVE_POLICIES: frozenset[str] = frozenset({"rule", "learned_weights", "learned_code"})
+# Factories per evolve-policy, same contract as the other registries: None means DECLARED
+# BUT NOT IMPLEMENTED and validate() rejects it unless allow_stubs=True. Without this, naming
+# a policy validated cleanly and ran nothing -- the exact failure this registry pattern
+# exists to prevent, left open on this axis alone.
+#   rule            a hand-written decision rule over the solve rate.
+#   learned_weights LinUCB over observability features; the weights ARE the policy.
+#   learned_code    the policy is generated source, validated and cost-vetted before use.
+EVOLVE_POLICY_FACTORIES: dict[str, Callable[..., object] | None] = {
+    "rule": _solve_rate_router,
+    "learned_weights": _contextual_router,
+    "learned_code": _code_policy_router,
+}
 
 # Shapers that break the centred-advantage invariant `sum_i A_i = 0`. Membership here is a
 # claim about the shaper's arithmetic, not a preference: any shaper adding a non-negative
@@ -277,6 +315,7 @@ def _stub_problems(cfg: "PipelineConfig") -> list["Incompatibility"]:
         ("gate", cfg.gate, GATES),
         ("critic", cfg.critic, CRITIC_FACTORIES),
         ("meta_critic", cfg.meta_critic, META_CRITIC_FACTORIES),
+        ("evolve_policy", cfg.evolve_policy, EVOLVE_POLICY_FACTORIES),
     ):
         if name in _LEGITIMATELY_EMPTY:
             continue
