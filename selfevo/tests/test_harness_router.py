@@ -259,6 +259,269 @@ def test_a_relaxed_failed_threshold_still_uses_a_self_target_when_one_exists():
     assert mode_of(r.route(ctx(0.0, teacher=False, evolve=True))) == TrainingMode.SKIP
 
 
+# --------------------------------------------------- the propose threshold (mixed units)
+
+# A MIXED group is the one regime RL can learn from, so it was never redirected. It still
+# contains failed samples, and their failure mode is information the RL update does not
+# consume -- so it can feed the gradient AND the harness. ``propose_threshold`` is the knob;
+# its default reproduces the old behaviour exactly, and these tests pin that first.
+
+
+def test_the_default_propose_threshold_is_the_failed_threshold_everywhere():
+    """ROLLBACK: None resolves to ``failed_threshold``, and a MIXED unit is by definition
+    above that, so the extension is inert for every configuration, granularity and rate."""
+    checked = 0
+    for part, vos, teacher, gran, p, (st, ft) in itertools.product(
+        (False, True), (False, True), (False, True), GRANS, RATES,
+        ((1.0, 0.0), (0.75, 0.25), (0.875, 0.125)),
+    ):
+        r = CoHarnessRouter(partition=part, validate_on_success=vos,
+                            solved_threshold=st, failed_threshold=ft)
+        assert r.propose_threshold is None
+        assert r.effective_propose_threshold == ft
+        d = r.route(ctx(p, teacher=teacher, evolve=True, gran=gran))
+        if ft < p < st:
+            assert mode_of(d) == TrainingMode.RL
+            assert d.harness is HarnessAction.NONE, f"mixed unit proposed at the default: p={p}"
+        checked += 1
+    assert checked == 2 * 2 * 2 * len(GRANS) * len(RATES) * 3
+
+
+def test_spelling_the_default_out_changes_nothing_including_the_reason():
+    """``None`` and an explicit ``failed_threshold`` are documented as the same rule, so a
+    decision must not depend on which way the config was written -- reason string included,
+    because the reason is what a run is audited from."""
+    for st, ft in ((1.0, 0.0), (0.75, 0.25), (0.5, 0.125)):
+        implicit = CoHarnessRouter(solved_threshold=st, failed_threshold=ft)
+        explicit = CoHarnessRouter(solved_threshold=st, failed_threshold=ft, propose_threshold=ft)
+        for p, teacher, evolve, gran in itertools.product(
+            RATES, (False, True), (False, True), GRANS
+        ):
+            c = ctx(p, teacher=teacher, evolve=evolve, gran=gran)
+            a, b = implicit.route(c), explicit.route(c)
+            assert (a.weights, a.harness, a.reason) == (b.weights, b.harness, b.reason), \
+                f"st={st} ft={ft} p={p} teacher={teacher} evolve={evolve} gran={gran.value}"
+
+
+def test_a_mixed_group_can_feed_the_gradient_and_the_harness_at_once():
+    """The general case of "one trajectory, two consumers": before this the only units that
+    reached both were unanimous ones, and a mixed group's failures were simply discarded."""
+    d = CoHarnessRouter(propose_threshold=0.5).route(ctx(0.25, teacher=False, evolve=True))
+    assert mode_of(d) == TrainingMode.RL
+    assert d.harness is HarnessAction.PROPOSE
+    assert "mixed group" in d.reason and "harness" in d.reason
+
+
+def test_the_decision_reads_the_effective_threshold_not_the_raw_failed_threshold():
+    """The property exists so the validation and the decision cannot disagree about what
+    the default is. A route() that read ``failed_threshold`` directly passes every
+    default-configuration test and silently ignores the setting."""
+    r = CoHarnessRouter(failed_threshold=0.25, propose_threshold=0.75)
+    assert r.effective_propose_threshold == 0.75
+    assert r.route(ctx(0.5, teacher=True, evolve=True)).harness is HarnessAction.PROPOSE
+    off = CoHarnessRouter(failed_threshold=0.25)
+    assert off.effective_propose_threshold == 0.25
+    assert off.route(ctx(0.5, teacher=True, evolve=True)).harness is HarnessAction.NONE
+
+
+def test_the_propose_threshold_is_inclusive_like_the_failed_threshold():
+    """Both are upper bounds on the solve rate, so both use ``<=``; only the solved side
+    uses ``>=``. An exclusive comparison here would drop exactly the rate a user names."""
+    r = CoHarnessRouter(propose_threshold=0.5)
+    assert r.route(ctx(0.25, teacher=True, evolve=True)).harness is HarnessAction.PROPOSE
+    assert r.route(ctx(0.5, teacher=True, evolve=True)).harness is HarnessAction.PROPOSE, \
+        "solve_rate == propose_threshold must count, as it does for failed_threshold"
+    assert r.route(ctx(0.75, teacher=True, evolve=True)).harness is HarnessAction.NONE
+
+
+def test_a_solved_unit_never_proposes_however_high_the_threshold_goes():
+    """A unit with no failures has no failure mode to report; PROPOSE there would name a
+    failure the rollout never produced. The solved branch owns those units."""
+    for pt in (0.25, 0.5, 0.75, 1.0):
+        d = CoHarnessRouter(propose_threshold=pt).route(ctx(1.0, teacher=True, evolve=True))
+        assert d.harness is HarnessAction.VALIDATE, f"solved unit proposed at pt={pt}"
+        d = CoHarnessRouter(propose_threshold=pt, validate_on_success=False).route(
+            ctx(1.0, teacher=True, evolve=True)
+        )
+        assert d.harness is HarnessAction.NONE, f"solved unit proposed at pt={pt}"
+
+
+def test_the_propose_threshold_never_moves_a_unit_between_training_modes():
+    """The two axes are orthogonal. If turning the harness path on for mixed units also
+    changed a mode, an ablation on this knob would confound the harness with the gradient."""
+    checked = 0
+    for pt, part, vos, teacher, evolve, gran, p in itertools.product(
+        (0.0, 0.25, 0.5, 0.75, 1.0), (False, True), (False, True), (False, True),
+        (False, True), GRANS, RATES,
+    ):
+        c = ctx(p, teacher=teacher, evolve=evolve, gran=gran)
+        base = CoHarnessRouter(partition=part, validate_on_success=vos).route(c)
+        got = CoHarnessRouter(partition=part, validate_on_success=vos,
+                              propose_threshold=pt).route(c)
+        assert mode_of(got) == mode_of(base), \
+            f"pt={pt} part={part} vos={vos} p={p} gran={gran.value} moved the mode"
+        checked += 1
+    assert checked == 5 * 2 * 2 * 2 * 2 * len(GRANS) * len(RATES)
+
+
+def test_partition_ignores_the_propose_threshold_at_every_value():
+    """Co-Harness is a partition. A mixed unit that both trains and evolves is not a
+    reproduction of it, whatever the threshold says -- including 1.0, which asks for the
+    widest possible relaxation."""
+    for pt in (0.0, 0.25, 0.5, 0.75, 1.0):
+        r = CoHarnessRouter(partition=True, propose_threshold=pt)
+        plain = CoHarnessRouter(partition=True)
+        for p, teacher, gran in itertools.product(RATES, (False, True), GRANS):
+            c = ctx(p, teacher=teacher, evolve=True, gran=gran)
+            a, b = r.route(c), plain.route(c)
+            assert (a.weights, a.harness, a.reason) == (b.weights, b.harness, b.reason), \
+                f"partition drifted at pt={pt} p={p} gran={gran.value}"
+            trains = mode_of(a) != TrainingMode.SKIP
+            evolves = a.harness is not HarnessAction.NONE
+            assert not (trains and evolves), f"both at pt={pt} p={p} gran={gran.value}"
+
+
+def test_the_new_propose_path_is_still_gated_on_a_harness_arm():
+    """An action emitted when no harness arm exists is a silent no-op. The guard has to
+    cover every path that reaches it, not only the ones that existed when it was written."""
+    checked = 0
+    for pt, p, gran, teacher in itertools.product(
+        (0.0, 0.25, 0.5, 0.75, 1.0), RATES, GRANS, (False, True)
+    ):
+        d = CoHarnessRouter(propose_threshold=pt).route(
+            ctx(p, teacher=teacher, evolve=False, gran=gran)
+        )
+        assert d.harness is HarnessAction.NONE, f"leaked at pt={pt} p={p} gran={gran.value}"
+        if 0.0 < p < 1.0 and p <= pt:
+            assert "no harness arm" in d.reason, "a dropped action must say so"
+            checked += 1
+    assert checked > 0, "the sweep never exercised the new path, so it proved nothing"
+
+
+def test_the_new_reason_is_attached_to_exactly_the_decisions_it_describes():
+    """Reasons are the audit record, and a reason on the wrong branch is invisible until
+    someone reads a log and believes it. Swept as a biconditional, not spot-checked."""
+    for pt, p, evolve in itertools.product(
+        (0.0, 0.25, 0.5, 0.75, 1.0), RATES, (False, True)
+    ):
+        d = CoHarnessRouter(propose_threshold=pt).route(ctx(p, teacher=True, evolve=evolve))
+        says = "failed samples also proposed to the harness" in d.reason
+        assert says == (0.0 < p < 1.0 and p <= pt), f"pt={pt} p={p}: {d.reason!r}"
+        if says:
+            assert mode_of(d) == TrainingMode.RL
+            assert d.harness is (HarnessAction.PROPOSE if evolve else HarnessAction.NONE)
+
+
+def test_a_propose_threshold_below_the_failed_threshold_is_refused():
+    """It would silence the harness on units the rule has already called failures, so the
+    two rules would contradict each other and the failed branch would win silently."""
+    for failed, propose in ((0.25, 0.0), (0.5, 0.25), (0.125, 0.0)):
+        with pytest.raises(ValueError, match="at least"):
+            CoHarnessRouter(failed_threshold=failed, propose_threshold=propose)
+
+
+def test_a_propose_threshold_above_the_solved_threshold_is_refused():
+    """Solve rates at or above ``solved_threshold`` take the VALIDATE branch, so the excess
+    range changes no decision: it is a config that reads differently and behaves the same."""
+    for solved, propose in ((0.5, 0.75), (0.5, 1.0), (0.75, 0.875)):
+        with pytest.raises(ValueError, match="at most"):
+            CoHarnessRouter(solved_threshold=solved, propose_threshold=propose)
+    # The two ends of the legal band stay legal, including the widest relaxation.
+    assert CoHarnessRouter(propose_threshold=1.0).effective_propose_threshold == 1.0
+    assert CoHarnessRouter(propose_threshold=0.0).effective_propose_threshold == 0.0
+
+
+def test_a_propose_threshold_outside_the_unit_interval_is_refused():
+    with pytest.raises(ValueError, match="must be in"):
+        CoHarnessRouter(propose_threshold=1.5)
+    with pytest.raises(ValueError, match="must be in"):
+        CoHarnessRouter(propose_threshold=-0.1)
+    with pytest.raises(ValueError, match="must be in"):
+        CoHarnessRouter(propose_threshold=float("nan"))
+
+
+def test_every_accepted_propose_threshold_names_a_distinct_rule():
+    """A value the router cannot act on is a knob that lies: two configurations read
+    differently, behave identically, and no logged metric tells them apart. The guarantee
+    is about the accepted REGION, so it is swept rather than argued from the defaults."""
+    grid = [i / 8 for i in range(9)]
+    probe = [i / 16 for i in range(17)]
+    accepted = 0
+    for solved, failed in itertools.product(grid, grid):
+        seen = {}
+        for propose in grid:
+            try:
+                r = CoHarnessRouter(solved_threshold=solved, failed_threshold=failed,
+                                    propose_threshold=propose)
+            except ValueError:
+                continue
+            accepted += 1
+            assert failed <= propose <= solved
+            sig = tuple(r.route(ctx(p, teacher=True, evolve=True)).harness for p in probe)
+            assert sig not in seen, (
+                f"propose_threshold {propose} is indistinguishable from {seen[sig]} "
+                f"at solved={solved} failed={failed}"
+            )
+            seen[sig] = propose
+    assert accepted > 0, "the sweep accepted no configuration, so it proved nothing"
+
+
+def test_the_harness_only_note_marks_exactly_the_units_the_gradient_never_sees():
+    """MUTATION SURVIVOR, now pinned. "unit is consumed by the harness only" is true of one
+    cell shape -- SKIP with a surviving action -- and nowhere else. Appended one conjunct
+    too loosely it lands on a unit that IS training; appended without the action check it
+    lands on a unit no consumer takes at all, and a run auditing its logs would read that
+    the harness picked up work it had in fact dropped."""
+    checked = 0
+    for pt, part, vos, teacher, evolve, gran, p in itertools.product(
+        (None, 0.0, 0.5, 1.0), (False, True), (False, True), (False, True),
+        (False, True), GRANS, RATES,
+    ):
+        d = CoHarnessRouter(partition=part, validate_on_success=vos,
+                            propose_threshold=pt).route(
+            ctx(p, teacher=teacher, evolve=evolve, gran=gran)
+        )
+        says = "consumed by the harness only" in d.reason
+        only = mode_of(d) == TrainingMode.SKIP and d.harness is not HarnessAction.NONE
+        assert says == only, (
+            f"pt={pt} part={part} vos={vos} p={p} teacher={teacher} evolve={evolve} "
+            f"gran={gran.value}: reason={d.reason!r} mode={mode_of(d)} harness={d.harness}"
+        )
+        checked += 1
+    assert checked == 4 * 2 * 2 * 2 * 2 * len(GRANS) * len(RATES)
+
+
+def test_the_new_path_is_not_secretly_gated_on_a_teacher_or_a_granularity():
+    """The threshold is a statement about the solve rate alone. A conjunct on has_teacher
+    or on the granularity would make the same config behave differently per batch, and the
+    solve-rate sweeps alone would not notice."""
+    for teacher, gran in itertools.product((False, True), GRANS):
+        d = CoHarnessRouter(propose_threshold=0.75).route(
+            ctx(0.5, teacher=teacher, evolve=True, gran=gran)
+        )
+        assert d.harness is HarnessAction.PROPOSE, f"teacher={teacher} gran={gran.value}"
+        assert mode_of(d) == TrainingMode.RL
+
+
+def test_adding_the_propose_threshold_did_not_shift_the_positional_signature():
+    """``self_target_mode`` was the fifth positional argument before this field existed. A
+    field inserted ahead of it would silently rebind a positionally-written config, and
+    neither value is type-checked, so nothing would raise."""
+    r = CoHarnessRouter(1.0, 0.0, False, True, TrainingMode.DISTILL)
+    assert r.self_target_mode == TrainingMode.DISTILL
+    assert r.propose_threshold is None
+    assert r.effective_propose_threshold == 0.0
+
+
+def test_the_factory_passes_the_new_field_through_and_validates_it():
+    """ROUTERS is how a config selects a router; a field it cannot reach is unusable."""
+    made = ROUTERS["coharness"](propose_threshold=0.5)
+    assert made.propose_threshold == 0.5
+    assert made.effective_propose_threshold == 0.5
+    with pytest.raises(ValueError):
+        ROUTERS["coharness"](failed_threshold=0.5, propose_threshold=0.25)
+
+
 # ----------------------------------------------------------------------- TOKEN semantics
 
 

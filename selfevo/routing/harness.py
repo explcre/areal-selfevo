@@ -71,10 +71,26 @@ class CoHarnessRouter:
             detectable. Ignored when ``partition`` is True.
         self_target_mode: Mode used for a solved unit whose target comes from its own
             correct sample. SFT by design -- hard distillation is the same estimator.
+        propose_threshold: Units with ``solve_rate <= propose_threshold`` that are not
+            solved contribute a PROPOSE action, *whatever mode they were given*. ``None``
+            (default) means ``failed_threshold``, so only wholly-failed units propose and
+            behaviour is unchanged. Raising it lets a MIXED unit feed the gradient and the
+            harness at once: such a unit still contains failed samples, and those failures
+            carry harness-relevant information that the RL update does not consume. This
+            is the general form of "one trajectory, two consumers"; at the default it is
+            switched off, at ``solved_threshold`` every mixed unit proposes, and under
+            ``partition`` it is ignored. It never reaches a *solved* unit -- a unit with
+            no failures has no failure mode to report -- which is why it is bounded above
+            by ``solved_threshold`` rather than by 1.
 
     Raises:
-        ValueError: If the thresholds cross, either lies outside [0, 1], or
-            ``self_target_mode`` is not a registered mode.
+        ValueError: If the thresholds cross, any lies outside [0, 1], or
+            ``self_target_mode`` is not a registered mode. ``propose_threshold`` outside
+            ``[failed_threshold, solved_threshold]`` is also rejected: below
+            ``failed_threshold`` it would silence the harness on units the rule has
+            already called failures, and above ``solved_threshold`` it names solve rates
+            the branch never sees, so two configurations that read differently would
+            behave identically and no log would tell them apart.
     """
 
     solved_threshold: float = 1.0
@@ -82,6 +98,16 @@ class CoHarnessRouter:
     partition: bool = False
     validate_on_success: bool = True
     self_target_mode: str = TrainingMode.SFT
+    propose_threshold: float | None = None
+
+    @property
+    def effective_propose_threshold(self) -> float:
+        """``propose_threshold``, defaulting to ``failed_threshold``.
+
+        Resolved in one place so the default cannot drift between the validation in
+        ``__post_init__`` and the decision in :meth:`route`.
+        """
+        return self.failed_threshold if self.propose_threshold is None else self.propose_threshold
 
     def __post_init__(self) -> None:
         for name, v in (
@@ -96,6 +122,24 @@ class CoHarnessRouter:
                 f"solved_threshold ({self.solved_threshold}); otherwise a unit would be "
                 "both solved and failed and the rule would depend on check order"
             )
+        if self.propose_threshold is not None:
+            if not 0.0 <= self.propose_threshold <= 1.0:
+                raise ValueError(
+                    f"propose_threshold must be in [0, 1], got {self.propose_threshold}"
+                )
+            if self.propose_threshold < self.failed_threshold:
+                raise ValueError(
+                    f"propose_threshold ({self.propose_threshold}) must be at least "
+                    f"failed_threshold ({self.failed_threshold}); a lower value would "
+                    "silence the harness on units the rule already calls failures"
+                )
+            if self.propose_threshold > self.solved_threshold:
+                raise ValueError(
+                    f"propose_threshold ({self.propose_threshold}) must be at most "
+                    f"solved_threshold ({self.solved_threshold}); a solved unit is offered "
+                    "to the harness as a VALIDATE case and has no failure to propose, so "
+                    "the excess range changes no decision and only misreports the config"
+                )
         if self.self_target_mode not in known_modes():
             raise ValueError(f"unknown mode {self.self_target_mode!r}")
 
@@ -128,7 +172,14 @@ class CoHarnessRouter:
                 mode, why = TrainingMode.SKIP, "failed; partitioned to harness"
         else:
             mode, why = TrainingMode.RL, "mixed group; RL has signal"
-            harness = HarnessAction.NONE
+            # A mixed unit contains failed samples, and their failure mode is information the
+            # RL update does not consume. Off at the default threshold; when enabled this is
+            # the general case of one trajectory feeding both consumers.
+            if not self.partition and ctx.solve_rate <= self.effective_propose_threshold:
+                harness = HarnessAction.PROPOSE
+                why = f"{why}; failed samples also proposed to the harness"
+            else:
+                harness = HarnessAction.NONE
 
         if not ctx.can_evolve_harness and harness is not HarnessAction.NONE:
             harness = HarnessAction.NONE
