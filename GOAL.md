@@ -147,6 +147,44 @@ averaged; Terminal-Bench 2.1 via Harbor/Terminus-2 with `parser=json`, `temperat
 at `temperature=1.0`, `top_p=0.95`, 256K context. Five-run averaging matters — our own
 measured noise floor is 0.008-0.027 depending on the benchmark.
 
+### M23 vs OpenRSI: an LLM DOES decide the evolution action there, and the axis differs
+
+Asked directly on 2026-08-31: is "let the LLM itself decide whether data evolves the model or
+the harness" the same idea as OpenRSI (2607.28568)? **Related, and importantly not identical.**
+
+| | OpenRSI / Frontis-MA1 | M23 as specified here |
+|---|---|---|
+| who decides | the 35B agent | an LLM router |
+| decides WHAT | which of four operators to apply: Draft, Improve, Debug, Crossover | which TARGET a trajectory improves: the policy, or the harness |
+| what each choice changes | the PROGRAM, in all four cases | different artefacts -- weights vs scaffold |
+| how the decider is trained | execution-grounded SFT **and** RL over the operators | not built |
+
+Every OpenRSI operator evolves the same artefact. The choice is *how* to improve the program,
+never *whether the value of this trajectory belongs in the model or in the scaffold*. Their
+operator set therefore does not cover the axis this project designed, and Co-Harness
+(2607.22688) covers it only as a fixed partition. That gap is the whole of M23's remaining
+novelty -- and it is narrower than "an LLM decides", which OpenRSI now clearly owns at scale.
+
+**The part that should update our plan, not just our citations.** OpenRSI trains its decider
+with **execution-grounded** credit: whether the resulting program actually ran better. Compare
+what this project measured -- a per-batch scalar reward delta credited to 64 decisions, which
+provably collapses every LinUCB arm to one parameter vector, and a per-prompt delta that
+changed the router's behaviour without changing any benchmark. Our credit signal was the
+binding constraint, and theirs is categorically stronger: per-decision, causally attached to
+an execution the decision produced, and available without waiting for a policy update to
+propagate.
+
+So the lesson to take from them is **not** "use an LLM to decide". It is: *make the credit
+signal something the decision directly causes*. Any M23 built here should be scored on whether
+its credit is execution-grounded, and if it is not, the credit-assignment finding predicts it
+will behave exactly like the contextual router did -- visibly active, measurably indifferent.
+
+**Consequence for sequencing.** M23 remains a fourth controller in the ablation
+(rule / learned-weights / learned-code / LLM), but it is now clearly downstream of two things
+that matter more: a credit signal worth learning from, and a consumer for the harness axis.
+Building an LLM router on top of the current batch-scalar credit would reproduce the measured
+null with a more expensive decider.
+
 ### Note on M23 (LLM-as-router): what would and would not be novel
 
 Asked directly: is an LLM that analyses rollouts and decides "evolve the harness or the
