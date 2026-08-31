@@ -644,6 +644,46 @@ per round, attached to the action that produced them.
 So the auditor's verdicts can BE the credit signal for a model-versus-harness router. That is
 not a wish: it is our measured requirement met by a released mechanism.
 
+### VERIFIED: the code is released, it is MIT, and the audit signal is structured
+
+Cloned `github.com/AMAP-ML/LongHorizon-Harness` and inspected it, 2026-08-31. This checks the
+one assumption the decision below rests on.
+
+* **License: MIT.** Not CC BY-NC. This matters more than it sounds -- OpenRSI's NC term is
+  inherited by derivatives and would block a permissive artifact release, and its vendored
+  AIRA-Dojo is separately NC. An MIT base removes that constraint entirely for anything built
+  here.
+* **Scale: 208 MB, 761 Python files, 231,666 lines.** `src/lh_harness` (the harness core),
+  plus `eval/` containing **three** ready harnesses: `TB-harness` (Terminal-Bench 2.1, our
+  B5), `WeaveBench-harness`, `OSWorldv2-harness`.
+* **The MEA roles are real modules**, not prose: `manager.py` (carries `task_state`,
+  `role_verified_context_chars`, a round-indexed `_human_gate`), `auditor_agent.py`,
+  `role_prompts.py`, plus `environment/`, `plugins/`, `supervisor/`.
+
+**The finding that matters.** `auditor_agent.py:182`:
+
+```
+def audit_report_from_episode_result(result: EpisodeResult, round_index: int, *,
+                                     language: str = "en") -> AuditReport
+```
+
+with the docstring: *"The role manager stores auditor output as natural language, but the final
+report and stop checks need a compact status, integrity flag, and artifact-deletion ledger."*
+The returned `AuditReport` carries `round_id`, a `status` (observed values include `blocked`,
+`missing`, `runtime_failed`, `delete_declared_unverified`), an integrity flag and a deletion
+ledger.
+
+So the auditor's output is **structured, per-round, and derived from the environment rather
+than from the model's self-assessment**. That is precisely the execution-grounded, per-decision
+credit signal this project measured itself to be missing -- available as a typed object, not
+as free text to be parsed.
+
+**What this does NOT establish.** Nothing has been run: no episode executed, no `AuditReport`
+observed from a live rollout, no Terminal-Bench task attempted here. Whether the status
+granularity actually separates *model-value* from *harness-value* per trajectory is falsifier
+(1) in the decision below, and it remains open. Reading a type signature is not measuring a
+signal.
+
 ### DECISION (2026-08-31): what this paper should be
 
 **Claim.** Long-horizon agent trajectories carry value for two different targets -- the policy
