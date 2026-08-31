@@ -16,6 +16,13 @@
 set -u -o pipefail
 
 # ----------------------------------------------------------------- CONFIG ----
+# cron and bare systemd units start with neither of these set, and `set -u` would abort on
+# the first reference -- before anything has been logged.
+USER="${USER:-$(id -un)}"
+HOME="${HOME:-$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)}"
+HOME="${HOME:-/tmp}"
+HARNESS_START="$(date +%s)"
+
 REPO_URL="${REPO_URL:-https://github.com/explcre/areal-selfevo.git}"
 REPO_BRANCH="${REPO_BRANCH:-selfevo/a100}"
 WORKDIR="${WORKDIR:-$HOME/selfevo-portable}"
@@ -42,32 +49,44 @@ STARTUP_S="${STARTUP_S:-1200}"
 # Reporting.
 WANDB_MODE="${WANDB_MODE:-online}"
 WANDB_PROJECT="${WANDB_PROJECT:-selfevo-routing}"
-RUN_NAME="${RUN_NAME:-${MODE}-${ARM}-$(hostname -s)-$(date +%m%d_%H%M)}"
+# Seconds, not just minutes: two copies started inside the same minute would otherwise
+# share a RUN_NAME, and the loser's manifest would clobber the winner's.
+RUN_NAME="${RUN_NAME:-${MODE}-${ARM}-$(hostname -s)-$(date +%m%d_%H%M%S)}"
+
+# The manifest is written by a python heredoc that reads os.environ, so every value it
+# reports has to be EXPORTED. A plain shell variable arrives there as an empty string, and
+# a manifest full of empty strings is the silent failure that reads as a success.
+export MODE ARM SOLVED_ADV MODEL BENCHES RUN_NAME WANDB_MODE WANDB_PROJECT
 
 mkdir -p "$WORKDIR" "$OUTDIR"
 LOG="$OUTDIR/${RUN_NAME}.log"
 MANIFEST="$OUTDIR/${RUN_NAME}.manifest.json"
+export PORTABLE_LOG="$LOG"
 
 log() { echo "[$(date -Is)] $*" | tee -a "$LOG"; }
-die() { log "FATAL: $*"; write_manifest "failed" "$*"; exit "${2:-1}"; }
-
-# One instance per WORKDIR. Two copies racing on the same checkout is the fastest way to
-# produce a corrupt run that looks like a code bug.
-exec 9>"$WORKDIR/.lock"
-flock -n 9 || { echo "another run_portable.sh holds $WORKDIR/.lock"; exit 3; }
 
 write_manifest() {
   # A single structured file is what gets handed back, so it is written on EVERY exit path,
   # including failure -- a manifest that only exists on success cannot report a failure.
   local status="$1" note="${2:-}"
-  python3 - "$MANIFEST" "$status" "$note" <<'PY' 2>/dev/null || true
+  if ! command -v python3 >/dev/null 2>&1; then
+    # A failure that happens before setup finds an interpreter still has to leave a
+    # manifest behind. Write the little we know by hand rather than nothing at all.
+    printf '{"run_name": "%s", "status": "%s", "note": "%s", "written_at": "%s",\n "host": "%s", "mode": "%s", "arm": "%s", "gpus_claimed": "%s", "log": "%s",\n "checkpoints": [], "evaluations": [], "degraded": "python3 was not on PATH"}\n' \
+      "$RUN_NAME" "$status" "${note//[\"\\]/}" "$(date -Is 2>/dev/null)" \
+      "${HOSTNAME:-}" "$MODE" "$ARM" "${CUDA_VISIBLE_DEVICES:-}" "$LOG" >"$MANIFEST"
+    return 0
+  fi
+  python3 - "$MANIFEST" "$status" "$note" <<'PY' || log "manifest: python3 failed on $MANIFEST"
 import json, os, pathlib, sys, subprocess, datetime
 manifest, status, note = sys.argv[1], sys.argv[2], sys.argv[3]
 out = pathlib.Path(manifest).parent
 def sh(c):
     try: return subprocess.run(c, shell=True, capture_output=True, text=True, timeout=20).stdout.strip()
     except Exception: return ""
-ckpts = sorted(str(p) for p in out.parent.rglob("*globalstep*") if p.is_dir())
+# OUTDIR, not its parent: the parent is WORKDIR, and walking that means walking the venv
+# and the HF cache -- minutes of stat() calls inside a signal handler.
+ckpts = sorted(str(p) for p in out.rglob("*globalstep*") if p.is_dir())
 evals = []
 for f in out.rglob("results.json"):
     try: evals.append({"file": str(f), "data": json.loads(f.read_text())})
@@ -93,14 +112,63 @@ json.dump({
 }, open(manifest, "w"), indent=2)
 PY
 }
-export PORTABLE_LOG="$LOG"
-trap 'write_manifest "interrupted" "received a signal"' INT TERM
+
+STATUS_WRITTEN=0
+MAIN_PID=$$
+
+on_signal() {
+  # A signal has to STOP us. The old trap wrote a manifest and returned, so `wait` came
+  # back non-zero and the retry loop relaunched the training the operator had just asked
+  # to stop -- on a box we do not own, that is the wrong way round.
+  log "received a signal; stopping"
+  declare -F cleanup_ours >/dev/null 2>&1 && cleanup_ours
+  write_manifest "interrupted" "received a signal"
+  STATUS_WRITTEN=1
+  exit 130
+}
+
+on_exit() {
+  # Every other way out -- an unset variable, SIGHUP when the ssh session drops, a return
+  # we did not anticipate -- still leaves a manifest behind.
+  local rc=$?
+  [ "${BASHPID:-$$}" = "$MAIN_PID" ] || return 0
+  [ "$STATUS_WRITTEN" -eq 1 ] || write_manifest "failed" "exited rc=$rc with no status"
+}
+
+trap on_signal INT TERM HUP
+trap on_exit EXIT
+
+# One instance per WORKDIR. Two copies racing on the same checkout is the fastest way to
+# produce a corrupt run that looks like a code bug.
+exec 9>"$WORKDIR/.lock"
+if ! flock -n 9; then
+  echo "another run_portable.sh holds $WORKDIR/.lock"
+  # Report even this: no manifest at all is indistinguishable from a crash. Under a name
+  # of its own, so the instance that does hold the lock never has its manifest clobbered.
+  # shellcheck disable=SC2030,SC2031  # the subshell scoping is the point: $MANIFEST must
+  # not be rewritten for anyone else.
+  ( MANIFEST="${MANIFEST%.json}.lockbusy.json"
+    write_manifest "failed" "another instance holds $WORKDIR/.lock" )
+  STATUS_WRITTEN=1
+  exit 3
+fi
+
+die() { log "FATAL: $1"; write_manifest "failed" "$1"; STATUS_WRITTEN=1; exit "${2:-1}"; }
+
+# A configuration that can never be satisfied should be refused, not looped on.
+[ "$MAX_GPUS" -ge "$MIN_GPUS" ] || die "MAX_GPUS=$MAX_GPUS is below MIN_GPUS=$MIN_GPUS" 4
 
 # ------------------------------------------------------------ FREE GPUS ----
 free_gpus() {
   # Only GPUs holding less than GPU_FREE_MIB. Someone else's 40 GB job makes its GPU theirs.
+  # The split tolerates both "0, 20214" and "0,20214" (drivers differ on the space; with a
+  # bare -F", " the no-space form left $2 empty, which read as free and printed the WHOLE
+  # line as an index). Both fields must be integers, so a "[N/A]" row is skipped rather
+  # than guessed at -- an unparseable row means we do not know, and we do not claim.
   nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits 2>/dev/null \
-    | awk -F", " -v t="$GPU_FREE_MIB" '$2 < t {print $1}' | head -n "$MAX_GPUS" | paste -sd,
+    | awk -F'[[:space:]]*,[[:space:]]*' -v t="$GPU_FREE_MIB" \
+        '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $2+0 < t+0 {print $1}' \
+    | head -n "$MAX_GPUS" | paste -sd,
 }
 
 claim_gpus() {
@@ -109,9 +177,15 @@ claim_gpus() {
     got="$(free_gpus)"
     local n=0
     [ -n "$got" ] && n=$(echo "$got" | tr ',' '\n' | grep -c .)
-    # AReaL splits GPUs between training and rollout, so an odd count wastes one.
-    if [ "$n" -ge "$MIN_GPUS" ]; then
-      [ $((n % 2)) -eq 1 ] && got="$(echo "$got" | cut -d, -f1-$((n - 1)))" && n=$((n - 1))
+    # AReaL splits GPUs between training and rollout, so an odd count wastes one. Round
+    # BEFORE the MIN_GPUS test: rounding after it returns MIN_GPUS-1 GPUs whenever
+    # MIN_GPUS is odd, and at n=1 `cut -f1-0` fails and returns an EMPTY list as a
+    # success -- which then reads as "claim nothing, and match every process on the box".
+    if [ $((n % 2)) -eq 1 ]; then
+      n=$((n - 1))
+      if [ "$n" -gt 0 ]; then got="$(echo "$got" | cut -d, -f"1-$n")"; else got=""; fi
+    fi
+    if [ "$n" -gt 0 ] && [ "$n" -ge "$MIN_GPUS" ]; then
       echo "$got"; return 0
     fi
     [ "$waited" -ge "$WAIT_FOR_GPUS_S" ] && return 1
@@ -150,7 +224,15 @@ setup() {
     pip install -q -U pip >>"$LOG" 2>&1
     pip install -q -e "$REPO_DIR" >>"$LOG" 2>&1 || return 1
   fi
-  python3 -c "import wandb" 2>/dev/null || pip install -q wandb >>"$LOG" 2>&1 || true
+  # Never pip-install into an interpreter we did not create: the environment we just
+  # reused may be the one a neighbour's job is importing from at this moment, and a
+  # resolver that upgrades a shared dependency under a live run is a way to break it.
+  if python3 -c "import wandb" 2>/dev/null; then :
+  elif [ "${VIRTUAL_ENV:-}" = "$WORKDIR/venv" ]; then
+    pip install -q wandb >>"$LOG" 2>&1 || true
+  else
+    log "wandb missing from the reused environment; not installing into someone else's env"
+  fi
 
   # Data and weights, fetched once and cached. HF_HOME is set explicitly because a shared
   # box often has a stale one pointing at a filesystem this user cannot write.
@@ -169,6 +251,14 @@ PY
 }
 
 # ----------------------------------------------------------------- RUN ----
+newest_checkpoint() {
+  # AReaL nests these as checkpoints/<user>/<experiment>/<trial>/default/<step>, so the
+  # one-level glob this used to be matched nothing at all and MODE=eval could never default
+  # to the checkpoint we had just trained -- it failed, and then retried the failure.
+  find "$OUTDIR/checkpoints" -maxdepth 6 -type d -name '*globalstep*' \
+    -printf '%T@\t%p\n' 2>/dev/null | sort -rn | head -1 | cut -f2-
+}
+
 run_once() {
   local gpus="$1" n="$2"
   cd "$REPO_DIR" || return 1
@@ -178,7 +268,7 @@ run_once() {
   ulimit -n 131072 2>/dev/null || true
 
   if [ "$MODE" = "eval" ]; then
-    local target="${CKPT:-$(ls -dt "$OUTDIR"/checkpoints/*globalstep* 2>/dev/null | head -1)}"
+    local target="${CKPT:-$(newest_checkpoint)}"
     [ -n "$target" ] || { log "MODE=eval needs CKPT= or a checkpoint under $OUTDIR"; return 2; }
     log "evaluating $target on $BENCHES using GPUs $gpus"
     CKPT_ROOT="$(dirname "$target")" BENCHES="$BENCHES" \
@@ -214,23 +304,49 @@ run_once() {
     stats_logger.wandb.mode="$WANDB_MODE" \
     +stats_logger.wandb.project="$WANDB_PROJECT" \
     +stats_logger.wandb.name="$RUN_NAME" \
-    "${routing[@]}" \
+    ${routing[@]+"${routing[@]}"} \
     +rollout.agent.admin_api_key="$(cat "$key_file")" \
     experiment_name="$RUN_NAME" trial_name=t1 >>"$LOG" 2>&1
 }
 
 # Kill only what we started. Patterns cover both spellings AReaL uses and the sglang servers,
 # which carry no experiment name and otherwise survive to hold their GPUs into the next try.
+ours_gpu() {
+  # True when /proc/$1 carries a NON-EMPTY CUDA_VISIBLE_DEVICES whose every device is one
+  # we claimed. Substring matching was wrong in both directions: our "0,1" matched a
+  # neighbour's "0,1,2,3" and killed them, an empty claim matched EVERY server on the box,
+  # our "3,2,1,0" matched nothing, and our full list never matched our own workers --
+  # AReaL hands each sglang server a single physical id, so the full list never appears.
+  local pid="$1" theirs d
+  [ -n "${CUDA_VISIBLE_DEVICES:-}" ] || return 1
+  theirs="$(tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null \
+            | sed -n 's/^CUDA_VISIBLE_DEVICES=//p' | head -1)"
+  [ -n "$theirs" ] || return 1
+  for d in ${theirs//,/ }; do
+    case ",${CUDA_VISIBLE_DEVICES}," in *",$d,"*) ;; *) return 1 ;; esac
+  done
+  return 0
+}
+
 cleanup_ours() {
+  # With nothing claimed there is nothing of ours to kill, and every test below would
+  # match a neighbour instead. Refusing is the only safe reading of an empty claim.
+  [ -n "${CUDA_VISIBLE_DEVICES:-}" ] || { log "cleanup skipped: no GPUs claimed"; return 0; }
   pkill -u "$USER" -f "experiment_name=${RUN_NAME}" 2>/dev/null
   pkill -u "$USER" -f -- "-experiment-name ${RUN_NAME}" 2>/dev/null
   sleep 8
   pkill -9 -u "$USER" -f "experiment_name=${RUN_NAME}" 2>/dev/null
   pkill -9 -u "$USER" -f -- "-experiment-name ${RUN_NAME}" 2>/dev/null
   # Only sglang servers whose GPUs are in our claimed set; a neighbour's must survive.
+  # A second test, on age: on a shared box the neighbour often runs as the SAME user, so
+  # -u $USER protects nobody. A server older than this harness cannot be one of ours.
+  local pid age ours_age
+  ours_age=$(( $(date +%s) - HARNESS_START ))
   for pid in $(pgrep -u "$USER" -f "inference_service.sglang.launch_server" 2>/dev/null); do
-    grep -q "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}" "/proc/$pid/environ" 2>/dev/null \
-      && kill -9 "$pid" 2>/dev/null
+    ours_gpu "$pid" || continue
+    age="$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ')"
+    [ -n "$age" ] && [ "$age" -gt "$ours_age" ] && continue
+    kill -9 "$pid" 2>/dev/null
   done
   sleep 5
 }
@@ -271,6 +387,8 @@ main() {
     if [ "$rc" -eq 0 ]; then
       log "attempt $attempt succeeded"
       write_manifest "succeeded" ""
+      STATUS_WRITTEN=1
+      # shellcheck disable=SC2031  # the lock-busy rename above was scoped to its subshell
       log "manifest: $MANIFEST"
       return 0
     fi
@@ -285,4 +403,6 @@ main() {
   die "all $MAX_ATTEMPTS attempts failed" 6
 }
 
-main "$@"
+# Sourcing exposes the functions without running anything, which is how
+# selfevo/tests/test_run_portable.py exercises them against a stubbed nvidia-smi.
+[ "${RUN_PORTABLE_SOURCE_ONLY:-0}" = "1" ] || main "$@"

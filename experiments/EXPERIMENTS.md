@@ -2328,3 +2328,69 @@ against a genuinely busy box, cost about a minute.
 `cleanup_ours` sparing a neighbour's sglang server. Those need free GPUs and, for the last
 one, a second job to not kill. They are the parts most likely to hurt someone else's work, so
 they are the parts that must not be assumed.
+
+---
+
+## The portable runner would have killed a collaborator's job. Twelve defects, all fixed
+
+Audited before handing it to anyone, on a box where a real neighbouring job (`sa2`, all 8
+GPUs) was running throughout. The neighbour finished the audit alive, at step 39, with all
+four of its sglang servers intact.
+
+**The headline invalidates the design's core safety assumption.** `cleanup_ours` was built on
+`pkill -u "$USER"`, on the theory that a collaborator's job runs as a different user. On this
+box the neighbouring job runs as **the same user**, and its sglang cmdlines match the pattern
+exactly. So `-u $USER` protects nobody, and the only thing standing between this script and
+someone else's training run was one `grep` on `CUDA_VISIBLE_DEVICES` -- which was wrong in
+BOTH directions:
+
+* **False positive.** The grep was an unanchored SUBSTRING match. `CVD=0,1` matches a
+  neighbour on `0,1,2,3`. `CVD=""` matches **everything**, including a neighbour on a
+  completely disjoint `4,5,6,7`. Verified read-only against the real neighbour PIDs: with an
+  empty CVD, all four of their servers matched.
+* **False negative.** AReaL gives each sglang server exactly ONE device id (`=7`, `=5`, ...),
+  so our full-list pattern `=0,1,2,3` can never match our OWN servers. On retry they survive
+  holding ~20 GB each, the re-claim then sees those GPUs as busy, and the script exits 4 --
+  having permanently squatted GPUs on someone else's machine.
+
+And the empty-CVD case was reachable: `claim_gpus` returned an empty list **as a success**.
+At `n=1`, `cut -d, -f1-$((n-1))` is `f1-0`, which errors, blanks the variable, and still
+`return 0`s -- reachable through the documented `MIN_GPUS=1`. So the catastrophic row above
+was one config flag away.
+
+**The other nine, each reproduced:** rounding applied AFTER the MIN test, so `MIN_GPUS=5` with
+5 free returned 4; `awk -F", "` misparsed a driver that emits `0,0` without a space, making
+`free_gpus` return `0,0,1,0` and claim boards regardless of memory; the manifest recorded
+empty strings because the values were never exported; `write_manifest` wrote nothing at all
+when python3 was absent, silently, returning success; `MODE=eval` could never find a
+checkpoint because the glob searched one level and AReaL nests four; `pip install wandb`
+targeted a REUSED environment -- on this box, the venv the live neighbouring job is importing
+from; and `USER`/`HOME` unset under cron aborted under `set -u` before anything was logged.
+
+**The trap was the worst of the quiet ones.** `trap ... INT TERM` called `write_manifest` and
+did not exit. Confirmed: after SIGTERM the script kept running, `wait` returned 143, and the
+retry loop **relaunched the training the operator had just asked to stop**. An unattended
+script that cannot be stopped by Ctrl-C on a machine you do not own is worse than one that
+crashes.
+
+**What this says about the process.** `bash -n` was clean throughout. shellcheck at `-o all`
+was clean and flagged **none** of the twelve -- every one was semantic. The smoke test I ran
+earlier caught two (the empty manifest fields and a cosmetic note); the audit caught ten more,
+including all the ones that would have hurt a collaborator. Neither alone was sufficient, and
+"it ran once and refused correctly" was not evidence of safety.
+
+Fixed: ownership is now set-containment plus an age test rather than a substring grep; an
+empty claim owns nothing; rounding precedes the MIN test; awk tolerates both CSV shapes and
+validates both fields as integers; manifest-visible variables are exported and a shell-only
+JSON fallback covers a missing python3; `on_signal` cleans up and exits 130 and an `on_exit`
+fuse covers every remaining path including the lock-busy one; wandb installs only into a venv
+we built ourselves.
+
+840 tests (774 + 66 new, none needing a GPU). All 11 fixes were mutation-tested by reverting
+them one at a time: 11 caught, 0 survivors.
+
+**Still unverified and stated as such:** that `cleanup_ours` actually reaps a real AReaL run
+(the patterns are tested for shape, not effect); the retry loop end to end; and whether
+`GPU_FREE_MIB=4096` is high enough, since a neighbour still loading weights can sit under
+4 GiB and look free. Reading `--query-compute-apps` would close that last one and is a design
+change I did not make unasked.
