@@ -16,10 +16,10 @@ Usage: compare_runs.py <suiteA> <suiteB> [--steps 28,57,86,115,144]
 from __future__ import annotations
 import argparse, json, math, pathlib, sys
 
-sys.path.insert(0, "/home/ubuntu/areal-selfevo/experiments/bench")
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from math_bench import grade
 
-SPLIT = pathlib.Path("/home/ubuntu/areal-selfevo/experiments/bench/math500_split.json")
+SPLIT = pathlib.Path(__file__).resolve().parent / "math500_split.json"
 
 
 def norm_cdf(x): return 0.5 * (1 + math.erf(x / math.sqrt(2)))

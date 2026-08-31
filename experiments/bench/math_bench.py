@@ -45,10 +45,50 @@ import statistics
 import sys
 import time
 from pathlib import Path
+import os
 
+# Root holding one directory per benchmark (each with test.jsonl). Differs per box -- the
+# A100 has it under the Absolute-Zero-Reasoner checkout, the H200 under /root/evaldata --
+# so it is an environment variable rather than a constant.
 DATA = Path(
-    "/home/ubuntu/baselines/Absolute-Zero-Reasoner/evaluation/math_eval/eval/data"
+    os.environ.get(
+        "MATH_EVAL_DATA",
+        os.path.expanduser(
+            "~/baselines/Absolute-Zero-Reasoner/evaluation/math_eval/eval/data"
+        ),
+    )
 )
+
+
+def require_dataset(name: str) -> Path:
+    """Path to one benchmark's ``test.jsonl``, checked to exist.
+
+    A missing dataset must stop the run. Left unchecked it produces an empty problem list,
+    which grades to zero and is indistinguishable in the output from a model that answered
+    everything wrong -- a silent-zero failure this project has already been bitten by.
+
+    Args:
+        name: Benchmark directory name, e.g. ``"math500"``.
+
+    Returns:
+        The path to ``<DATA>/<name>/test.jsonl``.
+
+    Raises:
+        FileNotFoundError: If the root or the file is absent, naming MATH_EVAL_DATA so the
+            fix is obvious from the message alone.
+    """
+    if not DATA.exists():
+        raise FileNotFoundError(
+            f"eval-data root {DATA} does not exist. Set MATH_EVAL_DATA to the directory "
+            f"holding one folder per benchmark (each with test.jsonl)."
+        )
+    f = DATA / name / "test.jsonl"
+    if not f.exists():
+        raise FileNotFoundError(
+            f"{f} not found. MATH_EVAL_DATA={DATA} exists but has no {name}/test.jsonl; "
+            f"present: {sorted(d.name for d in DATA.iterdir() if d.is_dir())[:12]}"
+        )
+    return f
 SUITE = ["aime24", "aime25", "amc23", "math500", "hmmt_2024", "hmmt_2025", "livemathbench"]
 
 PROMPT = (

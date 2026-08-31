@@ -19,7 +19,7 @@ Usage: selfconsistency.py <generations.jsonl> [--split report] [--trials 200]
 from __future__ import annotations
 import argparse, collections, json, math, pathlib, random, re, sys
 
-BENCH = pathlib.Path("/home/ubuntu/areal-selfevo/experiments/bench")
+BENCH = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(BENCH))
 from math_bench import grade
 

@@ -15,7 +15,7 @@ No GPU is needed: this regrades persisted text, it does not regenerate.
 from __future__ import annotations
 import json, math, pathlib, sys
 
-sys.path.insert(0, "/home/ubuntu/areal-selfevo/experiments/bench")
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from math_bench import grade  # the repo's own grader, not a reimplementation
 
 SUITE = pathlib.Path(sys.argv[1])

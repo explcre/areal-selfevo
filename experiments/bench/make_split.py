@@ -18,8 +18,13 @@ Run once:  python3 make_split.py --write
 """
 from __future__ import annotations
 import argparse, collections, hashlib, json, pathlib, random, sys
+import os
 
-DATA = pathlib.Path("/home/ubuntu/baselines/Absolute-Zero-Reasoner/evaluation/math_eval/eval/data/math500/test.jsonl")
+DATA = pathlib.Path(
+    os.path.expanduser(
+        "~/baselines/Absolute-Zero-Reasoner/evaluation/math_eval/eval/data/math500/test.jsonl"
+    )
+)
 OUT = pathlib.Path(__file__).resolve().parent / "math500_split.json"
 SEED = 20260830
 

@@ -22,11 +22,11 @@
 # released whether the job finishes, hangs in sglang startup, or wedges mid-generation.
 set -u
 LIMIT="${1:-0}"
-CKPT_ROOT="${CKPT_ROOT:-/home/ubuntu/areal-runs/checkpoints/ubuntu/step0d/t1/default}"
+CKPT_ROOT="${CKPT_ROOT:-$HOME/areal-runs/checkpoints/ubuntu/step0d/t1/default}"
 BASE="${BASE_MODEL:-Qwen/Qwen2.5-1.5B-Instruct}"
-RUN=/home/ubuntu/areal-selfevo/experiments/bench/run_math.sh
+RUN=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/run_math.sh
 STAMP=$(date +%m%d_%H%M)
-SUITE="/home/ubuntu/runs/math/sweep_$STAMP"
+SUITE="$HOME/runs/math/sweep_$STAMP"
 
 # Discover checkpoints and order them by global step NUMERICALLY. A lexical sort puts
 # globalstep115 before globalstep28, which would silently plot the series out of order.
@@ -88,5 +88,5 @@ echo "=== sweep complete ==="
 # 124 is timeout's signal that the watchdog fired; it must not be mistaken for a score.
 sort "$SUITE/exit_codes.txt" 2>/dev/null
 grep -q "^124 " "$SUITE/exit_codes.txt" 2>/dev/null && echo "WARNING: a job was killed by the watchdog (exit 124)"
-echo "$SUITE" > /home/ubuntu/runs/math/LAST_SWEEP
+echo "$SUITE" > $HOME/runs/math/LAST_SWEEP
 echo "analyse with: python3 experiments/bench/regrade.py $SUITE"

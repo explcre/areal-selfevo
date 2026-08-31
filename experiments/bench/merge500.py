@@ -8,12 +8,17 @@ disjoint by source index and must together cover exactly the 500 rows.
 from __future__ import annotations
 import json, math, pathlib, sys
 
-sys.path.insert(0, "/home/ubuntu/areal-selfevo/experiments/bench")
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from math_bench import grade
 
-D_FULL = pathlib.Path("/home/ubuntu/runs/math/sweep_0829_1628")          # step0d, all 500
-H_REPORT = pathlib.Path("/home/ubuntu/runs/math/sweep_0830_0557")        # step0h, report
-H_SEARCH = pathlib.Path("/home/ubuntu/runs/math/sweep_0830_1018")        # step0h, search
+# Suites live under $HOME by default; MATH_RUNS repoints them without editing
+# the historical suite names below, which record which run produced which number.
+RUNS_ROOT = os.environ.get("MATH_RUNS", os.path.expanduser("~/runs/math"))
+
+
+D_FULL = pathlib.Path(RUNS_ROOT) / "sweep_0829_1628"          # step0d, all 500
+H_REPORT = pathlib.Path(RUNS_ROOT) / "sweep_0830_0557"        # step0h, report
+H_SEARCH = pathlib.Path(RUNS_ROOT) / "sweep_0830_1018"        # step0h, search
 STEPS = [28, 57, 86, 115, 144]
 
 

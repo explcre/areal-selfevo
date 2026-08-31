@@ -8,9 +8,15 @@ persisted generations, so the bound is measured rather than asserted.
 import collections
 import json
 import sys
+import os
+
+# Suites live under $HOME by default; MATH_RUNS repoints them without editing
+# the historical suite names below, which record which run produced which number.
+RUNS_ROOT = os.environ.get("MATH_RUNS", os.path.expanduser("~/runs/math"))
+
 
 path = sys.argv[1] if len(sys.argv) > 1 else (
-    "/home/ubuntu/runs/math/qwen38_27b_v2/generations.jsonl"
+    os.path.join(RUNS_ROOT, "qwen38_27b_v2/generations.jsonl")
 )
 recs = [json.loads(l) for l in open(path)]
 

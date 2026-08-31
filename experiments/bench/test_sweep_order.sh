@@ -10,7 +10,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 SW="$HERE/sweep_entropy.sh"
 fail=0
 
-got=$(CKPT_ROOT=/home/ubuntu/areal-runs/checkpoints/ubuntu/step0d/t1/default LIST=1 \
+got=$(CKPT_ROOT=$HOME/areal-runs/checkpoints/ubuntu/step0d/t1/default LIST=1 \
       bash "$SW" | grep -o "gs[0-9]*" | tr "\n" " ")
 want="gs028 gs057 gs086 gs115 gs144 gs173 "
 if [ "$got" != "$want" ]; then
@@ -20,7 +20,7 @@ else
 fi
 
 # The base anchor must always lead: without it a flat series cannot be read.
-first=$(CKPT_ROOT=/home/ubuntu/areal-runs/checkpoints/ubuntu/step0d/t1/default LIST=1 \
+first=$(CKPT_ROOT=$HOME/areal-runs/checkpoints/ubuntu/step0d/t1/default LIST=1 \
         bash "$SW" | sed -n "2p" | cut -d: -f1)
 if [ "$first" != "base" ]; then
     echo "FAIL anchor: first job is '$first', not 'base'"; fail=1

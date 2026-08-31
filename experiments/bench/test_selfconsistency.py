@@ -6,7 +6,7 @@ produces a plausible curve rather than an error.
 from __future__ import annotations
 import json, subprocess, sys, tempfile, pathlib
 
-BENCH = pathlib.Path("/home/ubuntu/areal-selfevo/experiments/bench")
+BENCH = pathlib.Path(__file__).resolve().parent
 SC = BENCH / "selfconsistency.py"
 
 

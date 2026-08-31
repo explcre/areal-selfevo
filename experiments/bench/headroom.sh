@@ -14,9 +14,9 @@
 # One model per GPU group, all in parallel, each under a hard timeout.
 set -u
 STAMP=$(date +%m%d_%H%M)
-SUITE="/home/ubuntu/runs/math/headroom_$STAMP"
+SUITE="$HOME/runs/math/headroom_$STAMP"
 mkdir -p "$SUITE"
-RUN=/home/ubuntu/areal-selfevo/experiments/bench/run_math.sh
+RUN=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/run_math.sh
 BENCHES="${BENCHES:-math500,aime24,aime25,amc23}"
 
 # tag : model : gpus : concurrency
@@ -51,4 +51,4 @@ wait
 echo "=== headroom complete ==="
 sort "$SUITE/exit_codes.txt" 2>/dev/null
 grep -q "^124 " "$SUITE/exit_codes.txt" 2>/dev/null && echo "WARNING: a job hit the watchdog timeout"
-echo "$SUITE" > /home/ubuntu/runs/math/LAST_HEADROOM
+echo "$SUITE" > $HOME/runs/math/LAST_HEADROOM
