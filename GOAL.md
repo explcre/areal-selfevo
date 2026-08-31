@@ -65,6 +65,7 @@ wiring step is what turns six PARTIAL rows into a running experiment.
 | M13 | MEDS clustering | **PARTIAL** | `_cluster_with_hdbscan` + `_classify_with_knn` vendored VERBATIM; verified to recover 2 modes. Deps not installed on training boxes; not yet a controller feature |
 | M14 | BigBang two-level critic | **NOT BUILT** | `"two_level": None` |
 | M15 | Trajectory observability → policy inputs | **PARTIAL** | `observability.py`, 7 features at zero extra compute, 27/29 mutants (2 equivalent). **No caller in training** |
+| M24 | **Multi-teacher on-policy distillation** as the supplier for the UNSOLVED branch | **NOT BUILT** | Now the highest-value model-evolution item: the composition flip made unsolved the majority (60.9% of the channel on MATH) and it has no self-target |
 | M23 | **LLM-as-router**: an LLM reads a unit's rollouts (failure modes, solve rate, observability metrics) and decides evolve-model vs evolve-harness | **NOT BUILT** | See the positioning note below -- the idea is a combination of existing lines, so the contribution has to be the comparison, not the idea |
 | M21 | Code-as-policy (`learned_code`) | **DONE** | AST allowlist + subprocess cost-vetting; ~150 adversarial policies, 26/26 mutants. 2 escape families documented as unclosable by any AST rule |
 | M22 | Decision→advantage seam | **PARTIAL** | `group_apply.py` built; actor still hardcodes the rule, so routers decide nothing in training |
@@ -237,6 +238,43 @@ genuinely different scaffolds, and a dispatch rule needs the matched-proportion 
 every other arm -- otherwise "we dispatched" cannot be told apart from "one variant is just
 better". Neither exists yet. The value of writing it down now is that the action space, the
 features, and the control are all already built; what is missing is the variants.
+
+
+### Note on M24 (multi-teacher OPD): why it moved up, and three traps already known
+
+**Why it moved up.** The solved branch is abandoned (inert at 0.5, harmful at 2.0), and the
+composition flip put the UNSOLVED branch at 60.9% of the silent channel on MATH -- 25.5% of
+all groups, against 4.5% on GSM8K. That branch has no self-target by construction: every
+sample was wrong, so nothing in the rollout can serve as a target. A teacher is the only thing
+that turns it from SKIP into signal. Multi-teacher on-policy distillation is the natural
+supplier, and it is on-policy, which matters because the units are drawn from the student's
+own rollouts rather than from a fixed corpus.
+
+**Where it sits in the action space.** It does not add an axis. It supplies the target that
+makes `SFT_teacher` reachable in \eqref{eq:rule} -- the branch that is currently
+`(SKIP, PROPOSE)` because `has_teacher` is False everywhere. So the routing decision is
+unchanged; what changes is that one of its arms stops being a no-op.
+
+**Three traps, from measurements already in hand -- do not rediscover them:**
+
+1. **A null teacher is NOT a control.** Comparing "real teacher" against "no teacher" does not
+   isolate transferred knowledge; the difference includes the effect of simply having ANY
+   target, and the sign can flip. The control is a teacher matched in every respect except
+   the knowledge -- e.g. a shuffled or same-capability teacher -- not the absence of one.
+2. **Do not score multi-teacher gain by an energy ratio.** That statistic grows with the
+   number of teachers by construction, so "more teachers is better" falls out of the
+   arithmetic rather than the data. Use a normalised difference against the matched control.
+3. **Report the standard error on the DIFFERENCE, not per arm**, and watch for
+   validation/test inversion. An earlier multi-teacher analysis was underpowered in exactly
+   this way, and the scaling-with-N claim is the part that was fresh -- so it is also the part
+   most exposed if the statistics are loose.
+
+**Prior art bounds the claim.** Multi-teacher distillation itself is not ours (ECLARE, VDD and
+the wider ensemble-distillation line). What is not obviously claimed is using it as the
+*supplier for a routed branch selected by measured RL-silence*, with the teacher spent only
+on the units that provably cannot learn from RL. That framing also makes the cost argument
+sharp: a teacher is expensive, and routing means paying for it on ~25% of groups rather than
+all of them.
 
 
 ### Models
