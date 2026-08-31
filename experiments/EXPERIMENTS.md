@@ -2626,3 +2626,50 @@ first MATH run.
 
 Anything in between is informative too -- it would put a number on how much of the channel is
 each.
+
+---
+
+## 27B LoRA is blocked by a DEPENDENCY conflict, not by memory. And the memory was never the problem
+
+Asked whether we can train a 27B-class model. Answer: the arithmetic says comfortably yes,
+the environment says not on this box today.
+
+**Memory, computed rather than assumed** (`experiments/harness/preflight_lora.py`):
+
+    frozen bf16 weights   50.3 GiB total, 12.6 GiB/GPU sharded over 4
+    LoRA rank 32          ~81M params -> 0.91 GiB fp32 Adam state
+    estimated per-GPU     13.5 GiB, of 80 GiB on the A100 and 141 GiB on the H200
+
+So the earlier "we can only train 1.5B/7B" was wrong, and wrong by a wide margin. AReaL has
+native LoRA and the overrides resolve into the real dataclass. Weights are staged (52 GB, 18
+shards). Preflight passes on both boxes.
+
+**The actual blocker:**
+
+    ImportError: Found an incompatible version of torchao.
+    Found version 0.9.0, but only versions above 0.16.0 are supported
+
+raised from `Engine method 'initialize'` on the LoRA path. Upgrading torchao does not fix it:
+the newest torchao imports `ScalingType` from `torch.nn.functional`, which does not exist in
+the installed torch 2.9.1+cu128. So LoRA here requires a TORCH upgrade, and torch on this box
+is exactly what a previous finding warns about -- sglang is version-pinned against it, and a
+wrong torch made `device_count()` report 8 GPUs that could not be used.
+
+**I broke the environment doing this and repaired it.** `pip install -U torchao --no-deps`
+left a torchao that cannot import at all, which is worse than the original error because it
+would fail every run, not just LoRA ones. Reverted to 0.9.0 and verified torch 2.9.1+cu128
+with CUDA and 8 devices before doing anything else. Recorded because "I upgraded a package on
+a shared box" is exactly the kind of change that is invisible in a git log.
+
+**Consequences, in priority order:**
+
+1. **Do not hand 27B LoRA to the collaborator.** It does not run here yet; shipping it to a
+   box we cannot debug would be shipping a known failure.
+2. The tractable 27B paths are: a torch upgrade with sglang re-pinned (a real project, and
+   risky on a rented box), or 27B FULL fine-tuning, which needs ~324 GiB of optimizer state
+   -- sharded over 8 H200s that is ~40 GiB/GPU and plausible, but untested.
+3. A host-level side effect worth knowing: after the failed run, four GPUs kept 107 GiB each
+   with NO container-visible process holding them. vast.ai shows host PIDs that cannot be
+   killed from inside, so that memory is unreclaimable without a container restart. The
+   GPU-free guard added earlier caught this correctly and refused to launch on top of it --
+   which is the first time that guard has paid for itself.
