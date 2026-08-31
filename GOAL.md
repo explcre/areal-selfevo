@@ -377,8 +377,24 @@ changed".
 4. **Benchmark headroom mapped** across three scales.
 5. **NEGATIVE: token routing has no measurable effect** (McNemar 0.53–0.92) — consistent with its 1.7% reach.
 
+6. **G=16 does not halve the silent channel.** Matched GSM8K/1.5B/routing-off pair:
+   silent fraction 0.5906 at G=8 vs 0.4553 at G=16, where the homogeneous-binomial account
+   calibrated on the G=8 run predicts 0.3488. Doubling G buys a 22.9% relative reduction
+   against a predicted 41%, so a large share of the channel is prompts that are silent at ANY
+   group size. Between-run comparison, one run per G -- directional, not a coefficient.
+
 **Nothing yet demonstrates the method works.** Results 1–4 are evaluation contributions;
-result 5 is a null.
+result 5 is a null; result 6 is a property of the problem, not of the method.
+
+> **PROVISIONAL — composition numbers are under review (2026-08-31).** The silent-channel
+> decomposition violates the identity it must satisfy by construction:
+> `silent == solved + unsolved` fails at 104 of 116 steps in `g16`, with a second-half mean
+> residual of +0.277 and an excursion to **-0.109**, which is impossible for a partition into
+> subsets. Every "X% of the silent channel is solved" figure below and in Sec. 6 is a ratio of
+> the two implicated metrics, so those figures -- including the 87.5% that re-ordered the
+> critical path -- are provisional until the violation is explained. `silent_group_fraction`
+> is computed directly and is not implicated. See EXPERIMENTS.md for the measurement and for
+> the CPU identity test that should have preceded the claims.
 
 ---
 

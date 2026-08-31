@@ -3,6 +3,86 @@
 Measured results and negative results, newest first. A claim only belongs here once it has
 been observed end to end; a prediction belongs in GOAL.md until then.
 
+## 2026-08-31 — G=16: doubling the group size does NOT halve the silent channel
+
+The cheapest decisive experiment named in GOAL.md. If a group is silent because every member
+happened to land on the same side of the reward threshold -- a binomial tail with one solve
+rate p per prompt -- then silence falls as p^G, and doubling G should SQUARE it. If instead
+silence is driven by prompt HETEROGENEITY, with many prompts effectively always-solved or
+always-unsolved, silence barely moves with G because those prompts are silent at any G.
+
+Matched pair, GSM8K / Qwen2.5-1.5B-Instruct / routing OFF, second-half means:
+
+| G | run | silent_group_fraction | sd | steps |
+|---|-----|----------------------|-----|-------|
+| 8 | `step0m-off` (H200) | **0.5906** | 0.0417 | 145 |
+| 16 | `g16` (A100) | **0.4553** | 0.0756 | 116 |
+
+Homogeneous-binomial prediction, calibrated on the G=8 run itself: silence(16) =
+silence(8)^2 = 0.5906^2 = **0.3488**. Observed 0.4553 is **1.31x** that -- doubling G bought
+a 22.9% relative reduction where the homogeneous account predicts 41%.
+
+**Reading.** Directionally this supports heterogeneity: a large share of the silent channel is
+prompts that are silent at ANY group size, so buying signal by raising G is expensive and
+saturating. It is NOT the pure-heterogeneity extreme either, which would predict no movement
+at all; some prompts genuinely sit in the binomial-tail regime.
+
+**Confounds, stated because this is a between-run comparison and not a controlled sweep.**
+Different boxes; different batch size (256 vs 64 prompts); different epoch counts; one run per
+G, so the sd columns describe within-run step variation, not run-to-run variation. A clean
+version is a single-box sweep at G in {4, 8, 16} with batch size held fixed and >=2 seeds.
+Until that exists this is a strong directional result, not a measured coefficient.
+
+## 2026-08-31 — MEASUREMENT INTEGRITY: the silent-channel decomposition violates its own identity
+
+By construction `solved_group_fraction = mean(silent * solved)` and
+`unsolved_group_fraction = mean(silent * unsolved)`, both elementwise-bounded by
+`silent_group_fraction = mean(silent)`. Since a group cannot be both all-solved
+(`min > 0.5`) and all-unsolved (`max <= 0.5`), the identity
+
+    silent_group_fraction == solved_group_fraction + unsolved_group_fraction
+
+must hold at every step, and averaging over microbatches preserves it by linearity.
+
+**It does not hold.** In `g16` the residual `silent - (solved + unsolved)` has a second-half
+mean of **+0.277**, exceeds 0.01 at **104 of 116 steps**, and reaches **-0.109** at step 112 --
+negative, which is impossible for a decomposition into subsets. Step 0 satisfies it exactly
+(0.1875 = 0.1406 + 0.0469), so the computation is right at least initially and something about
+how the three scalars are aggregated or reported diverges afterwards. The same pattern appears
+in `sa2` (2nd-half mean +0.221, 113/145 steps, min -0.344).
+
+**Consequence, and it is not small.** The composition numbers this project has been quoting --
+"87.5% of the silent channel is solved", the MATH 39.1% / 81.6% figures, the 7x reach argument
+that RE-ORDERED the critical path -- are all ratios of these two metrics. Until the identity
+violation is explained they cannot be used quantitatively, and any claim resting on them is
+provisional. `silent_group_fraction` itself is the directly computed primary metric and is not
+implicated by this specific failure, so the G=16 result above still stands.
+
+**Not yet diagnosed.** Candidate explanations (sequence-level `seq_adv` summing to ~0 while
+tokens carry gradient; cross-rank aggregation weighting; a reported statistic that is not the
+plain mean) are guesses and are recorded as guesses. The next step is a CPU test that asserts
+the identity on the real `_compute_advantages` path, which is cheap and decisive -- exactly
+the check that should have existed before these numbers were quoted.
+
+## 2026-08-31 — Editing a shell script that bash is currently executing
+
+`bash` reads a script LAZILY, by byte offset, not into memory. A long-running script sits
+blocked on its final command with a file offset stored; inserting lines ABOVE that point
+shifts every later byte, so when bash resumes it reads from the old offset into the middle of
+a now-different line.
+
+I patched `experiments/harness/step0m.sh` to add the router arm while `g16` was still running
+from that same file, ~30 lines above the trainer invocation. The training itself was never at
+risk -- the python process is already exec'd and its metrics are already in the log -- but the
+teardown lines after it (`rc=${PIPESTATUS[0]}`, the exit-code echo, `exit "$rc"`) are read
+after the patch, and a garbled read there produces a wrong exit code, which makes the
+supervisor restart a run that actually succeeded.
+
+**How to apply.** Never edit a script an active run launched from. Write the change to a NEW
+filename and point the next launch at it -- which is what the H200 got
+(`step0m_router.sh`). This is the shell-script analogue of the rule already recorded for
+tensors in `group_apply`: do not mutate what a caller still holds.
+
 ## 2026-08-31 — The Router→advantage seam is live, and a uniform batch starves its own feedback
 
 **Built and verified.** `actor.py::_route_groups` had no test: it was called from
