@@ -2037,3 +2037,48 @@ verifying it requires actually killing something.
 **Cost.** ~4.5 hours of A100 time on a run that was dead, and step0l ends at step 213 of 290.
 Its comparison points (28/57/86/115/144) are all present, so nothing the analysis needs is
 lost -- but that is luck, not design.
+
+---
+
+## FIRST MEASUREMENT of DAPO's cost, and a confirmation that its filter does what it claims
+
+Both arms on the same 8xH200, same model, same data, differing in one flag.
+
+**1. The filter removes exactly the silent groups.** In the DAPO arm,
+`silent_group_fraction = 0.0000` on every one of the first 12 logged batches, against ~0.47
+on the OFF arm at the same point. Dynamic sampling rejects a group iff its reward std is
+zero, and zero std is unanimity, which is the zero-advantage condition -- so a DAPO training
+batch contains no RL-silent groups at all. That is the mechanism working, measured rather
+than assumed, and it is the cleanest possible confirmation that DAPO and this method act on
+the same set.
+
+**2. Cost, measured as wall-clock per accepted step:**
+
+| arm | steps | intervals | median s/step | mean s/step |
+|---|---|---|---|---|
+| off (vanilla GRPO) | 1-145 | 144 | **38.0** | 38.6 |
+| dapo               | 1-14  | 13  | **70.0** | 55.7 |
+
+**Ratio on medians: 1.84x.** Predicted from the OFF arm's early silent fraction
+(s = 0.327, so 1/(1-s) = 1.49x). Measured is higher, which is expected: wall-clock includes
+the filtering pass and partially-filled batches, not only the regeneration the 1/(1-s) model
+counts. So 1/(1-s) is a LOWER bound on the practical cost, not an estimate of it.
+
+**Preliminary, and here is why.** n = 13 intervals for DAPO against 144 for OFF, and the DAPO
+arm is at step 14 of 145. The multiplier should GROW over the run, because the silent
+fraction grows (0.33 -> 0.58 measured on the control), so this early number is the smallest
+it will be. Its mean (55.7s) sitting below its median (70.0s) also says the early intervals
+are not yet stable. To be re-measured at completion.
+
+**Why wall-clock rather than a generation count.** The generation counters do not reach the
+trainer in this controller layout. `RolloutController.export_stats` was fixed to stop
+dropping the `__count` keys, and that fix IS present on this box, but `rollout/accepted__count`
+never appears in the log -- so the run uses a stats path the fix does not cover. Recorded as
+an open gap rather than papered over, since an earlier entry in this file already claims that
+instrumentation was repaired: it was repaired in the place I looked, and that place is not
+the one this run uses.
+
+Wall-clock is arguably the better headline anyway. It is what a practitioner pays, it needs
+no counter to be exported, and it captures the filtering overhead a pure generation count
+would miss. The generation count remains worth having because it separates "regenerating" from
+"slower for some other reason", and that separation is not yet made.
