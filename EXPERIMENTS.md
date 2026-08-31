@@ -3,6 +3,41 @@
 Measured results and negative results, newest first. A claim only belongs here once it has
 been observed end to end; a prediction belongs in GOAL.md until then.
 
+## 2026-08-31 — The Router→advantage seam is live, and a uniform batch starves its own feedback
+
+**Built and verified.** `actor.py::_route_groups` had no test: it was called from
+`_compute_advantages` but nothing established that a Router's decision reaches the tensor the
+loss reads. Added `selfevo/tests/test_actor_router_seam.py` -- 11 tests driven through the
+REAL `_compute_advantages`, deliberately not through the helper, because a test that calls
+the helper cannot catch the helper being unreachable. `mutate_actor_router_seam.py`: **7/7
+killed**, including "router rebuilt every batch" (a learned router that silently never
+accumulates), "unit ids drop the batch prefix" (feedback credited to the wrong unit), and
+"unregistered router name silently ignored" (an arm that reports as run and never ran).
+
+Two of my initial assertions were wrong and both were informative:
+
+1. **The prompt region is not zero before routing.** The actor leaves real GAE values there
+   (the seam's own docstring measures -0.87 for an informative group). The correct claim is
+   that routing does not MOVE them, asserted against the unrouted tensor.
+2. **A fixed-mode router never produces feedback.** `batch_outcomes` credits one scalar --
+   the change in mean raw reward between consecutive batches -- across a batch's decisions.
+   If every group took the same mode, that scalar cannot be divided among them, so the update
+   is refused as `ConfoundedUpdate`.
+
+**(2) is a design constraint, not a test artifact.** A learned router that CONVERGES to one
+mode stops receiving feedback entirely: it is not punished for converging, it goes blind, and
+any later change in which mode is right is invisible to it. Exploration is the precondition
+for the learning signal existing at all, not merely a way to improve it. A converged-but-wrong
+router and a converged-and-right router look identical from the feedback stream; the
+`feedback/confounded_skips` counter is the only diagnostic that separates them.
+
+This predicts a specific failure mode for the LLM-as-router variant (M23): an LLM asked to be
+decisive collapses the mode distribution faster than a bandit with explicit exploration, and
+therefore starves its own feedback sooner. Worth measuring rather than assuming.
+
+**Still unverified:** that a learned router DECIDES BETTER than the fixed rule. Reachable is
+not effective. That is a GPU arm, now item 1b on the critical path.
+
 ## 2026-08-31 — Orphaned workers from a failed run silently disable the box
 
 **Measured.** Both boxes sat at ~0% GPU utilisation for hours while appearing "busy".

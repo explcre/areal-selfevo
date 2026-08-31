@@ -36,15 +36,22 @@ meta-controller, with a **validity condition** saying when each choice is legiti
 Legend: **DONE** built + tested + audited · **PARTIAL** exists but incomplete or unproven ·
 **NOT BUILT** declared only.
 
-**Scoreboard (2026-08-31, after the controller work).** Method **9 DONE / 6 PARTIAL /
+**Scoreboard (2026-08-31, after the seam was tested).** Method **10 DONE / 5 PARTIAL /
 7 NOT BUILT**; Engineering **6 DONE / 2 PARTIAL**; Benchmarks **4 DONE / 1 PARTIAL /
 10 NOT BUILT**. So: **no, the goal is not implemented.** What IS complete is one vertical
 slice -- measure the silent channel, decompose it, act on it, verify end-to-end -- and that
-slice is the paper's spine. The controller components now exist and are audited, but note how
-many read **PARTIAL for the same reason**: they are built and tested as components and have
-**no caller in training**. Until `actor.py` calls a Router instead of hardcoding the rule,
-`router=contextual` and `router=code_policy` are registry entries, not arms. That single
-wiring step is what turns six PARTIAL rows into a running experiment.
+slice is the paper's spine.
+
+**The "no caller in training" gap is now closed.** `actor.py::_route_groups` builds the
+configured Router, feeds it observability features, and applies its decisions through
+`group_apply`. As of 2026-08-31 that path has 11 tests driven through the REAL
+`_compute_advantages` entry point (not through the helper, which could not catch the helper
+being unreachable) and **7/7 mutants killed**. So `router=contextual` and
+`router=code_policy` are reachable arms rather than registry entries.
+
+What that does NOT establish, and the reason M8 and M15 stay PARTIAL: reachable is not the
+same as effective. Nothing yet shows a learned router DECIDES BETTER than the fixed rule in
+training. That needs a GPU arm, and it is now the top item on the critical path.
 
 ### Method
 
@@ -57,18 +64,18 @@ wiring step is what turns six PARTIAL rows into a running experiment.
 | M5 | RL/reverse-KL mix per token | **DONE** | extends AReaL's own `rl_loss_weight`/`distill_loss_weight` |
 | M6 | SFT / forward-KL modes | **PARTIAL** | SFT now REACHES the update for solved groups (a constant on their zero advantages IS the supervised step). Forward-KL still a name |
 | M7 | **Teacher** supplying routed units | **NOT BUILT** | DEMOTED by measurement: reaches only ~4.5% of groups. The free self-target covers 31.4% and is built |
-| M8 | Learned meta-controller | **PARTIAL** | `ContextualBanditRouter` (LinUCB over 7 features) built, audited, 29/29 mutants, demonstrably learns on a clean reward. Registered in `ROUTERS` + `EVOLVE_POLICY_FACTORIES`. **No caller in training** |
+| M8 | Learned meta-controller | **PARTIAL** | `ContextualBanditRouter` (LinUCB over 7 features) built, audited, 29/29 mutants, demonstrably learns on a clean reward. **Now called in training** via `_route_groups`. Gap: no evidence it out-decides the fixed rule on a real task |
 | M9 | Rule evolve-policy (cold start + baseline) | **NOT BUILT** | needed before "learned" is falsifiable |
 | M10 | Evolve model / harness / reward | **PARTIAL** | `HarnessAction` axis built, audited, 18/18 mutants. **No consumer**: nothing writes `can_evolve_harness`, nothing reads the action. Reward axis still a name |
 | M11 | Cadence: frozen / alternating / simultaneous | **NOT BUILT** | `CADENCES` = bare strings |
 | M12 | Evolvable reward formula | **NOT BUILT** | |
 | M13 | MEDS clustering | **PARTIAL** | `_cluster_with_hdbscan` + `_classify_with_knn` vendored VERBATIM; verified to recover 2 modes. Deps not installed on training boxes; not yet a controller feature |
 | M14 | BigBang two-level critic | **NOT BUILT** | `"two_level": None` |
-| M15 | Trajectory observability → policy inputs | **PARTIAL** | `observability.py`, 7 features at zero extra compute, 27/29 mutants (2 equivalent). **No caller in training** |
+| M15 | Trajectory observability → policy inputs | **PARTIAL** | `observability.py`, 7 features at zero extra compute, 27/29 mutants (2 equivalent). **Now called in training** -- `_route_groups` computes them from RAW reward each batch. Gap: no ablation showing which features carry the decision |
 | M24 | **Multi-teacher on-policy distillation** as the supplier for the UNSOLVED branch | **NOT BUILT** | Now the highest-value model-evolution item: the composition flip made unsolved the majority (60.9% of the channel on MATH) and it has no self-target |
 | M23 | **LLM-as-router**: an LLM reads a unit's rollouts (failure modes, solve rate, observability metrics) and decides evolve-model vs evolve-harness | **NOT BUILT** | See the positioning note below -- the idea is a combination of existing lines, so the contribution has to be the comparison, not the idea |
 | M21 | Code-as-policy (`learned_code`) | **DONE** | AST allowlist + subprocess cost-vetting; ~150 adversarial policies, 26/26 mutants. 2 escape families documented as unclosable by any AST rule |
-| M22 | Decision→advantage seam | **PARTIAL** | `group_apply.py` built; actor still hardcodes the rule, so routers decide nothing in training |
+| M22 | Decision→advantage seam | **DONE** | `group_apply.py` + `actor._route_groups`; 11 tests through the real `_compute_advantages`, **7/7 mutants**. Router state cached across batches, unit ids batch-prefixed, unregistered name refused |
 | M18 | Per-**group** routing (the silent channel) | **DONE** | in `_compute_advantages`; 17 tests on the REAL path, 7/7 mutants; verified firing live (`routed == solved`, diff 0.00e+00) |
 | M19 | Free self-target (RFT on solved groups) | **DONE** | `solved_advantage`; needs no teacher; reach 31.4% and RISING to 60% |
 | M20 | Unlikelihood on unsolved groups | **DONE** | `unsolved_advantage`, sign-guarded; reach only ~3.7% at this operating point |
@@ -240,6 +247,28 @@ better". Neither exists yet. The value of writing it down now is that the action
 features, and the control are all already built; what is missing is the variants.
 
 
+### Feedback for a learned router is only defined when the batch has mode diversity
+
+Found by the seam tests on 2026-08-31, and it constrains every learned-controller design here
+including M23 (LLM-as-router).
+
+`batch_outcomes` credits one scalar -- the change in mean raw reward between consecutive
+batches -- across the decisions in a batch. When every group took the SAME mode that scalar
+cannot be divided among them, so the update is refused as `ConfoundedUpdate` rather than
+applied to a vacuous attribution. Correct, and it has a consequence worth designing around:
+
+* A router that CONVERGES to one mode stops receiving feedback entirely. It is not punished
+  for converging; it simply goes blind, and any later drift in what the right mode would be
+  is invisible to it. Exploration is not merely helpful here, it is the precondition for the
+  learning signal existing at all.
+* So a converged-but-wrong router and a converged-and-right router are indistinguishable from
+  the feedback stream. The `feedback/confounded_skips` counter is the diagnostic: a run whose
+  skips rise to 100% has a controller that has stopped learning, however good its metrics
+  look.
+* This is a real property to report, not a bug to paper over. It also predicts a specific
+  failure for M23: an LLM-as-router asked to be decisive will collapse the mode distribution
+  faster than a bandit with explicit exploration, and will therefore starve its own feedback.
+
 ### Note on M24 (multi-teacher OPD): why it moved up, and three traps already known
 
 **Why it moved up.** The solved branch is abandoned (inert at 0.5, harmful at 2.0), and the
@@ -364,7 +393,11 @@ difference, and the reverse of the previous ordering.
    compute. This is the method's main lever and its main risk: sharpening an already-correct
    policy spends entropy, and entropy collapse is the failure mode already measured twice
    here. Until this runs, the solved branch defaults to SKIP.
+1b. **Run `router=contextual` as an arm** against the fixed rule at matched compute. The seam
+   is now tested end-to-end (M22), so this is a launch, not a build. It is what turns the
+   learned controller from "reachable" into a result -- or into an honest null.
 2. **Give `route_batch` a caller** -- otherwise M2 and the new harness axis are dead code.
+   NOTE this is now the ONLY remaining "no caller" gap; the group-level seam is closed.
 3. **Re-measure the split on OlympiadBench.** 0.875 is a property of GSM8K at a high solve
    rate, not a constant; a harder task moves mass to the unsolved branch.
 4. **M9 rule evolve-policy** -- cold start *and* the baseline the learned one must beat.
