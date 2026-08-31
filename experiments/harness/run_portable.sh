@@ -36,6 +36,12 @@ CKPT="${CKPT:-}"                      # eval only; defaults to the newest we tra
 BENCHES="${BENCHES:-math500}"
 
 # Shared-box etiquette.
+# Explicit pin, for when a collaborator has been told WHICH boards are theirs. Bypasses
+# auto-detection entirely: e.g. GPUS=4,5,6,7. Still checked for being free unless
+# GPUS_FORCE=1, because being told a GPU is yours and it actually being idle are
+# different claims, and starting anyway is how two jobs end up sharing a board.
+GPUS="${GPUS:-}"
+GPUS_FORCE="${GPUS_FORCE:-0}"
 MIN_GPUS="${MIN_GPUS:-4}"             # refuse rather than thrash below this
 MAX_GPUS="${MAX_GPUS:-8}"             # never claim more than this even if free
 GPU_FREE_MIB="${GPU_FREE_MIB:-4096}"  # a GPU holding more than this belongs to someone else
@@ -204,6 +210,21 @@ free_gpus() {
 
 claim_gpus() {
   local waited=0 got
+  if [ -n "$GPUS" ]; then
+    # Validate the pin rather than trusting it.
+    local n_pin busy
+    n_pin=$(echo "$GPUS" | tr ',' '\n' | grep -c .)
+    busy=$(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits 2>/dev/null \
+           | awk -F"[, ]+" -v t="$GPU_FREE_MIB" -v want=",$GPUS," \
+                 '"'"'index(want, ","$1",") && $2+0 >= t {printf "%s(%sMiB) ", $1, $2}'"'"')
+    if [ -n "$busy" ] && [ "$GPUS_FORCE" != "1" ]; then
+      log "GPUS=$GPUS was pinned but these already hold memory: $busy"
+      log "Someone else may be using them. Set GPUS_FORCE=1 to proceed anyway."
+      return 1
+    fi
+    [ $((n_pin % 2)) -eq 1 ] && log "WARNING: GPUS=$GPUS is an odd count; AReaL splits train/rollout"
+    echo "$GPUS"; return 0
+  fi
   while :; do
     got="$(free_gpus)"
     local n=0
