@@ -341,6 +341,74 @@ all of them.
 
 ---
 
+## 2c. Frontis-MA1 / OpenRSI (2607.28568) — read 2026-08-31, and it changes the positioning
+
+**What it is.** Yang et al., Frontis-MA1: a 35B agent post-trained for machine-learning
+engineering, plus **OpenMLE**, a released full-stack system for recursive self-improvement.
+Four atomic program-evolution operators -- **Draft** (write a program), **Improve** (refine a
+parent using execution feedback), **Debug** (repair a failure), **Crossover** (recombine two
+parents) -- composed into long-horizon search. Trained with execution-grounded SFT *and* RL on
+data deduplicated against every evaluation benchmark.
+
+**Reported.** MLE-Bench Lite, 12h/task on ONE RTX 4090 capped at 12 GB: base **39.39%** medal
+average, OpenMLE-Evo **60.61%**, OpenMLE-Evo-Max **71.21%**. Held-out NatureBench Lite:
+Match-SOTA 50% -> 70% by swapping in the trained model.
+
+**Released.** `github.com/FrontisAI/OpenRSI` under **CC BY-NC 4.0** (non-commercial; NOTICE
+covers third-party terms). Weights on HF: `FrontisAI/Frontis-MA1-35B` and
+`FrontisAI/Frontis-MA1-30B`, plus GGUF. Training code is included, not just inference:
+`OpenMLE-ERL/SFT/`, `OpenMLE-ERL/RL/`, `OpenMLE-Evo/`.
+
+**They state their own limitation**, which is worth copying: the Evo-Max number "changes the
+search system through benchmark-independent experience priors and asynchronous search, and
+should not be interpreted as a pure model gain." That is the same discipline this project uses
+for its own arms.
+
+### Why this is a problem for the current framing, stated plainly
+
+"Self-evolving LLM" now has a 35B system with released weights, a released stack, and a
+39->71 improvement on a real MLE benchmark. **Our measured position is a three-way null at
+1.5B** (see the credit-signal entry in EXPERIMENTS.md): batch credit, per-prompt credit and
+random assignment are indistinguishable on MATH-500 and OlympiadBench. A per-group routing
+result at 1.5B is not competitive with that as a systems contribution, and pretending
+otherwise would not survive review.
+
+### Why it is also the best opening this project has had
+
+1. **It solves the scale blocker without training.** 27B and 32B both failed to train on these
+   boxes. Frontis-MA1-30B does not need training -- it needs serving, and an H200 at 141 GB
+   can do that. The base model stops being the bottleneck.
+2. **It supplies the harness action space M10 lacks.** Our `HarnessAction` axis is
+   `PROPOSE/VALIDATE/NONE`, is inert (nothing writes `can_evolve_harness`, `actor.py:283`
+   discards `.harness`), and is thin. Draft/Improve/Debug/Crossover is a concrete, trained,
+   evaluated operator set. It is exactly the consumer the axis has never had.
+3. **It supplies a frontier benchmark we can actually afford.** MLE-Bench Lite runs at
+   12h/task on a single 12 GB card. This is the code/SDE benchmark the project has wanted and
+   repeatedly deferred as unaffordable; it is not.
+4. **Their operators partition by FUNCTION, not by model-vs-harness.** Draft/Improve/Debug/
+   Crossover all evolve the program. Nothing in their operator set decides whether a
+   trajectory should improve the *policy* or the *harness* -- which is precisely the
+   orthogonal axis this project designed and which Co-Harness (2607.22688) forces into a
+   partition. That gap is where a contribution could sit.
+
+### The honest shape of a contribution on top of it
+
+Their stack decides WHICH operator to apply. It does not decide whether a trajectory's value
+lies in updating the model or in evolving the harness, and it does not address credit
+assignment for that decision. This project has: a measured result that per-batch scalar credit
+provably collapses every LinUCB arm to one parameter vector; a per-prompt credit mechanism;
+matched-proportion controls; and an orthogonal model/harness axis. Those transfer to their
+operator set in a way they do not transfer to a 1.5B GRPO run.
+
+**This is a pivot, and it should be called one.** The 1.5B routing results do not carry over
+as a headline; they carry over as METHODOLOGY (the controls, the credit analysis, the noise
+floors). Any adoption must respect CC BY-NC 4.0 and attribute both the paper and the stack.
+
+**Not yet done, and none of it should be claimed until it is:** nothing from OpenRSI has been
+downloaded, no weight has been served, MLE-Bench Lite has never been run here, and the
+operator set has not been mapped onto `HarnessAction`. The numbers above are THEIR reported
+numbers, read from the paper and repo on 2026-08-31, not reproduced.
+
 ## 2b. Methods to compare against, and code to reuse rather than reimplement
 
 Standing preference: **use the authors' own repo** where one exists.

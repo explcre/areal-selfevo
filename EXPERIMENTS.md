@@ -3,6 +3,78 @@
 Measured results and negative results, newest first. A claim only belongs here once it has
 been observed end to end; a prediction belongs in GOAL.md until then.
 
+## 2026-08-31 — Three credit signals, three training behaviours, ONE capability outcome
+
+All three arms at `globalstep149`, greedy, FULL benchmarks (`n_graded == n_problems` in every
+row), OlympiadBench at its per-task cap of 16384:
+
+| arm | credit signal | MATH-500 (n=500) | OlympiadBench (n=675) |
+|-----|---------------|------------------|------------------------|
+| `ctx` | per-batch scalar | 0.5240 [0.480, 0.567] | 0.1837 [0.156, 0.215] |
+| `rnd` | random at ctx's measured proportions | 0.5260 [0.482, 0.569] | 0.1837 [0.156, 0.215] |
+| `ctxpc` | per-prompt delta | 0.5160 [0.472, 0.560] | 0.1852 [0.158, 0.216] |
+
+**Spread on MATH-500 is 0.010 -- HALF the measured 0.020 noise floor.** On OlympiadBench it is
+0.0015 against a jitter of roughly one point (the same ctx checkpoint scored 0.1941 and 0.1837
+at two caps). Every interval overlaps every other. Nothing here separates.
+
+**This is a stronger result than the earlier null, and it is the one worth reporting.** The
+earlier finding was that a learned router does not beat random assignment at matched
+proportions. This adds that an arm whose TRAINING BEHAVIOUR was completely different lands in
+the same place. `ctxpc` suppressed RL to near zero for roughly 70 steps, drove its mode mix
+across an L1 range of 0.24-1.14 where the batch-credit arm never left 0.027-0.069, and revised
+its preferences repeatedly. `ctx` did none of that. `rnd` made no decisions at all. All three
+score the same on held-out math.
+
+So at this scale and on this task, **how the per-group routing decision is made does not reach
+the benchmark.** The intervention changes what the trainer does, visibly and measurably, and
+does not change what the model can do.
+
+**Scope, stated so this is not over-read.** One seed per arm, one checkpoint, one training task
+(GSM8K), one model scale (1.5B), and no `router=off` arm scored at 149 for an absolute
+reference. It does NOT show that routing is worthless in general; it shows that at 1.5B these
+three credit signals are interchangeable as far as held-out math capability is concerned, and
+that training-time metrics (mode mix, L1 from uniform, preference formation) are NOT a proxy
+for capability here. That last clause is the practical lesson: several hours were spent
+reading mode-mix trajectories that turned out to predict nothing.
+
+**Caveat on `ctxpc`:** it stalled at step 152 (see the stall entry) and its checkpoint at 149 is
+the last saved. That is the same step at which `ctx` and `rnd` were scored, so the comparison
+is matched -- but `ctxpc` never ran to 290 and no arm has a full-length score.
+
+## 2026-08-31 — Second stall at the same place: this is a pattern, not an incident
+
+`ctxpc` stopped advancing at **step 152/290**. `ctx` stopped at **step 162/290** earlier the
+same day. Two runs, two boxes' worth of hours, both dying in the 150-165 band.
+
+Signature at the stall, identical in both:
+
+* the train log stops advancing but keeps being WRITTEN -- so log-age alone is a weaker signal
+  than it looks; what is written is `ProxyRolloutServer INFO: Cleaned up N stale sessions`,
+  repeating with N in the 8-45 range;
+* all 8 GPUs drop to **0% utilisation** while still holding memory;
+* the worker processes stay alive (5 of them here), so nothing crashes and nothing is reaped;
+* `supervise.sh` does not fire, because its stall timeout is 1800s and the run sits under that
+  while the log keeps ticking with cleanup messages.
+
+**What this rules out.** Not OOM (no allocation failure, memory held steady). Not the router
+-- `ctx` was `credit="batch"` and `ctxpc` was `credit="prompt"`, and the H200 arm `ctx2` ran
+the SAME batch-credit config to a clean 290/290. Not the box: `ctx` and `ctxpc` both stalled
+on the A100 while `ctx2` and `ctxpcc` both passed the same step band on the H200.
+
+**The remaining candidate, not yet tested:** the rollout session pool. "Cleaned up N stale
+sessions" is the only thing the process still emits, and generation is what stops. The A100
+runs use `sglang.mem_fraction_static=0.7` on 80 GB cards; the H200 runs use the same fraction
+on 141 GB cards, so the absolute KV budget differs by ~1.7x. That is a difference between the
+two boxes that tracks the stall, and it is cheap to test by lowering the fraction on the A100.
+
+**Cost so far:** two runs killed at roughly half length, and the arm comparison at 290 steps
+is now unavailable on the A100 for any arm.
+
+**What was salvaged.** `saver.freq_steps=25` meant `ctxpc` had a checkpoint at `globalstep149`
+-- the SAME step at which `ctx149` and `rnd149` were scored -- so the stall cost the tail of
+the run but not the comparison. Scored rather than relaunched.
+
 ## 2026-08-31 — RETRACTION: the "silent-channel identity violation" was my own regex bug
 
 Two entries below -- "MEASUREMENT INTEGRITY: the decomposition violates its own identity",

@@ -14,6 +14,10 @@
 set -u -o pipefail
 LAUNCH="${1:?launch script}"; RUN="${2:?run dir}"
 MAX_RESTARTS="${3:-6}"; STALL_S="${4:-1200}"; STARTUP_S="${5:-900}"
+# Poll period. Configurable ONLY so the stall guard can be tested in seconds instead
+# of minutes -- a watchdog that cannot be exercised is a watchdog nobody has checked,
+# and this one silently failed to fire on two real stalls.
+POLL_S="${POLL_S:-120}"
 LOG="$RUN/train.log"; SUP="$RUN/supervisor.log"
 TAG=$(basename "$LAUNCH" .sh)
 mkdir -p "$RUN"
@@ -31,7 +35,7 @@ for attempt in $(seq 0 "$MAX_RESTARTS"); do
   # Stall watchdog for this attempt.
   ( started=$(date +%s)
     while kill -0 "$RUN_PID" 2>/dev/null; do
-      sleep 120
+      sleep "$POLL_S"
       # Startup fuse: the log may be growing with server boot chatter while no training step
       # has ever appeared, in which case the stall check below never fires.
       if ! grep -qE "step [0-9]+/" "$LOG" 2>/dev/null; then
@@ -47,9 +51,28 @@ for attempt in $(seq 0 "$MAX_RESTARTS"); do
         fi
         continue
       fi
+      # PROGRESS, not log growth. Measured twice on 2026-08-31: `ctx` died at step 162 and
+      # `ctxpc` at step 152, and in BOTH cases this watchdog never fired, because the
+      # rollout proxy kept writing `ProxyRolloutServer INFO: Cleaned up N stale sessions`
+      # into the same log every few seconds for the entire stall. File mtime therefore
+      # stayed fresh while training was dead -- 16 minutes undetected in one case, 40 in
+      # the other. A log that is growing is not a run that is progressing, and the only
+      # thing that distinguishes them is whether the step counter moves.
+      #
+      # mtime is KEPT as a second signal: a log that stops entirely is also dead, and that
+      # is the case this check caught correctly before.
+      cur_step=$(grep -aoE "step [0-9]+/" "$LOG" 2>/dev/null | tail -1 | grep -oE "[0-9]+")
+      now=$(date +%s)
+      if [ -n "$cur_step" ] && [ "$cur_step" != "${last_step:-}" ]; then
+        last_step="$cur_step"; last_step_at="$now"
+      fi
+      : "${last_step_at:=$now}"
+      step_age=$(( now - last_step_at ))
       mt=$(stat -c %Y "$LOG" 2>/dev/null || echo 0)
-      age=$(( $(date +%s) - mt ))
-      if [ "$mt" -gt 0 ] && [ "$age" -gt "$STALL_S" ]; then
+      age=$(( now - mt ))
+      if [ "$step_age" -gt "$STALL_S" ]; then
+        say "WATCHDOG: no step past ${last_step:-?} for ${step_age}s (> ${STALL_S}s); log mtime age is only ${age}s, so the log was still being written while training was dead; dumping stacks then killing"
+      elif [ "$mt" -gt 0 ] && [ "$age" -gt "$STALL_S" ]; then
         say "WATCHDOG: $LOG stalled ${age}s (> ${STALL_S}s); dumping stacks then killing"
         for pid in $(pgrep -u "$USER" -f "rpc_server.*--role actor" | head -4); do
           say "--- stacks for $pid ---"
