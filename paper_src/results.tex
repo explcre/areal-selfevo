@@ -272,6 +272,248 @@ the limits plainly: $n=11$ batches for the MATH column against $98$ for GSM8K, o
 one scale, and --- the lesson of Sec.~\ref{sec:solvedbranch} --- locating mass is not the same
 as showing that acting on it helps.
 
+\subsection{The learned router does not beat its matched control}
+\label{sec:routernull}
+
+Sec.~\ref{sec:controller} names the control that decides this claim: \texttt{router=random}
+run at the contextual arm's \emph{measured} mode proportions, so the two arms differ only in
+\emph{which} unit receives which mode and not in the mixture. Those proportions were read off
+the last $40$ steps of the contextual run (\texttt{ctx}, $64$ groups per step) --- rl
+$0.2946$, sft $0.3527$, skip $0.3526$ --- and the control (\texttt{rnd}) was run at exactly
+them. Both arms are scored from \texttt{globalstep149} of their own run, GSM8K training,
+Qwen2.5-1.5B-Instruct, greedy decoding (temperature $0$, seed $0$). That step is the matched
+comparison point rather than a chosen one: the contextual run stalled at step $162$ of $290$
+while the control reached $245$, so $149$ is the latest checkpoint the two arms share.
+
+\begin{table}[t]
+\centering\small
+\caption{Learned router (\texttt{ctx}) against its matched-proportion control (\texttt{rnd}),
+both at \texttt{globalstep149}, greedy. Wilson $95\%$ intervals in brackets. MATH-500, AMC23
+and AIME are scored at \texttt{max\_tokens}${=}3072$ and OlympiadBench at $16384$; arms are
+compared only against each other at the same budget.}
+\label{tab:routernull}
+\begin{tabular}{lcccc}
+\toprule
+benchmark & $n$ & ctx & rnd & ctx $-$ rnd \\
+\midrule
+MATH-500      & 500 & 0.5240 $[0.480, 0.567]$ & 0.5260 $[0.482, 0.569]$ & $-0.0020$ \\
+OlympiadBench & 675 & 0.1837 $[0.156, 0.215]$ & 0.1837 $[0.156, 0.215]$ & $+0.0000$ \\
+AMC23         & 40  & 0.1750 $[0.087, 0.320]$ & 0.1250 $[0.055, 0.261]$ & $+0.0500$ \\
+AIME24        & 30  & 0.0000 $[0.000, 0.114]$ & 0.0000 $[0.000, 0.114]$ & $\phantom{+}0.0000$ \\
+AIME25        & 30  & 0.0000 $[0.000, 0.114]$ & 0.0333 $[0.006, 0.167]$ & $-0.0333$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Stated positively rather than as an absence: \textbf{at matched mode proportions, the
+per-unit routing decision buys nothing over assigning the same modes at random.} What this
+routing arm sets is the \emph{mixture}; which unit receives which mode carries no effect the
+suite can measure.
+
+\paragraph{Which rows can carry that claim, and which cannot.} Only the first two. MATH-500's
+$-0.0020$ is one tenth of the $0.020$ systematic noise floor measured for greedy scoring on
+this suite (Sec.~\ref{sec:trainreward} measures $0.0220$ on MATH-500 itself), and
+OlympiadBench returns the same score on both arms to four decimals over $675$ problems. The other three rows resolve nothing: at $n=40$ and $n=30$ the Wilson intervals span
+more than $20$ points, so AMC23's $+0.0500$ and AIME25's $-0.0333$ --- one problem out of
+thirty --- sit well inside them, and AIME24's $0.000$ on both arms is this scale's known floor
+rather than a comparison. One caveat on the intervals themselves: they are per-arm Wilson
+intervals, not the paired intervals on differences this section reports elsewhere. The paired
+test was not run for this pair, so what bounds the two resolving rows is the noise floor, not
+an interval on the difference.
+
+\paragraph{What a real effect on OlympiadBench would have to clear.} A single greedy score at
+$n=675$ carries about a point of jitter: the \emph{same} \texttt{ctx} checkpoint on the
+\emph{same} $675$ problems scored $0.1941$ at \texttt{max\_tokens}${=}8192$ and $0.1837$ at
+$16384$, with nothing changed but the budget. A future arm difference below roughly two points
+on this benchmark is therefore not evidence, and $+0.0000$ is far inside that. Both arms also
+leave generations that never emit a boxed final answer at any budget --- $78/675$ for ctx and
+$64/675$ for rnd at $16384$, against $79$ and $61$ at $8192$ --- so the truncation these rows
+carry is non-termination rather than a budget-bound score, and doubling the cap does not
+remove it.
+
+\paragraph{Scope, and what this does not claim.} One seed, one checkpoint, one training task,
+one model scale. It falsifies ``this router, with this credit signal, beats its matched
+control''. It does not show that routing cannot help, and by construction it says nothing
+about the mixture, on which the two arms are matched. Sec.~\ref{sec:credit} localises the
+failure, and the failure is not the bandit.
+
+\subsection{Why the router does not learn: the credit signal, not the bandit}
+\label{sec:credit}
+
+This subsection and the next report the controller's own training-time behaviour --- the mode
+mix it emits --- and not capability. They are diagnostics of a mechanism, not results on a
+held-out benchmark, and are labelled as such throughout.
+
+Under per-batch credit the router never developed a preference. Table~\ref{tab:batchcredit}
+gives its mode mix by quarter over the first $129$ logged steps of \texttt{ctx}.
+
+\begin{table}[t]
+\centering\small
+\caption{Mode mix under per-batch credit. \texttt{ctx}, GSM8K, Qwen2.5-1.5B-Instruct, first
+$129$ logged steps at $64$ groups per step. $L_1$ is the distance of the quarter's mean mix
+from uniform thirds; $1.33$ would be total concentration on one mode.}
+\label{tab:batchcredit}
+\begin{tabular}{lcccc}
+\toprule
+quarter (steps) & rl & sft & skip & $L_1$ vs.\ uniform \\
+\midrule
+Q1 ($1$--$32$)   & 0.305 & 0.341 & 0.354 & 0.056 \\
+Q2 ($33$--$64$)  & 0.299 & 0.338 & 0.363 & 0.069 \\
+Q3 ($65$--$96$)  & 0.351 & 0.303 & 0.346 & 0.061 \\
+Q4 ($97$--$129$) & 0.344 & 0.320 & 0.336 & \textbf{0.027} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The mix stays at uniform thirds and the trend is flat to \emph{decreasing} --- the last
+quarter is the most uniform of the four. A learner should move \emph{away} from uniform as its
+arm estimates separate; this does the opposite.
+
+\paragraph{Feedback was flowing, not blocked.} The absence is not a plumbing failure. Over
+those $129$ steps the router received $128$ feedback records, each covering all $64$ units of
+its batch, with exactly one batch in the whole run refused as confounded (a batch whose units
+all took one mode carries no comparison, and its update is skipped rather than made). The
+batches were not degenerate either: the most common mode's share stays between $0.352$ and
+$0.766$; all three modes are present in $95$ of the $128$ records, and the count never falls
+below $2.25$; and the weak-attribution flag, which fires when one mode exceeds $90\%$ of the
+units, reads $0$ in $108$ of the $128$ and never exceeds $0.5$. Both counts are averaged over
+four data-parallel ranks, which is why they are fractional: a value below $3$ means one
+rank's view of the batch was short a mode, not that the batch itself was. The router got $128$
+updates on batches that carried a comparison and formed no preference from them.
+
+\paragraph{The mechanism, as an argument.} LinUCB accumulates, for the arm $m$ that was
+chosen,
+%
+\[
+  A_m \;\leftarrow\; A_m + x x^\top,
+  \qquad
+  b_m \;\leftarrow\; b_m + r\,x ,
+  \qquad
+  \theta_m \;=\; A_m^{-1} b_m .
+\]
+%
+Per-batch credit gives every unit in the batch the same $r$, and under a cold start that
+assigns modes independently of the context $x$, an arm chosen $n_m$ times accumulates
+$A_m \approx n_m\,\mathbb{E}[x x^\top]$ and $b_m \approx r\,n_m\,\bar x$, so
+%
+\[
+  \theta_m \;\approx\; \bigl(n_m\,\mathbb{E}[x x^\top]\bigr)^{-1} r\,n_m\,\bar x
+           \;=\; \mathbb{E}[x x^\top]^{-1} r\,\bar x ,
+\]
+%
+which is \emph{the same vector for every arm}: the per-arm count cancels. The arms start
+identical and stay near-identical, selection is left to the exploration bonus, and the mix
+stays uniform. This rules out ``the router needs more steps'': an uninformative signal does
+not become informative with repetition.
+
+\paragraph{The mechanism, as a measurement.} The argument is turned into a test in
+\texttt{selfevo/tests/test\_credit\_assignment.py}, which drives the same registry-built
+router for $60$ batches of $64$ units and changes \emph{only} the credit (seed $0$, the
+default the test runs at). Under a shared
+per-batch scalar the largest pairwise distance between two arms' parameter vectors is $0.124$
+and no mode takes more than $0.379$ of the units (the test asserts $<0.5$ and $<0.55$). Under
+credit that depends on which mode was applied, the same router separates to $1.500$ and the
+rewarded mode takes $0.989$ of the units (asserted $>1.0$ and $>0.5$). Same bandit, same
+contexts, same number of updates, opposite outcome --- so the null of
+Sec.~\ref{sec:routernull} localises to the credit signal, not to the controller or its
+exploration.
+
+\subsection{Per-prompt credit changes the router's behaviour; centring the credit does not}
+\label{sec:promptcredit}
+
+The implied fix is to credit each decision with its own prompt's change in solve rate between
+the batch where it was routed and that prompt's next appearance, rather than with one scalar
+per batch. Table~\ref{tab:promptcredit} is the same measurement as
+Table~\ref{tab:batchcredit} on the arm that does this (\texttt{ctxpc}, identical to
+\texttt{ctx} except for the credit).
+
+\begin{table}[t]
+\centering\small
+\caption{Mode mix under per-prompt credit. \texttt{ctxpc}, GSM8K, Qwen2.5-1.5B-Instruct,
+first $85$ logged steps at $64$ groups per step; the run was still training when these were
+read. Compare $L_1$ against $0.027$--$0.069$ for per-batch credit
+(Table~\ref{tab:batchcredit}).}
+\label{tab:promptcredit}
+\begin{tabular}{lcccc}
+\toprule
+quarter (steps) & rl & sft & skip & $L_1$ vs.\ uniform \\
+\midrule
+Q1 ($1$--$21$)  & 0.905 & 0.046 & 0.049 & \textbf{1.144} \\
+Q2 ($22$--$42$) & 0.381 & 0.405 & 0.214 & 0.239 \\
+Q3 ($43$--$63$) & 0.000 & 0.353 & 0.647 & 0.667 \\
+Q4 ($64$--$85$) & 0.006 & 0.431 & 0.562 & 0.655 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The mix stops being uniform, and it revises: $L_1$ swings between $0.239$ and $1.144$ where
+per-batch credit never left $0.027$--$0.069$. Only the credit changed --- same router, same
+features, same exploration --- so the difference is attributable to the signal.
+
+\paragraph{The transition is abrupt, and it coincides with the first credit.} Per-prompt
+credit reaches nothing until a prompt recurs. \texttt{prompt\_credit/observed\_units} is
+exactly $0$ for steps $1$--$28$ and first non-zero at step $29$ ($4.25$ of $64$ units); the
+first step whose \texttt{rl\_groups} is $0$ is step $30$, the step immediately after. Before
+the credit arrives the arm is not routing on evidence at all: after three cold-start steps
+near uniform thirds ($0.352$, $0.328$, $0.332$ rl), steps $4$--$29$ sit at exactly $1.000$ rl.
+That is the documented tie-break artifact --- with no \texttt{observe} calls the arm
+parameters never move, the scores tie, and \texttt{argmax} resolves alphabetically to
+\textsc{rl} --- so the pre-transition plateau is not a preference either.
+
+\paragraph{Centring the credit changes essentially nothing, which kills the obvious
+confound.} The credited value is a prompt's change in solve rate across roughly $29$ steps of
+training, over which the policy improves generally; the signal therefore conflates ``the model
+got better'' with ``this mode helped this prompt''. Subtracting the batch's mean delta removes
+the common component. Matched over the first $89$ logged steps of each arm:
+
+\begin{table}[t]
+\centering\small
+\caption{RL share of the batch under raw (\texttt{ctxpc}) and batch-mean-centred
+(\texttt{ctxpcc}) per-prompt credit, matched over the first $89$ logged steps of each arm.}
+\label{tab:centring}
+\begin{tabular}{lcc}
+\toprule
+steps & raw & centred \\
+\midrule
+$1$--$15$  & 0.867 & 0.870 \\
+$16$--$30$ & 0.933 & 0.933 \\
+$31$--$89$ & 0.003 & 0.001 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The two arms are the same arm to within a third of a point in every window, and the common
+trend that centring removes is small: \texttt{prompt\_credit/mean\_delta} is exactly $0$ for
+the $28$ steps before credit flows and lies in $0.005$--$0.090$ (median $0.049$) afterwards.
+Removing the common trend does not move the behaviour, so \textbf{the training-progress
+confound is not the explanation} for the collapse away from \textsc{rl}.
+
+\paragraph{The surviving hypothesis, labelled as one.} What remains is that the transition is
+driven by the \emph{exploration bonus} rather than by the credit values: the heavily-used arm
+is the first to have its $A$ updated, so its confidence bonus is the first to shrink, and the
+untouched arms become relatively more attractive whatever the credit says. This predicts
+exactly the value-independence observed above, and it predicts self-correction once the
+bonuses equilibrate. The second prediction is at least not contradicted --- the raw arm's rl
+share returns from $0.000$ across steps $43$--$63$ to a mean of $0.336$ over steps
+$120$--$132$ ($0.26$ at step $130$) and $0.367$ over steps $115$--$152$, the last step logged
+when this was read --- but that is an
+observation on a run that is still training, not a test. \textbf{This has not been tested.}
+Two things would settle it. Logging the two terms of the LinUCB score separately at the
+transition: bonus exhaustion requires that the point estimates $x^\top\theta_m$ are still tied
+when the ranking flips, and is dead if they had already separated in favour of \textsc{sft}
+and \textsc{skip} before step $30$. And re-running the same credit with the exploration
+coefficient at zero: if the transition survives, it was never the bonus.
+
+\paragraph{Scope, and what this does not claim.} One arm per credit variant, one seed, one
+task, one scale, and both runs unfinished at the step counts quoted. Nothing here is a
+capability claim: \textbf{neither credit arm has been scored on the
+held-out suite}, and a mix that moves is not a mix that helps --- especially this one, which
+drives \texttt{rl\_groups} to zero, so that no group receives an ordinary policy gradient and
+every group is either supervised on its own correct sample or skipped. Sec.~\ref{sec:solvedbranch}
+measures that branch inert at $c_+=0.5$ and harmful at $c_+=2.0$, which is a reason to expect
+this regime to cost capability rather than to gain it. Until a scored arm exists, this is a
+demonstration that the credit signal controls the router's behaviour, and nothing more.
+
 \subsection{Not yet measured}
 
 Stated explicitly so the gap is not mistaken for an omission: whether training on the
