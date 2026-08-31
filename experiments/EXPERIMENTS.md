@@ -2484,3 +2484,52 @@ method now rests on the composition-flip claim -- that a harder task moves mass 
 to unsolved. That run (MATH-lighteval, routing off, measuring the natural composition) is
 live on the A100 as of this hour. If the composition does not flip, the honest paper is a
 negative one: a large, cheaply reachable channel in GRPO that is not worth reaching.
+
+---
+
+## THE COMPOSITION FLIPS. Registered in advance, and it holds
+
+The claim the method rests on, after the solved branch was abandoned: *a harder task moves the
+silent channel from solved-dominated to unsolved-dominated*. It was written into GOAL.md and
+this file BEFORE the run, as the thing that would decide whether the paper is positive or
+negative. Measured now on the same model (Qwen2.5-1.5B-Instruct), same config, differing only
+in the training task.
+
+| | GSM8K (step0l) | **MATH-lighteval (math-off)** |
+|---|---|---|
+| batches measured | 98 | 11 |
+| `silent_group_fraction` | 0.359 | **0.419** |
+| `solved_group_fraction` | 0.315 | **0.164** |
+| `unsolved_group_fraction` | 0.045 | **0.255** |
+| **solved share of the silent channel** | **87.5%** | **39.1%** |
+| **unsolved share** | 12.5% | **60.9%** |
+
+**The channel does not shrink -- it inverts.** Silence stays about the same size (0.36 vs
+0.42), but on the harder task the MAJORITY of it is unsolved rather than solved. In absolute
+terms the unsolved fraction of all groups goes from 4.5% to 25.5%, a **5.7x** increase, while
+the solved fraction roughly halves.
+
+**Why this rescues the method from the negative result.** The solved branch was measured inert
+at weight 0.5 and actively harmful at 2.0, and it was 87.5% of the channel on GSM8K -- which
+made the whole silent channel look worthless. On MATH that branch is only 39% of it. The
+unsolved branch, which has no self-target and for which a teacher or the harness is the ONLY
+possible consumer, is now the larger half and 5.7x bigger in absolute terms. The method's
+value was always predicted to live there; this is the first evidence that "there" is a real
+place rather than a rounding error.
+
+**Stated limits, because n is small and this is the load-bearing result:**
+
+* **n = 11 batches** against 98 for the GSM8K figure. The effect is enormous relative to the
+  spread (solved share 39.1% vs 87.5%, with GSM8K's per-batch range never dipping below 82.7%)
+  so it is not a sampling artefact, but the MATH numbers will be restated at full n.
+* This is ONE model at ONE scale. Whether the flip also tracks model capability is being
+  measured now on the H200 (same task, Qwen2.5-7B-Instruct), which is the second axis.
+* It says where the reachable mass IS, not that acting on it helps. The solved branch taught
+  exactly that lesson: reachable and worthless are compatible. The unsolved branch still has
+  no teacher and no harness consumer, so nothing has yet been shown to USE this mass.
+
+**What it changes about the paper.** The honest framing stops being "a large channel that is
+not worth reaching" and becomes "a large channel whose composition -- and therefore the right
+intervention -- depends on task difficulty, measured across two tasks that invert it".
+Routing on the SIDE of silence is what adapts across that shift, and that is a claim a fixed
+rule keyed on a single scalar cannot make.
