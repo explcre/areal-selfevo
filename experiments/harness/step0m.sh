@@ -82,6 +82,20 @@ KEYFILE="$HOME/.areal_admin_key"
 KEY=$(cat "$KEYFILE")
 [ -n "$KEY" ] || { echo "no admin key found"; exit 2; }
 
+# Refuse to start on GPUs that already hold memory. A previous run's sglang servers carry no
+# experiment name, so an experiment-scoped kill leaves them alive holding ~66 GB each; the new
+# run's servers then stack on top and the job dies with "Failed to CUDA calloc" tens of
+# minutes later, after the weights are already partially updated. Cheaper to refuse here.
+GPU_BUSY_MIB="${GPU_BUSY_MIB:-2048}"
+busy=$(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits \
+       | awk -F", " -v t="$GPU_BUSY_MIB" '$2 > t {printf "%s(%sMiB) ", $1, $2}')
+if [ -n "$busy" ]; then
+  echo "REFUSING TO LAUNCH: GPUs already hold memory: $busy" | tee -a "$LOG"
+  echo "Free them first (sglang servers survive an experiment-scoped pkill), or raise" | tee -a "$LOG"
+  echo "GPU_BUSY_MIB if this is deliberate co-tenancy." | tee -a "$LOG"
+  exit 4
+fi
+
 echo "=== ${EXP}: ARM=${ARM} SOLVED_ADV=${SOLVED_ADV} args=${ROUTING_ARGS[*]:-none} ===" >> "$LOG"
 
 python3 examples/math/gsm8k_rl.py \
