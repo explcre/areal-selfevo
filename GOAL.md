@@ -36,12 +36,15 @@ meta-controller, with a **validity condition** saying when each choice is legiti
 Legend: **DONE** built + tested + audited · **PARTIAL** exists but incomplete or unproven ·
 **NOT BUILT** declared only.
 
-**Scoreboard (2026-08-30, after the group-routing work).** Method **8 DONE / 2 PARTIAL /
-10 NOT BUILT**; Engineering **6 DONE / 2 PARTIAL**; Benchmarks **4 DONE / 1 PARTIAL /
+**Scoreboard (2026-08-31, after the controller work).** Method **9 DONE / 6 PARTIAL /
+7 NOT BUILT**; Engineering **6 DONE / 2 PARTIAL**; Benchmarks **4 DONE / 1 PARTIAL /
 10 NOT BUILT**. So: **no, the goal is not implemented.** What IS complete is one vertical
 slice -- measure the silent channel, decompose it, act on it, verify end-to-end -- and that
-slice is the paper's spine. Most remaining NOT BUILT rows are breadth (other benchmarks,
-other axes), not depth on the central claim.
+slice is the paper's spine. The controller components now exist and are audited, but note how
+many read **PARTIAL for the same reason**: they are built and tested as components and have
+**no caller in training**. Until `actor.py` calls a Router instead of hardcoding the rule,
+`router=contextual` and `router=code_policy` are registry entries, not arms. That single
+wiring step is what turns six PARTIAL rows into a running experiment.
 
 ### Method
 
@@ -54,14 +57,16 @@ other axes), not depth on the central claim.
 | M5 | RL/reverse-KL mix per token | **DONE** | extends AReaL's own `rl_loss_weight`/`distill_loss_weight` |
 | M6 | SFT / forward-KL modes | **PARTIAL** | SFT now REACHES the update for solved groups (a constant on their zero advantages IS the supervised step). Forward-KL still a name |
 | M7 | **Teacher** supplying routed units | **NOT BUILT** | DEMOTED by measurement: reaches only ~4.5% of groups. The free self-target covers 31.4% and is built |
-| M8 | Learned meta-controller | **NOT BUILT** | `EVOLVE_POLICIES` = bare strings |
+| M8 | Learned meta-controller | **PARTIAL** | `ContextualBanditRouter` (LinUCB over 7 features) built, audited, 29/29 mutants, demonstrably learns on a clean reward. Registered in `ROUTERS` + `EVOLVE_POLICY_FACTORIES`. **No caller in training** |
 | M9 | Rule evolve-policy (cold start + baseline) | **NOT BUILT** | needed before "learned" is falsifiable |
 | M10 | Evolve model / harness / reward | **PARTIAL** | `HarnessAction` axis built, audited, 18/18 mutants. **No consumer**: nothing writes `can_evolve_harness`, nothing reads the action. Reward axis still a name |
 | M11 | Cadence: frozen / alternating / simultaneous | **NOT BUILT** | `CADENCES` = bare strings |
 | M12 | Evolvable reward formula | **NOT BUILT** | |
-| M13 | MEDS reward shaping | **NOT BUILT** | `SHAPERS = {"none": None}` |
+| M13 | MEDS clustering | **PARTIAL** | `_cluster_with_hdbscan` + `_classify_with_knn` vendored VERBATIM; verified to recover 2 modes. Deps not installed on training boxes; not yet a controller feature |
 | M14 | BigBang two-level critic | **NOT BUILT** | `"two_level": None` |
-| M15 | Trajectory observability → policy inputs | **NOT BUILT** | |
+| M15 | Trajectory observability → policy inputs | **PARTIAL** | `observability.py`, 7 features at zero extra compute, 27/29 mutants (2 equivalent). **No caller in training** |
+| M21 | Code-as-policy (`learned_code`) | **DONE** | AST allowlist + subprocess cost-vetting; ~150 adversarial policies, 26/26 mutants. 2 escape families documented as unclosable by any AST rule |
+| M22 | Decision→advantage seam | **PARTIAL** | `group_apply.py` built; actor still hardcodes the rule, so routers decide nothing in training |
 | M18 | Per-**group** routing (the silent channel) | **DONE** | in `_compute_advantages`; 17 tests on the REAL path, 7/7 mutants; verified firing live (`routed == solved`, diff 0.00e+00) |
 | M19 | Free self-target (RFT on solved groups) | **DONE** | `solved_advantage`; needs no teacher; reach 31.4% and RISING to 60% |
 | M20 | Unlikelihood on unsolved groups | **DONE** | `unsolved_advantage`, sign-guarded; reach only ~3.7% at this operating point |

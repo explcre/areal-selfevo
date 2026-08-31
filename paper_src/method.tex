@@ -145,6 +145,54 @@ difference cannot be attributed to an incidental change of configuration.
 
 
 
+\subsection{Who decides: from a threshold to a controller}
+\label{sec:controller}
+
+Everything above specifies an action space. What chooses within it is a separate question,
+and it is where the contribution lies --- a rule keyed on $\hat p$ is a heuristic, and a
+learned policy that sees only $\hat p$ cannot beat the best threshold on $\hat p$ by more
+than noise. We therefore give the controller features, and instantiate it three ways so the
+comparison is an ablation rather than a demonstration.
+
+\paragraph{Features, at zero marginal cost.} Each unit is described by seven statistics
+computed from tensors the batch \emph{already carries} --- rewards, the loss mask, and the
+sampled log-probabilities. No extra forward pass, no extra generation. The constraint is
+deliberate: a feature set needing its own inference budget would have to beat spending that
+budget on more rollouts, which is a far higher bar than beating a threshold. Two of the seven
+carry information $\hat p$ cannot: the \emph{truncated fraction} separates a unit that failed
+from one that merely ran out of budget, and the \emph{log-probability dispersion} separates a
+group unanimous in its answer from one also unanimous in its reasoning. A solve-rate
+threshold collapses both distinctions by construction.
+
+\paragraph{Three controllers, one action space.}
+%
+\begin{itemize}
+  \item \textbf{Rule} --- thresholds on $\hat p$, as in \eqref{eq:rule}. The baseline the
+        others must beat, not a strawman: it encodes the exact zero-gradient condition.
+  \item \textbf{Learned weights} --- LinUCB, one ridge model per mode over the features,
+        updated from observed outcomes. Ridge rather than a network because the outcome
+        channel is confounded and low-signal --- one scalar per batch, produced by every
+        decision in it --- and capacity would mostly fit that noise.
+  \item \textbf{Learned code} --- the policy is generated \emph{source}, validated against an
+        allowlist and cost-vetted in a subprocess before adoption. Strictly larger
+        hypothesis class than weights: it can compose features into ratios and nested cases
+        rather than only reweighting them.
+\end{itemize}
+%
+\paragraph{The control that decides the claim.} A fourth arm shuffles which units receive
+which mode while holding the \emph{proportion} of units in each mode fixed. Without it, a
+controller that helps cannot be distinguished from a change in how much SFT the run did ---
+and the latter is not a controller at all. Any improvement reported for the learned arms is
+the improvement over this control, not over the fixed rule alone.
+
+\paragraph{What we verify about the learned arm, and what we do not.} On a synthetic
+environment whose two regions differ \emph{only} in the truncated fraction, with $\hat p$
+held identical, the contextual controller reaches the optimal mode in both regions across
+seeds, while a context-free bandit on the same stream provably cannot exceed $0.5$ in the
+worse region. That establishes the mechanism can use a feature a threshold cannot see. It
+does \emph{not} establish that it learns under the confounded batch-level channel of a real
+run, which is a separate claim and is not made here.
+
 \subsection{The procedure, end to end}
 \label{sec:algo}
 

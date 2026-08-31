@@ -42,6 +42,13 @@ We adopt this directly as the learned instantiation of our cluster key, against 
 key computed from the silence side of \eqref{eq:irl}; the two are a controlled ablation of
 \emph{how} to cluster, holding what is done with the clusters fixed.
 
+\paragraph{Policies as weights and as code.} Contextual bandits are the standard tool for
+per-instance algorithm selection under a scalar reward, and we use LinUCB unmodified; the
+contribution is not the estimator but what it is given to see. Generating a policy as
+executable source is the other established line, and we adopt it as a distinct arm rather
+than an alternative implementation, because the two differ in hypothesis class rather than in
+optimiser: weights reweight the features they are handed, code composes them.
+
 \paragraph{Evaluation practice.} Recent evaluation work documents how often agent results
 fail to survive controls that were available at the time. We adopt its checks as
 requirements rather than as discussion: paired tests on shared items, intervals reported on
