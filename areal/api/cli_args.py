@@ -1763,10 +1763,33 @@ class GroupRoutingConfig:
             The default is ``"batch"`` so this changes nothing unless asked for, and the three
             form an ablation ladder on exactly one axis: what the router is told about its own
             decisions.
+        decision: What is done with the WEIGHTS a router returns.
+
+            ``"argmax"`` (default, and what every run before this flag existed did) keeps the
+            single highest-weighted mode and discards the rest. ``RoutingDecision.weights``
+            has always been a ``Mapping[str, float]``, so a router able to say "60% SFT, 40%
+            RL" had that collapsed to "SFT" before it ever reached the advantage tensor, and
+            every soft router in the registry was run as a hard one.
+
+            ``"mixture"`` carries the weights through. A group's response-token advantages
+            become ``a * original + b * solved_advantage + c * 0`` for normalised weights
+            ``{rl: a, sft: b, skip: c}``. That is linear, and it reduces EXACTLY to the
+            ``"argmax"`` result whenever a router emits a one-hot decision, so the two are an
+            ablation pair on one axis -- whether soft routing is allowed to be soft -- rather
+            than two methods that happen to share a config block.
+
+            Feedback is deliberately NOT changed by this flag: a decision is still credited
+            under its argmax label, because ``DecisionOutcome`` carries one mode name and
+            there is no measured way to divide one prompt's change in solve rate among the
+            components of a mixture. A mixture arm therefore learns from a coarser signal
+            than it acts on. That is a stated limitation of this axis, not an oversight.
 
     Raises:
         ValueError: If either weight has the wrong sign, which is a footgun rather than a
-            preference.
+            preference; if ``credit`` or ``decision`` names a mode of operation that does
+            not exist; or if ``decision="mixture"`` is set without a ``router`` to emit the
+            weights. Every one of these is refused rather than defaulted, because a config
+            that quietly falls back reports an arm that never ran.
     """
 
     enabled: bool = False
@@ -1774,6 +1797,7 @@ class GroupRoutingConfig:
     unsolved_advantage: float = 0.0
     router: str | None = None
     credit: str = "batch"
+    decision: str = "argmax"
 
     def __post_init__(self):
         if self.credit not in ("batch", "prompt", "prompt_centered"):
@@ -1781,6 +1805,18 @@ class GroupRoutingConfig:
                 f"credit must be 'batch', 'prompt' or 'prompt_centered', got "
                 f"{self.credit!r}. An unknown value silently falling back to 'batch' would "
                 f"report a per-prompt-credit arm that never ran."
+            )
+        if self.decision not in ("argmax", "mixture"):
+            raise ValueError(
+                f"decision must be 'argmax' or 'mixture', got {self.decision!r}. An "
+                f"unknown value silently falling back to 'argmax' would report a mixture "
+                f"arm in which no mixture was ever applied."
+            )
+        if self.decision == "mixture" and not self.router:
+            raise ValueError(
+                "decision='mixture' requires a router: the fixed solved/unsolved rule emits "
+                "no weights, so this configuration would run the hardcoded constants and "
+                "report itself as a mixture arm."
             )
         if self.solved_advantage < 0:
             raise ValueError(
