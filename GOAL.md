@@ -594,6 +594,89 @@ all of them.
 
 ---
 
+## 2d. LongHorizon-Harness (2608.01964) — and THE DECISION about what this paper is
+
+**What it is.** Long-horizon execution reformulated as **task-state management**. The task
+state is held explicitly OUTSIDE execution and updated only with facts *independently verified
+from the environment*. The **Manage-Execute-Audit** loop: a *manager* maintains the state and
+picks the next subtask, a *fresh-context executor* performs it (so errors do not accumulate in
+a growing context), and a **read-only auditor verifies the resulting environment state** before
+the next round. An `AgentAdapter` makes model and harness backends interchangeable without
+modifying their native agent loops.
+
+**Reported.** Qwen3.7-Plus 51.8 -> **80.7** on WeaveBench, 69.7 -> **77.2** on Terminal-Bench
+2.1, 2.8 -> **8.3** on OSWorld 2.0; Claude Opus 4.7 20.0 -> **34.3** on an OSWorld 2.0 subset.
+Consistent across models, harnesses and domains. It appears to be **inference-time scaffolding**
+-- no training reported.
+
+### Why this is the most important paper for this project so far
+
+Read together with 2c, the two halves of our claimed axis are now BOTH occupied by strong,
+recent, released work:
+
+* **Model evolution** -- Frontis-MA1 trains a 35B agent over four program operators, 39 -> 71
+  on MLE-Bench Lite.
+* **Harness evolution** -- LongHorizon-Harness improves a *fixed* model by up to **+29 points**
+  with no training at all.
+
+That second number is the one to sit with. **A harness change bought +28.9 points on WeaveBench
+without touching a weight.** Every intervention this project has measured -- token routing,
+group routing, three credit signals -- moved capability by less than the noise floor. The
+harness side of the axis is where the effect sizes are, and we have been spending GPU-weeks on
+the model side at 1.5B.
+
+### What is STILL not owned, stated precisely
+
+Neither paper decides, per trajectory, **whether that trajectory's value belongs in the model
+or in the harness.** Frontis-MA1's four operators all evolve the program. LongHorizon-Harness
+improves the scaffold for every trajectory uniformly. Co-Harness (2607.22688) makes the choice
+but with a FIXED rule (success -> model, failure -> harness). Nobody routes it, and nobody has
+a credit signal for the routing.
+
+### The connection that makes this a paper rather than a wish
+
+Our own measurement says the binding constraint is credit: a per-batch scalar provably collapses
+every LinUCB arm to one parameter vector, and a per-prompt delta changed behaviour while moving
+no benchmark. OpenRSI's answer is execution-grounded credit. **LongHorizon-Harness's auditor
+already produces exactly that** -- independently verified facts about the environment state,
+per round, attached to the action that produced them.
+
+So the auditor's verdicts can BE the credit signal for a model-versus-harness router. That is
+not a wish: it is our measured requirement met by a released mechanism.
+
+### DECISION (2026-08-31): what this paper should be
+
+**Claim.** Long-horizon agent trajectories carry value for two different targets -- the policy
+and the scaffold -- and *which* target a trajectory should be spent on is decidable per
+trajectory, from execution-verified evidence, better than by the fixed rule Co-Harness uses or
+the uniform treatment both 2c and 2d apply.
+
+**Why it can beat SOTA rather than tie it.** The comparison is against a FIXED base model with
+a FIXED harness, adding only the routing decision. That is a delta at fixed base -- the only
+kind of result a reviewer does not discount as scaling. The baselines are strong and released,
+which makes the comparison meaningful rather than convenient.
+
+**Why it is innovative.** The orthogonal model/harness axis generalises Co-Harness's forced
+partition into an ablation; the credit signal is execution-grounded rather than reward-scalar;
+and the negative results already measured here (token routing null, group routing null, the
+LinUCB collapse proof) are the evidence that the naive versions do NOT work, which is what
+makes the working version worth reporting.
+
+**What this decision RETIRES.** Grinding further 1.5B GRPO routing arms. Result 7 already shows
+three credit signals producing one identical capability outcome; a fourth arm is a fourth
+indistinguishable number. Those runs become the paper's *negative-result* section and its
+methodology contribution, not its headline.
+
+**Falsifiers, named now.** (1) If the auditor's verdicts turn out to be too coarse to separate
+model-value from harness-value per trajectory, the credit problem is unsolved and the claim
+fails exactly as the 1.5B arms did. (2) If a fixed rule (Co-Harness's) matches the router at
+matched cost, the routing adds nothing and should be reported as such. (3) If harness gains
+dominate so completely that model updates never win the comparison, the axis is real but
+degenerate, and that is also a reportable finding.
+
+**Unverified:** nothing from 2608.01964 has been downloaded or run; code availability was not
+established from the abstract page. The numbers above are theirs as reported.
+
 ## 2c. Frontis-MA1 / OpenRSI (2607.28568) — read 2026-08-31, and it changes the positioning
 
 **What it is.** Yang et al., Frontis-MA1: a 35B agent post-trained for machine-learning
