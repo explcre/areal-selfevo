@@ -69,8 +69,8 @@ the same LinUCB router, the same features, the same exploration -- only the cred
 and it went from developing no preference to developing strong ones.
 
 **The timing is the evidence, not a coincidence.** `prompt_credit/observed_units` is 0 for
-steps 0-28 (no prompt has recurred yet) and first goes non-zero at step 29. The first step
-with `rl_groups == 0` is **step 29**. Before credit arrives the arm sits at ~100% RL, which is
+steps 0-28 (no prompt has recurred yet) and first goes non-zero at step 29. The first step with `rl_groups == 0` is **step 30**, the step immediately
+following. Before credit arrives the arm sits at ~100% RL, which is
 the documented tie-break behaviour: with no `observe()` calls the arms' parameters stay at
 their initial values, the scores tie, and `argmax` resolves alphabetically to `rl`. The moment
 real credit arrives the router abandons RL entirely.
@@ -244,7 +244,7 @@ mode -- not in the mixture.
 | AIME24 | 0.0000 | 0.0000 | 0.0000 | [0.000, 0.114] | [0.000, 0.114] |
 | AIME25 | 0.0000 | 0.0333 | -0.0333 | [0.000, 0.114] | [0.006, 0.167] |
 
-**MATH-500 is the only row with resolution, and it reads -0.0020** -- one fifth of the 0.020
+**MATH-500 is the only row with resolution, and it reads -0.0020** -- one TENTH of the 0.020
 systematic noise floor measured for greedy scoring here. AMC23 and AIME have 40 and 30
 problems, so their intervals span 20+ points and cannot separate anything.
 
@@ -373,10 +373,20 @@ from uniform as its arm estimates separate; this does the opposite. Per-step L1 
 of accumulating into a preference.
 
 **This is not the earlier exploration bug, and not a plumbing failure.** Feedback is flowing:
-128 feedback records, `n_modes=3` in every batch (so attribution is never vacuous),
-`n_units=64`, `weak_attribution=0.0` throughout, and exactly ONE `confounded_skips` in the
-whole run (the first batch, which has no predecessor). The router got 128 clean updates and
-learned nothing.
+128 feedback records, `n_units=64`, and exactly ONE `confounded_skips` in the whole run.
+CORRECTED 2026-08-31 against a boundary-anchored re-read of the log -- the first version of
+this entry overstated three of these:
+
+* `weak_attribution` is **not** 0.0 throughout. It is 0 in 108 of 128 records and reaches 0.5.
+* `n_modes` is **not** 3 in every batch. It reads 3 in 95 of 128 records, minimum 2.25. Both
+  counters are averaged over four data-parallel ranks, so a sub-3 value means one rank's view
+  was short a mode.
+* The single confounded skip is at **step 57**, not the first batch. The "no predecessor"
+  attribution was invented, not measured.
+
+The claim these support -- that feedback was flowing rather than blocked -- survives, and is
+backed additionally by `dominant_share` staying in [0.352, 0.766]. The router got 128 updates
+and learned nothing.
 
 **Mechanism, and it is structural rather than a tuning problem.** `batch_outcomes` credits a
 single scalar -- the change in mean raw reward between consecutive batches -- to every
