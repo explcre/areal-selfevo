@@ -330,6 +330,64 @@ applied to a vacuous attribution. Correct, and it has a consequence worth design
   failure for M23: an LLM-as-router asked to be decisive will collapse the mode distribution
   faster than a bandit with explicit exploration, and will therefore starve its own feedback.
 
+### The mode vocabulary is UNDER-FACTORED: three axes, not one list (2026-08-31)
+
+`TrainingMode` is a flat list -- `{rl, sft, distill, skip}` -- and that list conflates three
+independent choices. Asked directly whether the routed decision should instead pick, per unit,
+where the target comes from (teacher rollout, student rollout, oracle, ground truth) and what
+objective is applied (KL, reverse KL, CE, reward). It should, and the flat list is why we
+cannot currently ask that question.
+
+**Axis A -- where the TARGET tokens come from**
+
+| source | available without a teacher? | note |
+|---|---|---|
+| student's own rollout, filtered by reward | **yes** | the free self-target: a group with `solve_rate > 0` contains its own correct sample. Measured reach 29-33% of all groups |
+| student rollout, scored by a teacher | no | the on-policy distillation setting: student's distribution, teacher's judgement |
+| teacher's own rollout | no | off-policy; needs an importance correction the seam does not apply |
+| oracle / ground-truth reference | dataset-dependent | GSM8K and MATH ship reference solutions; most RL datasets do not |
+| none | yes | RL needs no target; SKIP uses nothing |
+
+**Axis B -- what OBJECTIVE is applied to it**
+
+| objective | what it optimises | where it already exists here |
+|---|---|---|
+| CE / max-likelihood on target tokens | mode of the target | this is what `sft` does, via a positive constant on a zero-advantage group |
+| forward KL to a teacher distribution | mass-covering | **name only** (M6 records forward-KL as unimplemented) |
+| reverse KL | mode-seeking | AReaL's own `distill_loss_weight` path (M5, DONE) |
+| policy gradient weighted by reward | expected reward | `rl` |
+| zero | nothing | `skip` |
+
+**Axis C -- whose distribution the SAMPLES came from**
+
+On-policy (student's current rollouts, importance ratio 1) versus off-policy (teacher rollouts
+or replay, needing correction). Everything routed today is on-policy, which is exactly why the
+self-target trick is sound: the policy-gradient step maximising `log p(y)` for a sampled `y`
+IS the supervised step on `y` when the ratio is 1.
+
+**What the current vocabulary actually spans.** `rl` = (no target, PG, on-policy). `sft` =
+(own correct sample, CE, on-policy) -- i.e. rejection-sampling FT. `skip` = null. `distill` is
+a registered NAME spanning an unspecified (teacher target, KL-family, on/off-policy) cell, and
+`apply_decisions` correctly refuses it rather than guessing which cell it means. So of a
+5 x 5 x 2 space we implement three cells and refuse one under-specified label.
+
+**Why factoring is worth doing, and why NOT yet as arms.** Factoring makes the interesting
+comparisons expressible: same target, different objective (CE vs reverse KL on the same
+self-target) isolates the objective; same objective, different target (CE on own-sample vs CE
+on oracle) isolates the target. Neither is askable with a flat list, and both are cheaper and
+sharper than adding whole new modes.
+
+But the measured position forbids running them as arms yet: three credit signals produced
+three very different training trajectories and ONE identical capability outcome. A finer
+factorisation multiplies the arms without touching the reason none of them separated. **The
+factorisation is a representational fix and a paper-framing asset; it is not an experiment.**
+
+**Concretely, the cheap first step** is to make `TrainingMode` carry `(target, objective)`
+rather than a bare name, keeping the three implemented cells bit-identical -- so the existing
+arms are unchanged by construction, and the vocabulary stops lying about how many choices are
+being made. That is a refactor with an exact-rollback property, exactly like the mixture seam,
+and it is the shape this repo has repeatedly shown it can verify.
+
 ### OPD as a ROUTED MODE, chosen on measured performance (asked 2026-08-31)
 
 The proposal: on-policy distillation should not be a separate pipeline but one of the modes
