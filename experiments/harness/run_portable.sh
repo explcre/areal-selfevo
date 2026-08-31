@@ -43,6 +43,7 @@ WAIT_FOR_GPUS_S="${WAIT_FOR_GPUS_S:-0}"   # >0 waits for a neighbour's job to fi
 
 # Resilience.
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-4}"
+GPU_BUSY_ON_EXIT_MIB="${GPU_BUSY_ON_EXIT_MIB:-2048}"
 STALL_S="${STALL_S:-1800}"
 STARTUP_S="${STARTUP_S:-1200}"
 
@@ -133,6 +134,18 @@ on_exit() {
   # we did not anticipate -- still leaves a manifest behind.
   local rc=$?
   [ "${BASHPID:-$$}" = "$MAIN_PID" ] || return 0
+  # ALWAYS release the GPUs we claimed. Measured: without this, a run that exhausted its
+  # retries left 113 processes and 4 GPUs holding ~131 GB each, indefinitely. On a shared box
+  # that is worse than the failure itself -- the collaborator loses half their machine to a
+  # job that already gave up, and nothing in the log says why the memory is gone.
+  # Guarded on having claimed anything, so the lock-busy path (which owns nothing) is a no-op.
+  if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+    cleanup_ours 2>/dev/null
+    local held
+    held=$(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits 2>/dev/null \
+           | awk -F", " -v t="$GPU_BUSY_ON_EXIT_MIB" '"'"'$2 > t {printf "%s ", $1}'"'"')
+    [ -n "$held" ] && log "WARNING: GPUs still holding memory after cleanup: $held"
+  fi
   [ "$STATUS_WRITTEN" -eq 1 ] || write_manifest "failed" "exited rc=$rc with no status"
 }
 
