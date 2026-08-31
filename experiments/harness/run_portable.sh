@@ -104,6 +104,7 @@ json.dump({
     "gpus_claimed": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
     "commit": sh("git -C '%s' rev-parse HEAD" % os.environ.get("REPO_DIR", "")),
     "wandb": {"mode": os.environ.get("WANDB_MODE", ""),
+              "degraded_from_online": os.environ.get("WANDB_DEGRADED", "0") == "1",
               "project": os.environ.get("WANDB_PROJECT", ""),
               "run": os.environ.get("RUN_NAME", "")},
     "checkpoints": ckpts,
@@ -157,6 +158,17 @@ die() { log "FATAL: $1"; write_manifest "failed" "$1"; STATUS_WRITTEN=1; exit "$
 
 # A configuration that can never be satisfied should be refused, not looped on.
 [ "$MAX_GPUS" -ge "$MIN_GPUS" ] || die "MAX_GPUS=$MAX_GPUS is below MIN_GPUS=$MIN_GPUS" 4
+
+
+wandb_usable() {
+  # Online W&B without a key does not warn -- it raises inside PPOTrainer construction and
+  # the whole run dies before step 1. A collaborator will not have our key, so an unattended
+  # run must not depend on one.
+  [ -n "${WANDB_API_KEY:-}" ] && return 0
+  grep -q "api.wandb.ai" "${HOME}/.netrc" 2>/dev/null && return 0
+  grep -qE "^api_key" "${HOME}/.config/wandb/settings" 2>/dev/null && return 0
+  return 1
+}
 
 # ------------------------------------------------------------ FREE GPUS ----
 free_gpus() {
@@ -353,6 +365,17 @@ cleanup_ours() {
 
 main() {
   log "run_portable: mode=$MODE arm=$ARM name=$RUN_NAME workdir=$WORKDIR"
+  if [ "$WANDB_MODE" = "online" ] && ! wandb_usable; then
+    # Degrade rather than die, and say so: an unattended run that fails because
+    # LOGGING is unconfigured has wasted the machine for no scientific reason. The
+    # offline run can be synced later with `wandb sync`, and the manifest records it.
+    log "WARNING: WANDB_MODE=online but no API key found (WANDB_API_KEY, ~/.netrc,"
+    log "         or ~/.config/wandb/settings). Falling back to offline; sync later"
+    log "         with: wandb sync ${OUTDIR}/wandb/offline-*"
+    WANDB_MODE=offline
+    WANDB_DEGRADED=1
+  fi
+  export WANDB_MODE WANDB_DEGRADED="${WANDB_DEGRADED:-0}"
   setup || die "setup failed" 5
 
   local gpus n
