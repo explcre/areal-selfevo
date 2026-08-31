@@ -2438,3 +2438,49 @@ So: usable on a whole box today, and to be handed over for a partial box only af
 4-GPU path is either fixed or the script is made to refuse a claim it cannot serve. Stating
 which of the two configurations was actually exercised matters more than the summary
 "it works".
+
+---
+
+## The solved branch is abandoned on evidence: inert at 0.5, HARMFUL at 2.0
+
+The predeclaration said "report the null, then vary `solved_advantage` ONCE before
+abandoning". Done. Both arms against the same control, full MATH-500, paired McNemar.
+
+| checkpoint | off (control) | sa 0.5 | sa 2.0 | p (2.0 vs off) |
+|---|---|---|---|---|
+| **base** (same weights) | 0.5360 | 0.5160 | 0.5140 | 0.193 -- noise floor |
+| gs028 | 0.5400 | 0.5180 | 0.5420 | 1.00 |
+| gs057 | 0.5220 | 0.5140 | 0.5000 | 0.278 |
+| gs086 | 0.5360 | 0.5160 | 0.5160 | 0.395 |
+| gs115 | 0.5360 | 0.5160 | 0.5380 | 1.00 |
+| **gs144** | 0.5400 | 0.5180 | **0.4860** | **0.0141** |
+
+**At 4x the weight the branch stops being inert and starts costing capability.** gs144 is
+-0.054 against the control, 2.5x the 0.022 noise floor, and the difference-in-differences
+after removing the base offset is **-0.032** -- a real effect, not the sweep offset that
+explained every difference in the 0.5 arm.
+
+**Multiplicity, stated rather than omitted.** This is one significant result among five
+paired tests. A Bonferroni threshold at 0.05/5 = 0.01 would NOT admit p=0.0141, so on the
+p-value alone this is suggestive, not conclusive. Two things argue it is real anyway, and
+both were visible before the p-value: the direction is negative or zero at four of five
+steps, and the largest effect is at the LAST checkpoint, which is the shape a cumulative
+over-sharpening would produce and is not the shape of a random hit.
+
+**Mechanism, consistent with what was already measured.** A solved group is solved because the
+model already assigns high probability to the correct answers. A small push adds nothing
+(0.5, null). A larger push sharpens an already-correct distribution, spends entropy, and
+costs held-out accuracy -- and the entropy trace recorded earlier already showed the routed
+arm descending faster mid-run. The two measurements agree without either being fitted to the
+other.
+
+**Consequence: the solved branch is abandoned**, on evidence and on a rule fixed in advance
+rather than on taste. That is 31.4% of groups -- the larger half of the silent channel -- and
+it is worth nothing at best.
+
+**What survives.** The remaining value is in the UNSOLVED half: no self-target, a teacher or
+the harness the only possible consumer, and only ~4.5% of groups on GSM8K. So the entire
+method now rests on the composition-flip claim -- that a harder task moves mass from solved
+to unsolved. That run (MATH-lighteval, routing off, measuring the natural composition) is
+live on the A100 as of this hour. If the composition does not flip, the honest paper is a
+negative one: a large, cheaply reachable channel in GRPO that is not worth reaching.
