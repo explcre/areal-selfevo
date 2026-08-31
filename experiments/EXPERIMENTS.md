@@ -2533,3 +2533,53 @@ not worth reaching" and becomes "a large channel whose composition -- and theref
 intervention -- depends on task difficulty, measured across two tasks that invert it".
 Routing on the SIDE of silence is what adapts across that shift, and that is a claim a fixed
 rule keyed on a single scalar cannot make.
+
+---
+
+## The governing variable is the SOLVE RATE, and the silence is prompt heterogeneity, not binomial tail
+
+Three (model, task) pairs, all Qwen2.5 with $G=8$:
+
+| run | solve rate | silent | solved share of silent |
+|---|---|---|---|
+| 1.5B on GSM8K | 0.858 | 0.359 | 87.5% |
+| 7B on MATH | 0.743 | 0.702 | 81.6% |
+| 1.5B on MATH | 0.474 | 0.411 | 38.2% |
+
+**Composition is monotone in the solve rate, not in the task and not in the model.** The
+earlier framing -- "a harder task flips the composition" -- was half the picture. A harder
+task lowers the solve rate and a stronger model raises it; they push in opposite directions
+and what governs the split is where the pair lands. 7B on MATH sits at 0.743 and behaves like
+1.5B on GSM8K (0.858), not like 1.5B on MATH (0.474). The variable is EFFECTIVE difficulty.
+
+**The closed form fails, and the failure is the finding.** For homogeneous per-sample success
+$p$, $P(\\text{all solved}) = p^G$ and $P(\\text{all unsolved}) = (1-p)^G$, giving:
+
+| run | predicted silent | measured | predicted solved share | measured |
+|---|---|---|---|---|
+| 1.5B GSM8K | 0.294 | 0.359 | 1.000 | 0.875 |
+| 7B MATH | 0.093 | **0.702** | 1.000 | 0.816 |
+| 1.5B MATH | 0.008 | **0.411** | 0.303 | 0.382 |
+
+The predicted silent fraction is wrong by up to **50x** (0.008 against 0.411). A homogeneous-$p$
+model says a group is unanimous only by sampling luck, which at $p \\approx 0.5$ is nearly
+impossible with $G=8$. The measurement says otherwise, so the assumption is what is wrong:
+**per-prompt difficulty is strongly bimodal**. Most silent groups come from prompts this model
+either always solves or never solves, not from the tail of a binomial.
+
+**Three consequences, and the third is the useful one:**
+
+1. The mean solve rate is a poor summary. Two runs at the same mean can have very different
+   silence if their prompt-difficulty distributions differ.
+2. The silent channel is a property of the DATA-model pairing, not of sampling. It is stable,
+   not noise.
+3. **Increasing $G$ will not shrink it.** If silence were binomial tail mass, more samples per
+   prompt would collapse it and the whole method would be unnecessary -- just sample more.
+   Because it is prompt heterogeneity, more samples per prompt mostly buys more identical
+   answers to the prompts that were already unanimous. That is a falsifiable prediction and
+   the cheapest experiment left: rerun one config at $G=16$ and check whether the silent
+   fraction falls as $p^{16} + (1-p)^{16}$ would demand (it should nearly vanish) or stays
+   near its $G=8$ value (heterogeneity).
+
+Until that test runs, "more samples does not fix this" is an inference, not a measurement, and
+is labelled as such.
