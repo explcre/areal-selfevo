@@ -115,10 +115,81 @@ nothing to learn from it, and any method that only evolves weights must discard 
 Routing it to the harness is what makes it recoverable at all, which is the concrete sense
 in which the harness axis is not a convenience.
 
+\paragraph{One trajectory, two consumers.} \eqref{eq:rule} as written still couples the two
+axes: a unit that RL can learn from contributes nothing to the harness. That is a residual
+partition, and it discards information --- a \emph{mixed} unit contains failed samples, and
+their failure mode is exactly what a harness evolver reads, while the RL update consumes only
+the reward. We therefore decouple the harness action with its own threshold $\tau_h$:
+%
+\begin{equation}
+  h(u) \;=\;
+  \begin{cases}
+    \textsc{validate} & \hat p_u = 1 \\
+    \textsc{propose}  & \hat p_u \le \tau_h \\
+    \textsc{none}     & \text{otherwise,}
+  \end{cases}
+  \qquad \tau_h \ge \tau_{\text{fail}} ,
+  \label{eq:harness}
+\end{equation}
+%
+so at $\tau_h = \tau_{\text{fail}}$ the rule is unchanged, and raising it lets a unit take
+$(\textsc{rl}, \textsc{propose})$ --- feeding the gradient and the harness from the same
+trajectory. Under $\texttt{partition}$ this is disabled, so the Co-Harness special case is
+preserved exactly.
+
 \paragraph{Rollback.} Every capability above is gated. With the harness arm disabled,
 $h(u) \equiv \textsc{none}$; with routing disabled, $\pi(u) \equiv (\textsc{rl},
 \textsc{none})$ for every unit and the update is bit-identical to unmodified GRPO. Each
 ablation in Sec.~\ref{sec:results} is one flag away from the vanilla baseline, so a
 difference cannot be attributed to an incidental change of configuration.
+
+
+
+\subsection{The procedure, end to end}
+\label{sec:algo}
+
+Algorithm~\ref{alg:route} is the whole method. Every line is either an existing GRPO step or
+a decision from \eqref{eq:rule}--\eqref{eq:harness}; nothing else is added, and with routing
+disabled lines 6--13 do not execute.
+
+\begin{algorithm}[t]
+\caption{Per-batch signal routing. $\mathcal{B}$ is a batch of prompts, $G$ samples each.}
+\label{alg:route}
+\begin{algorithmic}[1]
+\Require thresholds $\tau_{\text{solve}}{=}1$, $\tau_{\text{fail}}{=}0$, $\tau_h \ge \tau_{\text{fail}}$;
+         weights $c_+ \ge 0$, $c_- \le 0$; flags \texttt{routing}, \texttt{harness}
+\State roll out $G$ samples per prompt; score to binary rewards $r_{u,i}$
+\State $\hat p_u \gets \frac{1}{G}\sum_i r_{u,i}$ \Comment{group solve rate}
+\State $A_{u,i} \gets r_{u,i} - \hat p_u$ \Comment{group-centred advantages, \eqref{eq:adv}}
+\State $\mathcal{S} \gets \{u : \max_i |A_{u,i}| = 0\}$ \Comment{RL-silent: exactly the unanimous units}
+\If{\texttt{routing}}
+  \ForAll{$u \in \mathcal{S}$}
+    \If{$\hat p_u \ge \tau_{\text{solve}}$} \Comment{solved: a correct sample is its own target}
+      \State $A_{u,i} \gets A_{u,i} + c_+$ for all response tokens
+    \ElsIf{$\hat p_u \le \tau_{\text{fail}}$} \Comment{failed: no self-target exists}
+      \State $A_{u,i} \gets A_{u,i} + c_-$ \textbf{if} $c_- \neq 0$, else leave at $0$
+    \EndIf
+  \EndFor
+\EndIf
+\If{\texttt{harness}}
+  \State $\mathcal{P} \gets \{u : \hat p_u \le \tau_h\}$; \; $\mathcal{V} \gets \{u : \hat p_u = 1\}$
+  \State emit $(\textsc{propose}, u)$ for $u \in \mathcal{P}$ and $(\textsc{validate}, u)$ for $u \in \mathcal{V}$
+\EndIf
+\State PPO update on $\{A_{u,i}\}$, clipping unchanged
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Why the update needs no new loss term.} Line 8 is the whole of the supervised
+branch. For a solved unit every $A_{u,i}$ is zero, so adding $c_+$ makes the objective
+$c_+\sum_i \log \pi(y_{u,i})$ over samples already known to be correct --- which is supervised
+fine-tuning on them, with the importance ratio at $1$ because the data is on-policy. PPO's
+clip still bounds the step, which matters because sharpening an already-correct policy is the
+mechanism's predicted failure. Line 10 is its mirror: $c_- \le 0$ pushes down samples known to
+be wrong, and $c_- > 0$ is rejected rather than trusted, since it would train the model to
+reproduce them.
+
+\paragraph{Cost.} Lines 5--13 add no generation. The batch is the batch that GRPO already
+rolled out; the silent units are re-read, not re-sampled. This is the whole of the difference
+from DAPO, which reaches the same set by discarding it and paying to generate a replacement.
 
 \input{figures/routing_flow}
