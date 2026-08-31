@@ -1727,6 +1727,13 @@ class GroupRoutingConfig:
             because every sample was WRONG. Must be <= 0: the only sensible direction is
             down (unlikelihood on known-wrong samples). A positive value here would train
             the model to reproduce wrong answers, so it is rejected rather than trusted.
+        router: Name of a router in ``selfevo.compose.ROUTERS``. ``None`` (default) keeps the
+            fixed rule above -- solved groups get ``solved_advantage``, unsolved groups get
+            ``unsolved_advantage``. When set, the router decides the mode for EVERY group
+            from observability features, and ``solved_advantage`` becomes the magnitude
+            written for a group the router sends to SFT. This is the difference between a
+            hand-written threshold and a controller, and it is the only axis on which the
+            learned arms differ from the rule arm.
 
     Raises:
         ValueError: If either weight has the wrong sign, which is a footgun rather than a
@@ -1736,6 +1743,7 @@ class GroupRoutingConfig:
     enabled: bool = False
     solved_advantage: float = 0.0
     unsolved_advantage: float = 0.0
+    router: str | None = None
 
     def __post_init__(self):
         if self.solved_advantage < 0:

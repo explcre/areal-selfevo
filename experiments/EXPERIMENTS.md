@@ -2082,3 +2082,43 @@ Wall-clock is arguably the better headline anyway. It is what a practitioner pay
 no counter to be exported, and it captures the filtering overhead a pure generation count
 would miss. The generation count remains worth having because it separates "regenerating" from
 "slower for some other reason", and that separation is not yet made.
+
+---
+
+## The actor now calls a Router, and what that exposed
+
+`group_routing.router` names a key in `ROUTERS`. When set, the router decides the mode for
+EVERY group from observability features; when unset, the previous fixed rule applies. This
+is the wiring that turns `router=contextual` and `router=code_policy` from registry entries
+into arms, and it was the single step GOAL.md named as blocking six PARTIAL rows.
+
+Verified through the real `PPOActor._compute_advantages`, one silent group and one
+informative group:
+
+| router | silent group | informative group | differs from vanilla |
+|---|---|---|---|
+| none (fixed rule) | +0.500 | -0.866 | yes |
+| `coharness` | **+0.500** | -0.866 | **yes** |
+| `solve_rate` | 0.000 | -0.866 | no |
+| `static` | 0.000 | -0.866 | no |
+| `contextual` (untrained) | 0.000 | -0.866 | no |
+| any, `enabled=False` | -- | -- | **bit-identical** |
+
+**Three routers changing nothing is the correct result, not a broken seam.** `solve_rate`
+sends a solved group to SKIP, and SKIP on an already-silent group is a no-op by construction;
+`static` returns RL; an untrained `contextual` has every arm tied at zero and breaks the tie
+by name. Only `coharness` chooses SFT on a self-target, and it is the one that moves the
+tensor. Chasing this down was worth more than a green test would have been: the seam looked
+inert and was not.
+
+**The gap this exposes, stated plainly.** `contextual` can now ACT in a real run and cannot
+LEARN in one. Nothing computes a `DecisionOutcome` and calls `observe()` -- the feedback
+channel has a consumer and no producer, exactly mirroring how `RoutingContext.extra` had a
+consumer and no producer until this session. So a run configured with `router=contextual`
+today is a fixed policy with a UCB tie-break, and `validate()` already refuses that
+combination unless `require_feedback=True`, which is the right guard and is not yet
+satisfiable.
+
+That makes the ordering explicit: the outcome producer is now the single blocking step, as
+the actor call was before it. Until it exists, the learned arms are not runnable as learned
+arms, and no result may describe them that way.

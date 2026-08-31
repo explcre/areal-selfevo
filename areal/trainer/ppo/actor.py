@@ -190,6 +190,72 @@ class PPOActor:
     def compute_advantages(self, data: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return batched_call(self._compute_advantages, data, pass_meta=True)
 
+    def _route_groups(self, gr, data, raw_reward, advantages, sizes):
+        """Route every group with a configured Router and apply the decisions.
+
+        Built once and cached on ``self``: a learned router carries state between batches, so
+        constructing it per call would silently reset the thing that is supposed to learn.
+
+        Args:
+            gr: The ``GroupRoutingConfig``; ``gr.router`` names a key in ``ROUTERS``.
+            data: The batch dict, for ``loss_mask`` and ``logprobs``.
+            raw_reward: Per-sample rewards BEFORE bias/scaling/clipping/normalisation. The
+                features describe what the model actually did, and the transformed reward
+                does not.
+            advantages: Current advantage tensor.
+            sizes: Row counts per group.
+
+        Returns:
+            The advantage tensor after applying one decision per group.
+        """
+        from selfevo.compose import ROUTERS
+        from selfevo.integration.group_apply import apply_decisions
+        from selfevo.observability import group_features
+        from selfevo.routing.base import RoutingContext
+
+        router = getattr(self, "_selfevo_router", None)
+        if router is None:
+            factory = ROUTERS.get(gr.router)
+            if factory is None:
+                raise ValueError(
+                    f"group_routing.router={gr.router!r} is not a registered router; "
+                    f"known: {sorted(ROUTERS)}"
+                )
+            router = factory()
+            self._selfevo_router = router
+
+        feats = group_features(
+            raw_reward.detach().float().cpu(),
+            data["loss_mask"].detach().cpu(),
+            data["logprobs"].detach().float().cpu(),
+            list(sizes),
+            max_response_len=self.config.max_new_tokens,
+        )
+        step = getattr(self, "_selfevo_batch", 0)
+        self._selfevo_batch = step + 1
+        modes = []
+        for i, (f, g) in enumerate(zip(feats, sizes)):
+            ctx = RoutingContext(
+                solve_rate=f.solve_rate,
+                group_size=int(g),
+                # No teacher is wired, so a teacher-requiring mode is available only where the
+                # unit supplies its own target -- has_target covers that via has_self_target.
+                has_teacher=False,
+                unit_id=f"{step}:{i}",
+                extra=f.as_extra(),
+            )
+            modes.append(router.route(ctx).argmax())
+
+        routed, stats = apply_decisions(
+            advantages,
+            data["loss_mask"],
+            list(sizes),
+            modes,
+            sft_weight=float(gr.solved_advantage),
+        )
+        stats_tracker.scalar(**stats.as_metrics())
+        return routed
+
     def _compute_advantages(
         self, data: dict[str, Any], meta: TrajBatchMeta | None = None
     ) -> dict[str, Any]:
@@ -421,7 +487,14 @@ class PPOActor:
                 # The weights default to 0.0 and the feature defaults to disabled, so
                 # rollback is exact: adding 0.0 to a zero tensor changes no bit.
                 gr = getattr(self.config, "group_routing", None)
-                if gr is not None and getattr(gr, "enabled", False):
+                if gr is not None and getattr(gr, "enabled", False) and getattr(gr, "router", None):
+                    # A Router decides the mode for EVERY group from observability features,
+                    # rather than the fixed rule below deciding for the silent ones only.
+                    # This is the seam that makes router=contextual and router=code_policy
+                    # real arms instead of registry entries.
+                    advantages = self._route_groups(gr, data, raw_reward, advantages, sizes)
+                    data["advantages"] = advantages
+                elif gr is not None and getattr(gr, "enabled", False):
                     sizes_t = torch.tensor(sizes, device=advantages.device)
                     row_adv = torch.zeros(bs, device=advantages.device, dtype=advantages.dtype)
                     if gr.solved_advantage != 0.0:
