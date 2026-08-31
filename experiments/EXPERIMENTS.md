@@ -1771,3 +1771,80 @@ using population standard deviation to match `np.std` and keeping the singleton 
 It plugs into AReaL's existing `should_accept_fn` hook -- AReaL already ships `dynamic_bs`
 and a DAPO config, but NOT the dynamic-sampling criterion itself, so the hook was there with
 nothing in it. Default `dynamic_filter_fn=None` leaves upstream behaviour untouched.
+
+---
+
+## CORRECTIONS to the DAPO entry above, both found by audit before any run
+
+Appended rather than edited into the entry above, per this file's rule.
+
+### C1. `dynamic_bs` does the OPPOSITE of what the config help said, and DAPO needs it OFF
+
+The help text written for `dynamic_filter_fn` claimed rejection "only has an effect together
+with `dynamic_bs=true`, which is what makes the batch refill." That is backwards. From
+`areal/infra/workflow_executor.py:740-757`:
+
+    if not is_accepted:
+        if dynamic_bs:
+            total_attempts += 1
+            if total_attempts >= batch_size: break     # counts ATTEMPTS
+        continue
+    ...
+    if dynamic_bs:
+        if total_attempts >= batch_size: break         # accepted + rejected
+    elif accepted_cnt >= batch_size: break             # keeps generating until FULL
+
+So `dynamic_bs=True` stops after `batch_size` *attempts* and returns a **shrunken** batch of
+whatever was accepted; `dynamic_bs=False` keeps generating until `batch_size` are **accepted**,
+which is DAPO's oversampling. Measured on the real dispatcher with half the groups unanimous
+and `batch_size=8`: `dynamic_bs=False` returned 8 groups, `dynamic_bs=True` returned 4.
+
+**Consequence had this not been caught:** the DAPO arm would have trained on half-size
+batches with no oversampling — a hobbled baseline, and a hobbled baseline makes our own
+result worthless. The correct arm is
+`+dynamic_filter_fn=selfevo.baselines.dapo.dapo_dynamic_sampling` with `dynamic_bs` left at
+its default `false`. Note that upstream's own `examples/math/gsm8k_dapo_dynamic_bs.yaml` sets
+`dynamic_bs: true` with no filter, which is the wrong combination on both counts.
+
+### C2. The rejection count did NOT reach the trainer, so the cost was not measurable
+
+The entry above states that the instrumentation for measuring DAPO's true multiplier
+"already exists" because AReaL emits `rollout/accepted` and `rollout/rejected`. That was
+wrong, and wrong in the way this project keeps re-learning: the call existed, the *value* did
+not arrive.
+
+Both are recorded through `stats_tracker` as SCALARs, so the exported figure is the mean of a
+stream of ones — `1.0` — and the actual number lives in a `__count` key. Under the
+single-controller layout these runs use, `RolloutController.export_stats` used every
+`__count` only as a denominator and then dropped it:
+
+    worker-side : {'rollout/rejected': 1.0, 'rollout/rejected__count': 5, ...}
+    trainer saw : {'rollout/accepted': 1.0, 'rollout/rejected': 1.0}
+    trainer now : {..., 'rollout/accepted__count': 6, 'rollout/rejected__count': 10}
+
+Fixed additively (`final_stats.update(counts)`); `tests/test_rollout_controller.py` still
+passes 55/55. Without this the 1.49-2.40x prediction could not have been checked against
+anything, and the ratio 1.0/1.0 would have looked like a measurement.
+
+### C3. Smaller divergences from verl, and one gap left open
+
+* An EMPTY group was accepted (`numel() <= 1` swept it into the singleton carve-out). verl
+  drops it: `np.std([])` is NaN and `len([]) == 1` is False. Fixed to `n_samples == 1`.
+* Population vs sample std does **not** change any accept decision (proven by re-running the
+  suite with `unbiased=True`: all decision tests still pass); it changes only the reported
+  value, which is now pinned against `np.std`.
+* `traj["rewards"]` corresponds to verl's `seq_reward` / `acc`, not `seq_final_reward`. It is
+  the raw scalar from the reward function, before `reward_bias`/`reward_scaling`. AReaL has
+  no `seq_final_reward` analogue because it applies KL as a loss term rather than folding it
+  into the reward. MEDS' own run script filters on `acc`, which for a binary math reward is
+  the same number.
+* **Left open:** verl raises after `max_num_gen_batches` (10) regenerated batches. We have no
+  equivalent, so a dataset on which every group is unanimous would regenerate forever rather
+  than fail. Recorded, not fixed — it needs a decision about what the right behaviour is.
+* Also unguarded: a multi-turn agent emits one interaction per turn, so `len(rewards)` would
+  exceed `n_samples` and the std would mix turns with samples. The configured `MathAgent` is
+  single-turn, so it does not bite today.
+
+**Test state:** `selfevo/tests/test_dapo_baseline.py`, 48 tests; suite 293 -> 341 passing;
+9/9 mutations killed with no survivors, run against a copy of the repo rather than the live
+checkout so a mutated file could never be imported by the running job.

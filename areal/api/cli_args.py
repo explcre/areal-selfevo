@@ -3547,6 +3547,20 @@ class PPOConfig(BaseExperimentConfig):
             "This results in variable-sized batches of valid data."
         },
     )
+    dynamic_filter_fn: str | None = field(
+        default=None,
+        metadata={
+            "help": "Import path of a should_accept_fn(group) -> bool used to reject whole "
+            "rollout groups before training. None (default) accepts everything, which is "
+            "upstream behaviour. Set to "
+            "'selfevo.baselines.dapo.dapo_dynamic_sampling' for the DAPO dynamic-sampling "
+            "baseline, which rejects groups whose rewards do not vary. Keep dynamic_bs at "
+            "its default false: prepare_batch then keeps generating until batch_size groups "
+            "have been ACCEPTED, so every rejected group is replaced, which is DAPO's "
+            "oversampling. dynamic_bs=true stops after batch_size ATTEMPTS and returns a "
+            "smaller batch instead of refilling it."
+        },
+    )
 
     def __post_init__(self):
         """Validate the eval generation config."""

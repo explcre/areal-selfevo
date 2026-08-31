@@ -40,6 +40,8 @@ def main(args):
             workflow_kwargs=workflow_kwargs,
             eval_workflow="areal.workflow.openai.math_agent.MathAgent",
             eval_workflow_kwargs=eval_workflow_kwargs,
+            # None by default, so this line changes nothing unless a filter is configured.
+            dynamic_filter_fn=config.dynamic_filter_fn,
         )
 
 

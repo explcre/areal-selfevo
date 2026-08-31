@@ -1234,6 +1234,10 @@ class RolloutController:
             count_key = k + "__count"
             if count_key in counts and counts[count_key] > 0:
                 final_stats[k] = v / counts[count_key]
+        # Keep the counts themselves. A scalar recorded once per event with a constant value
+        # -- rollout/accepted and rollout/rejected are recorded as 1 -- has a mean of 1.0 and
+        # carries no information; the count is the whole measurement.
+        final_stats.update(counts)
         return final_stats
 
     def config_perf_tracer(self, config: PerfTracerConfig, role: str) -> None:
