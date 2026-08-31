@@ -106,7 +106,7 @@ a comparison is like-for-like rather than a benchmark of our choosing.
 | B2 | AIME 24/25 | common | **DONE** | unusable: 0.000 @1.5B, 0.867 @27B with a 24-pt CI on 30 problems |
 | B3 | AMC23, HMMT 24/25 | common | **DONE** | 30-40 problems; indicative only |
 | B4 | **OlympiadBench** | common | **DONE** | **the frontier math target**: 675 problems, 7-pt CI, 27B = 0.825 @8% trunc. Now IN `math_bench.SUITE` (2026-08-31); gold self-verifies **675/675** through our grader, so a low score is the model's. 94/675 carry multiple golds in one string -- exact match marks those wrong, so scores are a LOWER BOUND |
-| B5 | **Terminal-Bench 2.1** (Terminus-2 harness) | **Ornith-1.5** | **NOT BUILT** | Ornith-397B 86.1, 35B-A3B 67.8. Also AI2 2607.12227's benchmark, so it is where the evaluation bar was set |
+| B5 | **Terminal-Bench 2.1** | **Ornith-1.5** | **HARNESS AVAILABLE** | Ornith-397B 86.1, 35B-A3B 67.8. LongHorizon-Harness (MIT) ships `eval/TB-harness` with a conda env file and scripts; only the TASKS must be fetched separately into `datasets/terminal-bench-2-1/tasks`. LHH reports Qwen3.7-Plus 69.7 -> 77.2 here, so a published harness-swap comparison already exists on this benchmark |
 | B6 | **DeepSWE** (Claude Code harness) | **Ornith-1.5** | **NOT BUILT** | Ornith-397B 56.0 |
 | B7 | **Frontier-Bench** | **Ornith-1.5** | **NOT BUILT** | competitors near zero |
 | B8 | **SWE-bench Pro** (+ `-os`) | **BigBang-v1** | **NOT BUILT** | `ScaleAI/SWE-bench_Pro` |
@@ -117,6 +117,10 @@ a comparison is like-for-like rather than a benchmark of our choosing.
 | B13 | **Spider2 / BIRD** | enterprise SQL | **NOT BUILT** | both on disk, never run |
 | B14 | BioMysteryBench | domain | **NOT BUILT** | 90 gated, 155 GB |
 | B15 | GeneBench-Pro | domain | **NOT BUILT** | 10/129 public |
+| B16 | **WeaveBench** | LongHorizon-Harness | **HARNESS AVAILABLE** | `eval/WeaveBench-harness`. The benchmark with the largest reported harness effect: 51.8 -> 80.7 at fixed model. Long-horizon GUI+CLI |
+| B17 | **OSWorld-V2** | LongHorizon-Harness | **HARNESS AVAILABLE** | `eval/OSWorldv2-harness`, with VM providers for vmware/gcp/azure/aliyun/virtualbox/volcengine. Qwen3.7-Plus 2.8 -> 8.3; Claude Opus 4.7 20.0 -> 34.3 on a subset. Low absolute scores make it a poor separator today |
+| B18 | **MLE-Bench Lite** | Frontis-MA1 / OpenRSI | **HARNESS AVAILABLE** | `OpenMLE-Evo` adapters. 12h/task on ONE 12GB card. Base 39.39, Evo 60.61, Evo-Max 71.21 (their own note: Evo-Max changes the search system and is not a pure model gain) |
+| B19 | **NatureBench Lite** | Frontis-MA1 / OpenRSI | **HARNESS AVAILABLE** | held-out transfer set; Match-SOTA 50 -> 70 |
 
 **Do we need a frontier CODE benchmark? Yes -- but scale gates which one.** Answering this
 with measurement rather than preference:
