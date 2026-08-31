@@ -3,6 +3,41 @@
 Measured results and negative results, newest first. A claim only belongs here once it has
 been observed end to end; a prediction belongs in GOAL.md until then.
 
+## 2026-08-31 — DIAGNOSED: the decomposition violation is truncation, and the metric was incomplete
+
+Follow-up to the integrity finding below, resolved on the real path rather than by argument.
+
+`silent` is read from `seq_adv = (advantages * loss_mask).sum(-1)`. A sequence with NO
+response tokens contributes exactly 0 whatever its advantage, so a group of fully-truncated
+sequences reads as SILENT while its raw rewards are mixed -- and a mixed group is neither
+all-solved (`min > 0.5`) nor all-unsolved (`max <= 0.5`). Those groups fell out of the
+decomposition entirely.
+
+Reproduced as a falsifiable test before changing anything: with every sequence carrying
+response tokens the identity holds on four different reward patterns; zeroing one group's
+loss mask produces `silent=1.0, solved=0.5, unsolved=0.0`, a **+0.5** residual -- the same
+sign and mechanism as the **+0.277** mean seen in `g16`.
+
+**Fix.** A third bucket, `unclassified_group_fraction = mean(silent * (1-solved) *
+(1-unsolved))`, so the decomposition is complete by construction and ratios have a correct
+denominator. 5 tests, 4/5 mutants killed; the survivor ("compute silence without the loss
+mask") is EQUIVALENT under the shipped config and is documented as such in the harness --
+advantages are constant across a sequence there, so masked and unmasked sums are zero
+together. Killing it would need token-level advantages (`gae_lambda < 1` with a value model),
+which no config here uses.
+
+**What this does and does not restore.** It explains and removes the POSITIVE residual, and
+it means the composition question is now well-posed: a run reports how much of its silent
+channel is solved, unsolved, or merely truncated. It does NOT explain the NEGATIVE excursion
+(-0.109 at g16 step 112), which cannot arise from a missing bucket -- subsets cannot exceed
+their superset. That remains open, and the historical composition numbers stay PROVISIONAL
+until a rerun with the third bucket is available to compare against.
+
+**Consequence worth stating.** If `unclassified` turns out to be large in real runs, part of
+what this project has been calling the silent channel is not about correctness at all but
+about truncation, and neither the self-target argument nor the teacher argument applies to
+it. That is measurable on the next run and is now measured by default.
+
 ## 2026-08-31 — G=16: doubling the group size does NOT halve the silent channel
 
 The cheapest decisive experiment named in GOAL.md. If a group is silent because every member

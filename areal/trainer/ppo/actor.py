@@ -498,10 +498,26 @@ class PPOActor:
                     unsolved = torch.tensor(
                         [float(g.max() <= 0.5) for g in per_group_r], device=advantages.device
                     )
+                    # THIRD BUCKET, and it is not cosmetic. `silent` is read from
+                    # seq_adv = (advantages * loss_mask).sum(-1), so a sequence with NO
+                    # response tokens contributes exactly 0 whatever its advantage. A group
+                    # of fully-truncated sequences therefore reads as silent while its RAW
+                    # rewards are mixed -- neither all-solved (min > 0.5) nor all-unsolved
+                    # (max <= 0.5). Without this bucket those groups vanished from the
+                    # decomposition, so silent > solved + unsolved and every ratio taken
+                    # against solved+unsolved as the denominator was wrong. Measured in g16:
+                    # the residual exceeded 0.01 at 104 of 116 steps, mean +0.277.
+                    # Reproduced on the real path in selfevo/tests/test_silence_identity.py.
+                    other = silent * (1.0 - solved) * (1.0 - unsolved)
                     stats_tracker.scalar(
                         silent_group_fraction=float(silent.mean()),
                         solved_group_fraction=float((silent * solved).mean()),
                         unsolved_group_fraction=float((silent * unsolved).mean()),
+                        # Silent for a reason the solved/unsolved split cannot express --
+                        # in practice, truncation. A run where this is large has a silent
+                        # channel that is NOT about correctness, and the self-target and
+                        # teacher arguments do not apply to it.
+                        unclassified_group_fraction=float(other.mean()),
                         n_groups=float(n_groups),
                     )
 
