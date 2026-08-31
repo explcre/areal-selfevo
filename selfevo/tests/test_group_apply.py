@@ -148,6 +148,22 @@ def test_skip_zeroes_the_response_advantages():
     assert torch.equal(out[~lm.bool()], adv[~lm.bool()]), out
 
 
+@pytest.mark.parametrize("scale", [0.5, 2.0])
+def test_a_weight_valued_mask_scales_the_write_as_the_actor_scales_its_constant(scale):
+    """``loss_mask`` is 0/1 today, so multiplying by it and writing through a boolean of it
+    agree -- and a test that only ever sees 0/1 cannot tell the two apart (a mutant that
+    dropped the multiply survived until this test existed). The actor writes
+    ``row_adv * loss_mask``, which scales with the mask value; pinning the seam to the same
+    arithmetic keeps the two interchangeable if a weighted mask ever arrives, instead of
+    silently changing the magnitude of every SFT write on the day it does.
+    """
+    adv, lm = silent()
+    lm, w = lm * scale, 0.5
+    out, _ = apply_decisions(adv, lm, [4], [TrainingMode.SFT], sft_weight=w)
+    assert torch.equal(out, adv + w * lm), out
+    assert float(out[0, -1]) == w * scale
+
+
 def test_skip_is_not_rl_and_rl_is_not_skip():
     """Swapping the two branches must not pass: on an informative group they differ."""
     adv, lm = informative()

@@ -33,6 +33,60 @@ def load(argv: list[str]):
     return OmegaConf.to_object(cfg)
 
 
+
+
+def _check_router_modes(name: str) -> bool:
+    """Route synthetic units through a router and confirm the seam can apply every mode.
+
+    ``_route_groups`` passes ``decision.argmax()` straight to ``apply_decisions``, which
+    implements RL/SFT/SKIP and REFUSES a teacher-requiring mode -- deliberately, because
+    treating DISTILL as SKIP would report a distillation arm that never ran. That refusal is
+    a ValueError raised inside ``_compute_advantages``, i.e. it kills the run. A router that
+    can emit such a mode should therefore be rejected here, before any GPU is allocated,
+    rather than at whatever batch first happens to trigger it.
+
+    Args:
+        name: A key in ``selfevo.compose.ROUTERS``.
+
+    Returns:
+        True if every mode the router produced over the probe grid is applicable.
+    """
+    from selfevo.compose import ROUTERS
+    from selfevo.integration.group_apply import apply_decisions
+    from selfevo.observability import FEATURE_NAMES
+    from selfevo.routing.base import RoutingContext
+    import torch
+
+    factory = ROUTERS.get(name)
+    if factory is None:
+        print(f"FAIL: router {name!r} is not registered"); return False
+    router = factory()
+
+    seen, ok = set(), True
+    for rate in (0.0, 0.25, 0.5, 0.75, 1.0):
+        for teacher in (False, True):
+            extra = {k: 0.5 for k in FEATURE_NAMES}
+            extra["solve_rate"] = rate
+            ctx = RoutingContext(
+                solve_rate=rate, group_size=8, has_teacher=teacher,
+                unit_id=f"probe-{rate}-{teacher}", extra=extra,
+            )
+            seen.add(router.route(ctx).argmax())
+    for mode in sorted(seen):
+        try:
+            apply_decisions(
+                torch.zeros(2, 3), torch.ones(2, 3), [2], [mode], sft_weight=0.5
+            )
+        except ValueError as exc:
+            print(f"FAIL: router {name!r} can emit {mode!r}, which the seam cannot apply "
+                  f"-- this would raise inside _compute_advantages and kill the run: "
+                  f"{str(exc)[:90]}")
+            ok = False
+    if ok:
+        print(f"router {name!r} emits {sorted(seen)}; all applicable")
+    return ok
+
+
 def main() -> int:
     off = load(BASE)
     on = load(BASE + ON)
@@ -95,6 +149,10 @@ def main() -> int:
         print("FAIL: a positive unsolved_advantage was accepted through the CLI"); ok = False
     except Exception as exc:
         print(f"guard held through the CLI: {type(exc).__name__}: {str(exc)[:90]}")
+
+    # Every registered router that a run could name, checked against what the seam applies.
+    for name in ("solve_rate", "coharness", "static", "cluster", "random", "contextual"):
+        ok = _check_router_modes(name) and ok
 
     print("\nPREFLIGHT PASS" if ok else "\nPREFLIGHT FAIL")
     return 0 if ok else 1
