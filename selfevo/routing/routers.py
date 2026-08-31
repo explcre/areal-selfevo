@@ -183,7 +183,13 @@ class RandomRouter:
                 break
         else:  # pragma: no cover - only reachable on float round-off at the top of range
             chosen = self._modes[-1]
-        if known_modes()[chosen] and not ctx.has_teacher:
+        # has_TARGET, not has_teacher. A teacher-requiring mode is honourable whenever ANY
+        # target exists, and for a group with solve_rate > 0 the group's own correct sample
+        # is one -- that self-target is the method's central claim. Checking has_teacher
+        # instead made this control fall back to SKIP for every SFT draw in every run here
+        # (no run has an external teacher), so the "matched" control could not emit the mode
+        # it was supposed to match, and its mix collapsed to rl/skip. Measured 2026-08-31.
+        if known_modes()[chosen] and not ctx.has_target:
             # Never emit a decision the signal layer cannot honour; fall back to SKIP so
             # the control stays comparable rather than silently erroring mid-batch.
             return RoutingDecision(

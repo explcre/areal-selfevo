@@ -270,9 +270,28 @@ def test_random_router_is_reproducible_and_isolated_from_global_rng():
     assert seq_a == seq_b
 
 
-def test_random_router_degrades_to_skip_without_a_teacher():
+def test_random_router_degrades_to_skip_only_when_no_target_exists():
+    """SFT is honourable whenever ANY target exists, external or self.
+
+    Changed 2026-08-31 from gating on ``has_teacher`` to gating on ``has_target``. The old
+    behaviour degraded EVERY sft draw to skip in every run here, because no run wires an
+    external teacher -- so the "matched" control could not emit the mode it was matching and
+    its mix collapsed to rl/skip. That is not a control.
+
+    A group with ``solve_rate > 0`` drew at least one correct sample, and that sample is the
+    target: rejection-sampling fine-tuning, which is the method's central claim and what
+    ``apply_decisions`` already implements without any teacher tensor. The contextual router
+    emits sft under exactly these conditions in live training.
+
+    Degrading to skip is still correct when there is NO target at all.
+    """
     r = RandomRouter({TrainingMode.SFT: 1.0}, seed=0)
-    assert r.route(_ctx(0.5, teacher=False)).argmax() == TrainingMode.SKIP
+    # No teacher, but the group solved some samples -> its own correct sample IS the target.
+    assert r.route(_ctx(0.5, teacher=False)).argmax() == TrainingMode.SFT
+    # No teacher and nothing solved -> nothing to train toward, so skip.
+    assert r.route(_ctx(0.0, teacher=False)).argmax() == TrainingMode.SKIP
+    # An external teacher alone is still sufficient.
+    assert r.route(_ctx(0.0, teacher=True)).argmax() == TrainingMode.SFT
 
 
 def test_inverted_router_is_the_opposite_of_the_criterion():

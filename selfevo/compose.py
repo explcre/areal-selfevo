@@ -28,6 +28,8 @@ ratio, actual clipping, actual length normalisation).
 
 from __future__ import annotations
 
+import os
+
 from dataclasses import dataclass
 from typing import Callable
 
@@ -73,10 +75,65 @@ def _cluster_router(**kw: object) -> object:
     return ClusterRouter(**kw)  # type: ignore[arg-type]
 
 
+def _parse_proportions(spec: str) -> dict[str, float]:
+    """Parse ``"rl=0.29,sft=0.35,skip=0.35"`` into a mode->weight mapping.
+
+    Args:
+        spec: Comma-separated ``mode=weight`` pairs. Weights need not sum to 1;
+            :class:`RandomRouter` normalises them.
+
+    Returns:
+        The parsed mapping.
+
+    Raises:
+        ValueError: On a malformed pair or a non-numeric weight, rather than silently
+            dropping it -- a dropped mode becomes a control that never emits that mode.
+    """
+    out: dict[str, float] = {}
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            raise ValueError(f"bad proportion {part!r}; expected mode=weight")
+        mode, _, w = part.partition("=")
+        try:
+            out[mode.strip()] = float(w)
+        except ValueError:
+            raise ValueError(f"bad weight in {part!r}; expected a number") from None
+    if not out:
+        raise ValueError(f"no proportions parsed from {spec!r}")
+    return out
+
+
 def _random_router(**kw: object) -> object:
-    """Factory for :class:`selfevo.routing.routers.RandomRouter`, the matched control."""
+    """Factory for :class:`selfevo.routing.routers.RandomRouter`, the matched control.
+
+    Proportions come from ``SELFEVO_RANDOM_PROPORTIONS`` (e.g. ``"rl=0.29,sft=0.35,
+    skip=0.35"``) unless passed explicitly. There is deliberately NO usable default: the
+    class default is ``{rl: 1.0}``, and a control that routes everything to RL is
+    bit-identical to the off arm while reporting as a control. Measured 2026-08-31 -- the
+    `rnd` arm ran with rl_groups=64 and sft_groups=0 at every step for exactly this reason.
+
+    RandomRouter's own contract is that it must run at "the proportions the criterion router
+    actually produced, measured, not assumed", so the value belongs to the run, not to the
+    code.
+
+    Raises:
+        ValueError: If no proportions are supplied by either route.
+    """
     from .routing.routers import RandomRouter
 
+    if "proportions" not in kw:
+        spec = os.environ.get("SELFEVO_RANDOM_PROPORTIONS", "").strip()
+        if not spec:
+            raise ValueError(
+                "router=random needs proportions: set SELFEVO_RANDOM_PROPORTIONS, e.g. "
+                "'rl=0.29,sft=0.35,skip=0.35', to the proportions the criterion router was "
+                "MEASURED to produce. Refusing to fall back to the class default of "
+                "{rl: 1.0}, which is bit-identical to the off arm and reports as a control."
+            )
+        kw["proportions"] = _parse_proportions(spec)
     return RandomRouter(**kw)  # type: ignore[arg-type]
 
 

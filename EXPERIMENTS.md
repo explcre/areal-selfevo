@@ -3,6 +3,46 @@
 Measured results and negative results, newest first. A claim only belongs here once it has
 been observed end to end; a prediction belongs in GOAL.md until then.
 
+## 2026-08-31 — The matched control was also inert, for two independent reasons
+
+Same defect class as the contextual router's zero cold start, in the same registry, found the
+same way: watch what the arm actually emits. The `rnd` arm ran with `rl_groups=64`,
+`sft_groups=0`, `skip_groups=0` at every step -- bit-identical to the off arm while reporting
+as the control that every claim about the learned router has to beat.
+
+**Cause 1: no usable default, and one was taken anyway.** `RandomRouter.proportions` defaults
+to `{rl: 1.0}` and `_route_groups` builds routers with `factory()` and no arguments. The
+class docstring already said the control "must be run at the proportions the criterion router
+actually produced, measured, not assumed" -- so there is no correct default, and the factory
+now refuses unless `SELFEVO_RANDOM_PROPORTIONS` (or an explicit argument) supplies them.
+
+**Cause 2: the control could not emit the mode it was matching.** `RandomRouter` gated
+teacher-requiring modes on `ctx.has_teacher`, but `has_target = has_teacher or
+has_self_target`. No run here wires an external teacher, so EVERY sft draw degraded to skip
+and the mix collapsed to rl/skip -- even once the proportions were right. A group with
+`solve_rate > 0` supplies its own target; that is the method's central claim, it is what
+`apply_decisions` already implements with no teacher tensor, and it is what the contextual
+router does in live training. Fixed to gate on `has_target`.
+
+An existing test, `test_random_router_degrades_to_skip_without_a_teacher`, asserted the buggy
+behaviour. It was rewritten rather than deleted, to the stronger contract the system actually
+needs: sft with a self-target, skip with no target at all, sft with an external teacher alone.
+
+**Proportions, measured not assumed.** From the live `ctx` run over its last 40 steps:
+rl **0.2946**, sft **0.3527**, skip **0.3526** (sd ~0.12 per step, 64 groups/step). The
+control was relaunched at exactly these.
+
+**Worth noting about the bandit itself:** after 61 steps the contextual router's average mode
+mix is close to uniform thirds. It varies step to step, so it is not stuck the way the
+zero-cold-start version was, but it has not yet developed a strong preference. If that holds,
+the matched-proportion control is the right comparison and the honest outcome may be a null
+-- which is the result either way, and is why the control had to be fixed before it ran.
+
+**Operational, and it invalidated my STEP 1 orphan check on that box:** `nvidia-smi` on the
+H200 reports HOST pids from a different PID namespace, so `ps -o cmd= -p <pid>` returns empty
+and `kill -9 <pid>` is a no-op there (and could in principle hit an unrelated host process).
+Reaping on that box must use in-namespace `pgrep -f` patterns; the A100 is not affected.
+
 ## 2026-08-31 — Sizing the unclassified bucket retroactively: one headline halves, one survives
 
 The residual `silent - (solved + unsolved)` is exactly what the new
