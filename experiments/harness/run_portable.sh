@@ -34,6 +34,13 @@ EPOCHS="${EPOCHS:-5}"
 MODEL="${MODEL:-Qwen/Qwen2.5-1.5B-Instruct}"
 CKPT="${CKPT:-}"                      # eval only; defaults to the newest we trained
 BENCHES="${BENCHES:-math500}"
+# Group size. The silent channel is predicted to be prompt HETEROGENEITY rather than
+# binomial tail mass, which implies raising this will NOT shrink it. That prediction is
+# the cheapest decisive experiment left, so the knob is exposed.
+N_SAMPLES="${N_SAMPLES:-8}"
+DATASET="${DATASET:-openai/gsm8k}"
+# Anything else to hand the trainer verbatim, e.g. a different mb capacity for long data.
+PORTABLE_EXTRA="${PORTABLE_EXTRA:-}"
 
 # Shared-box etiquette.
 # Explicit pin, for when a collaborator has been told WHICH boards are theirs. Bypasses
@@ -348,7 +355,8 @@ run_once() {
     cluster.n_gpus_per_node="$n" \
     sglang.mem_fraction_static="$MEM_FRACTION" \
     actor.path="$MODEL" \
-    gconfig.n_samples=8 \
+    gconfig.n_samples="$N_SAMPLES" \
+    train_dataset.path="$DATASET" valid_dataset.path="$DATASET" \
     actor.optimizer.lr=1.0e-6 actor.eps_clip=0.2 actor.kl_ctl=0.0 \
     ~actor.adv_norm ++actor.mb_spec.granularity=8 \
     saver.freq_steps=25 total_train_epochs="$EPOCHS" \
@@ -359,6 +367,7 @@ run_once() {
     +stats_logger.wandb.name="$RUN_NAME" \
     ${routing[@]+"${routing[@]}"} \
     +rollout.agent.admin_api_key="$(cat "$key_file")" \
+    ${PORTABLE_EXTRA} \
     experiment_name="$RUN_NAME" trial_name=t1 >>"$LOG" 2>&1
 }
 

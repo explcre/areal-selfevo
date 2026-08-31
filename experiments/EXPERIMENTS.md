@@ -2583,3 +2583,46 @@ either always solves or never solves, not from the tail of a binomial.
 
 Until that test runs, "more samples does not fix this" is an inference, not a measurement, and
 is labelled as such.
+
+---
+
+## What the collaborator box should run, and why it is the G=16 test
+
+The portable runner defaulted to "another copy of our GSM8K arm", which is the least useful
+thing an extra 8xH200 could do -- we already have that arm, twice.
+
+**The assignment is the G=16 replication.** The measurements say the silent channel is prompt
+HETEROGENEITY, not binomial tail mass: a homogeneous-p model predicts 0.008 silence for 1.5B
+on MATH and we measure 0.411, wrong by 50x. That distinction decides whether the method is
+needed at all:
+
+* if silence is **binomial tail**, raising the group size collapses it. At p=0.474 and G=16,
+  p^16 + (1-p)^16 is about 7e-6. The whole channel would vanish and the correct advice would
+  be "sample more", not "route".
+* if silence is **heterogeneity**, the fraction stays near its G=8 value, because the prompts
+  producing it are ones the model always or never solves and more samples of those change
+  nothing.
+
+One run separates these, it needs no new code, and it is the cheapest decisive experiment
+left. It is also exactly the objection a reviewer raises first, so we would rather answer it
+with a measurement than an argument.
+
+    DATASET=DigitalLearningGmbH/MATH-lighteval \
+    N_SAMPLES=16 EPOCHS=1 ARM=off RUN_NAME=g16-math \
+    PORTABLE_EXTRA="actor.mb_spec.max_tokens_per_mb=49152 ref.mb_spec.max_tokens_per_mb=49152" \
+    WANDB_API_KEY=<key> bash experiments/harness/run_portable.sh
+
+`max_tokens_per_mb` is raised because a granularity-8 microbatch on MATH already reaches
+~11.7k tokens at G=8; at G=16 it roughly doubles, and the default 10240 is what killed our
+first MATH run.
+
+**What they send back** is the manifest plus the train log; the composition comes from
+`experiments/harness/parse_silence.py`. Predicted outcomes, written down before the run:
+
+| | silent fraction at G=16 |
+|---|---|
+| binomial-tail model | ~0.00 |
+| heterogeneity (our claim) | ~0.4, close to the G=8 value |
+
+Anything in between is informative too -- it would put a number on how much of the channel is
+each.
