@@ -648,6 +648,36 @@ per round, attached to the action that produced them.
 So the auditor's verdicts can BE the credit signal for a model-versus-harness router. That is
 not a wish: it is our measured requirement met by a released mechanism.
 
+### Generation caps, taken from THEIR configs rather than guessed (2026-08-31)
+
+Our per-task caps were measured on a 1.5B and are wrong for a reasoning model -- MATH-500
+truncated 50% and OlympiadBench 32.9% on the 30B. Rather than keep doubling, read what the
+released work configures.
+
+**OpenRSI (2607.28568):** all four RL run scripts carry
+`--eval-max-response-len "${EVAL_MAX_RESPONSE_LEN:-32768}"`
+(`OpenMLE-ERL/RL/scripts/run_openmle_rl_{a,}sync_{single,multi}_node.sh`). Other `max_tokens`
+values in that tree are 2000/2048/5000 and belong to utility calls, not to model generation.
+So **32768 is their evaluation default**, and the re-run now in flight uses exactly that --
+matching a published configuration rather than picking the next power of two.
+
+**LongHorizon-Harness (2608.01964):** role-dependent rather than single-valued --
+16000, 10000, 8192 and 4096 for the substantive roles, with 1500 and 512 for utility calls.
+This is worth copying as a PATTERN, not just as numbers: a long-horizon system does not use
+one cap, it uses a cap per role, because a manager summarising state and an executor writing
+code have different length distributions. Our own suite uses one cap per benchmark, which is
+the same mistake one level up.
+
+**Consequence for the per-task table.** The right shape is a cap per (benchmark x model class
+x role), and we currently have one dimension of that. The immediate fix is only the model-class
+dimension, since our scorer has no roles; the role dimension arrives with the harness work.
+
+**Also worth noting:** OpenRSI's training-side `seq_length = 4096` is far below its eval cap of
+32768. If that is the training context, a model trained at 4096 and evaluated at 32768 is being
+asked to generalise well beyond its training length, which is a plausible contributor to
+non-termination at long generations and is worth checking before blaming any routing arm for
+it.
+
 ### Initialise from the best-known harness per task, then evolve (2026-08-31)
 
 Proposed, and it resolves the constraint recorded below rather than dodging it. If
