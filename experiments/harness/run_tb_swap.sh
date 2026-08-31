@@ -2,7 +2,21 @@
 # Terminal-Bench 2.1 harness swap at FIXED model.
 #
 #   bash run_tb_swap.sh --smoke     # verify every prerequisite, change nothing, ~2 min
-#   bash run_tb_swap.sh --run       # actually run an arm (needs --arm and a task set)
+#   bash run_tb_swap.sh --fetch     # download the Terminal-Bench 2.1 task set, resumable
+#   bash run_tb_swap.sh --run       # run one arm (ARM=A|B)
+#
+# GPUs: set GPUS=0,1,2,3. NOTE what these are for. Terminal-Bench talks to a REMOTE model over
+# ANTHROPIC_BASE_URL, so the harness itself uses no GPU. GPUS only matters if this script also
+# serves your model (SERVE=1), in which case it pins sglang to those devices.
+#
+# W&B: harbor does NOT support Weights & Biases -- verified, `wandb` is not a harbor dependency
+# and appears nowhere in the TB harness. So this script logs the FINAL RESULT itself when
+# WANDB_API_KEY is set. Do not expect per-task streaming; there is no hook for it.
+#
+# Anthropic-compat caveat, stated because it will bite: the shipped config drives Claude Code
+# against an ANTHROPIC-compatible endpoint. sglang serves an OpenAI-compatible API. Serving
+# your own model therefore needs a translating proxy (e.g. LiteLLM in Anthropic mode) between
+# them. SERVE=1 starts sglang and tells you this; it does not magically make it Anthropic-shaped.
 #
 # The smoke path is the point: it checks each prerequisite INDEPENDENTLY and reports all
 # failures at once, rather than dying at the first one and hiding the rest. Every check here
@@ -104,8 +118,58 @@ fi
 echo "PREFLIGHT: all checks passed."
 [ "$MODE" = "--smoke" ] && { echo "(smoke mode: nothing was run)"; exit 0; }
 
+# ---- fetch mode: download the task set, resumably ----
+if [ "$MODE" = "--fetch" ]; then
+  DEST="${TB_TASKS:-$HOME/tb_tasks}"
+  LINK="$TB_DIR/datasets/terminal-bench-2-1/tasks"
+  mkdir -p "$DEST" "$TB_DIR/datasets/terminal-bench-2-1"
+  # Retry rather than fail: this is a large multi-task download over a public registry and a
+  # single transient error should not cost the whole fetch. harbor skips what it already has,
+  # so retrying is cheap and resumable.
+  for attempt in 1 2 3 4 5; do
+    echo "fetch attempt $attempt ..."
+    if "$VENV/bin/harbor" download "terminal-bench@2.1" -o "$DEST"; then
+      break
+    fi
+    echo "  attempt $attempt failed; retrying in $((attempt*20))s"
+    sleep $((attempt*20))
+  done
+  n=$(find -L "$DEST" -maxdepth 2 -mindepth 1 -type d 2>/dev/null | wc -l)
+  if [ "$n" -eq 0 ]; then
+    echo "FETCH FAILED: no tasks under $DEST after 5 attempts."
+    echo "  The registry name may have changed. Try: $VENV/bin/harbor download --help"
+    echo "  and list what is available, then set TB_TASKS to a manually obtained task tree."
+    exit 4
+  fi
+  [ -e "$LINK" ] || ln -s "$DEST" "$LINK"
+  echo "fetched $n task dirs -> $LINK"
+  exit 0
+fi
+
+# ---- optional: serve your own model on the pinned GPUs ----
+if [ "${SERVE:-0}" = "1" ]; then
+  : "${MODEL_PATH:?set MODEL_PATH to serve a model}"
+  : "${GPUS:?set GPUS=0,1,2,3 to pin the server}"
+  NTP=$(echo "$GPUS" | tr ',' '\n' | grep -c .)
+  echo "serving $MODEL_PATH on GPUs $GPUS (tp=$NTP), port ${SERVE_PORT:-8700}"
+  CUDA_VISIBLE_DEVICES="$GPUS" "$VENV/bin/python" -m sglang.launch_server \
+    --model-path "$MODEL_PATH" --served-model-name tbmodel \
+    --host 127.0.0.1 --port "${SERVE_PORT:-8700}" --tp "$NTP" \
+    --mem-fraction-static "${MEMFRAC:-0.8}" > "$TB_DIR/serve.log" 2>&1 &
+  SRV=$!
+  trap '[ -n "${SRV:-}" ] && kill -TERM "$SRV" 2>/dev/null' EXIT INT TERM
+  for i in $(seq 1 180); do
+    kill -0 "$SRV" 2>/dev/null || { echo "SERVER DIED - see $TB_DIR/serve.log"; tail -20 "$TB_DIR/serve.log"; exit 5; }
+    curl -sf "http://127.0.0.1:${SERVE_PORT:-8700}/v1/models" >/dev/null 2>&1 && break
+    sleep 5
+  done
+  echo "server up. NOTE: this is an OPENAI-compatible endpoint. The TB config wants an"
+  echo "ANTHROPIC-compatible one, so point ANTHROPIC_BASE_URL at a translating proxy, not"
+  echo "directly at this port, or the run will fail inside the container with auth/schema errors."
+fi
+
 # ---- actual run ----
-[ "$MODE" = "--run" ] || { echo "Usage: $0 --smoke | --run   (ARM=A|B, BASELINE_CFG=<yaml>)"; exit 2; }
+[ "$MODE" = "--run" ] || { echo "Usage: $0 --smoke | --fetch | --run   (ARM=A|B, BASELINE_CFG=<yaml>)"; exit 2; }
 case "$ARM" in
   B) CFG="$LHH_CFG" ;;
   A) CFG="${BASELINE_CFG:?set BASELINE_CFG for arm A}" ;;
@@ -121,6 +185,42 @@ cd "$TB_DIR" || exit 1
 # n_attempts 3: the published Terminal-Bench 2.1 protocol is pass@1 averaged over 3 repeats,
 # and our own measurements show a single score carries ~1 point of jitter. One repeat cannot
 # resolve a harness delta.
-"$VENV/bin/harbor" run -c "$CFG" 2>&1 | tee "$OUT/run.log"
-echo "EXIT=${PIPESTATUS[0]}" | tee -a "$OUT/run.log"
+# Retry a whole-run failure ONCE. Deliberately once, not many: a harness run is hours long,
+# and silently retrying a systematically broken config burns a night. A single retry covers a
+# transient container/registry hiccup; a second identical failure is information, not noise.
+RC=1
+for attempt in 1 2; do
+  "$VENV/bin/harbor" run -c "$CFG" 2>&1 | tee -a "$OUT/run.log"
+  RC=${PIPESTATUS[0]}
+  [ "$RC" -eq 0 ] && break
+  echo "attempt $attempt exited $RC" | tee -a "$OUT/run.log"
+  [ "$attempt" -eq 1 ] && { echo "retrying once in 60s"; sleep 60; }
+done
+echo "EXIT=$RC" | tee -a "$OUT/run.log"
+
+# W&B: harbor has no W&B integration (verified), so log the outcome ourselves. Optional and
+# non-fatal -- a logging failure must never fail an expensive completed run.
+if [ -n "${WANDB_API_KEY:-}" ]; then
+  "$VENV/bin/python" -m pip install -q wandb >/dev/null 2>&1 || true
+  WANDB_ARM="$ARM" WANDB_RC="$RC" WANDB_OUT="$OUT" WANDB_CFG="$CFG" \
+  "$VENV/bin/python" - <<'PY' 2>&1 | tail -3 || echo "W&B logging failed (run itself unaffected)"
+import os, glob, json
+import wandb
+run = wandb.init(project=os.environ.get("WANDB_PROJECT", "tb21-harness-swap"),
+                 name=f"arm{os.environ['WANDB_ARM']}-{os.path.basename(os.environ['WANDB_OUT'])}",
+                 config={"arm": os.environ["WANDB_ARM"], "config_path": os.environ["WANDB_CFG"]})
+run.summary["exit_code"] = int(os.environ["WANDB_RC"])
+# Attach whatever harbor wrote, without assuming a schema we have not verified.
+for f in glob.glob(os.path.join(os.environ["WANDB_OUT"], "**", "*.json"), recursive=True)[:20]:
+    try:
+        run.save(f)
+    except Exception:
+        pass
+run.finish()
+print("W&B logged")
+PY
+else
+  echo "WANDB_API_KEY unset - skipping W&B (optional)."
+fi
+
 echo "Send back: $OUT/run.log AND the per-task results (not just the aggregate)."
