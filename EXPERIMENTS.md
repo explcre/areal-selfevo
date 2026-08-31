@@ -3,6 +3,30 @@
 Measured results and negative results, newest first. A claim only belongs here once it has
 been observed end to end; a prediction belongs in GOAL.md until then.
 
+## 2026-08-31 — The scale blocker is gone: a 30B serves and generates on the A100
+
+Frontis-MA1-30B (2607.28568, CC BY-NC 4.0) downloaded -- 57 GB, 12 shards, public and ungated.
+Config: `Qwen3MoeForCausalLM`, 48 layers, hidden 2048, vocab 151936, i.e. a Qwen3 MoE, so the
+ACTIVE parameter count is far below 30B and inference is cheap relative to the total.
+
+Served with sglang, `--tp 4 --mem-fraction-static 0.75` on GPUs 0-3: endpoint came up, and a
+chat completion returned real reasoning ("Another way is to use the distributive property:
+17 * ..."). 68 GB per card at load. Torn down cleanly afterwards.
+
+**Why this matters more than it looks.** Every null this project has measured is at 1.5B, and
+"the model is too small for the intervention to matter" has been an untestable confound
+throughout. The 27B and 32B attempts failed at TRAINING -- AReaL materialises full weights per
+rank before sharding, and the preflight modelled post-shard steady state rather than load
+peak. The pivot does not need training. It needs serving, and serving works.
+
+So the confound is now testable: the same routing questions can be asked at a scale where the
+base policy is actually competent at the task, rather than at a scale where AIME reads 0.000
+for every arm.
+
+**Not yet done:** no benchmark has been scored with this model, MLE-Bench has never been run
+here, and no routing arm has touched it. This entry records only that it loads, serves and
+generates.
+
 ## 2026-08-31 — Three credit signals, three training behaviours, ONE capability outcome
 
 All three arms at `globalstep149`, greedy, FULL benchmarks (`n_graded == n_problems` in every

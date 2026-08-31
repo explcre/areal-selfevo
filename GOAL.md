@@ -147,6 +147,118 @@ averaged; Terminal-Bench 2.1 via Harbor/Terminus-2 with `parser=json`, `temperat
 at `temperature=1.0`, `top_p=0.95`, 256K context. Five-run averaging matters — our own
 measured noise floor is 0.008-0.027 depending on the benchmark.
 
+### The full granularity x axis x policy grid, and an HONEST feasibility ordering
+
+Asked to run every level (task / cluster / sample / turn / token), every evolve target (model /
+harness / reward), every decider (rule / learned weights / code-as-policy / LLM agent), with
+MEDS clustering choosing per-cluster treatment, over every named benchmark. Writing the grid
+down in full, then ordering it by what the measurements say is worth doing -- because the grid
+is much larger than the evidence, and the project has already spent GPU-weeks on cells that
+turned out not to separate.
+
+**The grid.** Granularity {task, cluster, sample, turn, token} x evolve-target {model,
+harness, reward} x decider {rule, learned-weights, code-as-policy, LLM} x mode-cell
+(target x objective x on/off-policy, Sec. above). That is several hundred arms. Nothing about
+the project's measured position supports enumerating it.
+
+**What the measurements already say about this grid, before spending anything:**
+
+* **Token level is nearly empty.** Measured reach 1.7%, and the paired test was null
+  (McNemar 0.53-0.92). Recorded as result 5.
+* **Sample/group level does not separate.** Three credit signals, three very different
+  training trajectories, ONE identical capability outcome (MATH-500 spread 0.010 against a
+  0.020 noise floor; OlympiadBench spread 0.0015). Adding granularity to a decision that does
+  not reach the benchmark multiplies arms, not information.
+* **The binding constraint is CREDIT, not granularity.** A per-batch scalar provably collapses
+  every LinUCB arm to one parameter vector; a per-prompt delta changed behaviour and moved no
+  benchmark. Until a decision's credit is attached to something the decision CAUSED, finer
+  granularity produces finer indistinguishability.
+* **Turn level is unexplored and is the one gap the evidence does not close.** Every null so
+  far is single-turn math. A multi-turn agentic setting is where turn-level routing could
+  matter and where the harness axis becomes real, which is exactly what OpenMLE-Gym provides.
+
+**Therefore the ordering, cheapest decisive first:**
+
+1. **Serve a 30B and score it on one frontier benchmark.** Removes the scale confound behind
+   every null so far. In progress: Frontis-MA1-30B (`Qwen3MoeForCausalLM`, 48 layers)
+   downloaded, 57 GB.
+2. **Get ONE execution-grounded credit signal working** in the OpenMLE-Gym loop -- did the
+   artefact this decision produced actually run better. This is the thing every previous arm
+   lacked, and no amount of granularity substitutes for it.
+3. **Model-versus-harness routing at TURN/trajectory level**, the axis their operators do not
+   cover and the one gap not closed by our nulls.
+4. **MEDS clustering as the granularity step**, and only here: cluster trajectories by failure
+   mode, then treat clusters differently. MEDS is vendored and now runs (`sklearn` backend,
+   isolated venv) but has no caller. It is worth wiring ONLY once (2) exists, because
+   per-cluster treatment without per-cluster credit reproduces the sample-level null one level
+   up.
+5. **Deciders, in increasing cost**: rule (built, and measured equivalent to `solve_rate` --
+   report the confound rather than hide it), learned weights (built, null), code-as-policy
+   (built, no caller), LLM agent (not built; OpenRSI now owns "an LLM decides", so only the
+   model-vs-harness axis is novel).
+6. **Reward evolution (M12)** last: it changes the objective the other arms are measured
+   against, so it invalidates comparisons made before it.
+
+**Benchmarks, ordered by what a 30B can actually move, not by prestige.** MLE-Bench Lite
+(12h/task on ONE 12 GB card -- affordable, and the pivot's home benchmark) and OlympiadBench
+(wired, full 675, frontier math) first. LiveCodeBench v6 next (problem-level, so a mid-size
+policy yields a separable distribution). SWE-bench Pro, Terminal-Bench 2.1, DeepSWE, HLE,
+FrontierScience, Spider2/BIRD, BioMysteryBench, GeneBench-Pro are all recorded in Sec. 2 and
+all remain NOT BUILT -- they are 397B-class or domain-gated targets, and running them at 30B
+would produce the same uninformative floor AIME produces at 1.5B. **The rule this project
+already learned applies: a benchmark that cannot separate two arms is not evidence, it is a
+table row.**
+
+### Build on AReaL or on OpenRSI? Measured from the code, 2026-08-31
+
+Cloned and inspected rather than judged from the README. OpenRSI is 110 MB, ~106k lines of
+Python in 485 files:
+
+| component | lines | what it gives us |
+|---|---|---|
+| `OpenMLE-ERL` | 59,294 | SFT + RL. **Built on `slime`** (Megatron + SGLang), vendored in-tree |
+| `OpenMLE-Evo` | 33,608 | search runtime and benchmark adapters (MLE-Bench, NatureBench) |
+| `OpenMLE-Gym` | 13,493 | task construction, execution, evaluation |
+
+**Two facts that change the calculus.**
+
+1. **They serve with SGLang and run Python 3.12 -- exactly our stack.** AReaL also rolls out
+   through SGLang. The serving layer is shared, so this is not two incompatible worlds.
+2. **They have an analogous group-advantage seam.** `OpenMLE-ERL/RL/
+   adaptive_reward_advantage_utils.py` (267 lines) exposes `group_samples_by_group_index`,
+   `score_to_group_adaptive_reward`, `compute_gspo_group_advantages` and
+   `compute_ttt_entropic_advantages`. That is the same structural layer our
+   `apply_decisions(advantages, loss_mask, group_sizes, modes)` operates at. Porting the
+   routing seam is a MAPPING onto an existing seam, not a rewrite -- which is much cheaper
+   than assumed before reading the code.
+
+**What each choice actually costs.**
+
+*Staying on AReaL* keeps 1166 tests, the routing seam, the mixture machinery, the credit
+work, and hard-won knowledge of its failure modes (weight-sync deadlock, the stall at step
+~150, the watchdog). It costs building an agentic harness, an operator set and an MLE
+benchmark adapter from nothing -- roughly the 47k lines of Gym + Evo that OpenRSI already
+ships -- and it leaves us at a scale where the intervention is measured NOT to reach the
+benchmark.
+
+*Moving the pivot to OpenRSI* buys the environment, the operators, the benchmark adapters and
+released 30B/35B weights, which together remove both the harness gap and the scale blocker.
+It costs learning slime/Megatron internals rather than FSDP, accepting **CC BY-NC 4.0**, and
+patching a codebase with no documented plugin interface.
+
+**Recommendation: build the PIVOT on OpenRSI; keep AReaL for token-level work and as the
+source of methodology.** The reasoning is not preference. Our pivot contribution -- routing
+the model-versus-harness axis -- requires a harness worth evolving and a benchmark where
+harness changes are measurable. OpenRSI has both and AReaL has neither. The asset we would
+otherwise be giving up, the group-advantage seam, turns out to have a structural counterpart
+on their side, so it ports. And what genuinely transfers regardless of base -- the
+matched-proportion controls, the credit-assignment analysis, the measured noise floors, the
+mutation discipline -- is methodology, which is base-independent.
+
+**Stated limit on this recommendation:** structure was inspected, nothing was run. The real
+cost of patching slime is unknown until a first patch is attempted, and that is the cheapest
+next thing that would confirm or overturn this.
+
 ### M23 vs OpenRSI: an LLM DOES decide the evolution action there, and the axis differs
 
 Asked directly on 2026-08-31: is "let the LLM itself decide whether data evolves the model or
