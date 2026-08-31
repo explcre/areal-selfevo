@@ -2173,3 +2173,59 @@ Until one of them exists, a `router=contextual` run learns during cold start and
 policy afterwards. `feedback/confounded_skips` counts the refused batches, so this is visible
 in a run rather than inferred -- a controller that has silently stopped learning looks exactly
 like one that has finished learning, and the counter is what separates them.
+
+---
+
+## RESULT: the free self-target is reachable and INERT. step0m answers its own predeclaration
+
+The A/B predeclared earlier in this file has run. Both arms on the same 8xH200, same model,
+data, seed and optimiser, differing in one flag; scored on the full MATH-500, paired McNemar.
+
+| checkpoint | off (control) | on (solved to SFT) | diff | McNemar p | diff minus base offset |
+|---|---|---|---|---|---|
+| **base** (identical weights) | 0.5360 | 0.5160 | **-0.0200** | 0.245 | -- noise floor |
+| gs028 | 0.5400 | 0.5180 | -0.0220 | 0.289 | -0.002 |
+| gs057 | 0.5220 | 0.5140 | -0.0080 | 0.738 | +0.012 |
+| gs086 | 0.5360 | 0.5160 | -0.0200 | 0.378 | 0.000 |
+| gs115 | 0.5360 | 0.5160 | -0.0200 | 0.373 | 0.000 |
+| gs144 | 0.5400 | 0.5180 | -0.0220 | 0.347 | -0.002 |
+
+n = 500 problems, paired. Significant at **0 of 5** steps.
+
+**The base checkpoint is the whole story.** It is the same weights in both sweeps, so its
+-0.0200 is pure measurement noise -- two sweeps sample at temperature and disagree. Every
+arm difference is that same -0.020, and the difference-in-differences is **0.000 to 0.002 at
+four of five steps**. After removing the sweep offset the intervention did nothing at all.
+This is a cleaner null than a table of insignificant p-values, because it identifies exactly
+what the observed gap was: not a weak effect, but the offset that was there before training
+started.
+
+**It is not a reach problem.** `routed_group_fraction` was measured at 0.23 rising to 0.60,
+and `routed == solved` exactly. The intervention touched 24-60% of every batch. It reached
+the units; reaching them changed nothing on held-out accuracy.
+
+**The likely reason, and it is not encouraging for this branch.** For a solved group the
+model ALREADY assigns high probability to the correct answers -- that is what made the group
+solved. SFT raises that probability further, PPO's clip bounds how far, and the marginal
+effect on problems the model has not seen is nil. Training on what a model already gets right
+teaches it what it already knows. The measured entropy behaviour agrees: the ON arm sharpened
+faster mid-run and landed on the same floor, i.e. the intervention changed the optimisation
+PATH and not the destination.
+
+**What this does to the claim.** The silent channel is 87.5% solved, and the solved part is
+now measured to be worth nothing at this weight. That moves the value to the UNSOLVED part --
+which is exactly the part with no self-target, where a teacher or the harness is the only
+available consumer, and which is only ~4.5% of groups on GSM8K. On a harder task that share
+grows. So the honest reading is that this operating point (an easy task, a high solve rate)
+is the WORST case for the method, not the best, and the composition-flip prediction is now
+the load-bearing claim rather than a nice-to-have.
+
+**Predeclared next step, and it was fixed in advance:** "report as a null, then vary
+`solved_advantage` ONCE before abandoning". Running `solved_advantage=2.0` -- 4x the typical
+standardised advantage rather than half of it. If that is also null, the solved branch is
+abandoned on evidence rather than on taste.
+
+**One methodological note worth keeping.** The full-500 comparison was used rather than the
+250-problem report half, and that is legitimate HERE only because this A/B searched nothing:
+the arms differ in one flag fixed before either ran. The protocol number on the report half is
+also null (0/5 significant, base gap 0.036), and is in `compare_runs.py` output.

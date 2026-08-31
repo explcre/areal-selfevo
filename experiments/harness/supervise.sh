@@ -44,13 +44,18 @@ for attempt in $(seq 0 "$MAX_RESTARTS"); do
         # the dead run kept its GPUs and the next attempt collided with it in name_resolve.
         pkill -u "$USER" -f "experiment_name=${TAG}" 2>/dev/null
         pkill -u "$USER" -f "${TAG}\.sh" 2>/dev/null
+        # The trainer carries `experiment_name=<tag>` (a Hydra override); the rpc_server
+        # workers carry `--experiment-name <tag>` (a CLI flag). ONE run carries both, and
+        # matching only the first left 96 workers alive holding 24-70 GB each.
+        pkill -u "$USER" -f -- "-experiment-name ${TAG}" 2>/dev/null
         sleep 15
         pkill -9 -u "$USER" -f "experiment_name=${TAG}" 2>/dev/null
+        pkill -9 -u "$USER" -f -- "-experiment-name ${TAG}" 2>/dev/null
         # sglang servers do not carry the experiment name on their command line, so they
         # survive the pattern above and hold their GPU memory into the next attempt.
         pkill -9 -u "$USER" -f "inference_service.sglang.launch_server" 2>/dev/null
         sleep 5
-        left=$(pgrep -u "$USER" -f "experiment_name=${TAG}" | wc -l)
+        left=$(pgrep -u "$USER" -f "experiment.name.${TAG}" | wc -l)
         say "after kill: $left processes still match experiment_name=${TAG}"
         break
       fi
