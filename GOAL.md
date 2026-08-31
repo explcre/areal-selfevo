@@ -648,6 +648,42 @@ per round, attached to the action that produced them.
 So the auditor's verdicts can BE the credit signal for a model-versus-harness router. That is
 not a wish: it is our measured requirement met by a released mechanism.
 
+### Initialise from the best-known harness per task, then evolve (2026-08-31)
+
+Proposed, and it resolves the constraint recorded below rather than dodging it. If
+best-reported-harness-per-benchmark is a strong published static policy that we must beat,
+then **start there and evolve from it** instead of evolving from scratch.
+
+Why this is the right shape and not just optimism:
+
+* **The baseline becomes the initialisation.** A policy initialised at the best static harness
+  cannot do worse than it by construction, provided the evolution step is gated on measured
+  improvement. The comparison "ours vs best static harness" then measures exactly the thing we
+  add, with no scaling or base-model confound.
+* **It is the cold start M9 was supposed to supply, and did not.** M9 was built to be the
+  sensible written rule a learned controller must beat, and its audit showed it collapses to
+  one predicate and does not de-confound anything. Best-known-harness-per-task is a genuinely
+  informative prior that the literature already computed for us, which is what M9's threshold
+  could not be grounded in.
+* **It fixes the failure mode we measured.** The contextual router sat at ~93% RL before any
+  credit arrived, purely because untouched LinUCB arms tie and `argmax` breaks ties
+  alphabetically. Initialising at a known-good policy replaces that arbitrary starting point
+  with an informative one, so the early phase is not wasted discovering what a leaderboard
+  already knows.
+* **Evolution then has a floor.** Every measured null in this project came from an arm that
+  could drift anywhere. An arm that starts at a strong prior and only moves on verified
+  improvement has a worst case equal to the baseline, which makes a null informative rather
+  than merely disappointing.
+
+**What it does not fix.** The credit problem is unchanged: deciding *when* a per-trajectory
+deviation from the static best is justified still needs execution-grounded evidence, which is
+falsifier (1). And a policy that never deviates is just the baseline wearing a controller --
+so the reportable quantity is the deviation rate AND its effect, not the final score alone.
+
+**Sequencing.** This becomes step 0 of the harness work: fix the per-task best harness from
+published numbers, reproduce it ourselves at matched protocol (Terminus 2, e2b, pass@1 over 3
+repeats), and only then allow per-trajectory deviation.
+
 ### The harness is already a measured axis in public leaderboards (2026-08-31)
 
 Raised: different papers/repos ship benchmark-specific harnesses, and each is presumably best
