@@ -196,6 +196,49 @@ is exactly why `MEDSClusterer` fits once and assigns thereafter rather than re-f
 batch.
 
 
+#### Correction: a harness DISPATCHER makes fine granularity coherent after all
+
+The table above says per-sample harness action is "degenerate", and that is wrong as stated.
+It is only degenerate if each sample gets its own UNIQUE harness. It is entirely coherent for
+each sample to be routed to one of a small **harness VARIANT SET** by a predicate on its
+features -- a tool-heavy scaffold for units whose failures look like missing information, a
+longer-budget scaffold for units that truncate, the plain scaffold otherwise.
+
+That reframes what "evolving the harness" means, into two things that evolve at different
+rates:
+
+* **the variant set** -- what scaffolds exist. Coarse, changes rarely, and is what
+  Co-Harness and EvoTrainer actually evolve.
+* **the dispatch rule** -- which unit gets which variant. Fine, changes every batch, and is
+  *the same object as our routing policy*.
+
+**This unifies the two axes into one action space**, which is the cleanest version of the
+claim in this document: the controller selects a pair
+
+    pi(u) = (estimator, harness_variant)
+
+per unit, from features. Model routing and harness routing stop being two mechanisms and
+become two coordinates of one decision. `truncated_fraction` -- already one of the seven
+features, and already the one that separates "failed" from "out of budget" -- is exactly the
+signal that should pick a longer-budget variant. That is a concrete, testable prediction the
+current design already has the inputs for.
+
+Granularity, restated correctly:
+
+| | dispatch (which variant) | variant-set evolution |
+|---|---|---|
+| token | still meaningless -- a scaffold applies to a whole rollout | meaningless |
+| sample | **coherent** -- pick a variant per prompt | too fine to learn from |
+| cluster | **coherent, and where the evidence aggregates** | **natural** |
+| task | coherent | natural (Co-Harness / SIA) |
+
+**What this costs to build, and why it is honest to say so:** a variant set needs at least two
+genuinely different scaffolds, and a dispatch rule needs the matched-proportion control like
+every other arm -- otherwise "we dispatched" cannot be told apart from "one variant is just
+better". Neither exists yet. The value of writing it down now is that the action space, the
+features, and the control are all already built; what is missing is the variants.
+
+
 ### Models
 
 | model | status |
