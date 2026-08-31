@@ -27,10 +27,13 @@ Why not AZR's runner: `math_eval/eval/math_eval.py` does `from vllm import LLM`,
 is not installed here. Installing it risks the torch/sglang environment. The runner is the
 easy half; the grader is the part worth reusing.
 
-Datasets come from the pinned AZR clone (MIT). Only benchmarks with a uniform
-`problem`/`answer` schema are included; olympiadbench (`question`/`final_answer`) and
-minerva_math (answer embedded in `solution`) need their own extraction and are deliberately
-left out rather than half-supported.
+Datasets come from the pinned AZR clone (MIT). Benchmarks with a uniform
+`problem`/`answer` schema are included as-is; olympiadbench (`question`/`final_answer`) has
+its own adapter in `load` and IS included -- it is the frontier math target, 675 problems
+with a 7-point CI, where MATH-500 saturates at 27B and AIME is unusable at 1.5B. Its gold
+answers self-verify 675/675 through this grader, measured 2026-08-31, so a low score from it
+is the model's and not the harness's. minerva_math (answer embedded in `solution`) still
+needs its own extraction and is left out rather than half-supported.
 """
 
 from __future__ import annotations
@@ -89,7 +92,8 @@ def require_dataset(name: str) -> Path:
             f"present: {sorted(d.name for d in DATA.iterdir() if d.is_dir())[:12]}"
         )
     return f
-SUITE = ["aime24", "aime25", "amc23", "math500", "hmmt_2024", "hmmt_2025", "livemathbench"]
+SUITE = ["aime24", "aime25", "amc23", "math500", "hmmt_2024", "hmmt_2025",
+         "livemathbench", "olympiadbench"]
 
 PROMPT = (
     "Solve the following math problem. Reason step by step, and put your final answer "

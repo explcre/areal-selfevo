@@ -105,7 +105,7 @@ a comparison is like-for-like rather than a benchmark of our choosing.
 | B1 | MATH-500 | ours/common | **DONE** | saturated at 27B (0.966); usable only at 1.5B/7B |
 | B2 | AIME 24/25 | common | **DONE** | unusable: 0.000 @1.5B, 0.867 @27B with a 24-pt CI on 30 problems |
 | B3 | AMC23, HMMT 24/25 | common | **DONE** | 30-40 problems; indicative only |
-| B4 | **OlympiadBench** | common | **DONE** | **the frontier target**: 675 problems, 7-pt CI, 27B = 0.825 @8% trunc |
+| B4 | **OlympiadBench** | common | **DONE** | **the frontier math target**: 675 problems, 7-pt CI, 27B = 0.825 @8% trunc. Now IN `math_bench.SUITE` (2026-08-31); gold self-verifies **675/675** through our grader, so a low score is the model's. 94/675 carry multiple golds in one string -- exact match marks those wrong, so scores are a LOWER BOUND |
 | B5 | **Terminal-Bench 2.1** (Terminus-2 harness) | **Ornith-1.5** | **NOT BUILT** | Ornith-397B 86.1, 35B-A3B 67.8. Also AI2 2607.12227's benchmark, so it is where the evaluation bar was set |
 | B6 | **DeepSWE** (Claude Code harness) | **Ornith-1.5** | **NOT BUILT** | Ornith-397B 56.0 |
 | B7 | **Frontier-Bench** | **Ornith-1.5** | **NOT BUILT** | competitors near zero |
@@ -117,6 +117,29 @@ a comparison is like-for-like rather than a benchmark of our choosing.
 | B13 | **Spider2 / BIRD** | enterprise SQL | **NOT BUILT** | both on disk, never run |
 | B14 | BioMysteryBench | domain | **NOT BUILT** | 90 gated, 155 GB |
 | B15 | GeneBench-Pro | domain | **NOT BUILT** | 10/129 public |
+
+**Do we need a frontier CODE benchmark? Yes -- but scale gates which one.** Answering this
+with measurement rather than preference:
+
+* **Math is not the gap.** B4 OlympiadBench is the frontier target, is wired into the scoring
+  suite as of 2026-08-31, and its golds self-verify 675/675. MATH-500 saturates at 27B and
+  AIME is unusable at 1.5B (0.000), so OlympiadBench is where a math claim gets made. The
+  blocker there is a method checkpoint worth scoring, not a missing benchmark.
+* **Code is the gap, and B5/B6/B8 are the wrong first move at our scale.** Terminal-Bench 2.1,
+  DeepSWE and SWE-bench Pro are reported by 397B-class systems (Ornith-397B: 86.1, 56.0).
+  A 1.5B or 7B policy scores at or near zero on repo-level SWE, and a table of zeros
+  distinguishes no arm from any other -- the same trap as AIME at 1.5B, which is already
+  recorded as B2's status. Running them now would buy a benchmark row and no signal.
+* **B12 LiveCodeBench v6 is the realistic first code benchmark**, because it is
+  problem-level rather than repo-level, so a small policy produces a non-degenerate score
+  distribution that arms can separate on.
+* **The frontier SDE benchmarks are the natural home of the HARNESS axis, not the model
+  axis.** On Terminal-Bench and DeepSWE the harness carries much of the work, which is exactly
+  what M10's harness-evolution action space is about, and both benchmarks publish a fixed
+  harness (Terminus-2, Claude Code) to evolve against. That makes them the right target for
+  the harness claim and the wrong target for a 1.5B model claim -- they need a competent base
+  policy first. Sequence accordingly: LiveCodeBench for the model claim, SDE for the harness
+  claim once a large-enough policy is available.
 
 **Ornith-1.5 evaluation protocol, to copy rather than invent:** five independent runs
 averaged; Terminal-Bench 2.1 via Harbor/Terminus-2 with `parser=json`, `temperature=1.0`,
