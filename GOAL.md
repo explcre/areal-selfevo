@@ -648,6 +648,50 @@ per round, attached to the action that produced them.
 So the auditor's verdicts can BE the credit signal for a model-versus-harness router. That is
 not a wish: it is our measured requirement met by a released mechanism.
 
+### The harness is already a measured axis in public leaderboards (2026-08-31)
+
+Raised: different papers/repos ship benchmark-specific harnesses, and each is presumably best
+on its own benchmark -- so pick the best harness per task. Checked, and this is stronger than
+a hunch: **the field already measures it and reports it separately.**
+
+* The Terminal-Bench 2.1 leaderboard states outright that it **evaluates the model and the
+  agent harness TOGETHER**, and that *"the same model can therefore receive different
+  Terminal-Bench 2.1 scores when paired with different agent harnesses."*
+* A **"Terminal-Bench 2.1 (Best Reported Harness)"** listing is tracked as its own leaderboard
+  variant, distinct from the standard-harness numbers. Somebody already found this distinction
+  worth maintaining.
+* Magnitudes are large: Claude Code with Opus 4.6 gained **+12.1 points** from a 2.1 harness
+  update alone. LHH reports Qwen3.7-Plus 69.7 -> 77.2 on the same benchmark. Both are
+  fixed-model, harness-only deltas.
+* Top of leaderboard: GPT-5.6 Sol 89.5, Claude Opus 5 via Claude Code 89.1.
+
+**Protocol we must match, taken from the leaderboard rather than invented:** Terminus 2 harness
+in an e2b sandbox, **pass@1 averaged over 3 repeats per task**. Our own greedy-scoring work
+measured a 0.020 noise floor and ~1 point of jitter on a single OlympiadBench score; a
+single-repeat harness comparison would be indistinguishable from that jitter. Three repeats is
+the published protocol AND the statistically necessary one here.
+
+`harbor` is the open-source runner for this, supports custom agent implementations, and is
+**verified installable in a plain venv (0.18.0, `harbor --help` works)** -- so the standard
+harness and a custom one can be run through the same executor, which is what makes a fair
+swap possible at all.
+
+**What this does and does not do for the contribution.**
+
+It HELPS: the model-versus-harness axis is not invented here. The field measures harness effect
+at fixed model, publishes it, and finds it large. That is the premise our routing decision
+rests on, and it is now cited rather than assumed.
+
+It CONSTRAINS: "pick the best harness" is therefore NOT novel -- a leaderboard variant already
+does exactly that, statically, per benchmark. Our claim has to stay narrower and sharper:
+routing **per trajectory**, between spending it on the model or on the harness, with
+**execution-grounded credit** from the auditor. Static best-harness selection is the baseline
+we must beat, not the contribution.
+
+**A concrete baseline this gives us for free:** best-reported-harness-per-benchmark is a strong,
+already-published static policy. If per-trajectory routing cannot beat "always use the best
+harness for this benchmark", that is a clean negative result and should be reported as one.
+
 ### Harness-swap at FIXED model: the cheapest instrument for the harness axis
 
 Raised 2026-08-31: run Frontis-MA1 under **its own** harness first, because a model
