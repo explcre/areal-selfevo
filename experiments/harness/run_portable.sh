@@ -221,9 +221,23 @@ claim_gpus() {
     # Validate the pin rather than trusting it.
     local n_pin busy
     n_pin=$(echo "$GPUS" | tr ',' '\n' | grep -c .)
-    busy=$(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits 2>/dev/null \
-           | awk -F"[, ]+" -v t="$GPU_FREE_MIB" -v want=",$GPUS," \
-                 '"'"'index(want, ","$1",") && $2+0 >= t {printf "%s(%sMiB) ", $1, $2}'"'"')
+    # Deliberately NOT awk, and not a $(...) one-liner. The previous version carried a
+    # baked-in '"'"'-style escape that bash parsed as `syntax error near unexpected token (`
+    # every time this ran. It failed SILENTLY on our own boxes -- the error went to stderr,
+    # `busy` came back empty, `[ -n "$busy" ]` was false, and the script proceeded -- so the
+    # GPU-pin safety check never actually validated anything. A collaborator's 8xH200 box
+    # surfaced it as "run_portable.sh: line 226". Measured 2026-08-31.
+    busy=""
+    while IFS=, read -r _idx _used; do
+      _idx=${_idx// /}; _used=${_used// /}
+      case "$_idx" in ''|*[!0-9]*) continue ;; esac
+      case "$_used" in ''|*[!0-9]*) continue ;; esac
+      for _pin in ${GPUS//,/ }; do
+        if [ "$_pin" = "$_idx" ] && [ "$_used" -ge "$GPU_FREE_MIB" ]; then
+          busy="$busy$_idx(${_used}MiB) "
+        fi
+      done
+    done < <(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits 2>/dev/null)
     if [ -n "$busy" ] && [ "$GPUS_FORCE" != "1" ]; then
       log "GPUS=$GPUS was pinned but these already hold memory: $busy"
       log "Someone else may be using them. Set GPUS_FORCE=1 to proceed anyway."

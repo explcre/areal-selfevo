@@ -330,6 +330,51 @@ applied to a vacuous attribution. Correct, and it has a consequence worth design
   failure for M23: an LLM-as-router asked to be decisive will collapse the mode distribution
   faster than a bandit with explicit exploration, and will therefore starve its own feedback.
 
+### OPD as a ROUTED MODE, chosen on measured performance (asked 2026-08-31)
+
+The proposal: on-policy distillation should not be a separate pipeline but one of the modes
+the router can pick per unit, and it should be preferred where it actually performs better.
+Recording it because the architecture already almost supports it, and because the parts that
+are missing are specific.
+
+**Already there.** `distill` is a REGISTERED `TrainingMode` and `known_modes()` reports it as
+target-requiring: `{'rl': False, 'sft': True, 'distill': True, 'skip': False}`. Since the
+mixture seam landed, a decision can also express a BLEND -- `{rl: 0.6, distill: 0.4}` is
+representable today, and `RoutingDecision` validates it.
+
+**Deliberately not there.** `apply_decisions` implements `_APPLIED = (RL, SFT, SKIP)` and
+REFUSES `distill` rather than silently degrading it to SKIP. That refusal is correct and
+should stay: a teacher-requiring mode needs a target tensor the seam does not have, and
+quietly skipping it would report a distillation arm that never ran -- the exact failure class
+that produced the inert contextual router and the inert random control.
+
+**So "OPD as a routed mode" needs three things, in this order:**
+
+1. **A teacher, and a target tensor at the seam.** Without it the mode is unimplementable, not
+   merely unimplemented. M24's three recorded traps apply here unchanged.
+2. **A distill branch in `apply_decisions`**, blending like the others: `new = a*original +
+   d*distill_target + ...`. The mixture machinery generalises; the target does not exist yet.
+3. **A credit signal that can tell distill from RL for the SAME unit.** This is the binding
+   constraint, not the plumbing.
+
+**Why (3) is the whole difficulty, from our own measurements.** "Prefer OPD where it performs
+better" requires the controller to MEASURE which mode performed better per unit. This project
+has now measured that a per-batch scalar cannot do that (it provably collapses every LinUCB
+arm to one parameter vector), and that a per-prompt delta changes the router's visible
+behaviour while moving no benchmark: three credit signals, three very different training
+trajectories, one identical capability outcome. Adding a fourth mode to a controller that
+cannot yet rank the three it has would produce a fourth indistinguishable arm.
+
+The OpenRSI lesson (Sec. 2c) applies directly: their decider works because credit is
+EXECUTION-GROUNDED -- did the artefact the decision produced actually run better. An OPD-vs-RL
+choice has a natural execution-grounded analogue (did this prompt's solve rate improve more
+under distill than under RL, on matched prompts), and that is the version worth building.
+A preference learned from batch-mean reward is not.
+
+**Status: NOT BUILT, and correctly sequenced behind a teacher (M24) and a credit signal that
+can rank modes.** Recorded so the idea is not lost, and so it is not started in the wrong
+order.
+
 ### Note on M24 (multi-teacher OPD): why it moved up, and three traps already known
 
 **Why it moved up.** The solved branch is abandoned (inert at 0.5, harmful at 2.0), and the
