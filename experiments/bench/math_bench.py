@@ -110,9 +110,15 @@ SUITE = ["aime24", "aime25", "amc23", "math500", "hmmt_2024", "hmmt_2025",
 # than being cut off mid-solution -- they are genuine failures, not budget artifacts. The
 # caps below are therefore chosen for HEADROOM and PROVENANCE, not because they raise scores.
 #
-# olympiadbench is the exception worth watching: 15.3% truncation at 3072 (103/675), the
-# highest in the suite, and it has NOT been re-measured at a higher cap. Its 8192 is a
-# hypothesis, and `cap_limited` in the results row is what will confirm or refute it.
+# olympiadbench is the exception, and the hypothesis was CONFIRMED by measurement: unlike
+# MATH-500 and AIME, where 3072 -> 8192 moved accuracy by less than noise, it gained
+# 0.1778 -> 0.1941 with truncation falling 15.3% -> 11.7% (103/675 -> 79/675). So a uniform
+# cap really was wrong for this suite, and this benchmark really is the long-output one.
+#
+# 8192 is still not enough: `cap_limited` fired at 11.7%, and it fired for one arm and not
+# the other (ctx 79/675 vs rnd 61/675), which makes an arm comparison at that cap unfair --
+# the arm that truncates more is penalised more. Raised to 16384 to test whether the gap
+# survives once neither arm is budget-bound.
 #
 # Anything absent falls back to the CLI value, so this table states only what differs.
 BENCH_OVERRIDES: dict[str, dict[str, object]] = {
@@ -121,7 +127,7 @@ BENCH_OVERRIDES: dict[str, dict[str, object]] = {
     "hmmt_2024": {"max_tokens": 8192},
     "hmmt_2025": {"max_tokens": 8192},
     "livemathbench": {"max_tokens": 8192},
-    "olympiadbench": {"max_tokens": 8192},
+    "olympiadbench": {"max_tokens": 16384},
 }
 
 # Every knob that changes what the model produces or how it is sampled. Recorded per

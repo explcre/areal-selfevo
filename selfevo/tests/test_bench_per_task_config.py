@@ -37,7 +37,9 @@ def test_a_benchmark_without_overrides_gets_the_cli_values():
 def test_an_override_wins_over_the_cli_default():
     """Otherwise the table is decorative and every benchmark runs at the global value."""
     assert mb.resolve_params("aime24", _args())["max_tokens"] == 8192
-    assert mb.resolve_params("olympiadbench", _args())["max_tokens"] == 8192
+    # OlympiadBench is the measured long-output case: 3072 -> 8192 gained 0.1778 -> 0.1941
+    # with truncation 15.3% -> 11.7%, and cap_limited still fired, so it was raised again.
+    assert mb.resolve_params("olympiadbench", _args())["max_tokens"] == 16384
 
 
 def test_unoverridden_keys_still_follow_the_cli_on_an_overridden_benchmark():

@@ -234,6 +234,12 @@ class PPOActor:
         step = getattr(self, "_selfevo_batch", 0)
         self._selfevo_batch = step + 1
 
+        # Which credit signal the router is trained on. "batch" is the shipped default and
+        # what every run before 2026-08-31 used; "prompt" credits each decision with its own
+        # prompt's change in solve rate. They differ on exactly one axis, so they are an
+        # ablation pair rather than two features.
+        use_prompt_credit = getattr(gr, "credit", "batch") == "prompt"
+
         # Close the loop on the PREVIOUS batch before deciding this one. The outcome of a
         # decision is not observable until after the update it took part in, so the earliest
         # a router can learn from batch N is at batch N+1.
@@ -245,7 +251,7 @@ class PPOActor:
         # updates were, so a result can be discounted by it instead of assumed clean.
         mean_reward = float(raw_reward.detach().float().mean())
         pending = getattr(self, "_selfevo_pending", None)
-        if pending is not None and hasattr(router, "observe"):
+        if not use_prompt_credit and pending is not None and hasattr(router, "observe"):
             from selfevo.routing.feedback import ConfoundedUpdate
             from selfevo.routing.outcomes import batch_outcomes
 
@@ -275,6 +281,53 @@ class PPOActor:
             )
             modes.append(router.route(ctx).argmax())
 
+        if use_prompt_credit and hasattr(router, "observe"):
+            # Credit each PRIOR decision with the change in ITS OWN prompt's solve rate,
+            # then record the decision just made. Same task, different point in training,
+            # so unlike the batch scalar the value varies with the mode.
+            #
+            # All members of a group are rollouts of one prompt, so the group's identity is
+            # any member's prompt tokens -- taken from the first row of the group's slice.
+            from selfevo.routing.feedback import DecisionOutcome
+            from selfevo.routing.prompt_credit import PromptCreditLedger, prompt_key
+
+            ledger = getattr(self, "_selfevo_ledger", None)
+            if ledger is None:
+                ledger = PromptCreditLedger()
+                self._selfevo_ledger = ledger
+
+            ids_cpu = data["input_ids"].detach().cpu().tolist()
+            mask_cpu = data["loss_mask"].detach().cpu().tolist()
+            outcomes: dict[str, DecisionOutcome] = {}
+            start = 0
+            for i, (f, g) in enumerate(zip(feats, sizes)):
+                row = start
+                start += g
+                try:
+                    key = prompt_key(ids_cpu[row], mask_cpu[row])
+                except ValueError:
+                    # A row with no prompt region carries no identity; skipping it loses one
+                    # observation, whereas keying on it would merge unrelated prompts.
+                    continue
+                paired = ledger.observe_and_record(
+                    key, f"{step}:{i}", modes[i], float(f.solve_rate), step
+                )
+                if paired is None:
+                    continue
+                prior, delta = paired
+                outcomes[prior.unit_id] = DecisionOutcome(
+                    mode=prior.mode, value=delta, batch_id=str(prior.step)
+                )
+            if outcomes:
+                router.observe(outcomes)
+            stats_tracker.scalar(**ledger.as_metrics())
+            # A router that has forgotten the prior unit cannot be credited, and its
+            # pending cache is bounded. Logged so a run where prompt credit is silently
+            # reaching nothing is visible rather than looking like a null result.
+            stats_tracker.scalar(
+                **{"prompt_credit/observed_units": float(len(outcomes))}
+            )
+
         routed, stats = apply_decisions(
             advantages,
             data["loss_mask"],
@@ -283,7 +336,7 @@ class PPOActor:
             sft_weight=float(gr.solved_advantage),
         )
         stats_tracker.scalar(**stats.as_metrics())
-        if hasattr(router, "observe"):
+        if not use_prompt_credit and hasattr(router, "observe"):
             self._selfevo_pending = (
                 {f"{step}:{i}": m for i, m in enumerate(modes)},
                 str(step),

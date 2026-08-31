@@ -163,3 +163,41 @@ def test_metrics_expose_the_starvation_signal():
     assert m["prompt_credit/evicted"] == 1.0
     assert m["prompt_credit/pending"] == 1.0
     assert m["prompt_credit/credited"] == 0.0
+
+
+# ------------------------------------------------------- within-batch duplicates -------
+
+
+def test_two_sightings_in_the_same_batch_do_not_pair():
+    """Found by the wired test, and it is a real defect rather than a test artifact.
+
+    Two groups in one batch can carry the same prompt. Pairing them credits one group's
+    decision with another group's solve rate at the IDENTICAL policy -- a delta measuring
+    sampling noise between two rollout groups, not the effect of a mode. The value of this
+    ledger is that the two observations are separated in training time.
+    """
+    led = PromptCreditLedger()
+    assert led.observe_and_record("k", "0:0", "sft", 0.2, step=0) is None
+    assert led.observe_and_record("k", "0:5", "rl", 0.9, step=0) is None
+    assert led.same_batch_skips == 1
+    assert led.credited == 0
+
+
+def test_the_first_decision_in_the_batch_is_the_one_that_pairs_later():
+    """The earlier record is kept, so the decision credited is the one applied first."""
+    led = PromptCreditLedger()
+    led.observe_and_record("k", "0:0", "sft", 0.2, step=0)
+    led.observe_and_record("k", "0:5", "rl", 0.9, step=0)      # refused, must not overwrite
+    got = led.observe_and_record("k", "1:0", "skip", 0.5, step=1)
+    assert got is not None
+    prior, delta = got
+    assert prior.unit_id == "0:0" and prior.mode == "sft"
+    assert delta == pytest.approx(0.3)                          # 0.5 - 0.2, not 0.5 - 0.9
+
+
+def test_same_batch_skips_are_reported():
+    """A batch full of duplicate prompts halves the pairing rate; that must be visible."""
+    led = PromptCreditLedger()
+    led.observe_and_record("k", "0:0", "sft", 0.2, step=0)
+    led.observe_and_record("k", "0:1", "rl", 0.2, step=0)
+    assert led.as_metrics()["prompt_credit/same_batch_skips"] == 1.0

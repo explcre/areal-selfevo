@@ -1,0 +1,67 @@
+"""Mutation test for the prompt-credit wiring in the actor."""
+import hashlib, pathlib, subprocess, sys
+
+REPO = pathlib.Path(sys.argv[1])
+TARGET = REPO / "areal/trainer/ppo/actor.py"
+TESTS = "selfevo/tests/test_prompt_credit_wired.py"
+
+MUTATIONS = [
+    ("prompt credit never runs, so credit='prompt' silently means 'batch'",
+     '        if use_prompt_credit and hasattr(router, "observe"):',
+     '        if False and hasattr(router, "observe"):'),
+    ("credit mode ignored, so both arms take the prompt path",
+     '        use_prompt_credit = getattr(gr, "credit", "batch") == "prompt"',
+     '        use_prompt_credit = True'),
+    ("credit mode ignored the other way, so the arm never exists",
+     '        use_prompt_credit = getattr(gr, "credit", "batch") == "prompt"',
+     '        use_prompt_credit = False'),
+    ("ledger rebuilt every batch, so no prompt ever pairs",
+     '            ledger = getattr(self, "_selfevo_ledger", None)',
+     '            ledger = None'),
+    ("outcomes credited to the CURRENT unit instead of the prior one",
+     '                outcomes[prior.unit_id] = DecisionOutcome(\n'
+     '                    mode=prior.mode, value=delta, batch_id=str(prior.step)\n'
+     '                )',
+     '                outcomes[f"{step}:{i}"] = DecisionOutcome(\n'
+     '                    mode=modes[i], value=delta, batch_id=str(step)\n'
+     '                )'),
+    ("the prompt key uses the whole row, so a prompt never matches itself",
+     '                    key = prompt_key(ids_cpu[row], mask_cpu[row])',
+     '                    key = str(ids_cpu[row])'),
+]
+
+
+def run_tests() -> bool:
+    r = subprocess.run([sys.executable, "-m", "pytest", TESTS, "-q", "--no-header", "-x"],
+                       cwd=REPO, capture_output=True, text=True, timeout=1800)
+    return r.returncode == 0
+
+
+def main() -> int:
+    original = TARGET.read_text()
+    digest = hashlib.sha256(original.encode()).hexdigest()
+    if not run_tests():
+        print("BASELINE IS RED"); return 2
+    print(f"baseline green; {len(MUTATIONS)} mutations\n")
+    survivors = []
+    for label, find, repl in MUTATIONS:
+        if original.count(find) != 1:
+            print(f"SKIP  {label}: anchor appears {original.count(find)}x")
+            survivors.append(label); continue
+        TARGET.write_text(original.replace(find, repl, 1))
+        try:
+            survived = run_tests()
+        finally:
+            TARGET.write_text(original)
+            assert hashlib.sha256(TARGET.read_text().encode()).hexdigest() == digest
+        print(f"{'SURVIVED' if survived else 'killed  '}  {label}")
+        if survived:
+            survivors.append(label)
+    print(f"\n{len(MUTATIONS) - len(survivors)}/{len(MUTATIONS)} killed")
+    for x in survivors:
+        print(f"  SURVIVOR: {x}")
+    return 1 if survivors else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

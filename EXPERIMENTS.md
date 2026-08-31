@@ -3,6 +3,92 @@
 Measured results and negative results, newest first. A claim only belongs here once it has
 been observed end to end; a prediction belongs in GOAL.md until then.
 
+## 2026-08-31 — A killed mutation harness left the target MUTATED, and the next run made it the baseline
+
+Worth recording because the second failure is worse than the first, and both were silent.
+
+A mutation harness writes a mutation, runs the tests, and restores in a `finally`. A 2-minute
+tool timeout killed one mid-mutation, so the restore never ran and
+`key = str(ids_cpu[row])` stayed on disk in place of
+`key = prompt_key(ids_cpu[row], mask_cpu[row])`.
+
+The next run then read the ALREADY-MUTATED file as its `original`. So it reported
+`baseline green` on a corrupted tree, reported that one mutation's anchor `appears 0x` and
+counted it as a survivor rather than an error, applied every other mutation on top of the
+corruption, and would have written the corrupted text back as the "restore". Five of six
+mutations were correctly restored; the sixth was permanent until caught.
+
+**Two independent defects had to line up, and both are recorded elsewhere in this log.** The
+harness left the file dirty, AND the wiring tests could not tell prompt-only keying from
+whole-row keying, because they reused IDENTICAL rows across the two sightings. Real rollouts
+of one prompt differ in their responses, so a whole-row key would never pair them -- the test
+used an unrealistic case, exactly like the earlier "hash only the first token" survivor whose
+test prompts differed at position 0.
+
+Fixed: the tests now vary the response tokens while holding the prompt fixed, which is the
+discriminating case. Re-run: **6/6 killed**, and the target file verified intact afterwards.
+
+**How to apply.** Run mutation harnesses in the background, never in a foreground call that
+can hit a tool timeout. After any harness run -- especially an interrupted one -- verify the
+target with `git diff` or by grepping for each mutation's replacement text. A
+`SKIP: anchor appears 0x` on a mutation that worked before is the tell that the file is
+already mutated. `baseline green` only says the tests pass on whatever is on disk.
+
+## 2026-08-31 — OlympiadBench really is the long-output benchmark, and the cap flag earned its keep
+
+The per-task cap hypothesis, tested. Same `ctx@149` checkpoint, OlympiadBench only:
+
+| cap | accuracy | Wilson 95% | truncated | cap_limited |
+|-----|----------|------------|-----------|-------------|
+| 3072 | 0.1778 | [0.151, 0.208] | 103/675 (15.3%) | n/a (pre-flag) |
+| 8192 | **0.1941** | [0.166, 0.226] | 79/675 (11.7%) | **True** |
+
+**Confirmed, and it is the exception.** On MATH-500 and AIME, 3072 -> 8192 moved accuracy by
+less than the noise floor. Here it gained +0.0163 and cut truncation by a quarter. So a
+uniform cap really was wrong for this suite, and this benchmark really is the one with long
+answers -- which is what the per-benchmark table was built to express.
+
+**The flag did the job it was built for.** At 8192, `cap_limited` fired for ctx (79/675,
+11.7%) and NOT for rnd (61/675, 9.0%). An arm comparison across that asymmetry is unfair: the
+arm that truncates more is penalised more, and truncated generations are graded wrong. So the
+observed ctx - rnd = **+0.0104** (0.1941 vs 0.1837, intervals [0.166,0.226] vs [0.156,0.215])
+is NOT reportable as an effect. It is a hint that has to be re-measured where neither arm is
+budget-bound. Raised to 16384 and both arms relaunched.
+
+Note what this would have looked like without the flag: a +1 point gap on the frontier
+benchmark, intervals overlapping, and nothing in the output to say one arm was
+budget-truncated more than the other.
+
+## 2026-08-31 — Per-prompt credit wired into the actor, and a within-batch defect it exposed
+
+`group_routing.credit` now selects the signal the router learns from: `"batch"` (default,
+unchanged, what every prior run used) or `"prompt"`. The prompt path keys each group by its
+prompt tokens, credits the PRIOR decision for that prompt with the change in its own solve
+rate, and records the current one. Default untouched, so rollback is exact and the two are an
+ablation pair on one axis.
+
+**A test written to check that different prompts do not pair failed, and it was the code that
+was wrong.** Two groups in ONE batch can carry the same prompt, and the ledger paired them --
+crediting one group's decision with another group's solve rate at the IDENTICAL policy. That
+delta measures sampling noise between two rollout groups, not the effect of a mode; the entire
+value of this ledger is that the two observations are separated in training time. The ledger
+now refuses to pair within a batch, keeps the earlier record so the decision that pairs with
+the prompt's next appearance is the one applied first, and counts `same_batch_skips` so a
+batch full of duplicate prompts is visible rather than silently halving the pairing rate.
+
+19 ledger tests (11/11 mutants) and 7 wiring tests driven through the real
+`_compute_advantages`. One mutation SKIPped on a stale anchor after the refactor and was
+rewritten rather than left as a hole -- a skipped mutation is an untested defect wearing a
+green tick.
+
+**Feasibility constraint worth recording:** the router's own `pending_cap` (4096) must exceed
+groups-per-step x steps-per-epoch (64 x 29 = 1856 here) or the prior unit's context is evicted
+before its prompt returns and prompt credit silently reaches nothing.
+`prompt_credit/observed_units` is logged per batch so that failure is visible.
+
+**Not yet run.** No arm has trained with `credit="prompt"`. It is the designed test of whether
+the null is the router or the signal, and it needs a GPU arm.
+
 ## 2026-08-31 — RESULT: the learned router is indistinguishable from its matched control
 
 The first real arm comparison. Both checkpoints at `globalstep149`, both scored greedily at

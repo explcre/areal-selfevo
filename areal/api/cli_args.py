@@ -1734,6 +1734,26 @@ class GroupRoutingConfig:
             written for a group the router sends to SFT. This is the difference between a
             hand-written threshold and a controller, and it is the only axis on which the
             learned arms differ from the rule arm.
+        credit: How a router's decisions are credited when feedback arrives.
+
+            ``"batch"`` (default, and what every run before 2026-08-31 used) credits ONE
+            scalar -- the change in mean raw reward between consecutive batches -- to every
+            decision in the batch. Measured over 129 live steps this teaches the router
+            nothing: with ``b_m += r x`` and a shared ``r``, every arm converges to the same
+            parameter vector and the per-arm counts cancel, so the mode mix stayed at uniform
+            thirds and got flatter. The resulting arm scored -0.0020 against its matched
+            random control on MATH-500, a fifth of the noise floor.
+
+            ``"prompt"`` credits each decision with the change in ITS OWN prompt's solve rate
+            between the batch where the decision was applied and that prompt's next
+            appearance. Same task, different point in training, so the signal varies with the
+            mode rather than being constant across the batch. Prompts recur about every 29
+            steps at the live config (10 epochs over ~7.4k GSM8K prompts), so a paired
+            observation is available roughly ten times per prompt.
+
+            The default is ``"batch"`` so this changes nothing unless asked for, and the two
+            are an ablation pair on exactly one axis: what the router is told about its own
+            decisions.
 
     Raises:
         ValueError: If either weight has the wrong sign, which is a footgun rather than a
@@ -1744,8 +1764,15 @@ class GroupRoutingConfig:
     solved_advantage: float = 0.0
     unsolved_advantage: float = 0.0
     router: str | None = None
+    credit: str = "batch"
 
     def __post_init__(self):
+        if self.credit not in ("batch", "prompt"):
+            raise ValueError(
+                f"credit must be 'batch' or 'prompt', got {self.credit!r}. An unknown value "
+                f"silently falling back to 'batch' would report a per-prompt-credit arm that "
+                f"never ran."
+            )
         if self.solved_advantage < 0:
             raise ValueError(
                 f"solved_advantage must be >= 0 (it is SFT on samples known to be "

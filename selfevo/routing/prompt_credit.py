@@ -105,11 +105,15 @@ class PromptCreditLedger:
             than silent: an eviction rate near the record rate means the ledger is too small
             and the router is being starved without anything in the log to say so.
         credited: Successful pairings.
+        same_batch_skips: Sightings refused because the prior decision was made in the SAME
+            batch. Counted rather than silent: a large value means the batch repeatedly
+            contains duplicate prompts, which halves the pairing rate.
     """
 
     capacity: int = 20000
     evicted: int = 0
     credited: int = 0
+    same_batch_skips: int = 0
     _pending: OrderedDict[str, PriorDecision] = field(
         default_factory=OrderedDict, init=False, repr=False
     )
@@ -141,8 +145,20 @@ class PromptCreditLedger:
             the prior decision was applied.
         """
         out: tuple[PriorDecision, float] | None = None
-        prior = self._pending.pop(key, None)
+        prior = self._pending.get(key)
+        if prior is not None and prior.step == step:
+            # SAME BATCH. Two groups can carry the same prompt within one batch, and pairing
+            # them would credit one group's decision with another group's solve rate at the
+            # IDENTICAL policy -- a delta that measures sampling noise between two rollout
+            # groups, not the effect of a mode. The whole point of this ledger is that the
+            # two observations are separated in training time.
+            #
+            # The earlier record is kept rather than overwritten, so the decision that pairs
+            # with the prompt's NEXT appearance is the one applied first in this batch.
+            self.same_batch_skips += 1
+            return None
         if prior is not None:
+            self._pending.pop(key, None)
             self.credited += 1
             out = (prior, value - prior.value)
         # The key was popped above whenever it was present, so this always inserts at the
@@ -162,4 +178,5 @@ class PromptCreditLedger:
             "prompt_credit/credited": float(self.credited),
             "prompt_credit/evicted": float(self.evicted),
             "prompt_credit/pending": float(len(self._pending)),
+            "prompt_credit/same_batch_skips": float(self.same_batch_skips),
         }

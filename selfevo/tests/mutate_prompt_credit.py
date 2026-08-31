@@ -16,9 +16,9 @@ MUTATIONS = [
      "    if n_prompt == 0:", "    if False:"),
     ("length mismatch accepted",
      "    if len(input_ids) != len(loss_mask):", "    if False:"),
-    ("records before crediting, so every delta is zero",
-     "        prior = self._pending.pop(key, None)",
-     "        self._pending[key] = PriorDecision(unit_id=unit_id, mode=mode, value=value, step=step)\n        prior = self._pending.pop(key, None)"),
+    ("records before crediting, so a sighting pairs with itself",
+     "        prior = self._pending.get(key)",
+     "        self._pending[key] = PriorDecision(unit_id=unit_id, mode=mode, value=value, step=step)\n        prior = self._pending.get(key)"),
     ("eviction takes the newest instead of the oldest",
      "            self._pending.popitem(last=False)",
      "            self._pending.popitem(last=True)"),
@@ -27,6 +27,13 @@ MUTATIONS = [
     ("delta sign flipped, rewarding harmful modes",
      "            out = (prior, value - prior.value)",
      "            out = (prior, prior.value - value)"),
+    ("same-batch guard removed, so duplicate prompts pair within one batch",
+     "        if prior is not None and prior.step == step:", "        if False:"),
+    ("same-batch guard fires on every sighting, so nothing ever pairs",
+     "        if prior is not None and prior.step == step:", "        if prior is not None:"),
+    ("same-batch skip overwrites the earlier record",
+     "            self.same_batch_skips += 1\n            return None",
+     "            self.same_batch_skips += 1\n            self._pending[key] = PriorDecision(unit_id=unit_id, mode=mode, value=value, step=step)\n            return None"),
 ]
 
 
