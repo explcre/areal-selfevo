@@ -3,6 +3,42 @@
 Measured results and negative results, newest first. A claim only belongs here once it has
 been observed end to end; a prediction belongs in GOAL.md until then.
 
+## 2026-08-31 — The base model is worth 3.5x what every routing intervention was worth
+
+OlympiadBench, 675 problems, cap 16384, identical harness and grader:
+
+| model | accuracy | Wilson 95% | truncated |
+|-------|----------|------------|-----------|
+| 1.5B `ctx149` (batch credit) | 0.1837 | [0.156, 0.215] | 78 |
+| 1.5B `rnd149` (random control) | 0.1837 | [0.156, 0.215] | 64 |
+| **Frontis-MA1-30B** | **0.6400** | [0.603, 0.675] | 222 (32.9%) |
+
+**+0.456, and the 30B number is still a lower bound** -- `cap_limited` fires at 32.9%
+truncation, so its true score is higher.
+
+**Put beside the routing results this is the whole story of the project so far.** Three credit
+signals -- per-batch scalar, per-prompt, per-prompt centred -- produced three visibly different
+training trajectories and a spread of **0.0015** on this exact benchmark. Swapping the base
+model moved it **0.456**. The intervention we spent GPU-weeks measuring is worth roughly a
+three-hundredth of what the base model is worth here.
+
+That is not an argument that routing cannot matter. It is a measurement of where the leverage
+was NOT, at the scale we were working, and it is the strongest justification yet for the pivot
+recorded in GOAL.md Sec. 2c-2d: stop grinding 1.5B arms, work where the effects are large
+enough to separate.
+
+**It also retires a defence.** "The intervention might matter at a scale where the model is
+competent" was the standing excuse for every null. At 1.5B the benchmark reads 0.18 for
+routing-on, routing-off and random alike; at 30B the same benchmark reads 0.64. The scale
+confound is no longer hypothetical -- it is measured, and it dwarfs everything else measured
+here.
+
+**Caveats, stated.** Different model families (Qwen2.5-1.5B-Instruct vs a Qwen3 MoE), so this
+is not a clean parameter-count ablation -- it is base-model-and-training vs base-model-and-
+training. The 30B is post-trained for agentic MLE work by Frontis, which plausibly helps on
+competition math too. And both 30B and 1.5B numbers remain cap-limited at different rates, so
+the gap is bounded below rather than pinned.
+
 ## 2026-08-31 — First 30B numbers, and our token caps are calibrated for the WRONG model class
 
 Frontis-MA1-30B on the frozen suite, versus the 1.5B `ctx149` checkpoint:
