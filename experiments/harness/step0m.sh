@@ -52,7 +52,10 @@ case "$ARM" in
 esac
 
 export PATH="$HOME/.local/bin:$PATH"
-source "/venv/main/bin/activate"
+# The two boxes have different venvs; pick whichever exists rather than hardcoding one.
+for V in "$HOME/venv312b/bin/activate" "/venv/main/bin/activate"; do
+  [ -f "$V" ] && { source "$V"; break; }
+done
 cd "$HOME/areal-selfevo" || exit 1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 ulimit -n 131072 || echo "WARNING: could not raise the file-descriptor limit"
@@ -61,7 +64,11 @@ export PYTHONUNBUFFERED=1
 # and the surviving ranks then spin at 100% utilization looking healthy.
 export AREAL_WEIGHT_SYNC_RETRIES="${AREAL_WEIGHT_SYNC_RETRIES:-5}"
 
-EXP="step0m-${ARM}"
+# EXP_NAME lets two runs of the SAME arm coexist -- e.g. two solved_advantage values --
+# and keeps the run directory written here identical to the one the supervisor watches.
+# Without it the watchdog polls a path the launcher never creates, sees it stale forever,
+# and kills a perfectly healthy run at the first stall check.
+EXP="${EXP_NAME:-step0m-${ARM}}"
 RUN="$HOME/runs/${EXP}"; mkdir -p "$RUN"
 LOG="$RUN/train.log"
 FILTER="$HOME/areal-selfevo/experiments/harness/logfilter.py"
