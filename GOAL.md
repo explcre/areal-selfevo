@@ -644,6 +644,36 @@ per round, attached to the action that produced them.
 So the auditor's verdicts can BE the credit signal for a model-versus-harness router. That is
 not a wish: it is our measured requirement met by a released mechanism.
 
+### Harness-swap at FIXED model: the cheapest instrument for the harness axis
+
+Raised 2026-08-31: run Frontis-MA1 under **its own** harness first, because a model
+post-trained on OpenMLE's four operators may underperform under a foreign loop -- and only
+then swap the harness. That train/inference coupling is a real confound and the ordering is
+right.
+
+It also turns into the cleanest experiment available for the harness axis:
+
+| arm | model | harness |
+|-----|-------|---------|
+| baseline | Frontis-MA1-30B | OpenMLE-Evo (its native loop) |
+| swap | Frontis-MA1-30B | LongHorizon-Harness via `AgentAdapter` |
+| swap | Frontis-MA1-30B | another strong harness (Claude Code / Codex integrations ship with LHH) |
+
+Model fixed, harness varied. It measures **how much of the achievable gain lives in the
+harness for a fixed policy** -- the quantity the model-versus-harness routing decision needs
+and that nobody has reported. LHH's `AgentAdapter` exists precisely to do this "without
+modifying their native agent loops", so the instrument is provided rather than built.
+
+**Two outcomes, both publishable.** If the swap HELPS, the harness axis carries real value at
+fixed model and routing to it is worth deciding. If the swap HURTS, that is train/inference
+harness coupling measured directly -- a finding neither paper reports, and one that constrains
+every "just use a better harness" claim.
+
+**Sequenced before the routing work, not after.** Routing between model and harness is only
+worth building once the harness delta at fixed model is known to be non-trivial. Measuring it
+first also avoids the trap this project already fell into: building a controller before
+establishing that the thing it controls moves the benchmark.
+
 ### VERIFIED: the code is released, it is MIT, and the audit signal is structured
 
 Cloned `github.com/AMAP-ML/LongHorizon-Harness` and inspected it, 2026-08-31. This checks the

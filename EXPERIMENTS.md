@@ -3,6 +3,44 @@
 Measured results and negative results, newest first. A claim only belongs here once it has
 been observed end to end; a prediction belongs in GOAL.md until then.
 
+## 2026-08-31 — First 30B numbers, and our token caps are calibrated for the WRONG model class
+
+Frontis-MA1-30B on the frozen suite, versus the 1.5B `ctx149` checkpoint:
+
+| benchmark | 1.5B `ctx149` | **30B** | 30B truncation |
+|-----------|---------------|---------|-----------------|
+| MATH-500 | 0.5240 | **0.5720** | 251/500 (**50.2%**) |
+| AMC23 | 0.1750 | **0.3250** | 30/40 (75%) |
+| AIME24 | 0.0000 | **0.1667** | 25/30 (83%) |
+
+**AIME goes from unusable to usable.** It reads 0.000 for every 1.5B arm -- recorded as B2's
+status and the reason it cannot separate anything -- and 0.1667 [0.073, 0.336] here. The scale
+confound behind every null this project has measured is now not merely testable but visibly
+different.
+
+**And every one of these numbers is a LOWER BOUND, by a lot.** Truncation runs 50-83%. A
+truncated generation is graded WRONG, so the 30B beats the 1.5B on all three benchmarks *while
+half or more of its generations are being cut off mid-reasoning*.
+
+**The finding: a token cap is a property of (benchmark x MODEL CLASS), not of the benchmark.**
+The per-task table was measured on Qwen2.5-1.5B-Instruct, where MATH-500 truncated at 7.8% and
+raising 3072 -> 8192 moved accuracy by less than the noise floor. The same caps applied to a
+30B reasoning model truncate 50% of MATH-500. The earlier conclusion "raising the cap does not
+help" was true of that model and is false of this one -- a scoped claim that would have been
+wrong if it had been stated unscoped.
+
+`cap_limited` (>10% truncation) fires on all three rows, which is what it was built for. But
+its threshold was chosen against 1.5B truncation rates; at these levels the flag is not
+flagging an edge case, it is saying the measurement is invalid.
+
+**Consequence.** No 30B-versus-1.5B comparison should be reported from this run, and no arm
+comparison at 30B should use these caps. The suite needs re-running with caps set for a
+long-reasoning model, and the per-task table needs a model-class dimension rather than a single
+global value per benchmark.
+
+**Not yet done:** OlympiadBench at 16384 was still generating when this was written, so its
+truncation rate at 30B is unknown; it may be adequate or may need the same treatment.
+
 ## 2026-08-31 — The scale blocker is gone: a 30B serves and generates on the A100
 
 Frontis-MA1-30B (2607.28568, CC BY-NC 4.0) downloaded -- 57 GB, 12 shards, public and ungated.
