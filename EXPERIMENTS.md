@@ -3,6 +3,42 @@
 Measured results and negative results, newest first. A claim only belongs here once it has
 been observed end to end; a prediction belongs in GOAL.md until then.
 
+## 2026-08-31 — The collapse is ABRUPT, and it happens between step 149 and 224
+
+Same checkpoint sweep, same 60-problem MATH-500 slice, same scoring path the base model passed
+at 1/30 truncation:
+
+| checkpoint | accuracy | truncated |
+|------------|----------|-----------|
+| step 49 | 0.6000 | **1/60** |
+| step 149 | 0.5833 | **1/60** |
+| step 224 | 0.3667 | **59/60** |
+| step 289 | 0.3500 | **60/60** |
+
+**The model is healthy at 149 and destroyed by 224.** Truncation goes 1/60 -> 59/60 across
+that window; it does not drift, it switches. Accuracy follows it down, 0.583 -> 0.367.
+
+**What this rules out.** Not a gradual entropy decay -- 100 steps of training before 149 leave
+truncation at 1 in 60. Not the onset of per-prompt credit either: that begins at step 29, and
+the model is still fine 120 steps later. Whatever causes this is specific to the 149-224
+window, which is AFTER the RL-suppression phase and after `rl_groups` had recovered to ~16-25%.
+
+**Why the abruptness matters.** A slow degradation would suggest the SFT constant gradually
+eroding the EOS probability. A switch suggests something closer to a threshold being crossed --
+the policy finding a region where not terminating is locally optimal under the routed
+objective, and then staying there. Those imply different fixes: the first wants a smaller
+constant, the second wants a termination term in the objective regardless of constant size.
+**Which of the two it is, is not yet established.**
+
+**Being narrowed now:** checkpoints 173 and 199, to cut the 75-step window down and see whether
+it coincides with anything visible in the routing metrics.
+
+**Still open, and it matters for how general this is:** whether `credit="batch"` collapses the
+same way at full length. `ctx2` ran 290 steps on the same config apart from the credit signal
+and has never been scored. If it collapses too, this is a property of the routed SFT constant
+and not of per-prompt credit; if it does not, per-prompt credit is implicated specifically.
+That is the single most informative unrun measurement available right now.
+
 ## 2026-08-31 — The centred-credit arm COLLAPSED into non-termination, and the control proves it is the model
 
 `ctxpcc` (`router=contextual`, `credit="prompt_centered"`) ran to full length, 290/290 -- the
