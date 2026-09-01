@@ -45,6 +45,33 @@ experiment has yet used either. The routed 30B arm is where they belong.
 a feature, grep its resolved config for the switch. `enabled:`, `router:` and `group_routing:`
 are three separate places a routing arm can be silently off.
 
+## 2026-09-01 — A100 utilisation during the 30B LoRA run: 95% actor, 54% rollout, and that is the price of on-policy data
+
+Twenty samples over sixty seconds, split by role:
+
+| half | GPUs | mean utilisation | busy samples |
+|---|---|---|---|
+| actor (FSDP training) | 0-3 | **95%** | 19/20 |
+| rollout (sglang) | 4-7 | **54%** | 15/20 |
+
+**A single sample is not a utilisation measurement.** The first reading I took showed the
+rollout half at 0% and looked like four idle cards; it had simply landed inside the bubble while
+the trainer ran its backward pass. Sampling turns that into 54%.
+
+**The remaining idle is structural, not a misconfiguration.** `max_head_offpolicyness: 2` is
+already set, so rollout runs up to two steps ahead of training -- that is why it sits at 54%
+rather than near zero. `max_concurrent_rollouts: 256` against `consumer_batch_size: 64` means
+the server is not concurrency-starved either.
+
+**Buying the rest back costs correctness.** The only knob that would fill more of the bubble is
+a larger staleness, which trades on-policy-ness for occupancy. That is a real trade rather than
+free throughput, and given this project's whole subject is how easily a training signal can be
+corrupted, it is not one to make casually or mid-run.
+
+So the honest answer to "is the box fully used" is: **the training half is, the rollout half is
+at the level synchronous-ish RL permits, and the gap is a property of the algorithm rather than
+of the configuration.**
+
 ## 2026-09-01 — Collaborator H200 sweep: one model measured, two returned nan and were marked DONE
 
 An independent 4x H200 box ran the sweep. **One model produced real numbers; two produced
