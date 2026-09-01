@@ -64,7 +64,19 @@ started_at() {
   if [ -n "$ts" ]; then date -d "$ts" +%s 2>/dev/null || stat -c %Y "$s"; else stat -c %Y "$s"; fi
 }
 
+# Counts requests the SERVER completed. That is not the same as results the client kept: on
+# 2026-09-01 the server returned 200 OK for 613 generations while the client discarded 662 of
+# them on a timeout, so this read 90.8% for a run that produced 13 usable answers. The server
+# log cannot see a client-side discard, so the number is reported for what it is.
 done_now() { grep -ac "POST /v1/chat/completions" "$1/server.log" 2>/dev/null || echo 0; }
+
+# Client-side failures, once the scorer has written them. Absent until the run ends, so this is
+# a post-hoc check rather than live -- but it is the number that decides whether a run counted.
+client_failed() {
+  local out="${1}.out"
+  [ -f "$out" ] || { echo ""; return; }
+  grep -hoE "fail=[0-9]+" "$out" 2>/dev/null | tail -1 | cut -d= -f2
+}
 
 discover() {
   local now f
@@ -106,7 +118,16 @@ if [ "${#DIRS[@]}" -eq 0 ]; then
   fi
 fi
 
-run_all() { local x; for x in "${DIRS[@]}"; do report "$x"; done; }
+run_all() {
+  local x f
+  for x in "${DIRS[@]}"; do
+    report "$x"
+    f="$(client_failed "$x")"
+    # A nonzero count here means the server did the work and the client threw it away, which is
+    # invisible in the bar above and is the difference between a result and a wasted GPU-day.
+    [ -n "$f" ] && [ "$f" != "0" ] && echo "      !! client DISCARDED $f responses (timeout?) -- the bar counts server completions"
+  done
+}
 if [ "$MODE" = "watch" ]; then
   while true; do echo "-- $(date +%H:%M:%S)"; run_all; sleep 30; done
 else

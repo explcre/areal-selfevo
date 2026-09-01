@@ -28,6 +28,18 @@ for _ in $(seq 1 180); do
   sleep 5
 done
 curl -sf "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1 || { echo "NOT READY"; tail -25 "$OUT/server.log"; exit 5; }
+# The client timeout must scale with the generation budget AND with how many generations share
+# the GPU. A fixed 600s was fine at 3072 tokens and 16-way concurrency; at 65536 tokens and 40-way
+# it killed 662 of 675 requests, which the scorer then reported as an accuracy over the 13
+# survivors. Raising concurrency raises per-request latency, so changing one knob without the
+# other converts a speed-up into a mass timeout that looks like a low score.
+#   budget/20 tokens-per-second is deliberately pessimistic: measured decode is ~90 tok/s per
+#   sequence, so this leaves better than 4x headroom before a healthy request is cut off.
+_MT="${MAXTOK:-3072}"; _CC="${CONC:-64}"
+DEFAULT_TIMEOUT=$(( _MT / 20 + _CC * 5 + 300 ))
+[ "$DEFAULT_TIMEOUT" -lt 600 ] && DEFAULT_TIMEOUT=600
+echo "TIMEOUT=${TIMEOUT:-$DEFAULT_TIMEOUT}s (max_tokens=$_MT conc=$_CC)"
+
 echo "endpoint up; scoring $TAG"
 # Declare the run's shape BEFORE any of it finishes. Without this a progress reader can only
 # learn which benchmarks a shard covers by watching them complete, which is precisely when the
@@ -42,7 +54,7 @@ python3 "$(dirname "$0")/math_bench.py" --base-url "http://127.0.0.1:$PORT/v1" \
   --benchmarks "${BENCHES:-aime24,aime25,amc23,math500}" \
   --max-tokens "${MAXTOK:-3072}" --concurrency "${CONC:-64}" --limit "${LIMIT:-0}" \
   --split "${SPLIT:-all}" \
-  --timeout "${TIMEOUT:-600}" \
+  --timeout "${TIMEOUT:-$DEFAULT_TIMEOUT}" \
   --out "$OUT/results.json" --gen-out "$OUT/generations.jsonl" 2>&1 | tee "$OUT/math.log"
 
 # Exit with the BENCHMARK's status, not tee's. Without this the script always exits 0, so a
