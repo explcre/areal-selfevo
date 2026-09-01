@@ -123,7 +123,7 @@ def _truncated_rows(loss_mask: torch.Tensor, max_new_tokens: int) -> torch.Tenso
     return loss_mask.sum(dim=-1) >= int(max_new_tokens)
 
 
-def route_all(router, contexts):
+def route_all(router, contexts, *, harness_consumer: bool = False):
     """Route every unit in a batch, preferring a router's batched entry point.
 
     This is a module-level function rather than inline code so that it can be driven directly
@@ -161,8 +161,49 @@ def route_all(router, contexts):
                 f"for {len(contexts)} contexts; decisions are positional and a mismatch "
                 f"would attach each group to another group's mode"
             )
-        return decisions
-    return [router.route(ctx) for ctx in contexts]
+    else:
+        decisions = [router.route(ctx) for ctx in contexts]
+    _refuse_dropped_harness(decisions, router, harness_consumer=harness_consumer)
+    return decisions
+
+
+def _refuse_dropped_harness(decisions, router, *, harness_consumer: bool) -> None:
+    """Refuse to silently discard harness actions when nothing consumes them.
+
+    ``RoutingDecision.harness`` is an axis orthogonal to the training mode, and NOTHING reads
+    it: ``_APPLIED`` in group_apply covers only RL, SFT and SKIP, and no production code sets
+    ``RoutingContext.can_evolve_harness``, so the field is inert end to end. A router that
+    nonetheless emits a harness action would have it vanish, and an arm labelled
+    "harness-evolving" would train identically to one that is not -- two runs whose only
+    difference is a name, with any gap between them attributed to something that never
+    happened. That failure has occurred here before under other names, and it is silent, so it
+    is refused rather than warned about.
+
+    Args:
+        decisions: Decisions just produced, in group order.
+        router: Only used to name the offender in the message.
+        harness_consumer: Set True by a caller that actually acts on the harness axis. Until
+            such a consumer exists this stays False everywhere and the guard is absolute.
+
+    Raises:
+        ValueError: If any decision carries a harness action other than ``NONE`` while no
+            consumer is declared.
+    """
+    if harness_consumer:
+        return
+    dropped = [
+        i for i, d in enumerate(decisions)
+        if getattr(getattr(d, "harness", None), "name", "NONE") != "NONE"
+    ]
+    if dropped:
+        raise ValueError(
+            f"{type(router).__name__} emitted a harness action on {len(dropped)} of "
+            f"{len(decisions)} decisions (first at index {dropped[0]}), but nothing consumes "
+            f"the harness axis: group_apply applies only RL/SFT/SKIP and no caller sets "
+            f"can_evolve_harness. Discarding these would make a harness-evolving arm train "
+            f"identically to one that is not. Build the consumer and pass "
+            f"harness_consumer=True, or route to a training mode instead."
+        )
 
 
 def _recentre_advantages(
