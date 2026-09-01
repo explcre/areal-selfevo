@@ -157,19 +157,25 @@ larger budget. Qwen3.8-27B, same model, same grader, only the cap changed:
 | MATH-500 | 0.9760 | 0.8% | **0.9800** | **0.2%** | +0.004 |
 | AIME24 | 0.9000 | 13.3% | **0.9333** | **6.7%** | +0.033 (1 problem) |
 | AIME25 | 0.9000 | 10.0% | **0.9333** | **3.3%** | +0.033 (1 problem) |
-| OlympiadBench | 0.7733 | 17.8% | **0.8891** | **0.15%** | **+0.116** |
+| OlympiadBench | 0.7733 | 17.8% | **0.8089** | **10.7%** | **+0.036** |
 
 **OlympiadBench is the exception, and it inverts the conclusion for that benchmark.** Where
-MATH-500 and both AIME sets moved by less than noise, OlympiadBench gains **+0.116** when the
+MATH-500 and both AIME sets moved by less than noise, OlympiadBench gains **+0.036** when the
 budget doubles, and its truncation collapses from 17.8% to a single problem in 675. **32768 was
 NOT the plateau there.** That is consistent with it being the only benchmark whose truncation
 was high in the first place -- the generations being cut off at 32768 were ones that would have
 been right.
 
-**Read that 0.8891 with its caveat**: it is over 613 of 675 graded, with 62 client-side
-failures, so it is an average over survivors and is biased upward. The failures are the slowest
-generations, which correlate with the hardest problems, so the true value is below 0.8891 and
-above the 0.7733 measured at half the budget. A clean re-run at concurrency 24 is in flight.
+**The clean re-run landed and the survivor bias was large.** At concurrency 24 with the scaled
+timeout: `acc=0.8089, n=675/675, fail=0, trunc=72 (10.7%)`. Every problem graded, nothing
+discarded. The survivor-biased figure was **0.8891**, so the bias was **+0.08** -- and in exactly
+the predicted direction, because the discarded generations are the slowest, which correlate with
+the hardest problems. **An average over survivors is not a conservative estimate; here it
+overstated the result by more than twice the effect being measured.**
+
+The honest OlympiadBench numbers are therefore **0.7733 at 32768 and 0.8089 at 65536, +0.036**,
+with truncation falling 17.8% -> 10.7%. Still the largest cap effect of the four benchmarks and
+still not fully saturated at 10.7%, but a quarter the size the biased read suggested.
 
 **All three are saturated at 32768.** MATH-500 moves +0.004 on n=500, where the standard error
 is ~0.006 -- inside noise. Each AIME set moves by exactly one problem out of 30, well inside the
