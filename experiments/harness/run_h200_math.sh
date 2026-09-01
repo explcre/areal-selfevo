@@ -46,6 +46,40 @@ FAILED=0
 
 py_of_venv(){ echo "$VENV/bin/python"; }
 
+# The benchmark problem files are NOT in this repo and NOT downloaded by --fetch, which only
+# gets model weights. Without them every shard dies instantly on FileNotFoundError -- and
+# before the PIPESTATUS fix, run_math.sh reported that as success, so a sweep "completed" four
+# models in under two minutes each and printed a results table assembled from unrelated files.
+# Measured on our own H200 on 2026-09-01. This check exists so that cannot happen silently.
+DATA_DIR="${MATH_EVAL_DATA:-$HOME/baselines/Absolute-Zero-Reasoner/evaluation/math_eval/eval/data}"
+
+check_datasets() {
+  # Returns 0 only when every benchmark this script can run has a NON-EMPTY test.jsonl.
+  local missing=() b f
+  for b in math500 amc23 aime24 aime25 olympiadbench; do
+    f="$DATA_DIR/$b/test.jsonl"
+    [ -s "$f" ] || missing+=("$b")
+  done
+  if [ ${#missing[@]} -gt 0 ]; then
+    echo "  FAIL  benchmark data missing under $DATA_DIR"
+    echo "        absent or empty: ${missing[*]}"
+    echo "        These files are not in this repo and --fetch does not download them."
+    echo "        Get them with:"
+    echo "          git clone --depth 1 --filter=blob:none --sparse \\"
+    echo "            https://github.com/LeapLabTHU/Absolute-Zero-Reasoner \\"
+    echo "            \$HOME/baselines/Absolute-Zero-Reasoner"
+    echo "          cd \$HOME/baselines/Absolute-Zero-Reasoner \\"
+    echo "            && git sparse-checkout set evaluation/math_eval/eval/data"
+    echo "        Or point MATH_EVAL_DATA=<dir> at a copy you already have."
+    return 1
+  fi
+  local n
+  n=$(wc -l < "$DATA_DIR/math500/test.jsonl" 2>/dev/null || echo 0)
+  ok "benchmark data present (math500 has $n rows)"
+  return 0
+}
+
+
 make_venv() {
   # Same four-route fallback as the harness installer: a stock python3-venv is preferred but
   # is genuinely absent on many images, and a collaborator should not be blocked by that.
@@ -115,6 +149,7 @@ if [ "$MODE" = "--install" ]; then
     "$P" -c "import ${pkg}" >/dev/null 2>&1 || "$P" -m pip install -q "$pkg" 2>&1 | tail -5
   done
   "$P" -c "import torch; print('  torch', torch.__version__, 'cuda', torch.version.cuda, 'devices', torch.cuda.device_count())" 2>&1 | tail -2
+  check_datasets || FAILED=$((FAILED+1))
   echo "install pass done - now run: bash $0 --fetch"
   exit $((FAILED > 0))
 fi
@@ -128,6 +163,7 @@ case "$MODE" in
      exit 2 ;;
 esac
 [ -x "$VENV/bin/python" ] || { echo "no venv at $VENV; run: bash $0 --install"; exit 2; }
+check_datasets || { echo "refusing to score without benchmark data"; exit 4; }
 P="$(py_of_venv)"
 
 if [ "$MODE" = "--fetch" ]; then
