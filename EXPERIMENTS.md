@@ -3,6 +3,54 @@
 Measured results and negative results, newest first. A claim only belongs here once it has
 been observed end to end; a prediction belongs in GOAL.md until then.
 
+## 2026-09-01 — The 30B LoRA ladder, WITH its baseline: the feared degradation is absent
+
+Eight adapter checkpoints plus the adapter-free base, all on held-out MATH-500 at a matched
+4096 cap. The base is the rung that was missing from every routed arm for weeks: without it a
+ladder shows a trend among adapters and cannot say whether training helped or hurt.
+
+| step | MATH-500 | truncation |
+|---|---|---|
+| **base, no adapter** | **0.6520** | 41.2% |
+| 24 | 0.6600 | 41.0% |
+| 49 | 0.6660 | 39.2% |
+| 74 | 0.6720 | 40.2% |
+| 99 | 0.6700 | 39.8% |
+| 115 | 0.6680 | 38.6% |
+| 124 | 0.6720 | 40.4% |
+| **149** | **0.6840** | 39.4% |
+| 174 | 0.6760 | 40.8% |
+
+**Truncation is constant across every rung (38.6-41.2%), which is what makes the ladder valid.**
+A cap that binds equally on all rungs is a constant confound; had truncation drifted, the cap
+would have become differential and the trend would be uninterpretable. This was checked, not
+assumed, because the routed arms taught that training can change response length.
+
+### What this settles
+
+**The feared degradation is absent, and the sign is opposite.** The run uses `eps_clip: 0.4` and
+`lr: 1.0e-05`, the recipe `step0l.sh` records as destroying held-out capability: `step0d` fell
+**0.528 -> 0.316 monotonically**, a drop of 0.21. Here the ladder **rises** 0.6520 -> 0.6840.
+Whatever that recipe does to a 1.5B under full fine-tuning, it is not doing it to a 30B under
+LoRA -- which is why the finding was flagged rather than acted on, and why the checkpoints were
+scored instead of the run being restarted.
+
+### What this does NOT establish
+
+**+0.032 is not a significant improvement on its own.** At p~0.67 and n=500 the standard error
+of a single accuracy is ~0.021, so a difference of two independent runs carries ~0.030. The
+best rung sits at roughly one standard error from the base. The measured noise floor at ~40%
+truncation is ~0.015 by interpolation between the 10% and 97% cases.
+
+What is more informative than any single pair is that **the ordering is near-monotone across
+nine points**: base < 24 < 49 < 74 ~ 99 ~ 115 ~ 124 < 149, with only 174 turning down. Noise
+around a constant does not usually arrive sorted. That is suggestive, not conclusive, and it is
+recorded as such.
+
+**Re-running the same ladder at 16384** to cut truncation from ~40% to ~10% and the noise floor
+with it. If the drift survives at the lower floor it becomes a measurement; if it vanishes, the
+honest conclusion is that LoRA on this base is neutral on held-out MATH-500.
+
 ## 2026-09-01 — An accidental repeat run measures the noise floor, and it depends on truncation
 
 `narrow.sh` was launched twice by mistake, so four checkpoints were each scored twice on
