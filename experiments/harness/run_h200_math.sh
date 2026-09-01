@@ -26,7 +26,16 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"  # needed by pick_ben
 # of gigabytes of model weights inside the checkout would pollute `git status` and a `git clean`
 # would delete all of it. The roomier of the two wins, and the decision is printed with the
 # reason. Setting BENCH_ROOT explicitly always overrides this.
-_free_gb() { df -BG --output=avail "$1" 2>/dev/null | tail -1 | tr -dc '0-9'; }
+# df on a path that does not exist yet prints nothing, which rendered the chosen root as
+# "auto: G free" -- an empty number where a number belongs, and exactly the silent-blank that
+# hides a failed measurement. Walk up to the nearest existing ancestor instead, and say so
+# rather than printing an empty string.
+_free_gb() {
+  local d="$1"
+  while [ -n "$d" ] && [ "$d" != "/" ] && [ ! -d "$d" ]; do d="$(dirname "$d")"; done
+  local v; v="$(df -BG --output=avail "${d:-/}" 2>/dev/null | tail -1 | tr -dc '0-9')"
+  echo "${v:-0}"
+}
 pick_bench_root() {
   local beside home_free beside_free
   beside="$(cd "$REPO/.." 2>/dev/null && pwd)/areal-bench"
