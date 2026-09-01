@@ -50,6 +50,29 @@ that checkpoint the failures are not all length -- something else is wrong with 
 there, and `nobox=44` against 303 at step 231 says the answers are formatted but wrong rather
 than absent. Not explained.
 
+### The RANDOM arm's full curve: the same jump, in the same 28-step window
+
+Completed 2026-09-01. MATH-500 truncation at a matched 16384 cap, both arms, every step:
+
+| step | 149 | 174 | **202** | 231 | 249 | 260 | 289 |
+|---|---|---|---|---|---|---|---|
+| `ctx2` (contextual) trunc | 6.4% | 13.2% | **99.4%** | 92.2% | 61.4% | 77.8% | 96.4% |
+| `rnd` (RANDOM) trunc | 6.0% | 12.4% | **99.6%** | 99.6% | -- | 97.4% | 98.2% |
+| `rnd` acc | 0.5100 | 0.4600 | 0.3420 | 0.3540 | -- | 0.2920 | 0.3260 |
+
+**Both arms jump between step 174 and 202, and they agree to within a percentage point at every
+measured step before and after.** 12.4 against 13.2 before; 99.6 against 99.4 after. The random
+router has no learned policy, no credit signal and no preference over modes, so the timing of
+this transition cannot be a property of the controller. It is a property of the routed constant.
+
+This is the third and cleanest line of evidence for that conclusion, after the step-289
+comparison and the single matched point at 174. It is also the strongest form: not merely that
+both collapse, but that they collapse **at the same step**.
+
+`rnd` retains more accuracy than `ctx2` after the transition (0.29-0.35 against 0.06-0.23), but
+both are ~98% truncated there, so the gap is which few generations happened to finish rather
+than a capability difference, and should not be reported as one.
+
 **What survives unchanged:** the collapse is not a cap artifact (5.3x budget moves truncation
 ~100% -> 96-98%), and the random arm tracks the contextual one -- `rnd@231` at 99.6% sits with
 `ctx2@202` at 99.4%, and both are near-total by 289.
