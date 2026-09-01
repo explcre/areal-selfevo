@@ -287,6 +287,7 @@ OVERRIDES=(
   gconfig.lora_name="$LORA_NAME"
   sglang.enable_lora="$ROLLOUT_USE_LORA"
   sglang.max_lora_rank="$MAX_LORA_RANK"
+  ++sglang.disable_cuda_graph=${DISABLE_CUDA_GRAPH:-true}
   sglang.mem_fraction_static="$MEM_FRACTION_STATIC"
 
   actor.kl_ctl="$KL_CTL"
