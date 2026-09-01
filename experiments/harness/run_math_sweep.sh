@@ -20,6 +20,9 @@ set -u -o pipefail
 MODE="${1:---plan}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BENCH_REPO="$(cd "$HERE/../.." && pwd)" . "$HERE/bench_env.sh"
+# Interpreter for the result-validity check.
+PYBIN="${BENCH_VENV:-}/bin/python"
+[ -x "$PYBIN" ] || PYBIN="$(command -v python3)"
 LOG="$OUTROOT/sweep.log"
 MAXTOK="${MAXTOK:-32768}"
 # The sweep smoke-tests itself before committing to days of work. A TINY model is used on
@@ -46,8 +49,22 @@ model_done(){
   # run_h200_math.sh writes two shards on a box with enough GPUs and a single _all shard
   # otherwise. Checking only the two-shard layout would re-score a finished model forever on
   # a small box, which is the sort of loop that quietly burns a weekend.
-  if [ -s "$OUTROOT/${tag}_all/results.json" ]; then return 0; fi
-  [ -s "$OUTROOT/${tag}_olymp/results.json" ] && [ -s "$OUTROOT/${tag}_core/results.json" ]
+  if shard_usable "$OUTROOT/${tag}_all/results.json"; then return 0; fi
+  shard_usable "$OUTROOT/${tag}_olymp/results.json" \
+    && shard_usable "$OUTROOT/${tag}_core/results.json"
+}
+
+shard_usable(){
+  # A shard is done only if it holds a REAL measurement. Testing that the file exists and is
+  # non-empty is not enough: a run whose every request was rejected -- which is what a cap
+  # larger than the model context does -- finishes normally and writes a valid results.json
+  # full of nulls. Under the old check those models were marked done and skipped forever, so
+  # re-running the sweep would re-run everything EXCEPT the runs that had failed. That is not
+  # hypothetical: on a collaborator box two of three models scored nothing and were recorded
+  # as complete.
+  local f="$1"
+  [ -s "$f" ] || return 1
+  "${PYBIN:-python3}" "$HERE/shard_usable.py" "$f" >/dev/null 2>&1
 }
 
 if [ "$MODE" = "--plan" ]; then
