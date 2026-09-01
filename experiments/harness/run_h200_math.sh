@@ -144,6 +144,16 @@ if [ "$MODE" = "--smoke" ]; then
   exit $rc
 fi
 
+shard_done() {
+  # True when this shard already produced a parseable results.json. Re-running a finished
+  # shard costs GPU-hours and, worse, can overwrite a good result with a worse one from a
+  # partial run. FORCE=1 overrides. The header promised this; it now exists.
+  local tag="$1" f="$OUTROOT/$1/results.json"
+  [ "${FORCE:-0}" = "1" ] && return 1
+  [ -s "$f" ] || return 1
+  "$P" -c "import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d else 1)" "$f" 2>/dev/null
+}
+
 if [ "$MODE" = "--run" ]; then
   echo "== run: full suite, $NGPU gpu(s), tp=$TP, max_tokens=$MAXTOK =="
   MP="$(resolve_model_path)"; echo "  model: $MP"
@@ -153,24 +163,36 @@ if [ "$MODE" = "--run" ]; then
   if [ "$NGPU" -ge $((TP * 2)) ]; then
     A="$(echo "$GPUS_ALL" | cut -d, -f1-$TP)"
     B="$(echo "$GPUS_ALL" | cut -d, -f$((TP + 1))-$((TP * 2)))"
-    BENCH_VENV="$VENV" BENCHES="olympiadbench" MAXTOK="$MAXTOK" CONC="${CONC:-24}" \
-      timeout 43200 bash "$REPO/experiments/bench/run_math.sh" "$MP" "${TAG}_olymp" "$A" 8711 \
-      > "$OUTROOT/${TAG}_olymp.out" 2>&1 &
-    P1=$!
-    BENCH_VENV="$VENV" BENCHES="math500,amc23,aime24,aime25" MAXTOK="$MAXTOK" CONC="${CONC:-24}" \
-      timeout 43200 bash "$REPO/experiments/bench/run_math.sh" "$MP" "${TAG}_core" "$B" 8721 \
-      > "$OUTROOT/${TAG}_core.out" 2>&1 &
-    P2=$!
-    echo "  olympiadbench -> gpu $A (log $OUTROOT/${TAG}_olymp.out)"
-    echo "  core suite    -> gpu $B (log $OUTROOT/${TAG}_core.out)"
-    wait $P1; echo "EXIT_OLYMP=$?" >> "$OUTROOT/${TAG}_olymp.out"
-    wait $P2; echo "EXIT_CORE=$?"  >> "$OUTROOT/${TAG}_core.out"
+    if shard_done "${TAG}_olymp"; then
+      echo "  olympiadbench -> SKIP (results.json exists; FORCE=1 to redo)"; P1=""
+    else
+      BENCH_VENV="$VENV" BENCHES="olympiadbench" MAXTOK="$MAXTOK" CONC="${CONC:-24}" \
+        timeout 43200 bash "$REPO/experiments/bench/run_math.sh" "$MP" "${TAG}_olymp" "$A" 8711 \
+        > "$OUTROOT/${TAG}_olymp.out" 2>&1 &
+      P1=$!
+    fi
+    if shard_done "${TAG}_core"; then
+      echo "  core suite    -> SKIP (results.json exists; FORCE=1 to redo)"; P2=""
+    else
+      BENCH_VENV="$VENV" BENCHES="math500,amc23,aime24,aime25" MAXTOK="$MAXTOK" CONC="${CONC:-24}" \
+        timeout 43200 bash "$REPO/experiments/bench/run_math.sh" "$MP" "${TAG}_core" "$B" 8721 \
+        > "$OUTROOT/${TAG}_core.out" 2>&1 &
+      P2=$!
+    fi
+    [ -n "$P1" ] && echo "  olympiadbench -> gpu $A (log $OUTROOT/${TAG}_olymp.out)"
+    [ -n "$P2" ] && echo "  core suite    -> gpu $B (log $OUTROOT/${TAG}_core.out)"
+    [ -n "$P1" ] && { wait $P1; echo "EXIT_OLYMP=$?" >> "$OUTROOT/${TAG}_olymp.out"; }
+    [ -n "$P2" ] && { wait $P2; echo "EXIT_CORE=$?"  >> "$OUTROOT/${TAG}_core.out"; }
   else
+    if shard_done "${TAG}_all"; then
+      echo "  all -> SKIP (results.json exists; FORCE=1 to redo)"
+    else
     BENCH_VENV="$VENV" BENCHES="math500,amc23,aime24,aime25,olympiadbench" \
       MAXTOK="$MAXTOK" CONC="${CONC:-24}" \
       timeout 86400 bash "$REPO/experiments/bench/run_math.sh" "$MP" "${TAG}_all" "$GPUS_ALL" 8711 \
       > "$OUTROOT/${TAG}_all.out" 2>&1
     echo "EXIT_ALL=$?" >> "$OUTROOT/${TAG}_all.out"
+    fi
   fi
   echo "== results =="
   grep -hE "^(math500|amc23|aime24|aime25|olympiadbench)" "$OUTROOT/${TAG}"*.out 2>/dev/null
