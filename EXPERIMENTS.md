@@ -3,6 +3,56 @@
 Measured results and negative results, newest first. A claim only belongs here once it has
 been observed end to end; a prediction belongs in GOAL.md until then.
 
+## 2026-09-01 — Matched at 65536, Qwen3.8-27B still beats Frontis. And the LoRA gain shrinks with the cap.
+
+### 1. The fairness question is settled: the ranking survives a matched, less-truncated budget
+
+| model | OlympiadBench @32768 | trunc | @65536 | trunc | graded |
+|---|---|---|---|---|---|
+| **Qwen3.8-27B** | 0.7733 | 17.8% | **0.8089** | **10.7%** | 675/675, fail 0 |
+| Frontis-MA1-30B | 0.7363 | 20.0% | **0.7615** | **10.7%** | 675/675, fail 0 |
+| **gap** | +0.037 | | **+0.047** | | |
+
+**Both models truncate at exactly 10.7% at 65536**, so the comparison is genuinely matched now:
+same cap, same truncation rate, every problem graded, no failures on either side. The gap does
+not close when the budget doubles -- it widens slightly. **The ranking is robust to the token
+budget**, which is what the objection asked for and what a single-cap comparison could not show.
+
+### 2. The LoRA base at 16384 substantially weakens last entry's reading
+
+`lora30b16k_base` = **0.8820** on MATH-500 (13.8% truncated, 500/500). Against the ladder:
+
+| rung | acc @16384 | trunc | vs base |
+|---|---|---|---|
+| **base** | **0.8820** | 13.8% | -- |
+| 24 | 0.8680 | 15.0% | **-0.014** |
+| 49 | 0.8720 | 15.0% | **-0.010** |
+| 74 | 0.8880 | 12.8% | +0.006 |
+| 99 | 0.8800 | 13.2% | -0.002 |
+| 115 | 0.8740 | 14.2% | **-0.008** |
+| 124 | 0.8880 | 12.6% | +0.006 |
+| 149 | 0.9000 | 11.4% | **+0.018** |
+| 174 | 0.8820 | 13.2% | 0.000 |
+
+**At 4096 the base was the LOWEST rung and every adapter beat it. At 16384 the base sits in the
+middle and four of eight rungs are BELOW it.** Only step 149 exceeds it meaningfully, by 0.018
+against a standard error on the difference of ~0.021.
+
+**The base-to-peak gap shrinks as the cap grows: +0.032 at 4096, +0.018 at 16384.** That is the
+signature of a gain that is substantially an artefact of the base being truncated more than the
+peak adapter (41.2% vs 39.4% at 4096; 13.8% vs 11.4% at 16384). Extrapolating, the gap plausibly
+closes at zero truncation.
+
+**Revised reading, replacing "the ladder rises":** LoRA on this base is **approximately neutral**
+on held-out MATH-500, with a possible small peak at step 149 that is not significant at either
+cap. What still stands is the negative claim it was run to test -- **the feared degradation is
+absent**, and `step0d`'s 0.21 monotone collapse does not appear at any cap.
+
+**The prediction is now explicit and testable**: at 65536, where truncation should approach zero,
+the base-to-149 gap should be smaller than 0.018 and consistent with zero. Three rungs are
+running to check it. If it comes back at 0.018 or larger, the truncation explanation is wrong and
+the effect is real.
+
 ## 2026-09-01 — The LoRA ladder REPLICATES at a 4x budget, and a confound appears
 
 The 4096 ladder was re-run at 16384 to drop the noise floor. Truncation fell from ~40% to ~13%
