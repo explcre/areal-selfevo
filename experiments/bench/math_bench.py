@@ -138,6 +138,12 @@ GEN_KEYS = ("max_tokens", "temperature", "top_p", "n", "concurrency", "timeout",
 # Above this share of truncated generations the score is measuring the token budget rather
 # than the model, and must not be compared against a run at a different cap.
 CAP_LIMITED_RATE = 0.10
+# Above this share of REQUESTS that never returned an answer, the run is not a measurement and
+# must not be reported as one. Measured 2026-09-01: asking a model whose context is 32768 for
+# 32768 NEW tokens makes the server reject every request, and the scorer then completes
+# normally and writes acc=nan with fail=500/500. Two models in one sweep were recorded "DONE"
+# that way. A crash is caught by the exit status; this is the failure that does NOT crash.
+FAILED_RATE_ABORT = 0.10
 
 
 # Sentinel marking "the user did not name this flag". argparse only applies a default when
@@ -609,6 +615,19 @@ def main() -> int:
             print(f"WARNING {r['benchmark']}: only {r['n_graded']}/{r['n_problems']} "
                   f"graded ({r['n_failed']} failed); accuracy is over survivors and is "
                   "biased upward", file=sys.stderr)
+        # A run that answered nothing is a broken run, not a zero score.
+        _nfail = int(r.get("n_failed", 0) or 0)
+        _ntot = int(r.get("n_problems", 0) or 0) or 1
+        if _nfail / _ntot > FAILED_RATE_ABORT:
+            raise SystemExit(
+                f"ABORT {r['benchmark']}: {_nfail}/{_ntot} requests FAILED "
+                f"({100.0 * _nfail / _ntot:.1f}%). This is not a score. The usual cause is "
+                f"max_tokens={(r.get('params') or {}).get('max_tokens')} exceeding the "
+                f"model's context window, "
+                f"which makes the server reject every request; check config.json "
+                f"max_position_embeddings and leave room for the prompt. Other causes: the "
+                f"endpoint died, or the served model name is wrong."
+            )
         if r.get("cap_limited"):
             print(f"CAP-LIMITED {r['benchmark']}: {r['n_truncated']}/{r['n_problems']} "
                   f"({r['truncation_rate']:.1%}) hit max_tokens="
