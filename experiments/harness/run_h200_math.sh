@@ -5,6 +5,7 @@
 # task in a container, so that benchmark is simply unavailable there. Nothing here needs a
 # container, a daemon, or root -- only Python, pip and the GPUs.
 #
+#   bash run_h200_math.sh --fetch-data # benchmark problem files, resumable and idempotent
 #   bash run_h200_math.sh --install   # venv + sglang + bench deps, tries several routes
 #   bash run_h200_math.sh --fetch     # download the model weights, resumable
 #   bash run_h200_math.sh --smoke     # 5 problems end to end on ONE gpu, ~5 min
@@ -71,7 +72,8 @@ check_datasets() {
     echo "  FAIL  benchmark data missing under $DATA_DIR"
     echo "        absent or empty: ${missing[*]}"
     echo "        These files are not in this repo and --fetch does not download them."
-    echo "        Get them with:"
+    echo "        Get them with:  bash $0 --fetch-data"
+    echo "        or by hand:"
     echo "          git clone --depth 1 --filter=blob:none --sparse \\"
     echo "            https://github.com/LeapLabTHU/Absolute-Zero-Reasoner \\"
     echo "            $BENCH_ROOT/baselines/Absolute-Zero-Reasoner"
@@ -110,6 +112,45 @@ make_venv() {
   echo "  every venv route failed; last 20 lines of $log:"; sed 's/^/      /' "$log" | tail -20
   return 1
 }
+
+if [ "$MODE" = "--fetch-data" ]; then
+  # Idempotent by design. A half-finished clone is the normal state here, because the previous
+  # advice was a bare `git clone` which fails outright once the directory exists, leaving the
+  # user to decide whether to delete it -- a decision they have no way to make safely.
+  echo "== fetch-data: benchmark problem files =="
+  bench_env_report
+  if check_datasets >/dev/null 2>&1; then
+    check_datasets
+    echo "nothing to do."
+    exit 0
+  fi
+  AZR="$(dirname "$(dirname "$(dirname "$(dirname "$MATH_EVAL_DATA")")")")"
+  echo "  target: $AZR"
+  if [ -d "$AZR/.git" ]; then
+    echo "  existing checkout found; completing it rather than deleting anything"
+    ( cd "$AZR" \
+      && git sparse-checkout init --cone 2>/dev/null \
+      && git sparse-checkout set evaluation/math_eval/eval/data \
+      && git checkout 2>/dev/null ) || echo "  (sparse-checkout on the existing clone failed)"
+  elif [ -e "$AZR" ] && [ -n "$(ls -A "$AZR" 2>/dev/null)" ]; then
+    echo "  FAIL  $AZR exists, is not empty, and is not a git checkout."
+    echo "        Not deleting it -- inspect it, then either move it aside or point"
+    echo "        MATH_EVAL_DATA at wherever the data actually is."
+    exit 5
+  else
+    mkdir -p "$(dirname "$AZR")"
+    git clone --depth 1 --filter=blob:none --sparse \
+      https://github.com/LeapLabTHU/Absolute-Zero-Reasoner "$AZR" || {
+        echo "  FAIL  clone failed (network, or the repo moved)"; exit 5; }
+    ( cd "$AZR" && git sparse-checkout set evaluation/math_eval/eval/data )
+  fi
+  if check_datasets; then
+    echo "fetch-data done - now run: bash $0 --smoke   (or the sweep)"
+    exit 0
+  fi
+  echo "  FAIL  data still missing after fetch; see the paths above"
+  exit 5
+fi
 
 if [ "$MODE" = "--install" ]; then
   bench_env_report
@@ -180,7 +221,7 @@ fi
 
 case "$MODE" in
   --fetch|--smoke|--run) ;;
-  *) echo "Usage: $0 --install | --fetch | --smoke | --run"
+  *) echo "Usage: $0 --install | --fetch-data | --fetch | --smoke | --run"
      echo "  MODEL=<hf id>   default $MODEL"
      echo "  MAXTOK=<n>      default $MAXTOK   TP=<n> default $TP"
      exit 2 ;;
