@@ -45,6 +45,23 @@ timing belongs to the routed constant rather than to any controller.
 
 Three failures compounded, and the first was mine.
 
+**CORRECTED 2026-09-01 (same day). The magnitude below is wrong and the mechanism is right.**
+`q38_olymp_64k.out` accumulated results from SEVERAL launches sharing one tag, and I read it
+once and quoted the worst line as if it were the run. Reading the whole file:
+
+| run | accuracy | graded | failed | truncated |
+|---|---|---|---|---|
+| the line I quoted | 0.6154 | 13/675 | 662 | -- |
+| second | 0.8717 | 265/675 | 410 | 0 |
+| **best** | **0.8891** | **613/675** | **62 (9.2%)** | **1** |
+
+So the claim "a GPU-day produced 13 usable answers" is false: the best run produced **613**.
+The timeout mechanism is real and the failure rate does scale with concurrency, but I
+overstated its size by reading a snapshot of a file that other processes were still writing.
+**A reused output tag makes a log a mixture of runs, and a single grep of it is not a
+measurement.** The 613/675 result is also the best OlympiadBench@65536 number we have -- see
+the saturation entry, which it changes.
+
 **1. Raising concurrency without raising the timeout.** I moved concurrency 16 -> 40 on a 65536
 run and called it safe because the worst-case KV fit the pool. The KV was never the constraint:
 more sequences sharing the cards means each takes longer, and `run_math.sh` held a **fixed
@@ -92,7 +109,19 @@ larger budget. Qwen3.8-27B, same model, same grader, only the cap changed:
 | MATH-500 | 0.9760 | 0.8% | **0.9800** | **0.2%** | +0.004 |
 | AIME24 | 0.9000 | 13.3% | **0.9333** | **6.7%** | +0.033 (1 problem) |
 | AIME25 | 0.9000 | 10.0% | **0.9333** | **3.3%** | +0.033 (1 problem) |
-| OlympiadBench | 0.7733 | 17.8% | running | -- | -- |
+| OlympiadBench | 0.7733 | 17.8% | **0.8891** | **0.15%** | **+0.116** |
+
+**OlympiadBench is the exception, and it inverts the conclusion for that benchmark.** Where
+MATH-500 and both AIME sets moved by less than noise, OlympiadBench gains **+0.116** when the
+budget doubles, and its truncation collapses from 17.8% to a single problem in 675. **32768 was
+NOT the plateau there.** That is consistent with it being the only benchmark whose truncation
+was high in the first place -- the generations being cut off at 32768 were ones that would have
+been right.
+
+**Read that 0.8891 with its caveat**: it is over 613 of 675 graded, with 62 client-side
+failures, so it is an average over survivors and is biased upward. The failures are the slowest
+generations, which correlate with the hardest problems, so the true value is below 0.8891 and
+above the 0.7733 measured at half the budget. A clean re-run at concurrency 24 is in flight.
 
 **All three are saturated at 32768.** MATH-500 moves +0.004 on n=500, where the standard error
 is ~0.006 -- inside noise. Each AIME set moves by exactly one problem out of 30, well inside the
@@ -268,8 +297,8 @@ than a capability difference, and should not be reported as one.
 `ctx2@202` at 99.4%, and both are near-total by 289.
 
 
-Truncation rises monotonically **6% -> 13% -> 78% -> 97%** across 149/174/260/289. There is no
-step at which it breaks; it is already doubled 25 steps after the last healthy checkpoint. This
+**SUPERSEDED -- see the correction above.** This paragraph read: truncation rises
+monotonically 6% -> 13% -> 78% -> 97% across 149/174/260/289, with no step at which it breaks; it is already doubled 25 steps after the last healthy checkpoint. This
 **corrects the earlier "threshold-like" reading**, which came from training-time length curves
 on runs that were killed at 162 and never saw the middle of this range.
 
@@ -308,6 +337,26 @@ measurements rather than lower bounds. Every Frontis-MA1-30B figure remains a lo
 **AMC23 at 1.0000 should be read as "saturated", not as a score.** n=40 with zero errors gives
 a Wilson interval of [0.912, 1.000]; the benchmark has no resolving power left at this
 capability and should be dropped from any comparison that needs to separate strong models.
+
+### Ornith-1.5-35B-A3B, recorded late (it was measured and never written down)
+
+Scored in the same H200 sweep, at the same 32768 cap, and **never entered here until now**. A
+subagent writing the paper refused to use these numbers because `grep` found them nowhere in the
+repo -- correctly, since a number that exists only in a terminal and on a disposable vast.ai box
+is not a record. Re-read from the artifact rather than from memory:
+
+| benchmark | Ornith-1.5-35B-A3B | trunc |
+|---|---|---|
+| MATH-500 | 0.9720 | 8/500 |
+| AMC23 | 0.9750 | 0/40 |
+| AIME24 | 0.8000 | 6/30 |
+| AIME25 | 0.8000 | 9/30 |
+| OlympiadBench | 0.7393 | 149/675 |
+
+It places between Qwen3.8-27B and Frontis-MA1-30B on every benchmark, and does not change the
+ordering. **Note a conflict with `results.tex:78`**, which quotes an Ornith OlympiadBench figure
+of 0.716 as a lower bound at 26% truncation; that is a different measurement at a different cap
+and the two should not be merged.
 
 ### OlympiadBench too: 0.7733 against 0.7363
 
