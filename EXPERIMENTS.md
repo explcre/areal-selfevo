@@ -3,6 +3,51 @@
 Measured results and negative results, newest first. A claim only belongs here once it has
 been observed end to end; a prediction belongs in GOAL.md until then.
 
+## 2026-09-01 — The 30B LoRA run is healthy, and two alarms I raised about it were both false
+
+I reported twice that the run emitted "no metrics of any kind" and then that its reward was
+"exactly 0.0000 across all 119 steps". **Both were my errors, and they were different errors.**
+
+1. **"No metrics."** AReaL prints metrics in box-drawing tables, not as `key: value`. My grep
+   pattern could not match that shape, so I reported an absence that was a pattern failure.
+   Parsing whole cells split on the box character recovers **34 distinct keys, 4012 lines**.
+2. **"Reward is zero."** `ppo_actor/final_reward/avg` is indeed 0.00000 at every step -- but
+   `max` is **+2.47490** and `min` is **-2.47490**. It is zero-MEAN by construction, because
+   GRPO normalises within a group. `advantages/avg` is 0 the same way, with max 3.89 and min
+   -3.81. A quantity that is zero by definition is not evidence of a dead signal, and I nearly
+   restarted a five-hour run over it.
+
+**The actual state at step 119/1160:**
+
+| metric | value | reading |
+|---|---|---|
+| `correct_n_seqs / n_seqs` | **445 / 512 = 86.9%** | the real learning signal, and it is high |
+| `no_eos_ratios/avg` | 0.035 | 3.5% non-terminating; healthy |
+| `kl_rewards/*` | 0 | expected, `kl_ctl: 0.0`, so no reference model |
+| `correct_seq_len/avg` | 836 | against `incorrect_seq_len/avg` 1061 |
+| checkpoints | **5** (steps 24/49/74/99/115) | scoreable offline |
+
+**The 86.9% solve rate is the interesting number, and it is a problem for gradient signal.** At
+that rate most groups are all-correct, so their advantages are identically zero and they carry
+no gradient -- which is precisely the silent-group phenomenon this whole project is about,
+appearing now at 30B on a task that is nearly saturated for it.
+
+### Two config values differ from our corrected recipe, and it is NOT yet clear that matters
+
+`eps_clip: 0.4` and `lr: 1.0e-05`, inherited from the upstream `gsm8k_grpo_lora.yaml`, against
+`step0l`'s measured `eps_clip: 0.2` and `lr: 1.0e-06`. `step0l.sh` records that the demo recipe
+"destroys held-out capability".
+
+**But that measurement was full fine-tuning of a 1.5B, and this is LoRA on a 30B.** LoRA
+adapters are conventionally trained at learning rates one to two orders of magnitude above full
+fine-tuning, so 1e-5 is conservative by LoRA standards rather than aggressive. Transferring the
+1.5B finding across both changes at once would be exactly the kind of unmeasured generalisation
+that has produced three wrong claims here already.
+
+**The way to settle it is the five checkpoints**: score 24/49/74/99/115 on held-out MATH-500 and
+look at the direction. `step0d` degraded 0.528 -> 0.316 monotonically under the bad recipe, so
+the signature is unmistakable if it is present. Queued behind the GPUs currently in use.
+
 ## 2026-09-01 — Scoring throughput: the 80GB memory rule was being applied to 140GB cards
 
 A 65536-cap OlympiadBench run on 4x H200 was measured at **0.01 requests/s, ETA 918 minutes**.
