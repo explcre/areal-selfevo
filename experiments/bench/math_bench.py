@@ -149,6 +149,11 @@ FAILED_RATE_ABORT = 0.10
 # for the better part of an hour, and a run that prints nothing cannot be distinguished from a
 # stalled one by any watchdog or any person watching.
 PROGRESS_EVERY_S = float(os.environ.get("PROGRESS_EVERY_S", "30"))
+_PROGRESS_WIDTH = int(os.environ.get("PROGRESS_WIDTH", "28"))
+# Whether to redraw in place. A bar written with carriage returns into a redirected log becomes
+# one unreadable line thousands of characters long, so the shape of the output depends on where
+# it is going, not on a preference.
+_PROGRESS_TTY = sys.stderr.isatty()
 
 
 # Sentinel marking "the user did not name this flag". argparse only applies a default when
@@ -508,12 +513,23 @@ async def run_bench(bench: str, args, gen_fh=None, explicit=None) -> dict:
                 _rate = _done / _elapsed if _elapsed > 0 else 0.0
                 _eta = (_total - _done) / _rate if _rate > 0 else float("nan")
                 _bad = sum(1 for r in recs if r["status"] != "ok")
-                print(
-                    f"  {bench}: {_done}/{_total} ({100.0 * _done / _total:5.1f}%) "
-                    f"{_rate:.1f}/s  elapsed {_elapsed / 60:.1f}m  eta {_eta / 60:.1f}m"
-                    + (f"  FAILING {_bad}" if _bad else ""),
-                    file=sys.stderr, flush=True,
+                _frac = _done / _total
+                _fill = int(round(_PROGRESS_WIDTH * _frac))
+                _bar = "#" * _fill + "-" * (_PROGRESS_WIDTH - _fill)
+                _line = (
+                    f"  {bench:<14s} [{_bar}] {100.0 * _frac:5.1f}%  "
+                    f"{_done}/{_total}  {_rate:.1f}/s  eta {_eta / 60:.1f}m"
+                    + (f"  FAILING {_bad}" if _bad else "")
                 )
+                # On a terminal, redraw one line in place. In a log file a carriage return
+                # produces an unreadable single mega-line, so there we print whole lines and
+                # accept the scrollback -- the file is read after the fact, not watched.
+                if _PROGRESS_TTY:
+                    print("\r" + _line + "\033[K", end="", file=sys.stderr, flush=True)
+                    if _done == _total:
+                        print(file=sys.stderr, flush=True)
+                else:
+                    print(_line, file=sys.stderr, flush=True)
 
     # as_completed yields in FINISH order, which would make generations.jsonl differ run to run
     # for identical inputs and defeat any diff between two scorings. Restore submission order.
