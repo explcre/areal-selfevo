@@ -3,6 +3,42 @@
 Measured results and negative results, newest first. A claim only belongs here once it has
 been observed end to end; a prediction belongs in GOAL.md until then.
 
+## 2026-09-01 — Scoring throughput: the 80GB memory rule was being applied to 140GB cards
+
+A 65536-cap OlympiadBench run on 4x H200 was measured at **0.01 requests/s, ETA 918 minutes**.
+The server's own numbers said why:
+
+* `max_total_num_tokens=2167479` with **`token usage: 0.28`** -- the KV cache was 72% empty
+* `#running-req: 16` -- concurrency, not memory, was the binding constraint
+* 85700 of 143771 MiB used per card -- 40% of the GPU sitting idle
+
+**Cause: `mem_fraction_static=0.55` is a rule for 80GB cards and these are 140GB cards.** The
+rule was recorded for a real failure and carried over to hardware it was never measured on. On
+an 80GB card 0.55 leaves the trainer room; on a 140GB card running nothing else it leaves 60GB
+unused.
+
+Two changes, neither of which alters what is computed:
+
+| knob | was | now | why it is safe |
+|---|---|---|---|
+| `mem_fraction_static` | 0.55 | 0.85 | 0.85 x 143771MiB = 122GB pool; nothing else is on these cards |
+| `concurrency` | 16 | 40 | worst case 40 x 65536 = 2.6M tokens against a pool of 3.6M |
+
+Measured effect on the pool: `max_total_num_tokens` **2167479 -> 3595866**, a 1.66x increase,
+with all eight GPUs at ~89% utilisation afterwards.
+
+**Not bit-identical, and that should be stated rather than glossed.** Decoding is greedy and
+requests are independent, so no answer depends on how many run beside it; but batched matmuls do
+not associate identically across batch sizes. Expect agreement within a problem or two of 675,
+not an exact reproduction. For a saturation check -- does accuracy climb from 32768 to 65536 --
+that is far below the effect being measured. For a paired comparison against an existing number
+at a different batch size, it is not, and the caps and concurrency must be matched instead.
+
+**Generalisation worth keeping:** a memory fraction is a fraction OF THE CARD, so any rule
+expressed as one silently changes meaning when the card changes. The check that catches it is
+`token usage` in the server log: if that sits well below 1.0 while a benchmark is slow, the
+budget is not the constraint and the concurrency is.
+
 ## 2026-09-01 — The collapse is SHARP (corrected), is NOT a cap artifact, and the random arm tracks it
 
 Every point below is MATH-500 at a **matched 16384 cap**, on the H200 checkpoints. 16384 and
