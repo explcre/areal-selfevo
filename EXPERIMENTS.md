@@ -3,6 +3,85 @@
 Measured results and negative results, newest first. A claim only belongs here once it has
 been observed end to end; a prediction belongs in GOAL.md until then.
 
+## 2026-09-01 — EOS hazard measured directly: neither proposed mechanism holds, and the collapse story was wrong
+
+Teacher-forced 64 frozen greedy responses through 27 checkpoints across both ladders
+(`ctx` routed, `step0l` unrouted control, plus the base model as step 0). All 27 loaded.
+Stop token determined empirically as **151645 `<|im_end|>`** -- all 64 responses ended on it,
+0 on 151643. Alignment verified by a stronger check than proposed: since Y is greedy,
+teacher-forced argmax must reproduce it, and agreement at the generator is **0.998** with
+`p_eos_at_true_end` **0.99928**. An off-by-one gives ~0 on both.
+
+### The EOS hazard does not erode. It strengthens.
+
+| step | ctx H | ctx p_end | ctx H_body | step0l H | step0l H_body |
+|---|---|---|---|---|---|
+| 24 | 0.99754 | 0.99754 | <5e-7 | 0.99924 | <5e-7 |
+| 74 | 0.99958 | 0.99958 | <5e-7 | 1.00204 | 0.00208 |
+| 99 | 0.99975 | 0.99976 | <5e-7 | **1.20534** | **0.20538** |
+| 149 | 0.99958 | 0.99958 | <5e-7 | 1.09105 | 0.09110 |
+
+`ctx` rises monotonically 0.99754 -> 0.99979, min across prompts 0.850 -> 0.994. Body hazard
+below 5e-7 at every step: the hazard is a spike at the response's semantic end and that spike
+never moves. **Mechanism A (smooth erosion) is refuted. Mechanism B is refuted at its premise
+-- the hazard is not the failing state variable at all.**
+
+A self-generated-Y control (each checkpoint scored on its own greedy output, n=32) reproduces
+it: `ctx` mean `p_end` stays 0.984-0.9999 while its own greedy length grows 324 -> 469. Not a
+stale-text artifact.
+
+### Three claims I made that the data does not support
+
+1. **"Routed arms collapse into non-terminating output" -- not on this box.** `ctx`'s
+   `no_eos_ratios` peaks at **0.0059**, six of 1024 rollouts. Scanning all 18 runs, the ones
+   that genuinely produced 1024-token non-terminating output are **step0b (15.6%)** and
+   **step0 (11.7%)** -- **both UNROUTED**, both old published-config runs (lr 6e-6,
+   eps_clip 0.4), whose collapse `step0l.sh` already attributes to entropy collapse. The
+   100%/97.8% truncation figures I cited are from H200 runs at step 289 that I cannot
+   currently verify because that box is unreachable; the A100 routed runs were killed at
+   step 162, before any such thing.
+2. **"The control is flat" -- false.** `step0l`'s H rises to **1.205** at step 99. Its end
+   spike is pinned at 0.99996, so the extra 0.21 of stop-mass is MID-response, on 16 of 64
+   responses, max 1.81. The control drifts toward stopping EARLIER. It does not confound the
+   comparison, but the claim was wrong.
+3. **The dose-response is not supported.** Constant 0.5 gives onsets 132 and 144; constant
+   2.0 gives 131. **Magnitude does not clearly shift onset at n=3.** I previously described
+   this as the strongest evidence we had. It is not evidence.
+
+### What does survive
+
+**Length moves like a threshold, and routing presence separates cleanly.** All three
+configured-routing runs sit on the same ~424-token plateau for >120 steps then break: onset
+(5 consecutive steps above baseline+4sd) at **ctx 144, ctxpc 132, sa2 131**, slope 0.34-0.57
+tok/step before and 5.6-9.2 after. **Zero of the matched unrouted runs ever cross**
+(step0l 273 steps, step0j 178, g16 116). Free greedy generation: `ctx` 327 -> 455 tokens,
+`step0l` 330 -> 316 and flat over 202 steps.
+
+So routing presence predicts crossing; routing MAGNITUDE does not predict onset.
+
+### Fix implication, reversed
+
+An explicit termination term (`overlong_reward_penalty`, `mask_no_eos_with_zero`) targets
+`p_eos`, which is **already 0.9996 and does not budge**. It has nothing to correct. The lever
+is the constant itself -- the same conclusion as before, reached for the opposite reason.
+
+### Trap: `route/*` metrics are NOT a routing indicator
+
+`sa2` emits no `route/*` metrics at all, yet its config carries
+`group_routing.enabled: true, solved_advantage: 2.0, router: null` -- the actor's hardcoded
+rule writes the constant without passing through the metric seam. **Routing status must be
+read from `actor.group_routing` in `config.yaml`, never from the presence of route metrics.**
+Any arm classified by metrics alone has been classified wrong.
+
+### Unmeasured
+
+The post-knee regime. `ctx`'s last checkpoint is step 149; the run continued to 162 with
+length still climbing (647 and rising) and the logs end mid-stats-table -- killed abruptly,
+not stopped on a criterion. If a real hazard collapse exists it lives past the last
+checkpoint, and nothing here can see it. Probes are greedy while training sampled at
+temperature 1.0; greedy length at 149 (455) tracks training seq_len at 145 (478), so it is a
+fair proxy, but the sampled tail is unmeasured.
+
 ## 2026-09-01 — The 27B LoRA run failed on config, not capacity, and two obvious causes were wrong
 
 `lora27b` died at engine init with CUDA OOM and stranded nothing. Diagnosed from its config
