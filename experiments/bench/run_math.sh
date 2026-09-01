@@ -29,6 +29,14 @@ for _ in $(seq 1 180); do
 done
 curl -sf "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1 || { echo "NOT READY"; tail -25 "$OUT/server.log"; exit 5; }
 echo "endpoint up; scoring $TAG"
+# Declare the run's shape BEFORE any of it finishes. Without this a progress reader can only
+# learn which benchmarks a shard covers by watching them complete, which is precisely when the
+# information stops being useful -- a half-done shard reported "total unknown" while sitting at
+# 59%. Written to the output dir as well as stdout so a monitor need not parse the log.
+printf '{"tag":"%s","benches":"%s","max_tokens":%s,"concurrency":%s,"started":%s}\n' \
+  "$TAG" "${BENCHES:-aime24,aime25,amc23,math500}" "${MAXTOK:-3072}" "${CONC:-64}" "$(date +%s)" \
+  > "$OUT/run_meta.json"
+echo "RUN_META benches=${BENCHES:-aime24,aime25,amc23,math500} max_tokens=${MAXTOK:-3072} conc=${CONC:-64}"
 # Repo copy, never a stale $HOME copy: numbers must come from audited code.
 python3 "$(dirname "$0")/math_bench.py" --base-url "http://127.0.0.1:$PORT/v1" \
   --benchmarks "${BENCHES:-aime24,aime25,amc23,math500}" \
