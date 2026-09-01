@@ -3,6 +3,101 @@
 Measured results and negative results, newest first. A claim only belongs here once it has
 been observed end to end; a prediction belongs in GOAL.md until then.
 
+## 2026-08-31 — MECHANISM: routing breaks GRPO's zero-mean advantage, and an unrouted control was already in our logs
+
+Code-level analysis. It **refutes my stated hypothesis** while confirming the cause, and it
+found a matched control we already had and had never looked at.
+
+### My hypothesis was wrong in its reason
+
+I claimed "nothing anywhere rewards EOS". **False.** EOS is INSIDE the masked region and DOES
+receive the positive constant (verified numerically on CPU). The correct statement is narrower:
+
+* For a **terminated** rollout the SFT push raises `log p` of R-1 non-EOS tokens and of EOS
+  once, and to first order these roughly cancel -- the EOS hazard integrates to ~1.
+* For a **truncated** rollout there is no EOS at all, so every one of its token-pushes is
+  "keep going" with **zero counterweight**. And because the loss is a token-mean
+  (`functional.py:506,571`; `actor.py:872`), a truncated rollout carries ~2.5x the gradient
+  mass of a typical terminating one.
+
+So the destabilising force is carried specifically by truncated rollouts inside SFT-routed
+groups, not by the constant in general.
+
+### The control that settles it was already in our logs
+
+**`step0l`**: same model, same GSM8K, same `n_samples: 8`, same `lr: 1.0e-06`, same
+`max_new_tokens: 1024` -- differing ONLY in `group_routing: null`. It ran **219 steps** with
+mean response length **flat at 275-300 from step 30 to 215**. `g16`, also unrouted, is flat
+too. **Three routed arms knee; two unrouted arms never do.**
+
+| step | `ctx` | `ctxpc` | **`step0l` (unrouted)** | `sa2` |
+|---|---|---|---|---|
+| 30 | 304 | 303 | 307 | 293 |
+| 140 | 340 | **435** | 296 | **445** |
+| 162 | **527** | – | 286 | – |
+| 200 | – | – | **283** | – |
+
+### The quantity that predicts it: a DC offset on the advantage field
+
+GRPO advantages are zero-mean by construction. Routing breaks that:
+
+| run | mean `advantages/avg` | knee |
+|---|---|---|
+| `step0l` (no routing) | **-0.0004** | never |
+| `g16` (no routing) | +0.0136 | never |
+| `ctx` | +0.1579 | ~142 |
+| `ctxpc` | +0.1675 | ~132 |
+| `sa2` | **+0.8979** | ~120 |
+
+**The knee arrives earlier the larger the offset**, and never at ~0. That is a dose-response
+relationship across five runs, which is far stronger than the single-arm story I had.
+
+### `sa2` refutes the "SKIP deletes the RL signal" sub-hypothesis
+
+`sa2` takes the fixed-rule branch with `unsolved_advantage: 0.0`, so ONLY silent-and-solved
+rows are touched -- confirmed by `routed_group_fraction == solved_group_fraction` to three
+decimals at every step. No informative advantage is ever deleted, nothing is ever skipped, and
+it still knees hardest. **Adding a positive constant to already-silent all-correct groups is
+sufficient on its own.**
+
+### Three defects found on the way
+
+1. **The PPO clip is inert.** With `ppo_n_minibatches: 1`, `recompute_logprob: true` and
+   `use_decoupled_loss: true`, the ratio is exactly 1: `importance_weight` avg=min=max=**1.0**,
+   `clip_ratio` **0.0**, `clipped_tokens` **0.0** across every step of all four runs. The
+   comment at `actor.py:645` claiming "PPO's clip still bounds how far one update can sharpen"
+   is **false in this configuration** -- these are unclipped REINFORCE updates, so nothing
+   bounds the constant.
+2. **A coordinate off-by-one.** `actor.py:445` builds a LOCAL rolled mask, written back to
+   `data` only at `:692` -- after routing at `:660`. So `apply_decisions` masks in TOKEN
+   coordinates while advantages are in EMITTER coordinates. Consequences: one live token per
+   row keeps its pre-routing advantage (so `skip` fails to zero one token per row), and one
+   written position per row falls outside the loss.
+3. **`no_eos_ratios` is mis-instrumented.** `actor.py:804` compares seqlens to the PADDED batch
+   width, so it counts ~1 row per batch of 512 and reads 0.002-0.005 throughout. There is
+   therefore **no usable training-time truncation rate anywhere in our logs**, which is why the
+   abruptness cannot be resolved from what we have.
+
+### No length term was active
+
+The only one in the codebase is DAPO's `overlong_reward_penalty`, which defaults to **False**
+(`cli_args.py:1899`) and is `false` in both arms' configs. `mask_no_eos_with_zero` is false too.
+The sole implicit brake is that a truncated rollout grades wrong and earns a negative
+group-normalised advantage -- **which `sft` overwrites with +0.5 and `skip` zeroes.**
+
+### Still open: smooth-vs-threshold
+
+Extrapolating `ctx`'s ~2.0%/step growth puts it at the 1024 cap right in the 199-224 window, so
+a smoothly advancing mean crossing a fixed cap reproduces 4/60 -> 59/60 with no dynamical
+threshold. A truncation-feedback loop also fits and additionally explains the acceleration at
+130-142. **Our logs cannot separate them** because the truncation-rate metric is broken.
+
+The discriminating experiment is cheap and needs no training: freeze one response set, then
+teacher-force it through the `ctx` and `step0l` checkpoint ladders (both have
+`globalstep{24,49,74,99,124,144,149}`) and plot the integrated EOS hazard. Smooth monotone decay
+for `ctx` and flat for `step0l` means a smaller constant suffices; a flat-then-cliff means the
+objective needs an explicit termination term.
+
 ## 2026-08-31 — BOTH credit signals collapse. The cause is the routed SFT constant, and the step-149 nulls were measured on pre-collapse models
 
 The discriminating measurement. `ctx2` and `ctxpcc` both ran 290 steps and differ ONLY in the
