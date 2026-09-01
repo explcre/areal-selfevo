@@ -763,6 +763,276 @@ we are calling null are small, and so is the sample they are null over. (iv) \em
 is itself moving}, as the paragraph above records, so Table~\ref{tab:eos} compares a flat
 routed arm against a drifting control rather than against a fixed reference.
 
+\subsection{Frontier comparison at an honest cap}
+\label{sec:frontier}
+
+Sec.~\ref{sec:cap} establishes that a benchmark number without its budget is not a
+measurement. Table~\ref{tab:frontier} applies that convention to the two frontier candidates
+for the fixed strong base: \texttt{Qwen3.8-27B} and \texttt{Frontis-MA1-30B}, both scored on
+the same box with the same grader at an explicit $32768$ cap, with the cap-precedence fix of
+Sec.~\ref{sec:cap} confirmed live on that box by the line the corrected code prints,
+\texttt{NOTE aime24: using explicit --max-tokens=32768} followed by
+\texttt{(BENCH\_OVERRIDES default 8192 not applied)}. Truncation is reported beside every
+accuracy, because at this cap it is the column that says whether the accuracy beside it is a
+measurement or a lower bound.
+
+\begin{table}[t]
+\centering\small
+\caption{Frontier comparison at a matched, explicit $32768$ cap, greedy, one run per model.
+\texttt{trunc} is the number of generations that reached the cap and were therefore graded
+wrong. AMC23 is included for completeness and is read as saturated rather than as a score.}
+\label{tab:frontier}
+\begin{tabular}{lccccc}
+\toprule
+ & & \multicolumn{2}{c}{\texttt{Qwen3.8-27B}} & \multicolumn{2}{c}{\texttt{Frontis-MA1-30B}} \\
+\cmidrule(lr){3-4}\cmidrule(lr){5-6}
+benchmark & $n$ & accuracy & trunc & accuracy & trunc \\
+\midrule
+MATH-500      & 500 & \textbf{0.9760} & 4/500 (0.8\%)   & 0.8980 & 57/500 (11.4\%) \\
+AMC23         & 40  & 1.0000          & 0/40            & 0.9500 & 2/40 \\
+AIME24        & 30  & \textbf{0.9000} & 4/30 (13.3\%)   & 0.8000 & 6/30 (20.0\%) \\
+AIME25        & 30  & \textbf{0.9000} & 3/30 (10.0\%)   & 0.7000 & 6/30 (20.0\%) \\
+OlympiadBench & 675 & \textbf{0.7733} & 120/675 (17.8\%) & 0.7363 & 135/675 (20.0\%) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{The truncation column carries as much of the comparison as the accuracy column.}
+\texttt{Qwen3.8-27B} is $0.8\%$ cap-limited on MATH-500 against \texttt{Frontis-MA1-30B}'s
+$11.4\%$, so its MATH-500 figure is close to a measurement while every
+\texttt{Frontis-MA1-30B} figure in the table remains a lower bound. The smaller model wins on
+all five benchmarks and is less cap-limited on all five, which is why the paper's fixed strong
+base is \texttt{Qwen3.8-27B}: a delta measured on it is both harder to obtain and harder to
+dismiss as scale.
+
+\paragraph{AMC23 at $1.0000$ is saturation, not a score.} With $n=40$ and zero errors the
+Wilson interval is $[0.912, 1.000]$, so the benchmark cannot separate two models that both sit
+here and the row resolves nothing. We report it and then decline to use it: AMC23 has no
+resolving power left at this capability and is excluded from any comparison that has to
+separate strong models.
+
+\paragraph{A matched cap is not automatically a fair cap.} Both models truncate at $32768$, so
+neither number measures capability; both measure \emph{capability under a $32768$ budget},
+which is a legitimate quantity but not the one a bare ranking implies. Where a cap binds on
+both sides, part of the gap is verbosity rather than skill, and the ranking is trustworthy
+only if it is stable as the cap grows. On OlympiadBench \texttt{Frontis-MA1-30B} is visibly
+still on the slope --- $0.6237$ at $16384$ ($33.3\%$ truncated), $0.7363$ at $32768$
+($20.0\%$), with $65536$ not run --- so that row in particular is a comparison of two lower
+bounds. Sec.~\ref{sec:capsat} supplies the stability check for the other four.
+
+\paragraph{Scope.} One run per model, greedy, one set of caps. AIME at $n=30$ carries about
+$0.1$ of run-to-run jitter on this pipeline, so $0.9000$ against $0.8000$ on AIME24 is about
+one jitter width and is not significant on its own; the MATH-500 gap, $0.9760$ against
+$0.8980$ at $n=500$, is well outside it and is the row that carries the ranking. Both
+OlympiadBench figures inherit the grader caveat of Sec.~\ref{sec:cap}: $94$ of the $675$
+problems state more than one gold answer in a single answer string and are marked wrong
+however the model answers.
+
+\subsection{The 32768 cap is saturated: doubling the budget buys essentially nothing}
+\label{sec:capsat}
+
+The fairness objection to Table~\ref{tab:frontier} is that a cap which binds on both sides
+partly measures verbosity. The check is to raise it. Table~\ref{tab:capsat} re-scores
+\texttt{Qwen3.8-27B} at $65536$: same model, same grader, only the cap changed.
+
+\begin{table}[t]
+\centering\small
+\caption{\texttt{Qwen3.8-27B} at $32768$ against the same model at $65536$. Truncation more
+than halves on every benchmark while accuracy barely moves. OlympiadBench at $65536$ is still
+running and is reported as not yet measured rather than omitted.}
+\label{tab:capsat}
+\begin{tabular}{lccccc}
+\toprule
+benchmark & @32768 & trunc & @65536 & trunc & $\Delta$ \\
+\midrule
+MATH-500      & 0.9760 & 0.8\%  & \textbf{0.9800} & 0.2\% & $+0.004$ \\
+AIME24        & 0.9000 & 13.3\% & \textbf{0.9333} & 6.7\% & $+0.033$ (1 problem) \\
+AIME25        & 0.9000 & 10.0\% & \textbf{0.9333} & 3.3\% & $+0.033$ (1 problem) \\
+OlympiadBench & 0.7733 & 17.8\% & \multicolumn{2}{c}{not yet measured} & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+MATH-500 moves $+0.004$ at $n=500$, where the standard error is about $0.006$ --- inside
+noise. Each AIME set moves by exactly one problem out of thirty, well inside the $\approx 0.1$
+jitter recorded at that $n$. The informative quantity is the pair: \textbf{truncation more
+than halves while accuracy does not follow}, which is the signature of a budget that was
+already sufficient. The generations being cut off at $32768$ were ones that were going to be
+graded wrong regardless. For MATH-500 and both AIME sets, therefore, the $32768$ numbers of
+Table~\ref{tab:frontier} are measurements rather than lower bounds, and the ranking there can
+be stated plainly.
+
+\paragraph{OlympiadBench is the one that is still open.} It is also the one where truncation
+at $32768$ was high enough for verbosity to matter ($17.8\%$ against
+\texttt{Frontis-MA1-30B}'s $20.0\%$). Its $65536$ measurement is re-running; the first attempt
+at that cap is void for the reason given in Sec.~\ref{sec:harness} and is not quoted here or
+anywhere else in this paper.
+
+\paragraph{A caveat that belongs with these numbers.} The $65536$ run used concurrency $40$
+against the earlier run's $24$, so the batch composition differed between the two columns.
+Decoding is greedy and the requests are independent, so no answer depends on which others ran
+beside it; but batched matmuls do not associate identically across batch sizes, and a
+one-problem AIME difference is exactly the resolution at which that could contribute. This
+does not weaken the conclusion, which rests on the accuracy \emph{not} moving while truncation
+halved, and not on the sign of $+0.033$.
+
+\subsection{The noise floor is a function of truncation}
+\label{sec:noisetrunc}
+
+\texttt{narrow.sh} was launched twice by mistake, so four checkpoints were each scored twice
+on MATH-500 at a matched $16384$ cap. The duplication measures the run-to-run spread of this
+exact pipeline directly, rather than by assertion, and it does so at two very different
+truncation rates.
+
+\begin{table}[t]
+\centering\small
+\caption{An accidental repeat run. Four checkpoints from the \texttt{ctx2} (contextual) and
+\texttt{rnd} (random-router control) ladders, each scored twice on MATH-500 at a matched
+$16384$ cap. \emph{spread} is $|A - B|$.}
+\label{tab:noisetrunc}
+\begin{tabular}{lcccc}
+\toprule
+checkpoint & run A & run B & spread & truncation \\
+\midrule
+\texttt{rnd}@173  & 0.4600 & 0.4580 & \textbf{0.002} & 10\% \\
+\texttt{ctx2}@173 & 0.4580 & 0.4480 & \textbf{0.010} & 11\% \\
+\texttt{ctx2}@199 & 0.2660 & 0.2420 & \textbf{0.024} & 96\% \\
+\texttt{rnd}@199  & 0.3480 & 0.3220 & \textbf{0.026} & 99\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+At $\approx 10\%$ truncated the same checkpoint reproduces to $0.002$--$0.010$; at $\approx
+97\%$ truncated it moves by $0.024$--$0.026$, an order of magnitude worse. The noise floor is
+therefore not one number for this suite --- it is a function of how much of the batch the cap
+is cutting off.
+
+\paragraph{The rule this licenses.} Above roughly $80\%$ truncation an accuracy is dominated
+by which few generations happened to finish, and finishing is not random: the survivors are
+the fastest generations, hence the shortest. \textbf{We do not compare accuracies taken above
+$\approx 80\%$ truncation}, and where two such points differ we read the truncation channel
+instead. This had until now been argued rather than measured; Table~\ref{tab:noisetrunc} is
+the measurement.
+
+\paragraph{What it retires.} We had recorded that the random-router arm \emph{retains more
+accuracy} than the contextual one after the transition of Sec.~\ref{sec:transition} --- at
+step $289$, $0.3260$ against $0.1740$. Both points sit at $96$--$98\%$ truncation, where the
+repeat spread is $0.025$, so what that comparison reports is which few generations finished on
+each arm rather than a capability difference. The sign survives; the magnitude does not, and
+neither does any ordering among the post-transition points. We withdraw the reading here
+rather than quietly not repeating it.
+
+\subsection{The collapse transition narrows to steps 174--199, and both arms cross together}
+\label{sec:transition}
+
+Every point in Table~\ref{tab:transition} is MATH-500 truncation at a matched $16384$ cap,
+on the checkpoint ladders of the contextual arm (\texttt{ctx2}) and the random-router control
+(\texttt{rnd}). The cap is $16384$ and not $32768$ because these are 1.5B checkpoints with
+\texttt{max\_position\_embeddings: 32768}; asking such a model for $32768$ \emph{new} tokens
+is rejected outright (Sec.~\ref{sec:harness}). It is $5.3\times$ the $3072$ these arms were
+originally scored at.
+
+\begin{table}[t]
+\centering\small
+\caption{MATH-500 truncation at a matched $16384$ cap across both ladders. Accuracies are
+deliberately not tabulated past the transition: by Sec.~\ref{sec:noisetrunc} they are not
+comparable there, and truncation is the trustworthy channel.}
+\label{tab:transition}
+\begin{tabular}{lcccccccc}
+\toprule
+step & 149 & 173 & 174 & 199 & 202 & 231 & 260 & 289 \\
+\midrule
+\texttt{ctx2} (contextual) & 6.4\% & 11\% & 13.2\% & \textbf{96\%} & 99.4\% & 92.2\% & 77.8\% & 96.4\% \\
+\texttt{rnd} (random)      & 6.0\% & 10\% & 12.4\% & \textbf{99\%} & 99.6\% & 99.6\% & 97.4\% & 98.2\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{The unmeasured window is twenty-five steps wide, and both arms cross inside it.}
+Truncation goes $13.2 \to 96$ on the contextual arm and $12.4 \to 99$ on the random one
+between step $174$ and step $199$. The two ladders agree to within a percentage point at every
+measured step on either side of that window --- $12.4$ against $13.2$ before, $99.6$ against
+$99.4$ after.
+
+\paragraph{This is the strongest form of the controller-is-not-the-cause result.} The random
+router has no learned policy, no credit signal and no preference over modes
+(Sec.~\ref{sec:routernull}), so the timing of this transition cannot be a property of the
+controller. It is a property of the routed constant, which both arms share. The earlier
+evidence for that conclusion was that both arms collapse; this is the stronger statement that
+they collapse \emph{at the same step}.
+
+\paragraph{It is also not a cap artifact, which was a live possibility.} The original
+step-$289$ scores were taken at $3072$ with $\approx 100\%$ truncation, where an accuracy is a
+truncation rate wearing accuracy's clothing. Raising the budget $5.3\times$ moves truncation
+from $\approx 100\%$ only to $96$--$98\%$. These policies genuinely emit more than $16384$
+tokens; the pathology is in the model and not in the budget.
+
+\paragraph{Two wrong shapes from one missing interval, recorded because the error repeats.}
+This table has now corrected the reading of the same transition twice, in opposite directions.
+From training-time length curves on runs killed at step $162$ we first called the change
+\emph{threshold-like}; from four points at $149/174/260/289$ we then corrected that to
+\emph{gradual, not a cliff}; filling in $202$, $231$, $173$ and $199$ shows it is
+\emph{sharp}. Both wrong shapes came from drawing a line through the same unmeasured gap.
+The general form is worth more than the particular correction: interpolating a shape across an
+interval that contains no measurement produces a confident claim whose sign is set by which
+endpoints happened to exist.
+
+\paragraph{What the table does not support.} There is no clean post-collapse plateau. After
+the transition the contextual arm reads $99.4 \to 92.2 \to 77.8 \to 96.4$, non-monotone across
+four points; its step-$249$ checkpoint (not shown, outside the matched step set) is the oddest,
+at $61.4\%$ truncation with the ladder's lowest accuracy, so at that checkpoint the failures
+are not all length. That is unexplained and we do not model it.
+
+\subsection{Three ways a harness reported a number that was not a measurement}
+\label{sec:harness}
+
+Sec.~\ref{sec:cap} reports one defect of this kind. It was not the only one, and the three
+together have a shape worth stating as a contribution rather than as an apology: in all three
+the run completed, exited zero, and wrote a plausible number, so nothing downstream of the
+score could have caught them.
+
+\paragraph{(i) A defaults table silently outranking an explicit cap.} \texttt{resolve\_params}
+applied a per-benchmark \texttt{BENCH\_OVERRIDES} table unconditionally, so an explicit
+\texttt{--max-tokens} was parsed, accepted and discarded. AIME24 read $0.2667$ at an applied
+$8192$ against $0.8000$ at the requested $32768$, and AIME25 $0.2667$ against $0.7000$: a
+factor of three from a flag that appeared on every command line and reached no sampler.
+Table~\ref{tab:cap} is that measurement.
+
+\paragraph{(ii) A cap larger than the model's context, which fails every request.} A re-score
+asked 1.5B checkpoints with \texttt{max\_position\_embeddings: 32768} for $32768$ \emph{new}
+tokens. The server rejected every request, and the scorer reported
+\texttt{acc=nan} with \texttt{fail=500/500}. A \texttt{nan} in an accuracy column reads as a
+score to any reader who does not read the failure column beside it, which is the entire
+argument for printing that column.
+
+\paragraph{(iii) A client timeout discarding work the server had already done.} Concurrency
+was raised $16 \to 40$ on a $65536$ OlympiadBench run while the launcher held a fixed
+\texttt{--timeout 600}. The KV pool was never the constraint; more sequences sharing the cards
+means each takes longer, and per-request latency crossed the fixed deadline. The server's
+access log records $613$ generations returned with \texttt{200 OK}; the client kept $13$ of
+$675$ and counted $662$ failures. The scorer then reported \texttt{acc=0.6154, n=13/675,
+fail=662} and exited zero. Roughly a GPU-day of generation produced thirteen usable answers,
+and the $0.6154$ is void: it is an average over self-selected survivors, which are the fastest
+generations, hence the shortest, hence not a random sample of the benchmark.
+
+\paragraph{Why a warning is not a guard.} The scorer did print that its accuracy was over
+survivors and biased upward. That is correct and it is not enough, because a warning beside a
+plausible number is read as a number. The abort-on-failure-rate guard that would have stopped
+this at $98\%$ failures had been written, tested and committed --- to a repository the scoring
+box cannot reach, so the box was still running a copy transferred by hand hours earlier. A fix
+that exists only in version control does not protect a machine that cannot reach version
+control. The progress monitor compounded it: it counted server-side completions, which is all
+a server log can show, and read $90.8\%$ complete for a run that yielded thirteen answers.
+
+\paragraph{The convention we adopt, stated as a requirement on reporting.} Every benchmark
+number in this paper is reported with three things beside it: \textbf{the token budget it was
+taken at, the fraction of generations that hit that budget, and the number of requests that
+failed}. Any one of the three defects above is invisible without one of them, and each
+produced a number in the plausible range. The generalisation is that a harness which cannot
+fail cannot measure: if a run has no path that aborts, then a successful exit carries no
+information, and the score it wrote is a property of the harness's defaults rather than of the
+model.
+
 \subsection{Not yet measured}
 
 Stated explicitly so the gap is not mistaken for an omission: whether training on the
