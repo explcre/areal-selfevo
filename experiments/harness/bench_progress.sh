@@ -1,19 +1,36 @@
 #!/usr/bin/env bash
-# Progress for a scoring run that is ALREADY RUNNING, without touching it.
+# Progress for scoring runs that are ALREADY RUNNING, without touching them.
 #
 # The scorer's own bar exists only in recent revisions, and restarting a run to get it would
-# discard hours of finished work. This reads the sglang access log, which counts completed chat
-# requests, so it works against any running scorer at any revision.
+# discard hours of finished work. This reads the inference server's access log, which counts
+# completed requests, so it reports on any running scorer at any revision.
 #
-#   bash bench_progress.sh <out-dir>          # one reading
-#   bash bench_progress.sh <out-dir> watch    # refresh every 30s
-#
-# <out-dir> is the directory holding server.log, e.g. $OUTROOT/<tag>_olymp
+#   bash bench_progress.sh                 # every ACTIVE run, found automatically
+#   bash bench_progress.sh watch           # the same, refreshing every 30s
+#   bash bench_progress.sh <out-dir>       # one specific run
+#   bash bench_progress.sh <out-dir> watch
 set -u
-D="${1:?usage: bench_progress.sh <out-dir> [watch]}"
-MODE="${2:-once}"
-S="$D/server.log"
-[ -f "$S" ] || { echo "no server.log under $D"; exit 2; }
+
+MODE=once
+DIRS=()
+for a in "$@"; do
+  case "$a" in
+    watch) MODE=watch ;;
+    *)     DIRS+=("$a") ;;
+  esac
+done
+
+# Sourcing the shared env keeps this agreeing with the scripts that WRITE the results. Deriving
+# a root independently is how a guard and a scorer ended up checking different paths.
+_HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "$_HERE/bench_env.sh" ]; then
+  BENCH_REPO="$(cd "$_HERE/../.." 2>/dev/null && pwd)" . "$_HERE/bench_env.sh" >/dev/null 2>&1 || true
+fi
+OUTROOT="${OUTROOT:-$HOME/runs/math}"
+
+# A run counts as ACTIVE when its server log moved recently. Recency, not name matching: a name
+# cannot distinguish a live run from its own corpse, and log movement is the signal that can.
+ACTIVE_S="${ACTIVE_S:-600}"
 
 total_for() {
   case "$1" in
@@ -22,57 +39,76 @@ total_for() {
   esac
 }
 
-# Total = sum of the benchmarks this shard actually names in its own output. Guessing from the
-# tag was wrong: a "core" shard is not always the same four benchmarks, and a hardcoded total
-# silently reports the wrong percentage rather than admitting it does not know.
+# Prefer what the run DECLARED at startup over what it has finished. Inferring the benchmark set
+# from completed benchmarks means the total is unknown exactly while it is needed.
 guess_total() {
-  local out="${D}.out" meta="$D/run_meta.json" t=0 b n blist=""
-  # Prefer what the run DECLARED at startup; fall back to what it has emitted so far.
-  if [ -f "$meta" ]; then
-    blist="$(grep -oE '"benches":"[^"]*"' "$meta" 2>/dev/null | sed 's/.*:"//;s/"//')"
-  fi
+  local d="$1" meta="$1/run_meta.json" out="${1}.out" t=0 b blist=""
+  [ -f "$meta" ] && blist="$(sed -n 's/.*"benches":"\([^"]*\)".*/\1/p' "$meta" 2>/dev/null)"
   if [ -n "$blist" ]; then
-    for b in ${blist//,/ }; do n="$(total_for "$b")"; t=$(( t + n )); done
+    for b in ${blist//,/ }; do t=$(( t + $(total_for "$b") )); done
     echo "$t"; return
   fi
   [ -f "$out" ] || { echo 0; return; }
   for b in olympiadbench math500 amc23 aime24 aime25; do
-    if grep -qaE "^${b} +acc=|^NOTE ${b}:|^CAP-LIMITED ${b}:|RUN_META.*${b}" "$out" 2>/dev/null; then
-      n="$(total_for "$b")"; t=$(( t + n ))
-    fi
+    grep -qaE "^${b} +acc=|^NOTE ${b}:|^CAP-LIMITED ${b}:|RUN_META.*${b}" "$out" 2>/dev/null \
+      && t=$(( t + $(total_for "$b") ))
   done
   echo "$t"
 }
 
-# Elapsed from the FIRST timestamp sglang wrote, not the file mtime. mtime advances with every
-# line, so using it reported ~0 seconds elapsed and a rate of 9 requests/second on a run that
-# had been going for minutes -- numbers that look precise and are pure artefact.
+# Elapsed from the FIRST timestamp the server wrote. The file's mtime advances with every line,
+# so using it reported zero elapsed and an impossible rate on a run going for minutes.
 started_at() {
-  local ts
-  ts="$(grep -aoE '^\[[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}' "$S" 2>/dev/null | head -1 | tr -d '[')"
-  if [ -n "$ts" ]; then date -d "$ts" +%s 2>/dev/null || stat -c %Y "$S"; else stat -c %Y "$S"; fi
+  local s="$1/server.log" ts
+  ts="$(grep -aoE '^\[[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}' "$s" 2>/dev/null | head -1 | tr -d '[')"
+  if [ -n "$ts" ]; then date -d "$ts" +%s 2>/dev/null || stat -c %Y "$s"; else stat -c %Y "$s"; fi
 }
 
-done_now() { grep -ac "POST /v1/chat/completions" "$S" 2>/dev/null || echo 0; }
+done_now() { grep -ac "POST /v1/chat/completions" "$1/server.log" 2>/dev/null || echo 0; }
+
+discover() {
+  local now f
+  now="$(date +%s)"
+  for f in "$OUTROOT"/*/server.log; do
+    [ -f "$f" ] || continue
+    [ $(( now - $(stat -c %Y "$f") )) -le "$ACTIVE_S" ] && echo "${f%/server.log}"
+  done
+}
 
 report() {
-  local d t elapsed rate eta fill w=28 bar
-  d="$(done_now)"; t="$(guess_total)"
-  elapsed=$(( $(date +%s) - $(started_at) )); [ "$elapsed" -lt 1 ] && elapsed=1
-  rate="$(awk -v d="$d" -v e="$elapsed" 'BEGIN{printf "%.3f", d/e}')"
-  if [ "$t" -gt 0 ] && [ "$d" -le "$t" ]; then
-    fill=$(awk -v d="$d" -v t="$t" -v w="$w" 'BEGIN{printf "%d", (d/t)*w + 0.5}')
-    [ "$fill" -gt "$w" ] && fill="$w"; [ "$fill" -lt 0 ] && fill=0
-    bar=""; for ((i=0;i<fill;i++)); do bar="$bar#"; done
-    for ((i=fill;i<w;i++)); do bar="$bar-"; done
-    awk -v b="$bar" -v d="$d" -v t="$t" -v r="$rate" -v e="$elapsed" \
-      'BEGIN{eta=(r>0)?(t-d)/r/60:-1; printf "  [%s] %5.1f%%  %d/%d  %.2f/s  elapsed %.0fm  eta %s\n", b, 100*d/t, d, t, r, e/60, (eta>=0)?sprintf("%.0fm",eta):"?"}'
+  local d="$1" name done_ total elapsed rate
+  name="$(basename "$d")"
+  [ -f "$d/server.log" ] || { printf '  %-26s no server.log\n' "$name"; return; }
+  done_="$(done_now "$d")"; total="$(guess_total "$d")"
+  elapsed=$(( $(date +%s) - $(started_at "$d") )); [ "$elapsed" -lt 1 ] && elapsed=1
+  rate="$(awk -v a="$done_" -v e="$elapsed" 'BEGIN{printf "%.3f", a/e}')"
+  if [ "$total" -gt 0 ] && [ "$done_" -le "$total" ]; then
+    awk -v n="$name" -v a="$done_" -v t="$total" -v r="$rate" -v e="$elapsed" 'BEGIN{
+      w=24; f=int((a/t)*w+0.5); if(f>w)f=w; if(f<0)f=0; b="";
+      for(i=0;i<f;i++)b=b"#"; for(i=f;i<w;i++)b=b"-";
+      eta=(r>0)?(t-a)/r/60:-1;
+      printf "  %-26s [%s] %5.1f%%  %d/%d  %.2f/s  elapsed %.0fm  eta %s\n",
+        n, b, 100*a/t, a, t, r, e/60, (eta>=0)?sprintf("%.0fm",eta):"?" }'
   else
-    # No percentage rather than a wrong one. A shard that has not yet named its benchmarks, or
-    # has completed more requests than the benchmarks it named (n>1 sampling), cannot be scaled.
-    awk -v d="$d" -v r="$rate" -v e="$elapsed" \
-      'BEGIN{printf "  %d requests done  %.2f/s  elapsed %.0fm  (total unknown; no percentage)\n", d, r, e/60}'
+    # No percentage rather than a wrong one.
+    awk -v n="$name" -v a="$done_" -v r="$rate" -v e="$elapsed" 'BEGIN{
+      printf "  %-26s %d requests  %.2f/s  elapsed %.0fm  (total unknown)\n", n, a, r, e/60 }'
   fi
 }
 
-if [ "$MODE" = "watch" ]; then while true; do report; sleep 30; done; else report; fi
+if [ "${#DIRS[@]}" -eq 0 ]; then
+  mapfile -t DIRS < <(discover)
+  if [ "${#DIRS[@]}" -eq 0 ]; then
+    echo "no active scoring run under $OUTROOT"
+    echo "  a run is active if its server.log moved in the last ${ACTIVE_S}s;"
+    echo "  raise ACTIVE_S=<seconds>, or pass a directory explicitly."
+    exit 1
+  fi
+fi
+
+run_all() { local x; for x in "${DIRS[@]}"; do report "$x"; done; }
+if [ "$MODE" = "watch" ]; then
+  while true; do echo "-- $(date +%H:%M:%S)"; run_all; sleep 30; done
+else
+  run_all
+fi
