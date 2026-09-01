@@ -6,7 +6,10 @@
 # point and re-running it loses at most the model in flight.
 #
 #   bash run_math_sweep.sh --plan     # show what WOULD run, download nothing
-#   bash run_math_sweep.sh --run      # do it, with a watchdog
+#   bash run_math_sweep.sh --run      # smoke-test the path, then do it, with a watchdog
+#
+# --run ALWAYS smokes first, on a tiny model, and refuses to start the real sweep if that
+# fails. SKIP_SMOKE=1 bypasses it; SMOKE_MODEL=<hf id> changes which model is used.
 #
 # MODELS is a comma-separated list of HF ids. The default is the set we need re-scored at a
 # cap large enough for reasoning models: every number we hold for these was measured at a cap
@@ -19,6 +22,12 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUTROOT="${OUTROOT:-$HOME/runs/math}"
 LOG="$OUTROOT/sweep.log"
 MAXTOK="${MAXTOK:-32768}"
+# The sweep smoke-tests itself before committing to days of work. A TINY model is used on
+# purpose: the point is to prove the path -- venv, sglang, serving, generation, grading -- not
+# to measure anything, and a 0.5B downloads in seconds where the real models take many minutes.
+# A broken path discovered after a 60GB download costs an evening; discovered here it costs
+# five minutes.
+SMOKE_MODEL="${SMOKE_MODEL:-Qwen/Qwen2.5-0.5B-Instruct}"
 MODELS="${MODELS:-\
 deepseek-ai/DeepSeek-R1-Distill-Qwen-32B,\
 Qwen/Qwen2.5-Math-72B-Instruct,\
@@ -68,9 +77,27 @@ fi
     [ "$stall" -ge 4 ] && echo "[watchdog] sweep log has not grown in $((stall*15)) min" >> "$LOG"
     prev="$now"
   done
-) &
+) >/dev/null 2>&1 &
 WD=$!
 trap 'kill "$WD" 2>/dev/null' EXIT
+
+if [ "${SKIP_SMOKE:-0}" = "1" ]; then
+  say "smoke SKIPPED by SKIP_SMOKE=1"
+else
+  say "smoke: $SMOKE_MODEL (proves the path before any long download)"
+  if ! MODEL="$SMOKE_MODEL" timeout 1800 bash "$HERE/run_h200_math.sh" --fetch >> "$LOG" 2>&1; then
+    say "SMOKE FAILED: could not fetch $SMOKE_MODEL. Nothing else will work either; stopping."
+    say "  see $LOG. Run 'bash $HERE/run_h200_math.sh --install' first if the venv is missing."
+    exit 1
+  fi
+  if ! MODEL="$SMOKE_MODEL" timeout 3600 bash "$HERE/run_h200_math.sh" --smoke >> "$LOG" 2>&1; then
+    say "SMOKE FAILED: $SMOKE_MODEL did not score end to end. Stopping before the real sweep."
+    say "  last 30 lines of $LOG:"
+    tail -30 "$LOG" | sed 's/^/    /'
+    exit 1
+  fi
+  say "smoke PASSED; the serve/generate/grade path works on this box"
+fi
 
 say "sweep starting: max_tokens=$MAXTOK"
 IFS=',' read -ra MS <<< "$MODELS"
