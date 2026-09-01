@@ -3,6 +3,43 @@
 Measured results and negative results, newest first. A claim only belongs here once it has
 been observed end to end; a prediction belongs in GOAL.md until then.
 
+## 2026-09-01 — The 27B LoRA run failed on config, not capacity, and two obvious causes were wrong
+
+`lora27b` died at engine init with CUDA OOM and stranded nothing. Diagnosed from its config
+and log. It is worth writing down because two natural explanations are FALSE, and acting on
+either would have wasted a day.
+
+**Not the cause (checked, both wrong):**
+
+* `target_modules: []` looks like LoRA targeting nothing. It is not: `fsdp_engine.py:1118`
+  maps an empty list to `"all-linear"`. Harmless.
+* A full-precision reference model looks like the obvious 54GB. It was never built:
+  `rl_trainer.py:206` creates `ref` only when `kl_ctl > 0`, and the run had `kl_ctl: 0.0`,
+  so `self.ref` was `None`.
+
+**The actual cause: rollout and trainer were colocated on the same cards.** At the OOM, GPU 0
+held one process at **57.93 GiB** (sglang, `mem_fraction_static: 0.6`) plus three trainer
+workers at ~8.2 GiB each -- **82.5 GiB on an 80 GiB card**. `allocation_mode` was `''` and the
+scheduling spec at line 707 said `type: colocation`, so nothing ever separated them, despite
+`deploy_mode: separation` appearing at line 234. The 49.41 GiB single allocation in the second
+OOM is the trainer trying to materialise the base model beside a server already holding 58 GiB.
+
+**A second defect that would have broken the run even with memory to spare.** LoRA was enabled
+on only one side: `actor.use_lora: true` (line 487) against `rollout.use_lora: false` (line
+320) and sglang `enable_lora: null` / `max_lora_rank: null` (lines 194-195). The trainer would
+have learned adapters while the rollout engine served the **base** model, so the RL loop would
+sample from one policy and update another. `cli_args.py:1374` states the requirement plainly --
+LoRA "should be enabled together with vLLM/SGLang" -- and the config violated it silently.
+
+**The run's name asserted what its config denied.** It is called `lora27b`; three of the four
+LoRA switches were off. This is the same failure as the B200 arms tagged `mt8` while running
+`MT=4`: a name is not a configuration, and only the config file is evidence. Any claim about
+what an arm did must be read from its config, never from its name.
+
+Required for a corrected 30B LoRA attempt: separate the rollout and train allocations rather
+than colocating, or drop `mem_fraction_static` far enough that both fit; and set
+`rollout.use_lora`, sglang `enable_lora`, and `max_lora_rank` to match the actor.
+
 ## 2026-09-01 — The cap-precedence bug was corrupting every frontier number, by 3x on AIME
 
 `resolve_params` applied `BENCH_OVERRIDES` unconditionally, so an explicit `--max-tokens`
