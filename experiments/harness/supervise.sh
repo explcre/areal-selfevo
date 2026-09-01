@@ -27,8 +27,19 @@ say "supervisor start: launch=$LAUNCH run=$RUN max_restarts=$MAX_RESTARTS stall=
 
 for attempt in $(seq 0 "$MAX_RESTARTS"); do
   say "attempt $attempt: launching"
-  # First attempt keeps whatever the caller set; later attempts must resume, not restart.
-  if [ "$attempt" -gt 0 ]; then export EXTRA_ARGS="${EXTRA_ARGS:-} recover.mode=auto"; fi
+  # Recovery is enabled on EVERY attempt, including the first. Enabling it only on retries
+  # was self-defeating: with mode disabled the trainer writes no recover checkpoint, so a
+  # retry asking to resume had nothing to resume FROM and restarted at step zero regardless.
+  # Measured on the live 30B run -- seventeen hours in, recover.freq_secs 3600, and zero
+  # recover checkpoints on disk. The retry path existed and could not have worked.
+  #
+  # Safe on a fresh run: the documented meaning of 'auto' is to recover only if recover info
+  # and checkpoints are available, so with none present it starts normally. What it changes is
+  # that the checkpoints now get WRITTEN, which is the thing a later attempt needs.
+  case " ${EXTRA_ARGS:-} " in
+    *" recover.mode="*) : ;;                       # an explicit caller setting wins
+    *) export EXTRA_ARGS="${EXTRA_ARGS:-} recover.mode=auto" ;;
+  esac
   bash "$LAUNCH" >> "$SUP" 2>&1 &
   RUN_PID=$!
 
