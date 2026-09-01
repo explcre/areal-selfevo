@@ -3,6 +3,53 @@
 Measured results and negative results, newest first. A claim only belongs here once it has
 been observed end to end; a prediction belongs in GOAL.md until then.
 
+## 2026-09-01 — CRITICAL PATH ITEM 1: the unrouted control, scored at last. Routing does not help.
+
+Every previously scored checkpoint (`ctx149`, `ctxpc149`, `rnd149`) is a ROUTED arm. The
+routing-off control had **never been scored**, so every routing-vs-no-routing statement made
+here rested on a baseline that did not exist. This supplies it. Both arms re-scored together
+at an explicit matched cap of 8192 rather than reusing stored numbers whose cap is unrecorded.
+
+| arm | step | MATH-500 | AMC23 | AIME24 | trunc (MATH-500) |
+|---|---|---|---|---|---|
+| `step0l` control | 57 | 0.5040 | 0.325 | 0.0333 | 6 |
+| `step0l` control | 149 | **0.5260** | 0.250 | 0.0000 | **2** |
+| `step0l` control | 199 | **0.5460** | 0.275 | 0.0333 | 1 |
+| `ctx` ROUTED | 149 | **0.5060** | 0.125 | 0.0667 | **32** |
+
+### What is and is not significant
+
+**The accuracy difference is NOT significant and must not be reported as one.** At the matched
+step, routed 0.5060 against control 0.5260 is a 0.020 gap on n=500; the standard error of that
+difference is ~0.032, so z ~ 0.63. The Wilson intervals overlap heavily ([0.462,0.550] against
+[0.482,0.569]). This is also inside the +/-6pt MATH-500 noise band recorded earlier.
+
+**The truncation difference IS large and is not a noise artifact**: 32 truncated against 2, at
+the same cap, same benchmark, same step -- a 16x difference. That is a direct measurement, not
+an inference, and it matches the independently measured length growth. AMC23 shows the same
+sign (4 truncated against 0, accuracy 0.125 against 0.250) but n=40 is too small to lean on.
+
+### The defensible statement
+
+**Routing bought nothing and cost length.** The control improves across training,
+0.5040 -> 0.5260 -> 0.5460 over steps 57/149/199, so the training signal is real and the
+pipeline works. The routed arm at step 149 sits at 0.5060, indistinguishable from the control's
+step-57 value and below its step-149 value, while truncating 16x more often. The mechanism
+already measured -- the routed constant grows response length without touching the EOS hazard
+-- shows up here as generations that run past the cap and are graded wrong.
+
+**This closes critical-path item 1 as a negative result.** SFT on a unit's own correct sample,
+as implemented, does not beat SKIP. Combined with the earlier router-vs-random null and the
+withdrawn dose-response, the naive form of this method does not work, and that is now measured
+against a real control rather than asserted.
+
+### Caveats
+
+Single seed per arm. `step0l@199` is 50 steps past the matched point and is shown to establish
+that the control keeps improving, not as a matched comparison. AIME at 1.5B is a floor effect
+for every arm (0.00-0.067) and carries no signal. The routed arm has no checkpoint past 149,
+so the post-knee regime remains unmeasured.
+
 ## 2026-09-01 — EOS hazard measured directly: neither proposed mechanism holds, and the collapse story was wrong
 
 Teacher-forced 64 frozen greedy responses through 27 checkpoints across both ladders
