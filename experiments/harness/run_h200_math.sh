@@ -15,12 +15,18 @@
 set -u -o pipefail
 
 MODE="${1:-}"
-VENV="${BENCH_VENV:-$HOME/bench-env}"
+# Where the LARGE artefacts live: the venv (a torch install is several GB), the model cache
+# (tens of GB per model) and the outputs. This is NOT always $HOME -- on a container the home
+# directory is often a small overlay while the real volume is mounted elsewhere, and a
+# collaborator whose repo sits on /data would otherwise fill /root with model weights. Set
+# BENCH_ROOT to the volume that actually has the space.
+BENCH_ROOT="${BENCH_ROOT:-$HOME}"
+VENV="${BENCH_VENV:-$BENCH_ROOT/bench-env}"
 PY="${BENCH_PYTHON:-python3}"
 MODEL="${MODEL:-Qwen/Qwen2.5-Math-7B-Instruct}"
 TAG="${TAG:-$(echo "$MODEL" | tr '/' '_')}"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-OUTROOT="${OUTROOT:-$HOME/runs/math}"
+OUTROOT="${OUTROOT:-$BENCH_ROOT/runs/math}"
 # Reasoning models need room; a truncated generation is graded WRONG, so a cap that is too
 # small silently reports a token budget rather than a capability. See BENCH_OVERRIDES.
 MAXTOK="${MAXTOK:-32768}"
@@ -51,7 +57,7 @@ py_of_venv(){ echo "$VENV/bin/python"; }
 # before the PIPESTATUS fix, run_math.sh reported that as success, so a sweep "completed" four
 # models in under two minutes each and printed a results table assembled from unrelated files.
 # Measured on our own H200 on 2026-09-01. This check exists so that cannot happen silently.
-DATA_DIR="${MATH_EVAL_DATA:-$HOME/baselines/Absolute-Zero-Reasoner/evaluation/math_eval/eval/data}"
+DATA_DIR="${MATH_EVAL_DATA:-$BENCH_ROOT/baselines/Absolute-Zero-Reasoner/evaluation/math_eval/eval/data}"
 
 check_datasets() {
   # Returns 0 only when every benchmark this script can run has a NON-EMPTY test.jsonl.
@@ -67,8 +73,8 @@ check_datasets() {
     echo "        Get them with:"
     echo "          git clone --depth 1 --filter=blob:none --sparse \\"
     echo "            https://github.com/LeapLabTHU/Absolute-Zero-Reasoner \\"
-    echo "            \$HOME/baselines/Absolute-Zero-Reasoner"
-    echo "          cd \$HOME/baselines/Absolute-Zero-Reasoner \\"
+    echo "            $BENCH_ROOT/baselines/Absolute-Zero-Reasoner"
+    echo "          cd $BENCH_ROOT/baselines/Absolute-Zero-Reasoner \\"
     echo "            && git sparse-checkout set evaluation/math_eval/eval/data"
     echo "        Or point MATH_EVAL_DATA=<dir> at a copy you already have."
     return 1
@@ -105,6 +111,8 @@ make_venv() {
 }
 
 if [ "$MODE" = "--install" ]; then
+  echo "  BENCH_ROOT=$BENCH_ROOT  ($(df -h "$BENCH_ROOT" 2>/dev/null | awk 'NR==2{print $4" free on "$6}'))"
+  echo "  venv=$VENV  out=$OUTROOT  hf_cache=${HF_HOME:-$BENCH_ROOT/hf_cache}"
   echo "== install: venv + sglang + bench deps (no docker, no root) =="
   make_venv || exit 1
   P="$(py_of_venv)"
@@ -168,7 +176,7 @@ P="$(py_of_venv)"
 
 if [ "$MODE" = "--fetch" ]; then
   echo "== fetch: $MODEL =="
-  export HF_HOME="${HF_HOME:-$HOME/hf_cache}"
+  export HF_HOME="${HF_HOME:-$BENCH_ROOT/hf_cache}"
   # snapshot_download resumes, so a dropped connection costs only the current shard.
   "$P" - "$MODEL" <<'PYEOF'
 import sys
@@ -181,7 +189,7 @@ fi
 
 resolve_model_path() {
   # Prefer a local snapshot so a scoring run never depends on the network mid-flight.
-  export HF_HOME="${HF_HOME:-$HOME/hf_cache}"
+  export HF_HOME="${HF_HOME:-$BENCH_ROOT/hf_cache}"
   local p
   p="$("$P" - "$MODEL" <<'PYEOF' 2>/dev/null
 import sys

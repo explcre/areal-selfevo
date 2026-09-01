@@ -12,7 +12,9 @@ else
 fi
 ulimit -n 131072 || true
 MODEL="${1:?model path or hf id}"; TAG="${2:?tag}"; GPUS="${3:-0,1}"; PORT="${4:-8404}"
-OUT="$HOME/runs/math/$TAG"; mkdir -p "$OUT"
+# Follows OUTROOT/BENCH_ROOT so every caller writes to the same volume; $HOME is only the
+# fallback, and on a container it is often the wrong (small) one.
+OUT="${OUTROOT:-${BENCH_ROOT:-$HOME}/runs/math}/$TAG"; mkdir -p "$OUT"
 CUDA_VISIBLE_DEVICES="$GPUS" python3 -m sglang.launch_server \
   --model-path "$MODEL" --served-model-name evalmodel \
   --host 127.0.0.1 --port "$PORT" --tp $(echo "$GPUS" | tr ',' '\n' | wc -l) \
