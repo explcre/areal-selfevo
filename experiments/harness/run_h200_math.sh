@@ -84,6 +84,33 @@ if [ "$MODE" = "--install" ]; then
       bad "sglang install failed" "Scroll up for the pip error. If it is a TLS failure, set: $P -m pip config set global.cert /path/to/corp-ca.pem"
     fi
   fi
+
+  # sglang[all] resolves a torch whose CUDA build does not necessarily match the driver. On
+  # our own H200 that produced a torch that imports fine and then reports FEWER GPUs than the
+  # machine has, so a run silently uses a fraction of the box. Pin the pair that is known to
+  # work here and verify the device count against the driver rather than trusting the import.
+  TORCH_WANT="${TORCH_VER:-2.9.1}"; TORCH_CU="${TORCH_CUDA:-cu128}"
+  HAVE="$("$P" -c 'import torch;print(torch.__version__)' 2>/dev/null || echo none)"
+  case "$HAVE" in
+    "${TORCH_WANT}+${TORCH_CU}") ok "torch $HAVE" ;;
+    *)
+      echo "  pinning torch==${TORCH_WANT}+${TORCH_CU} (have: $HAVE)"
+      "$P" -m pip install -q "torch==${TORCH_WANT}" \
+        --index-url "https://download.pytorch.org/whl/${TORCH_CU}" 2>&1 | tail -12
+      ;;
+  esac
+
+  SMI_N="$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | grep -c .)"
+  TORCH_N="$("$P" -c 'import torch;print(torch.cuda.device_count())' 2>/dev/null || echo 0)"
+  if [ "${SMI_N:-0}" -gt 0 ] && [ "$TORCH_N" != "$SMI_N" ]; then
+    bad "torch sees $TORCH_N GPU(s) but the driver reports $SMI_N" \
+        "This is the CUDA-build mismatch, not a hardware fault: torch imports fine and silently
+           under-reports devices, so a run would use part of the box. Reinstall the matching build:
+             $P -m pip install torch==${TORCH_WANT} --index-url https://download.pytorch.org/whl/${TORCH_CU}
+           Check your driver's CUDA version with nvidia-smi and set TORCH_CUDA=cu126|cu128|cu130 to match."
+  else
+    ok "torch sees $TORCH_N GPU(s), matching the driver"
+  fi
   for pkg in datasets huggingface_hub math_verify; do
     "$P" -c "import ${pkg}" >/dev/null 2>&1 || "$P" -m pip install -q "$pkg" 2>&1 | tail -5
   done
