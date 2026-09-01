@@ -514,6 +514,255 @@ measures that branch inert at $c_+=0.5$ and harmful at $c_+=2.0$, which is a rea
 this regime to cost capability rather than to gain it. Until a scored arm exists, this is a
 demonstration that the credit signal controls the router's behaviour, and nothing more.
 
+\subsection{A benchmark score is a property of the token budget it was taken at}
+\label{sec:cap}
+
+The scoring harness resolved generation parameters by applying a per-benchmark defaults table
+unconditionally, so an explicit \texttt{--max-tokens} was parsed, accepted, and then
+discarded. A run made with the wrong budget still succeeds and still writes a plausible
+number, so the defect is invisible from the score alone. Table~\ref{tab:cap} re-scores one
+30B checkpoint (\texttt{Frontis-MA1-30B}, a \texttt{Qwen3MoeForCausalLM} mixture of experts)
+after fixing the precedence: same model, same server, same concurrency, same grader, and the
+only thing that differs between the two halves of each block is which cap reached the sampler.
+
+\begin{table}[t]
+\centering\small
+\caption{One 30B checkpoint scored at the cap that was requested and at the cap that was
+applied. \texttt{cap asked} is what the command line requested --- the same value in every
+row --- and \texttt{cap used} is what the sampler received. Nothing else changed.}
+\label{tab:cap}
+\begin{tabular}{lccccc}
+\toprule
+benchmark & $n$ & cap asked & cap used & accuracy & truncated \\
+\midrule
+AIME24 & 30 & 32768 & 8192  & 0.2667 & 73.3\% \\
+AIME24 & 30 & 32768 & 32768 & \textbf{0.8000} & 20.0\% \\
+\midrule
+AIME25 & 30 & 32768 & 8192  & 0.2667 & 73.3\% \\
+AIME25 & 30 & 32768 & 32768 & \textbf{0.7000} & 20.0\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+AIME24 moves by a factor of three and AIME25 by a factor of $2.6$, from a flag that appeared
+on the command line of every earlier score and never reached the sampler.
+
+\paragraph{Both corrected rows are still lower bounds.} $20\%$ of generations reach even the
+$32768$ cap and are graded wrong, so $0.8000$ and $0.7000$ bound this checkpoint from below
+rather than measuring it. OlympiadBench carries a second and unrelated lower-bound caveat at
+every cap: $94$ of its $675$ problems state more than one gold answer inside a single answer
+string, which the exact-match grader marks wrong however the model answers.
+
+\paragraph{What made the defect visible, and it was not the score.} The corrected code prints
+the budget it resolved (\texttt{NOTE ... BENCH\_OVERRIDES default 8192 not applied}), and the
+results row records the generation parameters the run actually used, so the requested cap can
+be compared against the applied one. Recording the parameters a run used is not bookkeeping;
+without it a cap defect produces no symptom at all, because the run still completes and the
+number it writes is still in range.
+
+\paragraph{The general form, which outlives this particular bug.} A default that silently
+outranks an explicit request is indistinguishable, from outside, from the request being
+honoured. We therefore state the convention rather than assume it: \textbf{a benchmark number
+is a property of the token budget unless the budget is reported}, and a comparison taken
+across two budgets is not a comparison.
+
+\subsection{Length moves like a threshold, and routing \emph{presence} is what separates}
+\label{sec:knee}
+
+Mean response length during training does not drift upward under routing; it holds a plateau
+and then breaks out of it. We fix the onset criterion before reading the runs: onset is the
+first step of five consecutive steps whose mean response length exceeds the run's own
+pre-onset baseline by more than four of that baseline's standard deviations.
+
+\begin{table}[t]
+\centering\small
+\caption{Length-knee onset across six GSM8K runs on Qwen2.5-1.5B-Instruct. $c_+$ is the
+constant written onto solved groups. ``steps'' is the number of logged training steps
+available for the run, so the control rows record how long a crossing had to fail to appear.}
+\label{tab:knee}
+\begin{tabular}{llccc}
+\toprule
+run & group routing & $c_+$ & steps & onset \\
+\midrule
+\texttt{ctx}    & on  & 0.5 & 162 & 144 \\
+\texttt{ctxpc}  & on  & 0.5 & 152 & 132 \\
+\texttt{sa2}    & on  & 2.0 & 145 & 131 \\
+\midrule
+\texttt{step0l} & off & --- & 273 & none \\
+\texttt{step0j} & off & --- & 178 & none \\
+\texttt{g16}    & off & --- & 116 & none \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+All three runs with group routing configured hold a flat plateau for more than $120$ steps and
+then cross; none of the three runs without it ever crosses, over $273$, $178$ and $116$ steps.
+Slope brackets the change: $0.34$--$0.57$ tokens per step before onset across the three routed
+runs, and $5.6$--$9.2$ after.
+
+\paragraph{The same separation appears in free generation.} Scored outside training, greedily,
+from the checkpoint ladders: \texttt{ctx} grows $327 \to 455$ tokens, while \texttt{step0l}
+moves $330 \to 316$ and is flat over $202$ steps.
+
+\paragraph{Presence, not magnitude.} We state the surviving claim in the narrowest form the
+data supports. Whether group routing is \emph{configured} predicts whether a run crosses; the
+\emph{magnitude} of the constant does not predict when it crosses, which is the negative
+result of Sec.~\ref{sec:routingnegatives}. Three runs on each side is enough to notice a clean
+split and not enough to estimate an effect, and the six runs are not a matched sweep:
+\texttt{g16} trains at $G=16$ where the others use $G=8$, \texttt{step0j} carries the
+token-level rule of Sec.~\ref{sec:negative} and is unrouted only at the group level, and the
+runs were allowed different numbers of steps.
+
+\paragraph{How each run was classified, because the obvious way is wrong.} Routing status is
+read from \texttt{actor.group\_routing} in each run's \texttt{config.yaml}, never from the
+presence of \texttt{route/*} metrics in its log. \texttt{sa2} emits no \texttt{route/*} metric
+at all while its config carries \texttt{group\_routing.enabled: true} with
+\texttt{solved\_advantage: 2.0} and \texttt{router: null} --- the actor's fixed-rule branch
+writes the constant without passing through the metric seam. Classified from metrics alone,
+\texttt{sa2} would have been counted on the wrong side of Table~\ref{tab:knee}, and it is the
+run carrying the larger constant.
+
+\subsection{Three negative results on the routed arms}
+\label{sec:routingnegatives}
+
+\paragraph{(a) The learned router shows no preference over its matched random control.}
+Sec.~\ref{sec:routernull} is that result and we do not restate its table: at the contextual
+arm's own measured mode proportions the per-unit decision is worth $-0.0020$ on MATH-500 and
+$+0.0000$ on OlympiadBench, against a $0.020$ noise floor, and Sec.~\ref{sec:credit} localises
+the cause to the credit signal rather than to the controller.
+
+\paragraph{(b) The dose-response between constant magnitude and knee onset is not supported.}
+We had recorded --- and described as the strongest evidence available --- that the larger the
+constant written onto solved groups, the earlier the length knee arrives. Under the onset
+criterion of Sec.~\ref{sec:knee} it does not hold. $c_+ = 0.5$ gives onsets at steps $132$
+(\texttt{ctxpc}) and $144$ (\texttt{ctx}); $c_+ = 2.0$ gives $131$ (\texttt{sa2}), which sits
+inside the spread of the two $0.5$ arms rather than ahead of them. Three runs at two operating
+points cannot resolve a dose-response, and the earlier claim is withdrawn here rather than
+quietly not repeated.
+
+\paragraph{(c) The runs that genuinely produced non-terminating output were the
+\emph{unrouted} ones.} Reading training-time \texttt{no\_eos\_ratios} across all $18$ training
+runs logged for this study, the routed arm \texttt{ctx} peaks at $0.0059$ --- six of $1024$
+rollouts. The two runs that produced non-terminating output at any material rate are
+\texttt{step0b} ($0.156$) and \texttt{step0} ($0.117$), and \textbf{both have group routing
+off}. Both use the same aggressive hyperparameters as the demo recipe of
+Sec.~\ref{sec:trainreward} (lr $6\times10^{-6}$, clip $0.4$), which that section already
+measures to destroy capability.
+
+\paragraph{The caveat that keeps (c) from being stronger than it is.}
+\texttt{no\_eos\_ratios} is mis-instrumented: it compares sequence lengths against the
+\emph{padded} batch width, so it can only count rows that reach that width and it
+under-counts. Every value it reports is a lower bound. That is enough to establish the
+positive half of (c) --- \texttt{step0b} and \texttt{step0} really did produce non-terminating
+output --- and not enough on its own to establish the negative half. What supports the
+negative half is Sec.~\ref{sec:eos}, which measures the routed arm's stop probability
+directly, and the routed arm's free greedy output, which grows to $455$ tokens against a
+$1024$ training cap rather than running away from it.
+
+\subsection{Teacher-forced EOS hazard: the routed arm's termination signal does not erode}
+\label{sec:eos}
+
+Sec.~\ref{sec:knee} leaves two candidate mechanisms that the training logs cannot separate,
+and both are statements about the probability of stopping. Under \emph{smooth erosion}, an
+objective that raises the log-probability of tokens that were produced gradually lowers the
+probability the model assigns to the stop token. Under a \emph{dynamical threshold}, that
+probability holds and then collapses. We measured the quantity rather than argued about it.
+
+\paragraph{Protocol.} One set of $64$ greedy responses is generated once and frozen. Each of
+$27$ checkpoints --- the routed ladder (\texttt{ctx}), the matched control with group routing
+off (\texttt{step0l}), and the base model as step $0$ --- is then teacher-forced over those
+same token sequences, and we read the model's probability of the stop token at every position.
+Writing $T$ for the position of the true final token,
+%
+\[
+  H \;=\; \sum_{t \le T} p_{\mathrm{eos}}(t),
+  \qquad
+  p_{\mathrm{end}} \;=\; p_{\mathrm{eos}}(T),
+  \qquad
+  H_{\mathrm{body}} \;=\; H - p_{\mathrm{end}} ,
+\]
+%
+so $H$ is the integrated stop hazard over a response, $p_{\mathrm{end}}$ is the spike at its
+semantic end, and $H_{\mathrm{body}}$ is stop-mass placed anywhere else.
+
+\paragraph{Two things pinned before the numbers mean anything.} The stop token was determined
+empirically rather than assumed: all $64$ frozen responses end on $151645$
+(\texttt{<|im\_end|>}) and none on $151643$. Alignment between the scored positions and the
+text was checked by the strongest test available here --- the frozen responses are greedy, so
+a correctly aligned teacher-forced pass must reproduce them by argmax. Agreement at the
+generating checkpoint is $0.998$, with $p_{\mathrm{end}} = 0.99928$; an off-by-one gives
+approximately zero on both.
+
+\begin{table}[t]
+\centering\small
+\caption{Integrated EOS hazard over $64$ frozen greedy responses, teacher-forced through the
+routed ladder (\texttt{ctx}) and the group-routing-off control (\texttt{step0l}). Four of the
+$27$ probed checkpoints, at steps both ladders share.}
+\label{tab:eos}
+\begin{tabular}{lccccc}
+\toprule
+ & \multicolumn{3}{c}{\texttt{ctx} (routed)} & \multicolumn{2}{c}{\texttt{step0l} (control)} \\
+\cmidrule(lr){2-4}\cmidrule(lr){5-6}
+step & $H$ & $p_{\mathrm{end}}$ & $H_{\mathrm{body}}$ & $H$ & $H_{\mathrm{body}}$ \\
+\midrule
+24  & 0.99754 & 0.99754 & $<5\times10^{-7}$ & 0.99924 & $<5\times10^{-7}$ \\
+74  & 0.99958 & 0.99958 & $<5\times10^{-7}$ & 1.00204 & 0.00208 \\
+99  & 0.99975 & 0.99976 & $<5\times10^{-7}$ & \textbf{1.20534} & \textbf{0.20538} \\
+149 & 0.99958 & 0.99958 & $<5\times10^{-7}$ & 1.09105 & 0.09110 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The routed arm's hazard does not erode. Across the ladder it rises, from $0.99754$ at the
+earliest probed checkpoint to a maximum of $0.99979$, and the minimum over the $64$ prompts
+rises with it, $0.850 \to 0.994$. $H_{\mathrm{body}}$ stays below $5\times10^{-7}$ at every
+probed step, so the hazard is a spike at the response's semantic end and that spike does not
+move. We quote the range rather than a trend because the four steps in Table~\ref{tab:eos} are
+not themselves ordered ($0.99975$ at step $99$ against $0.99958$ at $149$, a difference of
+$1.7\times10^{-4}$); what the ladder supports is that $H$ stays within $2.5\times10^{-3}$ of
+$1$ throughout and at no point declines toward zero.
+
+\paragraph{This refutes both mechanisms we had entertained.} Smooth erosion predicts a falling
+$H$, and it does not occur. The dynamical-threshold account is refuted at its premise rather
+than at its prediction: the hazard is not the failing state variable at all, because it never
+leaves a $2.5\times10^{-3}$ band while the same arm's free greedy output grows from $327$ to
+$455$ tokens. Whatever the length increase is, it is not the model losing its ability to stop.
+
+\paragraph{Not a stale-text artifact.} The responses are frozen, so a sufficiently drifted
+checkpoint could in principle be scored on text it would never itself produce. A
+self-generated control repeats the measurement with each checkpoint scored on its \emph{own}
+greedy output ($n=32$): \texttt{ctx}'s mean $p_{\mathrm{end}}$ stays in $[0.984, 0.9999]$ while
+its own greedy length grows $324 \to 469$.
+
+\paragraph{The control is not flat, and we had claimed it was.} \texttt{step0l}'s $H$ rises to
+$1.205$ at step $99$. Its end spike is pinned at $0.99996$ throughout, so the extra $0.205$ of
+stop-mass sits \emph{mid-response}, on $16$ of the $64$ responses, reaching $1.81$ on one. The
+control drifts toward stopping \emph{earlier}, which is the opposite direction from the routed
+arm's length growth and therefore does not confound the comparison --- but the claim that it
+was flat was wrong, and is corrected here rather than dropped.
+
+\paragraph{What this retires on the fix side.} The codebase offers exactly two explicit
+termination terms, \texttt{overlong\_reward\_penalty} and
+\texttt{mask\_no\_eos\_with\_zero}, and both are disabled in every arm reported in this
+paper. Either one acts on $p_{\mathrm{eos}}$,
+which is already $0.9996$ at the true end and does not move. There is nothing there for it to
+correct, so if the routed constant needs to be made safe the lever is the constant itself, not
+a termination penalty added beside it.
+
+\paragraph{Limitations of the termination and length measurements.} Four, stated together
+because each bounds Secs.~\ref{sec:knee}--\ref{sec:eos}. (i) \emph{The post-knee regime is
+unmeasured.} \texttt{ctx}'s last saved checkpoint is step $149$; the run continued to $162$
+with mean length still climbing ($647$ and rising) and was then killed abruptly rather than
+stopped on a criterion, so a hazard collapse living past the last checkpoint is not something
+these probes could see. (ii) \emph{The probes are greedy and the training was not.} The frozen
+and self-generated sets are both greedy, while training sampled at temperature $1.0$. Greedy
+length at step $149$ ($455$) tracks the training-time sequence length at step $145$ ($478$),
+so greedy is a fair proxy for the mean, but the sampled tail is not measured. (iii) $n = 64$
+prompts for the frozen probe and $32$ for the self-generated control: the hazard differences
+we are calling null are small, and so is the sample they are null over. (iv) \emph{The control
+is itself moving}, as the paragraph above records, so Table~\ref{tab:eos} compares a flat
+routed arm against a drifting control rather than against a fixed reference.
+
 \subsection{Not yet measured}
 
 Stated explicitly so the gap is not mistaken for an omission: whether training on the
