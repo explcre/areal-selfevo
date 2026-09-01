@@ -140,12 +140,49 @@ GEN_KEYS = ("max_tokens", "temperature", "top_p", "n", "concurrency", "timeout",
 CAP_LIMITED_RATE = 0.10
 
 
-def resolve_params(bench: str, args) -> dict:
+# Sentinel marking "the user did not name this flag". argparse only applies a default when
+# the attribute is absent from the namespace, so pre-seeding with this reveals which
+# generation parameters were EXPLICIT on the command line.
+_EXPLICIT: set = set()
+
+_UNSET = object()
+
+
+def explicit_gen_keys(parser, argv) -> set:
+    """Which :data:`GEN_KEYS` the caller named on the command line.
+
+    An explicit ``--max-tokens 32768`` must outrank :data:`BENCH_OVERRIDES`; without this
+    distinction the table wins silently and a deliberate cap change is discarded while the
+    run still reports success. That is not hypothetical -- it invalidated a full 30B
+    re-score, which ran at the table's caps and looked fine.
+
+    Args:
+        parser: The argument parser that produced the real namespace.
+        argv: The argument list to inspect, excluding the program name.
+
+    Returns:
+        The subset of :data:`GEN_KEYS` present in ``argv``.
+    """
+    ns = argparse.Namespace(**{k: _UNSET for k in GEN_KEYS})
+    try:
+        parser.parse_known_args(list(argv), namespace=ns)
+    except SystemExit:
+        return set()
+    return {k for k in GEN_KEYS if getattr(ns, k, _UNSET) is not _UNSET}
+
+
+def resolve_params(bench: str, args, explicit=frozenset()) -> dict:
     """Generation parameters for one benchmark: CLI values with per-benchmark overrides.
+
+    Precedence is explicit CLI > :data:`BENCH_OVERRIDES` > CLI default. The table exists to
+    give each benchmark a workable default cap, not to override a cap the caller asked for
+    on purpose.
 
     Args:
         bench: Benchmark name.
         args: Parsed CLI namespace supplying the defaults.
+        explicit: Generation keys the caller named on the command line, from
+            :func:`explicit_gen_keys`. These are never overridden by the table.
 
     Returns:
         A dict with exactly :data:`GEN_KEYS`.
@@ -163,8 +200,17 @@ def resolve_params(bench: str, args) -> dict:
             f"known: {list(GEN_KEYS)}"
         )
     out = {k: getattr(args, k) for k in GEN_KEYS}
-    out.update(over)
+    applied = {k: v for k, v in over.items() if k not in explicit}
+    for k in sorted(set(over) & set(explicit)):
+        if over[k] != out[k]:
+            print(
+                f"NOTE {bench}: using explicit --{k.replace('_', '-')}={out[k]} "
+                f"(BENCH_OVERRIDES default {over[k]} not applied)",
+                flush=True,
+            )
+    out.update(applied)
     return out
+
 
 PROMPT = (
     "Solve the following math problem. Reason step by step, and put your final answer "
@@ -387,7 +433,7 @@ async def run_bench(bench: str, args, gen_fh=None) -> dict:
         probs = probs[: args.limit]
     # Resolved ONCE per benchmark and threaded through, so every completion in this
     # benchmark provably used the same parameters and the results row can report them.
-    params = resolve_params(bench, args)
+    params = resolve_params(bench, args, _EXPLICIT)
     url = args.base_url.rstrip("/") + "/chat/completions"
     sem = asyncio.Semaphore(params["concurrency"])
     conn = aiohttp.TCPConnector(limit=params["concurrency"])
@@ -473,6 +519,10 @@ def main() -> None:
     ap.add_argument("--out", type=str, default="")
     ap.add_argument("--gen-out", type=str, default="", help="JSONL of every completion")
     args = ap.parse_args()
+    # Explicit CLI generation flags outrank BENCH_OVERRIDES; see resolve_params.
+    global _EXPLICIT
+    _EXPLICIT = explicit_gen_keys(ap, sys.argv[1:])
+
 
     # avg@n at temperature 0 measures batching nondeterminism, not model uncertainty:
     # measured on amc23 n=4, only 11/40 problems produced 4 identical samples.
