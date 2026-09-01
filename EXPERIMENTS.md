@@ -3,6 +3,46 @@
 Measured results and negative results, newest first. A claim only belongs here once it has
 been observed end to end; a prediction belongs in GOAL.md until then.
 
+## 2026-09-01 — A GPU-day of work generated, then thrown away by a client timeout I created
+
+Three failures compounded, and the first was mine.
+
+**1. Raising concurrency without raising the timeout.** I moved concurrency 16 -> 40 on a 65536
+run and called it safe because the worst-case KV fit the pool. The KV was never the constraint:
+more sequences sharing the cards means each takes longer, and `run_math.sh` held a **fixed
+`--timeout 600`**. Per-request latency went past it. **The server returned `200 OK` for 613
+generations; the client discarded 662 of them.** Roughly a GPU-day produced 13 usable answers.
+
+**2. The scorer reported a score anyway.** `acc=0.6154, n=13/675, fail=662`, exit 0. It printed
+`WARNING ... accuracy is over survivors and is biased upward` -- correct, and not enough, since
+a warning beside a plausible number is read as a number. The `FAILED_RATE_ABORT` guard written
+earlier that day would have aborted this at 98% failures.
+
+**3. The guard was not on the box.** It was written, mutation-tested, committed and pushed --
+and the H200 has no GitHub credentials, so it still ran the copy scp'd hours earlier.
+**A fix that exists only in git does not protect a machine that cannot reach git.**
+
+### Fixes
+
+* The client timeout now scales: `max_tokens/20 + concurrency*5 + 300`, floored at 600, printed
+  at startup. 3072/16 still gets 600s; 65536/40 gets 3776s. Roughly 4x more generous than
+  measured decode speed (~90 tok/s/sequence).
+* `bench_progress.sh` counted server completions -- which is all a server log can show -- and
+  read **90.8% for a run that produced 13 answers**. It now says so, and reports the client-side
+  discard count once the scorer writes it.
+* Current code copied to the H200, guard confirmed present.
+
+### The lesson worth keeping
+
+**Concurrency and timeout are coupled; a throughput knob that raises per-request latency will
+break a fixed deadline.** And the diagnostic that settles it in one step is the server's own
+access log: `613 x 200 OK` against `fail=662` locates the failure on the client side
+immediately, where the client's empty error text says nothing at all.
+
+The 65536 OlympiadBench measurement is re-running at concurrency 24 with the scaled timeout.
+**The earlier 0.6154 is void and must not be cited** -- it is an average over 13 self-selected
+survivors, which are the fastest generations, hence the shortest, hence not a random sample.
+
 ## 2026-09-01 — Cap saturation: doubling the budget to 65536 buys essentially nothing
 
 The fairness objection was that comparing two models at a cap which truncates BOTH partly
