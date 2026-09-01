@@ -219,15 +219,43 @@ echo "== Terminal-Bench 2.1 harness-swap preflight =="
 #    this script exists rather than a README instruction.
 if ! command -v docker >/dev/null 2>&1; then
   bad "docker not installed" "Terminal-Bench runs EVERY task in a container. Install it, e.g.:
+             apt-get install -y docker.io docker-compose-plugin   (apt uses its own signed
+             mirror, so it still works where 'curl https://get.docker.com' is TLS-intercepted)
              curl -fsSL https://get.docker.com | sh   (as root, or with sudo)
+           No daemon possible? podman is rootless and daemonless:
+             apt-get install -y podman podman-docker podman-compose
            then start it:  dockerd >/tmp/dockerd.log 2>&1 &   (or: systemctl start docker)
            A container host often needs --privileged or a mounted /var/run/docker.sock;
            if you cannot get a daemon, tell us - that decides whether this task is runnable there."
 elif ! docker info >/dev/null 2>&1; then
   bad "docker present but daemon unusable" \
-      "Typically the user is not in the docker group: sudo usermod -aG docker \$USER, then re-login. Verify with: docker info"
+      "Typically the user is not in the docker group: sudo usermod -aG docker \$USER, then re-login. Verify with: docker info
+           On podman, the shim needs a running API service:
+             podman system service --time=0 unix:///run/podman/podman.sock &
+             export DOCKER_HOST=unix:///run/podman/podman.sock"
+elif ! docker compose version >/dev/null 2>&1; then
+  # harbor drives tasks through `docker compose` with a docker-compose.yaml per task, so a
+  # working `docker info` is NOT sufficient. podman-docker supplies `docker` but compose is a
+  # separate provider, and without it every task fails after the preflight has already passed.
+  bad "docker present but 'docker compose' is missing" \
+      "harbor runs every task through 'docker compose', not plain 'docker run'. Install a compose provider:
+             apt-get install -y docker-compose-plugin        # real docker
+             apt-get install -y podman-compose               # podman: 'podman compose' then delegates to it
+           Verify with:  docker compose version"
 else
-  ok "docker daemon usable"
+  ok "docker daemon usable ($(docker compose version 2>/dev/null | head -1))"
+  # Pulling an image is the step most likely to fail behind a TLS-intercepting proxy, and it
+  # fails at task time rather than here unless it is checked. Cheap, and it is the real loop.
+  if [ "${TB_SKIP_PULL:-0}" != "1" ]; then
+    if docker run --rm hello-world >/dev/null 2>&1; then
+      ok "container run + registry pull work"
+    else
+      bad "cannot run a container from the registry" \
+          "'docker run --rm hello-world' failed. Usually the image registry is unreachable or TLS
+           is intercepted. Try: docker pull hello-world   and read the error.
+           Set TB_SKIP_PULL=1 to skip this check if images are pre-loaded."
+    fi
+  fi
 fi
 
 # 2. Python 3.12 + harbor. conda is NOT required despite the upstream README; harbor 0.18.0
