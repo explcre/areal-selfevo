@@ -3,6 +3,43 @@
 Measured results and negative results, newest first. A claim only belongs here once it has
 been observed end to end; a prediction belongs in GOAL.md until then.
 
+## 2026-09-01 — Qwen3.8-27B beats Frontis-MA1-30B on every core benchmark, and its numbers are cleaner
+
+Scored on the H200 at an honest 32768 cap, with the cap-precedence fix carried across by hand
+(the box has no GitHub credentials, so without copying it would have silently run the old
+code). The fix is confirmed live on this box by the emitted line
+`NOTE aime24: using explicit --max-tokens=32768 (BENCH_OVERRIDES default 8192 not applied)`.
+
+| benchmark | **Qwen3.8-27B** | trunc | Frontis-MA1-30B | trunc |
+|---|---|---|---|---|
+| MATH-500 | **0.9760** | 4/500 (0.8%) | 0.8980 | 57/500 (11.4%) |
+| AMC23 | **1.0000** | 0/40 | 0.9500 | 2/40 |
+| AIME24 | **0.9000** | 4/30 (13%) | 0.8000 | 6/30 (20%) |
+| AIME25 | **0.9000** | 3/30 (10%) | 0.7000 | 6/30 (20%) |
+
+**The truncation column matters as much as the accuracy column.** Qwen3.8-27B is only 0.8%
+cap-limited on MATH-500 against Frontis-MA1-30B's 11.4%, so its numbers are close to real
+measurements rather than lower bounds. Every Frontis-MA1-30B figure remains a lower bound.
+
+**AMC23 at 1.0000 should be read as "saturated", not as a score.** n=40 with zero errors gives
+a Wilson interval of [0.912, 1.000]; the benchmark has no resolving power left at this
+capability and should be dropped from any comparison that needs to separate strong models.
+
+### Consequence for GOAL.md
+
+The paper's plan is a delta at a FIXED STRONG BASE, which is what makes a result
+un-discountable as scaling. That base should be **Qwen3.8-27B, not Frontis-MA1-30B**: it is
+smaller, stronger on all four, and less cap-limited, so a delta measured on it is both harder
+to obtain and harder to dismiss. The 30B LoRA run currently training on the A100 uses
+Frontis-MA1-30B and should be re-pointed once it has served its purpose as a pipeline proof.
+
+### Caveats
+
+Single run per model, greedy, one seat of caps. AIME n=30 has ~0.1 run-to-run jitter recorded
+here, so 0.9000 against 0.8000 on AIME24 is within about one jitter width and should not be
+called significant on its own; the MATH-500 gap (0.9760 vs 0.8980, n=500) is well outside it.
+OlympiadBench for Qwen3.8-27B was still running when this was written.
+
 ## 2026-09-01 — RECOVERED from the H200: all three routed arms collapse at step 289, RANDOM INCLUDED
 
 The H200 was never down. It is a vast.ai instance and its address had changed; I reported it
