@@ -1908,6 +1908,33 @@ class GroupRoutingConfig:
             was overwriting.
 
             False by default, which leaves the update bit-identical.
+        harness_variants: Names of the harness scaffolds this run may dispatch between,
+            resolved against ``selfevo.harness.base.VARIANTS``.
+
+            This is the ONLY thing that makes ``RoutingContext.can_evolve_harness`` True in
+            production, and therefore the only thing that lets a router emit a
+            ``HarnessAction`` at all: ``areal.trainer.ppo.actor._refuse_dropped_harness``
+            raises on any non-NONE action while no consumer is declared, and the consumer is
+            the ``selfevo.harness.dispatch.HarnessDispatcher`` this list builds. ``None`` --
+            the default -- means no harness arm, no dispatcher, no consumer, and that guard
+            stays absolute, which is exactly what every run before this field existed did.
+
+            **Two or more names are required for the axis to move.** A one-name list builds a
+            dispatcher whose ``can_evolve`` is False: the dispatch rule has one possible
+            answer, so every proposal is refused and the arm trains identically to a run with
+            no harness arm at all. That configuration is still allowed, because it is the
+            matched CONTROL for a dispatching arm -- same code path, same emitted metrics,
+            one scaffold instead of two -- but it is not an evolvable harness and does not
+            report itself as one.
+
+            Names must be unique. ``["plain", "plain"]`` would otherwise look like a
+            two-variant arm, set ``can_evolve_harness`` True, and dispatch between a scaffold
+            and itself.
+
+            A ``router`` is required alongside this. The fixed solved/unsolved rule produces
+            no ``RoutingDecision`` and therefore no ``HarnessAction``, and ``_route_groups``
+            -- the only place a dispatcher is built -- does not run without a router, so the
+            pairing would carry a harness arm in its config and dispatch nothing.
 
     Raises:
         ValueError: If either weight has the wrong sign, which is a footgun rather than a
@@ -1925,6 +1952,7 @@ class GroupRoutingConfig:
     decision: str = "argmax"
     zero_mean: bool = False
     exclude_truncated_from_sft: bool = False
+    harness_variants: list[str] | None = None
 
     def __post_init__(self):
         if self.credit not in ("batch", "prompt", "prompt_centered"):
@@ -1945,6 +1973,35 @@ class GroupRoutingConfig:
                 "no weights, so this configuration would run the hardcoded constants and "
                 "report itself as a mixture arm."
             )
+        if self.harness_variants is not None:
+            dupes = sorted(
+                {n for n in self.harness_variants if self.harness_variants.count(n) > 1}
+            )
+            if dupes:
+                raise ValueError(
+                    f"harness_variants repeats {dupes}. A repeated name would make a "
+                    f"one-scaffold run look like a two-variant set, set "
+                    f"can_evolve_harness True, and dispatch a scaffold to itself."
+                )
+            # Resolved HERE rather than at the first batch: an unknown name silently
+            # dropped would shrink a two-variant arm to a one-variant control, and this
+            # config is read before any GPU is touched.
+            from selfevo.harness.base import VARIANTS
+
+            unknown = [n for n in self.harness_variants if n not in VARIANTS]
+            if unknown:
+                raise ValueError(
+                    f"harness_variants names unregistered variant(s) {unknown}; "
+                    f"registered: {sorted(VARIANTS)}"
+                )
+            if not self.router:
+                raise ValueError(
+                    "harness_variants requires a router: the fixed solved/unsolved rule "
+                    "produces no RoutingDecision and therefore no HarnessAction, and "
+                    "_route_groups -- the only place a dispatcher is built -- never runs "
+                    "without one. This configuration would carry a harness_variants line "
+                    "and dispatch nothing, reporting itself as an arm it is not."
+                )
         if self.solved_advantage < 0:
             raise ValueError(
                 f"solved_advantage must be >= 0 (it is SFT on samples known to be "

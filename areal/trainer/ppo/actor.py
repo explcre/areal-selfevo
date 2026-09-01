@@ -170,20 +170,27 @@ def route_all(router, contexts, *, harness_consumer: bool = False):
 def _refuse_dropped_harness(decisions, router, *, harness_consumer: bool) -> None:
     """Refuse to silently discard harness actions when nothing consumes them.
 
-    ``RoutingDecision.harness`` is an axis orthogonal to the training mode, and NOTHING reads
-    it: ``_APPLIED`` in group_apply covers only RL, SFT and SKIP, and no production code sets
-    ``RoutingContext.can_evolve_harness``, so the field is inert end to end. A router that
-    nonetheless emits a harness action would have it vanish, and an arm labelled
-    "harness-evolving" would train identically to one that is not -- two runs whose only
-    difference is a name, with any gap between them attributed to something that never
-    happened. That failure has occurred here before under other names, and it is silent, so it
-    is refused rather than warned about.
+    ``RoutingDecision.harness`` is an axis orthogonal to the training mode, and for most of
+    this repo's history NOTHING read it: ``_APPLIED`` in group_apply covers only RL, SFT and
+    SKIP, and no production code set ``RoutingContext.can_evolve_harness``, so the field was
+    inert end to end. A router that nonetheless emits a harness action would have it vanish,
+    and an arm labelled "harness-evolving" would train identically to one that is not -- two
+    runs whose only difference is a name, with any gap between them attributed to something
+    that never happened. That failure has occurred here before under other names, and it is
+    silent, so it is refused rather than warned about.
+
+    A consumer now exists: ``selfevo.harness.dispatch.HarnessDispatcher``, built by
+    ``_route_groups`` when ``group_routing.harness_variants`` names a variant set. This guard
+    was deliberately NOT relaxed when it arrived. It still fires for every run that configures
+    no variant set -- which is every run launched so far -- and it is what stops the next
+    router from re-opening the same hole. ``harness_consumer`` is passed from the PRESENCE of
+    a dispatcher and is never hardcoded, so the flag cannot drift away from the fact.
 
     Args:
         decisions: Decisions just produced, in group order.
         router: Only used to name the offender in the message.
-        harness_consumer: Set True by a caller that actually acts on the harness axis. Until
-            such a consumer exists this stays False everywhere and the guard is absolute.
+        harness_consumer: Set True by a caller that actually acts on the harness axis. False
+            wherever no dispatcher was configured, which keeps the guard absolute there.
 
     Raises:
         ValueError: If any decision carries a harness action other than ``NONE`` while no
@@ -199,10 +206,11 @@ def _refuse_dropped_harness(decisions, router, *, harness_consumer: bool) -> Non
         raise ValueError(
             f"{type(router).__name__} emitted a harness action on {len(dropped)} of "
             f"{len(decisions)} decisions (first at index {dropped[0]}), but nothing consumes "
-            f"the harness axis: group_apply applies only RL/SFT/SKIP and no caller sets "
-            f"can_evolve_harness. Discarding these would make a harness-evolving arm train "
-            f"identically to one that is not. Build the consumer and pass "
-            f"harness_consumer=True, or route to a training mode instead."
+            f"the harness axis in this run: group_apply applies only RL/SFT/SKIP, and no "
+            f"harness dispatcher was configured, so nothing set can_evolve_harness. "
+            f"Discarding these would make a harness-evolving arm train identically to one "
+            f"that is not. Set group_routing.harness_variants to two or more registered "
+            f"variants, or route to a training mode instead."
         )
 
 
@@ -423,6 +431,19 @@ class PPOActor:
             router = factory()
             self._selfevo_router = router
 
+        # The harness half of a routing decision finally has a consumer, and this is the one
+        # place production decides whether it exists. Cached like the router and for a
+        # stronger reason: the ACTIVE VARIANT is persistent state -- a harness is a shared
+        # artefact that applies to every future rollout -- so rebuilding per batch would reset
+        # the selection every step and make a dispatching arm indistinguishable from one that
+        # never moved. hasattr, not getattr-or-None, because None is a legitimate cached
+        # value here: it is what "no harness arm" looks like.
+        if not hasattr(self, "_selfevo_harness"):
+            from selfevo.harness.dispatch import build_dispatcher
+
+            self._selfevo_harness = build_dispatcher(getattr(gr, "harness_variants", None))
+        dispatcher = self._selfevo_harness
+
         feats = group_features(
             raw_reward.detach().float().cpu(),
             data["loss_mask"].detach().cpu(),
@@ -484,6 +505,11 @@ class PPOActor:
                 # No teacher is wired, so a teacher-requiring mode is available only where the
                 # unit supplies its own target -- has_target covers that via has_self_target.
                 has_teacher=False,
+                # True exactly when a variant set with 2+ members is configured. A
+                # single-variant dispatcher has one possible answer, so it reports
+                # can_evolve False and every router drops its action, leaving the arm
+                # bit-identical to the control it is supposed to be compared against.
+                can_evolve_harness=dispatcher is not None and dispatcher.can_evolve,
                 unit_id=f"{step}:{i}",
                 extra=f.as_extra(),
             )
@@ -499,7 +525,18 @@ class PPOActor:
         #
         # ONE call per unit either way: a router may be stateful, and routing twice to read the
         # weights and then the label would double every update it makes.
-        decisions = route_all(router, contexts)
+        decisions = route_all(router, contexts, harness_consumer=dispatcher is not None)
+
+        # Consume the harness coordinate. Declared as a consumer above on the presence of the
+        # dispatcher, not on its can_evolve: a single-variant dispatcher still consumes every
+        # action and records that it REFUSED it, which is a different run from one where the
+        # action vanished. Without a dispatcher this stays False and
+        # _refuse_dropped_harness remains absolute.
+        if dispatcher is not None:
+            harness_batch = dispatcher.consume(d.harness for d in decisions)
+            # Emitted every step, including the steps where nothing proposed, so a run whose
+            # harness axis went quiet is visible rather than looking like a missing key.
+            stats_tracker.scalar(**harness_batch.as_metrics())
 
         for decision in decisions:
             # The RAW weights. apply_mixtures normalises, and normalising here as well would

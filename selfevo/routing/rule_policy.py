@@ -40,11 +40,12 @@ repo has caught in other guises. So the honest result is:
   ``SolveRateRouter`` (whose ``I_RL`` is computed from ``solve_rate == 1.0``) skips them.
   No grader in this repo is non-binary, so the divergence is latent.
 * The harness axis. ``SolveRateRouter`` has none. This one emits
-  :class:`~selfevo.routing.base.HarnessAction.PROPOSE` -- but **that action cannot fire in
-  any current run and cannot be observed if it did**: nothing writes
-  ``ctx.can_evolve_harness``, and ``actor._route_groups`` keeps only ``.argmax()``, dropping
-  ``.harness`` on the floor. This is the same "no consumer" gap GOAL.md's M10 row states,
-  and it is stated here rather than left for a reader to discover.
+  :class:`~selfevo.routing.base.HarnessAction.PROPOSE`, and that action now has somewhere to
+  go: ``actor._route_groups`` builds a :class:`~selfevo.harness.dispatch.HarnessDispatcher`
+  when ``group_routing.harness_variants`` names two or more variants, writes
+  ``ctx.can_evolve_harness`` from it, and feeds ``.harness`` to it. It still fires in NO run
+  that leaves ``harness_variants`` unset, which is every run launched so far, so the
+  divergence from ``SolveRateRouter`` remains latent rather than measured.
 
 What remains genuinely different, and the reason this ships rather than reverting the slot
 to ``SolveRateRouter``, is narrow and worth naming precisely: each branch here is cited to
@@ -222,8 +223,10 @@ class RulePolicyRouter:
             it would not supply the target that side is missing.
         truncated_threshold: Fraction of a group's samples that must have hit the token
             budget before the group is proposed to the harness. Defaults to 1.0. Note the
-            harness action it gates **cannot fire in any current run**: nothing writes
-            ``ctx.can_evolve_harness`` and ``actor._route_groups`` discards ``.harness``.
+            harness action it gates fires only in a run that configures
+            ``group_routing.harness_variants`` with two or more variants; without one
+            ``ctx.can_evolve_harness`` is False and this router drops the action before
+            emitting it.
             **This number is not pinned by a measurement and the docstring says so rather
             than inventing one.** 1.0 is the only value at which *every* sample in the group
             failed to terminate, so the group's failure mode is unambiguous -- the same

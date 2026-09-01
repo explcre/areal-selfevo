@@ -2373,3 +2373,86 @@ launched in its own session, kept running against a checkout being restored unde
 handler now kills the child's process group, restores, prints the INTACT/MUTATED table, and
 `os._exit`s. Extends the 2026-08-31 entry on killed mutation harnesses: it is not enough for
 the restore to happen, the run has to be able to show that it did.
+## 2026-09-01 — The harness axis gets a consumer, and the guard that named its absence stays armed
+
+`RoutingDecision.harness` had existed, been audited and been mutation-covered for weeks while
+being **inert end to end**. Nothing in production set `RoutingContext.can_evolve_harness`, so
+`CoHarnessRouter` and `RulePolicyRouter` both dropped their `HarnessAction` before emitting it;
+`_APPLIED` in `group_apply` covers only RL/SFT/SKIP, so nothing read the field either. The one
+thing standing between that and a published "harness-evolving" arm was
+`_refuse_dropped_harness`, which raises when a decision carries a non-NONE action and no caller
+declares `harness_consumer=True`. `selfevo/harness/` held `HarnessVariant`, `HarnessRollout`, a
+`HarnessAdapter` protocol and `mini_swe.py`, and **nothing in the production loop imported any
+of it**.
+
+**What was built.** `selfevo/harness/dispatch.py`: a `HarnessDispatcher` that owns a set of
+`HarnessVariant`s and one active selection, plus `build_dispatcher(names)` resolving config
+names against the `VARIANTS` registry. `_route_groups` builds one when
+`group_routing.harness_variants` is set, writes `can_evolve_harness` from it, passes
+`harness_consumer=` from its PRESENCE, and feeds it `decision.harness`. `route/harness_*`
+metrics name the active variant and count PROPOSE/VALIDATE/NONE and actual switches.
+
+**Four decisions that are the content, not the plumbing.**
+
+**1. It dispatches over CONFIGURATIONS, and that is not a shortcut.** `mini_swe.py` needs
+Docker images (`swebench/sweb.eval.x86_64.*`), a `SWE-bench_Verified` download and a served
+model before it can produce one rollout. Docker is not available on this box and all 8 A100s
+are busy, so a dispatcher that depended on an adapter could not have been exercised at all and
+the axis would have shipped untested for a second time. The adapter is a pluggable optional
+attribute used only by `HarnessDispatcher.run`; nothing on the dispatch path touches it.
+
+**2. Two variants is a floor, and it is enforced rather than assumed.** `can_evolve` is
+`len(variants) >= 2`. A one-variant set is a dispatch rule with one possible answer, so an arm
+configured that way and labelled "harness-evolving" is its own control. It stays constructible
+because it IS the matched control — same code path, same emitted keys, one scaffold — but it
+reports `can_evolve_harness` False and refuses every proposal. Two further construction guards
+close the doors around it: duplicate names (`["plain","plain"]` would look like two variants),
+and variants whose `step_limit` and `settings` are identical (two names for one scaffold, which
+dispatches to itself while logging switches).
+
+**3. A batch moves the harness at most once, and this was a real bug avoided, not tidiness.**
+A harness is a SHARED artefact. Routers emit `HarnessAction` per group, so a batch of 32 groups
+can carry a dozen PROPOSEs. Walking them one at a time rotates the active variant once per
+proposal — and with an EVEN number of proposals over a two-variant set the step ends where it
+began. The run would log a dozen switches per batch and be indistinguishable, at every step
+boundary, from an arm that never switched. `consume()` counts every action and acts once, which
+is GOAL.md's "propose per unit, aggregate, act once" at batch granularity.
+
+**4. The guard was satisfied, not weakened.** `harness_consumer` is passed as
+`dispatcher is not None`, never hardcoded, and never keyed on `can_evolve` — a one-variant
+dispatcher is still a consumer that refuses. `_refuse_dropped_harness` is byte-unchanged apart
+from a docstring that no longer claims no consumer exists, and the pre-existing
+`test_harness_axis_guard.py` still passes. Three mutants prove the distinction is load-bearing:
+hardcoding `harness_consumer=True` is killed by the no-dispatcher case, keying it on
+`can_evolve` is killed by the control arm, and leaving it at its default is killed by the
+dispatching arm.
+
+**Mutation results: 57/58 killed, 1 equivalent-and-removed, 0 skipped**, against a copy that is
+sha256-identical to the live checkout at start and finish. A copy rather than the live tree
+because `experiments/harness/lora30b.sh` was running with
+`PYTHONPATH=/home/ubuntu/areal-selfevo` across a dozen relaunchable workers, the same reason
+`mutate_harness_router.py` gives.
+
+**The one survivor in round 1, and why it is not a gap.** Swapping `record.changed` for
+`record.action is HarnessAction.PROPOSE` in the aggregation loop survived every test. It is an
+EQUIVALENT mutant: `apply()` returns `changed=True` for a PROPOSE exactly when `can_evolve` is
+True, and `can_evolve` cannot change inside one batch, so the two predicates agree on every
+input the loop can produce. Reporting it as a survivor would report a no-op as a gap. It was
+removed with a comment recording the proof, and replaced by the reachable defect in the same
+place — keying on "some action happened", i.e. `record.action is not HarnessAction.NONE` —
+which a VALIDATE ahead of a PROPOSE distinguishes. That ordering is the ordinary shape of a
+batch (solved groups validate, failed groups propose, in group order), and there was no test
+for it; there is now, and the mutant dies to it. **The rule that produced this: when a mutant
+survives, first ask whether it can differ from the original at all.**
+
+**A guard the round-1 list did not have.** `harness_variants` without a `router` is now
+refused. `_route_groups` — the only place a dispatcher is built — does not run under the fixed
+solved/unsolved rule, so that pairing would carry a harness arm in its config and dispatch
+nothing, and the refusal guard cannot catch it because a router that never runs emits no action
+to refuse.
+
+**What is NOT claimed.** No arm has trained with this. The dispatch rule is round-robin, not
+the feature-driven rule GOAL.md predicts (`truncated_fraction == 1` selecting a longer-budget
+variant); `selector` is the seam for that and is exercised by tests, but a feature rule is a
+larger claim needing its own matched-proportion control. And the three registered variants
+differ only in `step_limit`, which is a real axis but a thin one.
