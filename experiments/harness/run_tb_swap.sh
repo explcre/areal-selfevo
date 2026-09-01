@@ -39,6 +39,31 @@ ok(){   printf '  \033[32mok\033[0m    %s\n' "$1"; }
 bad(){  printf '  \033[31mFAIL\033[0m  %s\n' "$1"; printf '        -> %s\n' "$2"; FAILED=$((FAILED+1)); }
 warn(){ printf '  \033[33mwarn\033[0m  %s\n' "$1"; }
 
+
+# Install harbor into $VENV and, on failure, SHOW WHY. An earlier version piped this to
+# /dev/null and told the user to "run it manually to see the error" -- which is the script
+# withholding the one thing that would let them fix it. A collaborator hit exactly that.
+install_harbor() {
+  local log="${TMPDIR:-/tmp}/harbor_install.$$.log"
+  rm -rf "$VENV" 2>/dev/null
+  if ! "$PY" -m venv "$VENV" > "$log" 2>&1; then
+    echo "  venv creation FAILED:"; sed 's/^/      /' "$log" | tail -12
+    echo "      hint: on conda pythons try   $PY -m venv --without-pip $VENV   or use python3.12-venv"
+    return 1
+  fi
+  "$VENV/bin/python" -m ensurepip --upgrade >> "$log" 2>&1 || true
+  "$VENV/bin/python" -m pip install --upgrade pip >> "$log" 2>&1 || true
+  if "$VENV/bin/python" -m pip install --no-cache-dir harbor==0.18.0 >> "$log" 2>&1; then
+    return 0
+  fi
+  echo "  pip install harbor==0.18.0 FAILED. Last 20 lines:"
+  sed 's/^/      /' "$log" | tail -20
+  echo "      full log: $log"
+  echo "      common causes: no network/proxy (set HTTPS_PROXY), a conda python whose venv"
+  echo "      lacks pip (the ensurepip above should fix that), or a pip too old for the wheel."
+  return 1
+}
+
 # ---- install mode: bring a BARE box to the point where --smoke can pass ----
 # Written because the collaborator's H200 is a different machine from ours and will have none
 # of this. Everything here is idempotent: re-running it after a partial failure is safe.
@@ -66,8 +91,7 @@ if [ "$MODE" = "--install" ]; then
   if [ ! -x "$VENV/bin/harbor" ]; then
     if command -v "$PY" >/dev/null 2>&1; then
       echo "  creating $VENV and installing harbor==0.18.0 ..."
-      "$PY" -m venv "$VENV" && "$VENV/bin/python" -m pip install -q --upgrade pip \
-        && "$VENV/bin/python" -m pip install -q --no-cache-dir harbor==0.18.0
+      install_harbor || echo "  (see the error above - this is the blocker, not a symptom)"
     else
       echo "  SKIP: no python3.12 available to build the venv"
     fi
@@ -107,7 +131,11 @@ echo "== Terminal-Bench 2.1 harness-swap preflight =="
 #    nothing runs. Our A100 fails here with a docker.sock permission error, which is why
 #    this script exists rather than a README instruction.
 if ! command -v docker >/dev/null 2>&1; then
-  bad "docker not installed" "Terminal-Bench runs tasks in containers. Install Docker."
+  bad "docker not installed" "Terminal-Bench runs EVERY task in a container. Install it, e.g.:
+             curl -fsSL https://get.docker.com | sh   (as root, or with sudo)
+           then start it:  dockerd >/tmp/dockerd.log 2>&1 &   (or: systemctl start docker)
+           A container host often needs --privileged or a mounted /var/run/docker.sock;
+           if you cannot get a daemon, tell us - that decides whether this task is runnable there."
 elif ! docker info >/dev/null 2>&1; then
   bad "docker present but daemon unusable" \
       "Typically the user is not in the docker group: sudo usermod -aG docker \$USER, then re-login. Verify with: docker info"
@@ -129,12 +157,12 @@ elif ! command -v "$PY" >/dev/null 2>&1; then
 else
   ok "$PY present"
   echo "        creating venv at $VENV and installing harbor==0.18.0 ..."
-  "$PY" -m venv "$VENV" >/dev/null 2>&1
-  "$VENV/bin/python" -m pip install -q --no-cache-dir harbor==0.18.0 >/dev/null 2>&1
+  install_harbor || true
   if "$VENV/bin/harbor" --help >/dev/null 2>&1; then
     ok "harbor installed and runnable ($("$VENV/bin/python" -m pip show harbor 2>/dev/null | awk '/^Version/{print $2}'))"
   else
-    bad "harbor not runnable" "pip install harbor==0.18.0 into $VENV failed; run it manually to see the error."
+    bad "harbor not runnable - the pip error is printed above" \
+        "Fix that error first. Everything downstream (agent imports, task fetch, both arms) depends on harbor."
   fi
 fi
 
@@ -196,6 +224,9 @@ PYCHK
 )
   case "$agent_check" in
     *BOTH_OK*) ok "both arms' agent classes import (no extra env build needed)" ;;
+    *"No module named 'harbor'"*)
+      # Do not report this as a separate problem: it is the harbor failure above, restated.
+      warn "agent import skipped - harbor is not installed yet (see the harbor failure above)" ;;
     *) bad "an agent class does not import: $agent_check" \
            "This fails hours into a run, inside a container. Fix before launching." ;;
   esac
