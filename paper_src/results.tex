@@ -828,53 +828,78 @@ OlympiadBench figures inherit the grader caveat of Sec.~\ref{sec:cap}: $94$ of t
 problems state more than one gold answer in a single answer string and are marked wrong
 however the model answers.
 
-\subsection{The 32768 cap is saturated: doubling the budget buys essentially nothing}
+\subsection{The 32768 cap is saturated on three benchmarks of four; OlympiadBench is the
+exception}
 \label{sec:capsat}
 
 The fairness objection to Table~\ref{tab:frontier} is that a cap which binds on both sides
 partly measures verbosity. The check is to raise it. Table~\ref{tab:capsat} re-scores
-\texttt{Qwen3.8-27B} at $65536$: same model, same grader, only the cap changed.
+\texttt{Qwen3.8-27B} at $65536$: same model, same grader, same box, only the cap changed.
+
+\paragraph{Correction to an earlier version of this subsection.} The OlympiadBench row read
+\emph{not yet measured} while its $65536$ run was still going, and the subsection was titled
+as though saturation held on all four benchmarks. It does not. That row is now measured, it
+contradicts the old title for that benchmark, and the title and the framing below are the
+correction. The three saturated rows are unchanged.
 
 \begin{table}[t]
 \centering\small
-\caption{\texttt{Qwen3.8-27B} at $32768$ against the same model at $65536$. Truncation more
-than halves on every benchmark while accuracy barely moves. OlympiadBench at $65536$ is still
-running and is reported as not yet measured rather than omitted.}
+\caption{\texttt{Qwen3.8-27B} at $32768$ against the same model at $65536$, greedy, one run
+per cell. On MATH-500 and both AIME sets truncation more than halves and the accuracy does
+not follow, which is saturation. On OlympiadBench the accuracy does follow. Both
+OlympiadBench cells graded $675/675$ with zero request failures.}
 \label{tab:capsat}
 \begin{tabular}{lccccc}
 \toprule
 benchmark & @32768 & trunc & @65536 & trunc & $\Delta$ \\
 \midrule
-MATH-500      & 0.9760 & 0.8\%  & \textbf{0.9800} & 0.2\% & $+0.004$ \\
-AIME24        & 0.9000 & 13.3\% & \textbf{0.9333} & 6.7\% & $+0.033$ (1 problem) \\
-AIME25        & 0.9000 & 10.0\% & \textbf{0.9333} & 3.3\% & $+0.033$ (1 problem) \\
-OlympiadBench & 0.7733 & 17.8\% & \multicolumn{2}{c}{not yet measured} & --- \\
+MATH-500      & 0.9760 & 0.8\%  & \textbf{0.9800} & 0.2\%  & $+0.004$ \\
+AIME24        & 0.9000 & 13.3\% & \textbf{0.9333} & 6.7\%  & $+0.033$ (1 problem) \\
+AIME25        & 0.9000 & 10.0\% & \textbf{0.9333} & 3.3\%  & $+0.033$ (1 problem) \\
+\midrule
+OlympiadBench & 0.7733 & 17.8\% & \textbf{0.8089} & 10.7\% & $+0.036$ \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-MATH-500 moves $+0.004$ at $n=500$, where the standard error is about $0.006$ --- inside
-noise. Each AIME set moves by exactly one problem out of thirty, well inside the $\approx 0.1$
-jitter recorded at that $n$. The informative quantity is the pair: \textbf{truncation more
-than halves while accuracy does not follow}, which is the signature of a budget that was
-already sufficient. The generations being cut off at $32768$ were ones that were going to be
-graded wrong regardless. For MATH-500 and both AIME sets, therefore, the $32768$ numbers of
-Table~\ref{tab:frontier} are measurements rather than lower bounds, and the ranking there can
-be stated plainly.
+\paragraph{Three of the four are saturated at $32768$.} MATH-500 moves $+0.004$ at $n=500$,
+where the standard error is about $0.006$ --- inside noise. Each AIME set moves by exactly one
+problem out of thirty, well inside the $\approx 0.1$ run-to-run jitter recorded at that $n$.
+For those three the informative quantity is the pair rather than either number: truncation
+more than halves while accuracy does not follow, which is the signature of a budget that was
+already sufficient, and the generations being cut off at $32768$ were ones that were going to
+be graded wrong regardless. Their $32768$ figures in Table~\ref{tab:frontier} are therefore
+measurements rather than lower bounds, and the ranking on those three rows can be stated
+plainly.
 
-\paragraph{OlympiadBench is the one that is still open.} It is also the one where truncation
-at $32768$ was high enough for verbosity to matter ($17.8\%$ against
-\texttt{Frontis-MA1-30B}'s $20.0\%$). Its $65536$ measurement is re-running; the first attempt
-at that cap is void for the reason given in Sec.~\ref{sec:harness} and is not quoted here or
-anywhere else in this paper.
+\paragraph{OlympiadBench is not saturated, and it is the largest cap effect of the four.}
+Doubling the budget buys $+0.036$ there, with truncation falling $17.8\% \to 10.7\%$, on
+$675$ problems graded with zero request failures on both rows. For this benchmark $32768$ was
+not the plateau, and the generations it cut off were ones that would have been graded right.
+We attach no significance statement to $+0.036$: no repeat run of this benchmark at this cap
+exists, and the repeat spreads of Sec.~\ref{sec:noisetrunc} were measured on other
+checkpoints and another benchmark. What the row supports is the qualitative claim that here
+the accuracy tracks the truncation and elsewhere it does not.
 
-\paragraph{A caveat that belongs with these numbers.} The $65536$ run used concurrency $40$
-against the earlier run's $24$, so the batch composition differed between the two columns.
-Decoding is greedy and the requests are independent, so no answer depends on which others ran
-beside it; but batched matmuls do not associate identically across batch sizes, and a
-one-problem AIME difference is exactly the resolution at which that could contribute. This
-does not weaken the conclusion, which rests on the accuracy \emph{not} moving while truncation
-halved, and not on the sign of $+0.033$.
+\paragraph{The exception falls where a cap argument predicts it.} Ordered by truncation at
+$32768$ the four are MATH-500 $0.8\%$, AIME25 $10.0\%$, AIME24 $13.3\%$, OlympiadBench
+$17.8\%$, and the only one that gains from a larger budget is the one whose truncation was
+highest to begin with. That is the saturation claim read in the other direction: a cap can
+only be costing accuracy where it is binding, so ``the budget is sufficient'' is a statement
+about a benchmark and not about a model, and it has to be checked per benchmark. $10.7\%$ is
+still not zero, so the $65536$ OlympiadBench figure is itself not fully saturated and remains
+a lower bound; Sec.~\ref{sec:frontier65k} carries it into the comparison it was run for.
+
+\paragraph{A caveat that belongs with these numbers.} The $65536$ MATH-500 and AIME runs used
+concurrency $40$ against the earlier runs' $24$, so the batch composition differed between
+the two columns on those three rows. Decoding is greedy and the requests are independent, so
+no answer depends on which others ran beside it; but batched matmuls do not associate
+identically across batch sizes, and a one-problem AIME difference is exactly the resolution
+at which that could contribute. This does not weaken the conclusion, which rests on the
+accuracy \emph{not} moving while truncation halved, and not on the sign of $+0.033$. The
+OlympiadBench row is the exception in the useful direction: after the client-timeout failure
+of Sec.~\ref{sec:harness} it was re-run at concurrency $24$, the same concurrency as its
+$32768$ row, so that pair is matched on batch composition as well as on cap.
 
 \subsection{The noise floor is a function of truncation}
 \label{sec:noisetrunc}
@@ -1032,6 +1057,235 @@ produced a number in the plausible range. The generalisation is that a harness w
 fail cannot measure: if a run has no path that aborts, then a successful exit carries no
 information, and the score it wrote is a property of the harness's defaults rather than of the
 model.
+
+\subsection{The matched frontier comparison at 65536}
+\label{sec:frontier65k}
+
+Sec.~\ref{sec:frontier} compares the two frontier candidates at a single cap and records why
+that is not enough: where a cap binds on both sides, part of the gap is verbosity rather than
+skill. Sec.~\ref{sec:capsat} then shows that OlympiadBench is the one row where the cap was
+in fact still binding. Table~\ref{tab:frontier65k} re-runs that row for both models at
+$65536$. It supersedes the statement in Sec.~\ref{sec:frontier} that $65536$ had not been run
+for \texttt{Frontis-MA1-30B}.
+
+\begin{table}[t]
+\centering\small
+\caption{OlympiadBench, $n=675$, greedy, one run per cell, \texttt{trunc} the fraction of
+generations that reached the cap. At $65536$ the two models truncate at the same rate to the
+precision reported and every problem is graded on both sides, so the comparison is matched on
+cap, on truncation and on coverage.}
+\label{tab:frontier65k}
+\begin{tabular}{lccccc}
+\toprule
+model & @32768 & trunc & @65536 & trunc & graded @65536 \\
+\midrule
+\texttt{Qwen3.8-27B}     & \textbf{0.7733} & 17.8\% & \textbf{0.8089} & 10.7\% & 675/675, fail 0 \\
+\texttt{Frontis-MA1-30B} & 0.7363          & 20.0\% & 0.7615          & 10.7\% & 675/675, fail 0 \\
+\midrule
+gap                      & $+0.037$        &        & $+0.047$        &        & \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{The ranking survives a matched, less-truncated budget.} At $32768$ the gap is
+$+0.037$ with the two models truncating at $17.8\%$ and $20.0\%$; at $65536$ it is $+0.047$
+with both at $10.7\%$. The gap does not close when the budget doubles --- it widens slightly
+--- and it widens at the point where the truncation asymmetry that could have explained it
+has gone. This is what a single-cap comparison cannot establish. At one cap, ``the stronger
+model is simply the terser one'' is an alternative account of the entire gap, and no amount
+of care about the grader touches it, because the two models are not being asked the same
+question when one of them is cut off more often. Two caps, with the truncation rates
+converging to each other and the ordering unchanged, is the observation that rules it out.
+
+\paragraph{The larger model is still on the slope.} Across three caps
+\texttt{Frontis-MA1-30B} reads $0.6237$ at $16384$ ($33.3\%$ truncated), $0.7363$ at $32768$
+($20.0\%$) and $0.7615$ at $65536$ ($10.7\%$). It is still climbing, and so is
+\texttt{Qwen3.8-27B}. Neither $65536$ figure is a measurement of capability; both are
+capability under a $65536$ budget, and both remain lower bounds while $10.7\%$ of generations
+reach the cap. What is now established is the \emph{ordering}, at a budget where the
+verbosity confound has been reduced rather than assumed away.
+
+\paragraph{Scope.} One run per cell, greedy. Both rows inherit the grader caveat of
+Sec.~\ref{sec:cap}: $94$ of the $675$ problems state more than one gold answer in a single
+answer string and are marked wrong however the model answers. That caveat applies equally to
+both models, so it moves both accuracies and not the gap.
+
+\subsection{Survivor bias is not conservative: an average over survivors is biased upward}
+\label{sec:survivor}
+
+The OlympiadBench figure at $65536$ was read three times before it was measured once, and the
+three wrong reads are worth more than the incident that produced them, because they quantify
+a bias that is ordinarily assumed to run the other way. The mechanism is the one
+Sec.~\ref{sec:harness}(iii) reports: concurrency was raised while the client held a fixed
+timeout, so generations the server had already completed were discarded client-side, and the
+scorer averaged over whatever survived. Table~\ref{tab:survivor} places those survivor
+averages beside the clean rerun.
+
+\begin{table}[t]
+\centering\small
+\caption{OlympiadBench at a $65536$ cap, \texttt{Qwen3.8-27B}. The first three rows are
+averages over the responses that survived a client timeout and are \emph{not} benchmark
+scores; the last is the clean rerun at concurrency $24$ with a timeout that scales with the
+token budget. \texttt{trunc} counts \emph{graded} generations that reached the cap, so it is
+a count over the survivors in the first three rows.}
+\label{tab:survivor}
+\begin{tabular}{lcccc}
+\toprule
+read & accuracy & graded & failed & trunc \\
+\midrule
+survivors, first read     & 0.6154 & 13/675  & 662        & --- \\
+survivors, further on     & 0.8717 & 265/675 & 410        & 0 \\
+survivors, furthest on    & 0.8891 & 613/675 & 62 (9.2\%) & 1 \\
+\midrule
+clean rerun               & \textbf{0.8089} & 675/675 & 0 & 72 (10.7\%) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{The bias is upward, and it is larger than the effect being measured.} The best
+survivor read, $0.8891$ over $613$ of $675$, overstates the clean $0.8089$ by $+0.08$. The
+effect that run existed to measure is the cap effect of Sec.~\ref{sec:capsat}, $+0.036$. The
+bias is more than twice it. A survivor average is therefore not a noisier version of the
+score with the same centre; it is a different quantity, and quoting it would have more than
+doubled the headline in the direction that flatters the model.
+
+\paragraph{The direction is predictable, which is what makes this methodology rather than an
+anecdote.} What the client discarded were the requests that took longest. Longest means most
+tokens, and on a mathematics benchmark the longest responses are the ones on the hardest
+problems --- the same correlation that makes truncation itself a difficulty-biased filter.
+Removing them removes hard problems from the average, so the average rises. The truncation
+column shows the same selection from the other side: the $613$-survivor read contains exactly
+\emph{one} truncated generation against $72$ in the complete run, because a generation long
+enough to reach the cap was also slow enough to be discarded. A read that loses the slow
+responses is structurally unable to see the cap effect it was launched to measure.
+
+\paragraph{Against the intuition that dropping data is safe.} The reflex is that a partial
+result is a conservative result: fewer samples, a wider interval, the same centre. That holds
+only when the drop mechanism is independent of the outcome, and here it is anti-correlated
+with the outcome by construction. The failure is also silent. All three survivor rows are
+plausible OlympiadBench numbers, all three came from processes that exited zero, and the
+$0.8891$ row has a $9.2\%$ failure rate that a reader scanning for problems would not
+consider disqualifying. We therefore treat the completion count as part of a score's
+identity rather than as diagnostics beside it, which is the reporting convention of
+Sec.~\ref{sec:harness}, and we make a high failure rate abort the scorer rather than warn:
+a warning printed next to a plausible number is read as a number.
+
+\paragraph{A correction this forces on Sec.~\ref{sec:harness}.} That subsection reports the
+incident as a GPU-day of generation yielding thirteen usable answers. The mechanism is right
+and the $0.6154$ is void either way, but the magnitude is wrong. The output file accumulated
+several launches under one reused tag; the $13/675$ line was the earliest of them and the
+same file's furthest-completed launch reached $613/675$. The loss was overstated by reading
+one line of a file that other processes were still writing. A reused output tag makes a log a
+mixture of runs, and a single \texttt{grep} of such a file is not a measurement.
+
+\subsection{An unrouted 30B LoRA control, and what it is not}
+\label{sec:lora30b}
+
+\paragraph{What this run is, read from its resolved configuration.} \texttt{lora30b} trains a
+LoRA adapter on \texttt{Frontis-MA1-30B} with GRPO on eight A100s. Its resolved configuration
+reads \texttt{group\_routing: null} and \texttt{token\_routing: null}. \textbf{The run has no
+routing of any kind. It is the matched control for a routed arm at 30B, not an instance of
+the method.} We state this before the numbers because the run was described internally as the
+method for several days on the strength of its name. A name is not a configuration, and the
+only thing that settles what a run tested is the switch in the config it resolved.
+
+\begin{table}[t]
+\centering\small
+\caption{\texttt{lora30b} adapter checkpoints against the adapter-free base, held-out
+MATH-500, $n=500$ per cell, greedy, every cell graded $500/500$ with zero request failures.
+The same nine rungs are scored at two caps. \texttt{trunc} is the fraction of generations
+that reached the cap. This is a control ladder: no rung has routing enabled.}
+\label{tab:lora30b}
+\begin{tabular}{lcccc}
+\toprule
+ & \multicolumn{2}{c}{cap $4096$} & \multicolumn{2}{c}{cap $16384$} \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}
+step & accuracy & trunc & accuracy & trunc \\
+\midrule
+base, no adapter & 0.6520 & 41.2\% & 0.8820 & 13.8\% \\
+24               & 0.6600 & 41.0\% & 0.8680 & 15.0\% \\
+49               & 0.6660 & 39.2\% & 0.8720 & 15.0\% \\
+74               & 0.6720 & 40.2\% & 0.8880 & 12.8\% \\
+99               & 0.6700 & 39.8\% & 0.8800 & 13.2\% \\
+115              & 0.6680 & 38.6\% & 0.8740 & 14.2\% \\
+124              & 0.6720 & 40.4\% & 0.8880 & 12.6\% \\
+149              & \textbf{0.6840} & 39.4\% & \textbf{0.9000} & 11.4\% \\
+174              & 0.6760 & 40.8\% & 0.8820 & 13.2\% \\
+\midrule
+base to peak     & \multicolumn{2}{c}{$+0.032$} & \multicolumn{2}{c}{$+0.018$} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{The conclusion is approximately neutral.} The peak rung is step $149$ at both
+caps, and the base-to-peak gap is $+0.032$ at $4096$ and $+0.018$ at $16384$. At $16384$,
+with $p \approx 0.88$ at $n=500$, the standard error of one accuracy is $0.0145$ and a
+difference of two runs carries about $0.021$, so $+0.018$ sits inside one standard error of
+the difference. At $4096$, with $p \approx 0.67$, the same figures are about $0.021$ and
+$0.030$, so $+0.032$ is roughly one standard error there too. Neither cap supports calling
+the peak an improvement. At $16384$ the base is not even the lowest rung: four of the eight
+adapter checkpoints score below it, the worst by $0.014$. \textbf{LoRA on this base is
+approximately neutral on held-out MATH-500}, and that is the claim we make for it.
+
+\paragraph{The gap shrinks as the cap grows, and the truncation column says why it might.}
+$+0.032$ at $4096$ becomes $+0.018$ at $16384$. Truncation falls along the ladder in both
+columns, and the base is the more truncated end of it in both: $41.2\%$ against the peak's
+$39.4\%$ at $4096$, $13.8\%$ against $11.4\%$ at $16384$. Part of the apparent gain is
+therefore not accuracy but the base being cut off more often than the peak adapter, which is
+to say the adapter becoming more concise as training proceeds --- the opposite of the length
+growth the routed 1.5B arms produced (Sec.~\ref{sec:knee}). A gain that shrinks as the
+confound shrinks has the shape of an artefact, and extrapolated to zero truncation this one
+plausibly closes. Three rungs are being scored at $65536$ to test that: if the gap returns at
+$+0.018$ or larger where truncation is near zero, the truncation account is wrong and the
+effect is real. That is a prediction and it is not a result.
+
+\paragraph{What survives on the other side, recorded because it is not settled.} The
+\emph{shape} replicates across two budgets differing fourfold with truncation differing
+threefold: the same peak at step $149$, the same downturn at $174$, and a near-monotone
+ordering of the rungs in between. The rise from step $24$ to step $149$ is present in both
+columns ($0.6600 \to 0.6840$ at $4096$, $0.8680 \to 0.9000$ at $16384$). Noise around a
+constant does not usually arrive sorted twice. We record that as suggestive and decline to
+claim it, because the significance calculation above is the binding constraint and it says no.
+
+\paragraph{What the ladder does settle: the feared degradation is absent.} \texttt{lora30b}
+inherits \texttt{eps\_clip: 0.4} and \texttt{lr: 1.0e-05} from an upstream demo recipe, and
+the aggressive recipe of Sec.~\ref{sec:trainreward} cost \texttt{step0d} $0.194$ absolute on
+this same benchmark, monotonically, under full fine-tuning of a 1.5B. Nothing of that shape
+appears here at either cap. That is why the checkpoints were scored rather than the run
+restarted, and it is the negative claim the ladder was launched to test. It does not transfer
+the 1.5B finding either, because two things changed at once --- the scale, and full
+fine-tuning to LoRA --- and adapters are conventionally trained one to two orders of
+magnitude above full fine-tuning learning rates, which makes this learning rate conservative
+by LoRA standards rather than aggressive.
+
+\subsection{Scope of the routing claims, stated as a limitation}
+\label{sec:routingscope}
+
+\paragraph{Every routing measurement in this paper is at 1.5B.} \texttt{ctx}, \texttt{ctxpc},
+\texttt{ctx2}, \texttt{rnd} and \texttt{step0j} all train Qwen2.5-1.5B-Instruct. The null
+against the matched control (Sec.~\ref{sec:routernull}), the credit-signal analysis
+(Secs.~\ref{sec:credit} and~\ref{sec:promptcredit}), the length threshold
+(Sec.~\ref{sec:knee}), the termination probe (Sec.~\ref{sec:eos}) and the collapse and its
+timing (Sec.~\ref{sec:transition}) are all claims at that scale. None of them is evidence
+about routing at any other scale.
+
+\paragraph{No routed arm at 30B has been run.} The only 30B training run reported here,
+\texttt{lora30b} of Sec.~\ref{sec:lora30b}, has routing disabled and is the control half of
+the comparison the paper's claim needs; the treatment half does not exist. Sec.~\ref{sec:lora30b}
+therefore bears on plain GRPO with a LoRA adapter at 30B and on nothing else, and no reading
+of it as a routing result at a fixed strong base is supported. The frontier work of
+Secs.~\ref{sec:frontier}, \ref{sec:capsat} and~\ref{sec:frontier65k} selects and characterises
+that base; it does not measure a delta on it. A delta at a fixed strong base is the paper's
+stated goal and it is currently half-measured.
+
+\paragraph{The two stabilisers have never been used by an experiment.} The zero-mean
+advantage correction (\texttt{zero\_mean}), which re-centres the advantage field after all
+routing writes so the batch mean is restored, and the exclusion of non-terminating rows from
+the supervised write (\texttt{exclude\_truncated\_from\_sft}) are both implemented in the
+actor, both default to off, and are covered by a mutation suite that kills $39$ of $39$
+mutants. No run reported in this paper enables either. They are code, not results: this paper
+makes no measurement of their effect, and the mechanism arguments that motivated them stand
+as arguments.
 
 \subsection{Not yet measured}
 
