@@ -145,6 +145,11 @@ CAP_LIMITED_RATE = 0.10
 # that way. A crash is caught by the exit status; this is the failure that does NOT crash.
 FAILED_RATE_ABORT = 0.10
 
+# Seconds between progress lines. A time cadence, not a count: OlympiadBench at a large cap runs
+# for the better part of an hour, and a run that prints nothing cannot be distinguished from a
+# stalled one by any watchdog or any person watching.
+PROGRESS_EVERY_S = float(os.environ.get("PROGRESS_EVERY_S", "30"))
+
 
 # Sentinel marking "the user did not name this flag". argparse only applies a default when
 # the attribute is absent from the namespace, so pre-seeding with this reveals which
@@ -483,9 +488,36 @@ async def run_bench(bench: str, args, gen_fh=None, explicit=None) -> dict:
                 "correct": correct, "text": r["text"],
             }
 
-        recs = await asyncio.gather(
-            *[one(i, p, k) for i, p in enumerate(probs) for k in range(params["n"])]
-        )
+        # Progress, because a long benchmark otherwise prints nothing between "endpoint up"
+        # and its final line -- for OlympiadBench that is close to an hour of silence, during
+        # which a stalled run and a healthy one look identical from outside.
+        _tasks = [one(i, p, k) for i, p in enumerate(probs) for k in range(params["n"])]
+        _total = len(_tasks)
+        _t0 = time.time()
+        _done = 0
+        _next_report = 0.0
+        recs = []
+        for _fut in asyncio.as_completed(_tasks):
+            recs.append(await _fut)
+            _done += 1
+            _elapsed = time.time() - _t0
+            # Report on a time cadence rather than a count, so a slow benchmark still speaks
+            # early and a fast one does not spam. First line comes at PROGRESS_EVERY_S.
+            if _elapsed >= _next_report or _done == _total:
+                _next_report = _elapsed + PROGRESS_EVERY_S
+                _rate = _done / _elapsed if _elapsed > 0 else 0.0
+                _eta = (_total - _done) / _rate if _rate > 0 else float("nan")
+                _bad = sum(1 for r in recs if r["status"] != "ok")
+                print(
+                    f"  {bench}: {_done}/{_total} ({100.0 * _done / _total:5.1f}%) "
+                    f"{_rate:.1f}/s  elapsed {_elapsed / 60:.1f}m  eta {_eta / 60:.1f}m"
+                    + (f"  FAILING {_bad}" if _bad else ""),
+                    file=sys.stderr, flush=True,
+                )
+
+    # as_completed yields in FINISH order, which would make generations.jsonl differ run to run
+    # for identical inputs and defeat any diff between two scorings. Restore submission order.
+    recs.sort(key=lambda r: (r["run_pos"], r["sample"]))
 
     if gen_fh is not None:
         for rec in recs:

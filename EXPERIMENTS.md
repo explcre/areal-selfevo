@@ -3,7 +3,7 @@
 Measured results and negative results, newest first. A claim only belongs here once it has
 been observed end to end; a prediction belongs in GOAL.md until then.
 
-## 2026-09-01 — The collapse is GRADUAL, is NOT a cap artifact, and the random arm tracks it
+## 2026-09-01 — The collapse is SHARP (corrected), is NOT a cap artifact, and the random arm tracks it
 
 Every point below is MATH-500 at a **matched 16384 cap**, on the H200 checkpoints. 16384 and
 not 32768 because these are 1.5B checkpoints with `max_position_embeddings: 32768`; asking for
@@ -26,7 +26,34 @@ truncation rate wearing accuracy's clothing. Raising the budget **5.3x** moves t
 ~100% only to **96-98%**. These policies genuinely emit more than 16384 tokens. The pathology
 is in the model, not in the budget.
 
-### 2. It is GRADUAL, not a cliff, and it starts before step 174
+### 2. CORRECTED 2026-09-01 (same day): it is SHARP, not gradual
+
+I recorded "gradual, not a cliff" from four points (149/174/260/289) and the intermediate
+steps refute it. With 202/231/249 filled in, MATH-500 truncation at a matched 16384 cap reads:
+
+| step | 149 | 174 | **202** | 231 | 249 | 260 | 289 |
+|---|---|---|---|---|---|---|---|
+| `ctx2` trunc | 6.4% | 13.2% | **99.4%** | 92.2% | 61.4% | 77.8% | 96.4% |
+| `ctx2` acc | 0.5060 | 0.4280 | 0.2340 | 0.1240 | 0.0600 | 0.1100 | 0.1740 |
+| `rnd` trunc | 6.0% | 12.4% | -- | 99.6% | -- | -- | 98.2% |
+
+**Truncation goes 13.2% -> 99.4% between step 174 and 202.** That is a transition inside a
+28-step window, not a slope. My earlier reading came from having no point between 174 and 260
+and drawing a line through the gap -- the same error as the original "threshold" claim, made in
+the opposite direction. **Two wrong shapes from the same missing interval.**
+
+After the transition it does NOT settle: 99.4 -> 92.2 -> 61.4 -> 77.8 -> 96.4. Non-monotone
+across five points, so there is no clean "post-collapse plateau" either.
+
+`ctx2@249` is the oddest point: the LOWEST accuracy (0.0600) with only 61.4% truncation, so at
+that checkpoint the failures are not all length -- something else is wrong with the outputs
+there, and `nobox=44` against 303 at step 231 says the answers are formatted but wrong rather
+than absent. Not explained.
+
+**What survives unchanged:** the collapse is not a cap artifact (5.3x budget moves truncation
+~100% -> 96-98%), and the random arm tracks the contextual one -- `rnd@231` at 99.6% sits with
+`ctx2@202` at 99.4%, and both are near-total by 289.
+
 
 Truncation rises monotonically **6% -> 13% -> 78% -> 97%** across 149/174/260/289. There is no
 step at which it breaks; it is already doubled 25 steps after the last healthy checkpoint. This

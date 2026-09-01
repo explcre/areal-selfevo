@@ -19,8 +19,7 @@ set -u -o pipefail
 
 MODE="${1:---plan}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BENCH_ROOT="${BENCH_ROOT:-$HOME}"
-OUTROOT="${OUTROOT:-$BENCH_ROOT/runs/math}"
+BENCH_REPO="$(cd "$HERE/../.." && pwd)" . "$HERE/bench_env.sh"
 LOG="$OUTROOT/sweep.log"
 MAXTOK="${MAXTOK:-32768}"
 # The sweep smoke-tests itself before committing to days of work. A TINY model is used on

@@ -20,46 +20,14 @@ MODE="${1:-}"
 # directory is often a small overlay while the real volume is mounted elsewhere, and a
 # collaborator whose repo sits on /data would otherwise fill /root with model weights. Set
 # BENCH_ROOT to the volume that actually has the space.
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"  # needed by pick_bench_root below
-# Chosen automatically so a collaborator does not have to know which mount is the big one.
-# Candidates are $HOME and a directory BESIDE the repo -- beside, never inside: a venv plus tens
-# of gigabytes of model weights inside the checkout would pollute `git status` and a `git clean`
-# would delete all of it. The roomier of the two wins, and the decision is printed with the
-# reason. Setting BENCH_ROOT explicitly always overrides this.
-# df on a path that does not exist yet prints nothing, which rendered the chosen root as
-# "auto: G free" -- an empty number where a number belongs, and exactly the silent-blank that
-# hides a failed measurement. Walk up to the nearest existing ancestor instead, and say so
-# rather than printing an empty string.
-_free_gb() {
-  local d="$1"
-  while [ -n "$d" ] && [ "$d" != "/" ] && [ ! -d "$d" ]; do d="$(dirname "$d")"; done
-  local v; v="$(df -BG --output=avail "${d:-/}" 2>/dev/null | tail -1 | tr -dc '0-9')"
-  echo "${v:-0}"
-}
-pick_bench_root() {
-  local beside home_free beside_free
-  beside="$(cd "$REPO/.." 2>/dev/null && pwd)/areal-bench"
-  home_free="$(_free_gb "$HOME")"; beside_free="$(_free_gb "$(dirname "$beside")")"
-  : "${home_free:=0}" "${beside_free:=0}"
-  # Only move off $HOME when the alternative is meaningfully bigger, so a box where both live
-  # on one filesystem keeps its familiar layout instead of sprouting a new directory.
-  if [ "$beside_free" -gt "$(( home_free * 2 ))" ] && [ "$beside_free" -gt 50 ]; then
-    echo "$beside"
-  else
-    echo "$HOME"
-  fi
-}
-if [ -z "${BENCH_ROOT:-}" ]; then
-  BENCH_ROOT="$(pick_bench_root)"
-  BENCH_ROOT_WHY="auto: $(_free_gb "$BENCH_ROOT")G free (set BENCH_ROOT=<dir> to override)"
-else
-  BENCH_ROOT_WHY="set explicitly"
-fi
-VENV="${BENCH_VENV:-$BENCH_ROOT/bench-env}"
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# One definition of the roots, shared with the sweep and exported so the scorer inherits it.
+BENCH_REPO="$REPO" . "$(dirname "${BASH_SOURCE[0]}")/bench_env.sh"
+VENV="$BENCH_VENV"
 PY="${BENCH_PYTHON:-python3}"
 MODEL="${MODEL:-Qwen/Qwen2.5-Math-7B-Instruct}"
 TAG="${TAG:-$(echo "$MODEL" | tr '/' '_')}"
-OUTROOT="${OUTROOT:-$BENCH_ROOT/runs/math}"
+
 # Reasoning models need room; a truncated generation is graded WRONG, so a cap that is too
 # small silently reports a token budget rather than a capability. See BENCH_OVERRIDES.
 MAXTOK="${MAXTOK:-32768}"
@@ -90,7 +58,7 @@ py_of_venv(){ echo "$VENV/bin/python"; }
 # before the PIPESTATUS fix, run_math.sh reported that as success, so a sweep "completed" four
 # models in under two minutes each and printed a results table assembled from unrelated files.
 # Measured on our own H200 on 2026-09-01. This check exists so that cannot happen silently.
-DATA_DIR="${MATH_EVAL_DATA:-$BENCH_ROOT/baselines/Absolute-Zero-Reasoner/evaluation/math_eval/eval/data}"
+DATA_DIR="$MATH_EVAL_DATA"   # exported by bench_env.sh; the SAME path math_bench.py reads
 
 check_datasets() {
   # Returns 0 only when every benchmark this script can run has a NON-EMPTY test.jsonl.
@@ -144,9 +112,7 @@ make_venv() {
 }
 
 if [ "$MODE" = "--install" ]; then
-  echo "  BENCH_ROOT=$BENCH_ROOT  [$BENCH_ROOT_WHY]"
-  mkdir -p "$BENCH_ROOT" 2>/dev/null
-  echo "             $(df -h "$BENCH_ROOT" 2>/dev/null | awk 'NR==2{print $4" free on "$6}')"
+  bench_env_report
   echo "  venv=$VENV  out=$OUTROOT  hf_cache=${HF_HOME:-$BENCH_ROOT/hf_cache}"
   echo "== install: venv + sglang + bench deps (no docker, no root) =="
   make_venv || exit 1
@@ -225,7 +191,7 @@ P="$(py_of_venv)"
 
 if [ "$MODE" = "--fetch" ]; then
   echo "== fetch: $MODEL =="
-  export HF_HOME="${HF_HOME:-$BENCH_ROOT/hf_cache}"
+
   # snapshot_download resumes, so a dropped connection costs only the current shard.
   "$P" - "$MODEL" <<'PYEOF'
 import sys
@@ -238,7 +204,7 @@ fi
 
 resolve_model_path() {
   # Prefer a local snapshot so a scoring run never depends on the network mid-flight.
-  export HF_HOME="${HF_HOME:-$BENCH_ROOT/hf_cache}"
+
   local p
   p="$("$P" - "$MODEL" <<'PYEOF' 2>/dev/null
 import sys
