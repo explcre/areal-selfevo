@@ -45,6 +45,63 @@ experiment has yet used either. The routed 30B arm is where they belong.
 a feature, grep its resolved config for the switch. `enabled:`, `router:` and `group_routing:`
 are three separate places a routing arm can be silently off.
 
+## 2026-09-01 — The harness axis has a consumer: the paper's second target is no longer a name
+
+The claim this paper is built on is that a trajectory can be routed between two targets, the
+POLICY and the HARNESS. The policy half has worked for weeks. **The harness half was inert end
+to end** -- `can_evolve_harness` was never set True outside tests, `RoutingDecision.harness` was
+read by nothing, and `selfevo/harness/` held a `HarnessVariant`, an adapter protocol and a
+concrete adapter that **no production code imported**. An arm labelled "harness-evolving" would
+have trained identically to one that was not.
+
+`HarnessDispatcher` now owns a variant set and one active selection, and `_route_groups` builds
+it from a new `group_routing.harness_variants`. Verified in the committed source rather than
+from the report: `actor.py:512` sets `can_evolve_harness=dispatcher is not None and
+dispatcher.can_evolve`, and `actor.py:528` passes `harness_consumer=dispatcher is not None`.
+
+### Three design decisions that are content, not plumbing
+
+1. **A one-variant set is NOT evolvable.** `can_evolve` requires two or more members, enforced
+   in one place. Construction also refuses duplicate names and variants whose `step_limit` and
+   `settings` are identical -- both produce a set that looks evolvable and dispatches to itself.
+2. **Dispatch acts at most once per batch.** A harness is a SHARED artefact while routers emit
+   per group. Applying a dozen PROPOSEs one at a time rotates the variant a dozen times, and an
+   EVEN count over a two-variant set lands back where the step began -- logging a dozen switches
+   while being byte-identical at every step boundary to an arm that never moved. That is exactly
+   the silent-identity failure this work exists to prevent, reappearing inside the fix.
+3. **Dispatch is over CONFIGURATIONS, not executions.** `mini_swe.py` needs Docker images, a
+   SWE-bench download and a served model, none of which exist here; depending on it would have
+   left the axis untestable a second time. The adapter is optional.
+
+The refusal guard from `7a4c3ef4` is satisfied rather than weakened -- its control flow is
+byte-unchanged, and `harness_consumer` keys on dispatcher PRESENCE, so a one-variant dispatcher
+is still a consumer that refuses every proposal.
+
+**58/58 mutations killed, tests 1325 -> 1397.** One round-one survivor was an EQUIVALENT mutant
+(`record.changed` against `record.action is PROPOSE`, which agree on every reachable input
+because `can_evolve` cannot change inside a batch); it was replaced with the reachable defect in
+the same place -- a VALIDATE counting as having acted -- plus the test that catches it, a batch
+with VALIDATE before PROPOSE, which is the ordinary shape when solved groups validate and failed
+groups propose.
+
+### What is NOT claimed
+
+**No arm has trained with this.** The dispatch rule is round-robin, not feature-driven, and the
+registered variants differ only in `step_limit`. The interesting rule -- `truncated_fraction`
+high implies a longer budget -- is the one GOAL.md predicts and it needs its own
+matched-proportion control, exactly as every routed arm did. This makes the axis real; it does
+not yet make it useful, and those are different claims.
+
+### On OpenRSI and LongHorizon-Harness, checked by reading their code
+
+Both are cloned here. **Neither supplies harness evolution.** OpenRSI's `Program` stores
+`code: str` -- task-SOLUTION code scored by sandbox execution -- so its DRAFT/IMPROVE/DEBUG/
+CROSSOVER operators evolve answers to MLE tasks, AlphaEvolve-style, not scaffolds. What
+transfers is the STRUCTURE (a database of artefacts with parent links, fitness and visit counts)
+and the operator vocabulary; adopting the code would import an MLE program search we do not want
+plus CC BY-NC 4.0 obligations. LongHorizon-Harness is a FIXED harness: valuable as an
+initialisation and an audit signal, as GOAL.md already says, but it evolves nothing.
+
 ## 2026-09-01 — A100 utilisation during the 30B LoRA run: 95% actor, 54% rollout, and that is the price of on-policy data
 
 Twenty samples over sixty seconds, split by role:
