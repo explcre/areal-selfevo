@@ -114,6 +114,30 @@ else
 fi
 
 # 6. Both arms must be defined. Upstream ships ONLY the LHH arm; the baseline is the work.
+# Both arms' AGENT CLASSES must import, not merely their config files exist. A config naming
+# a class that cannot be constructed fails hours into a run, inside a container, after the
+# task set has been staged. Verified 2026-08-31: with PYTHONPATH set to Harness/src, the
+# harbor venv imports BOTH harbor_agent:CuaHarnessClaudeCodeAgent (arm B) and
+# harbor.agents.terminus_2.terminus_2:Terminus2 (arm A) with no extra installs beyond
+# harbor itself -- so no separate environment build is needed for the TB path.
+if [ -d "$TB_DIR/Harness/src" ] && [ -x "$VENV/bin/python" ]; then
+  agent_check=$(cd "$TB_DIR" && PYTHONPATH="$TB_DIR/Harness/src" "$VENV/bin/python" - <<'PYCHK' 2>&1
+try:
+    import harbor_agent
+    getattr(harbor_agent, "CuaHarnessClaudeCodeAgent")
+    from harbor.agents.terminus_2.terminus_2 import Terminus2  # noqa: F401
+    print("BOTH_OK")
+except Exception as e:
+    print(f"{type(e).__name__}: {e}")
+PYCHK
+)
+  case "$agent_check" in
+    *BOTH_OK*) ok "both arms' agent classes import (no extra env build needed)" ;;
+    *) bad "an agent class does not import: $agent_check" \
+           "This fails hours into a run, inside a container. Fix before launching." ;;
+  esac
+fi
+
 LHH_CFG="$TB_DIR/Scripts/tbench21_full_cua_harness_claudecode_qwen37_enable_thinking.yaml"
 [ -f "$LHH_CFG" ] && ok "arm B (LHH MEA) config shipped" || bad "arm B config missing" "Expected $LHH_CFG"
 if [ -n "${BASELINE_CFG:-}" ] && [ -f "$BASELINE_CFG" ]; then
