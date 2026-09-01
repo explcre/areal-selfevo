@@ -72,6 +72,15 @@ class ApplyStats:
             out one-hot is an ARGMAX run wearing a mixture label, and mass alone cannot
             distinguish the two: eight one-hot RL groups and eight half-RL/half-SFT groups
             both put mass on more than one mode across the batch.
+        sft_excluded_rows: Rows that sat in a group carrying SFT mass and did NOT receive
+            the constant because ``sft_rows`` withheld it. 0 whenever ``sft_rows`` is None,
+            which is the default and what every run before that argument existed did.
+
+            Reported because the withholding is otherwise invisible: a run configured to
+            exclude truncated rows cannot be distinguished from one where the exclusion
+            never fired unless the count is on the panel -- and it CAN legitimately be zero,
+            since a routed arm measured on 2026-09-01 had only six non-terminating rollouts
+            in 1024.
     """
 
     counts: dict[str, float]
@@ -79,6 +88,7 @@ class ApplyStats:
     n_groups: int
     n_rows: int
     mixed_groups: int = 0
+    sft_excluded_rows: int = 0
 
     def as_metrics(self) -> dict[str, float]:
         """Flat metrics, prefixed so they do not collide with the actor's own keys.
@@ -92,6 +102,12 @@ class ApplyStats:
         :attr:`mixed_groups` is NOT emitted here. Adding a key would make an argmax run's
         key set differ from a mixture run's, so the actor logs it separately and logs it on
         BOTH branches.
+
+        :attr:`sft_excluded_rows` is NOT emitted here either, and for a second reason on top
+        of that one: the fixed solved/unsolved rule in the actor never builds an
+        :class:`ApplyStats` at all, so a key emitted from here would exist on the router arm
+        and be missing from the rule arm. The actor logs ``route/sft_excluded_rows`` on
+        every branch instead.
         """
         out = {f"route/{m}_groups": float(n) for m, n in self.counts.items()}
         out["route/changed_row_fraction"] = self.changed_rows / max(self.n_rows, 1)
@@ -106,6 +122,7 @@ def apply_decisions(
     modes: list[str],
     *,
     sft_weight: float,
+    sft_rows: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, ApplyStats]:
     """Apply one mode per group to the advantage tensor.
 
@@ -119,6 +136,32 @@ def apply_decisions(
         sft_weight: Magnitude written for an SFT group. Must be finite and >= 0: SFT is
             training toward a target believed correct, and a negative weight would train
             away from it.
+        sft_rows: Optional ``(B,)`` per-ROW veto on the SFT constant. A row whose entry is
+            falsy does not receive it and its advantages survive exactly as they arrived,
+            i.e. that row falls back to RL. ``None`` (the default) means every row is
+            eligible, which is what every run before this argument existed did.
+
+            The rows a caller withholds from are TRUNCATED rollouts. Such a rollout grades
+            WRONG, so it earns a negative group-normalised advantage, and the SFT constant
+            overwrites that with a positive one -- over more tokens than any other row in
+            its group, since a token-mean loss gives a row at the generation cap ~2.5x the
+            gradient mass of a terminating one. The row the update is least entitled to
+            reinforce is the one the constant reinforces hardest.
+
+            The ORIGINAL argument for this was different and has been refuted: that a
+            truncated rollout carries no EOS, so the constant erodes termination. Measured
+            2026-09-01, the EOS hazard does not erode under routing -- it strengthens
+            monotonically, 0.99754 -> 0.99979, body hazard below 5e-7. The overwritten
+            advantage above survives that refutation; the erosion story does not. See
+            ``GroupRoutingConfig.exclude_truncated_from_sft`` for the full record.
+
+            A veto, not a SKIP: leaving the row alone is the ABSENCE of an intervention,
+            whereas zeroing it would delete the RL signal the row still carries -- for a
+            truncated rollout, the negative group-normalised advantage that its wrong grade
+            earned, which is precisely the counterweight the constant was overwriting.
+
+            Only the SFT write is vetoed. SKIP still zeroes, because SKIP is not the
+            positive constant and the mechanism above is specific to that constant's sign.
 
     Returns:
         ``(advantages, stats)``. The input tensor is not modified in place -- the caller may
@@ -127,8 +170,8 @@ def apply_decisions(
 
     Raises:
         ValueError: On a shape or rank mismatch, a non-floating-point advantage tensor, a
-            grouping that does not partition the batch, an unknown or unsupported mode, or a
-            negative or non-finite ``sft_weight``.
+            grouping that does not partition the batch, an unknown or unsupported mode, a
+            negative or non-finite ``sft_weight``, or an ``sft_rows`` that is not ``(B,)``.
     """
     if advantages.shape != loss_mask.shape:
         raise ValueError(
@@ -177,10 +220,25 @@ def apply_decisions(
             "silently treating it as SKIP would report a distillation arm that never ran."
         )
 
+    allow = None
+    if sft_rows is not None:
+        if sft_rows.dim() != 1 or int(sft_rows.shape[0]) != b:
+            raise ValueError(
+                f"sft_rows must have shape ({b},), got {tuple(sft_rows.shape)}: it is "
+                "indexed by ROW alongside the advantage tensor, so a mismatched one either "
+                "broadcasts over the wrong axis or vetoes rows other than the ones asked "
+                "for -- and both fail silently"
+            )
+        # (B, 1) so it broadcasts against a group's (g, T) block, and BOOL: the veto is a
+        # yes/no about a row. A float veto would scale the constant instead of withholding
+        # it, which is a second undeclared magnitude rather than an exclusion.
+        allow = sft_rows.to(torch.bool).reshape(-1, 1)
+
     out = advantages.clone()
     mask = loss_mask.to(out.dtype)
     counts = {m: 0 for m in _APPLIED}
     changed = 0
+    excluded = 0
     start = 0
     for g, mode in zip(group_sizes, modes):
         sl = slice(start, start + g)
@@ -202,9 +260,20 @@ def apply_decisions(
         # prompt positions (measured: -0.87 there for an informative group) in a tensor the
         # caller still holds.
         new = torch.where(m != 0, written, before)
+        if allow is not None and mode == TrainingMode.SFT:
+            # Applied to the RESULT rather than folded into the `where` above, so that with
+            # sft_rows=None -- the default -- the write above is textually and numerically
+            # the code every prior run executed, and the rollback claim does not rest on two
+            # expressions agreeing.
+            row_ok = allow[sl]
+            excluded += int((~row_ok).sum())
+            new = torch.where(row_ok, new, before)
         changed += int((before != new).any(dim=-1).sum())
         out[sl] = new
     return out, ApplyStats(
+        sft_excluded_rows=excluded,
+        # Keyword order is irrelevant to the call and load-bearing to
+        # selfevo/tests/mutate_group_apply.py, which anchors on the next line verbatim.
         counts=counts, changed_rows=changed, n_groups=len(group_sizes), n_rows=b
     )
 
@@ -286,6 +355,7 @@ def apply_mixtures(
     mixtures: Sequence[Mapping[str, float]],
     *,
     sft_weight: float,
+    sft_rows: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, ApplyStats]:
     """Apply a WEIGHTED MIXTURE of modes per group to the advantage tensor.
 
@@ -324,6 +394,16 @@ def apply_mixtures(
         sft_weight: Magnitude of the SFT component at full weight, i.e. the value written
             when ``b == 1``. Must be finite and >= 0, for the reason given in
             :func:`apply_decisions`.
+        sft_rows: Optional ``(B,)`` per-ROW veto on the SFT constant, with the meaning and
+            the measured justification given in :func:`apply_decisions`. It is passed
+            straight through to both extremes, so the reduction holds here too: a one-hot
+            SFT mixture on a vetoed row produces the same tensor AND the same
+            ``sft_excluded_rows`` as the hard path.
+
+            On a genuinely MIXED group the veto makes the SFT component a no-op rather than
+            a zero, exactly as it does on the hard path, so a row with ``{rl: a, sft: b}``
+            comes out at ``(a + b) * original``: the withheld share reverts to leaving the
+            row alone, which is what "do not apply the constant here" means.
 
     Returns:
         ``(advantages, stats)``. The caller's tensor is not modified in place. In the
@@ -357,6 +437,7 @@ def apply_mixtures(
     base, _ = apply_decisions(
         advantages, loss_mask, group_sizes,
         [TrainingMode.RL] * n_decisions, sft_weight=sft_weight,
+        sft_rows=sft_rows,
     )
     # The SFT extreme is built LAZILY, on the first group that actually carries SFT mass.
     # Building it eagerly made this function RAISE where apply_decisions succeeds: an all-SFT
@@ -369,9 +450,13 @@ def apply_mixtures(
     # redundant clone. The caller's tensor is never touched.
     out = base
     mask = loss_mask.to(out.dtype)
+    # Already validated by the RL-extreme call above, so a malformed sft_rows is refused by
+    # the single guard in apply_decisions rather than by a second copy of it here.
+    allow = None if sft_rows is None else sft_rows.to(torch.bool).reshape(-1, 1)
     mass = {m: 0.0 for m in _APPLIED}
     mixed = 0
     changed = 0
+    excluded = 0
     start = 0
     for g, w in zip(group_sizes, weights):
         rows = slice(start, start + g)
@@ -411,10 +496,17 @@ def apply_mixtures(
                 sft_only, _ = apply_decisions(
                     advantages, loss_mask, group_sizes,
                     [TrainingMode.SFT] * n_decisions, sft_weight=sft_weight,
+                    sft_rows=sft_rows,
                 )
             # No `b == 1.0` special case: `1.0 * x` is bit-preserving for every value a
             # float can hold, so a shortcut here would be code no test could distinguish.
             terms.append(b * sft_only[rows])
+            if allow is not None:
+                # Rows in a group carrying SFT mass whose share of the constant was
+                # withheld. Counted per group, like changed_rows and for the same reason:
+                # for a ONE-HOT sft decision this has to equal what apply_decisions reports,
+                # or the reduction claim would hold of the tensor but not of the stats.
+                excluded = excluded + int((~allow[rows]).sum())
         if not terms:
             blended = torch.zeros_like(block)          # pure SKIP: c * 0
         elif len(terms) == 1:
@@ -437,4 +529,5 @@ def apply_mixtures(
         n_groups=len(group_sizes),
         n_rows=int(advantages.shape[0]),
         mixed_groups=mixed,
+        sft_excluded_rows=excluded,
     )

@@ -65,6 +65,116 @@ def _infer_prompt_lens(
     return torch.where(has_gen, first_gen_idx, attention_mask.long().sum(-1))
 
 
+def _truncated_rows(loss_mask: torch.Tensor, max_new_tokens: int) -> torch.Tensor:
+    """Per-row mask: True where the rollout hit the generation cap instead of terminating.
+
+    Args:
+        loss_mask: ``(B, T)``, non-zero on response tokens. EITHER coordinate convention
+            works. ``torch.roll`` permutes positions within a row, so the per-row SUM read
+            here is invariant under the ``shifts=-1`` roll ``_compute_advantages`` applies
+            -- a row's response LENGTH is not a coordinate, which is what makes this signal
+            immune to the emitter/token off-by-one documented in that method.
+        max_new_tokens: The generation cap the rollout was produced under,
+            i.e. ``PPOActorConfig.max_new_tokens``.
+
+    Returns:
+        ``(B,)`` bool, True where the response reached the cap.
+
+    Why the cap and not ``seq_no_eos_mask`` / ``no_eos_ratios``: both of those compare
+    ``attention_mask.sum(-1)`` to ``attention_mask.shape[-1]``, i.e. a sequence's length to
+    the PADDED BATCH WIDTH. A row is flagged only when it happens to be the longest row in
+    its own padded batch, so ``no_eos_ratios`` counted about one row per batch of 512 and
+    read 0.002-0.005 at every step of four runs -- there is no usable training-time
+    truncation rate anywhere in those logs. Padding is not what stops a generation; the cap
+    is. ``no_eos_ratios`` is deliberately left alone rather than redefined, because it has
+    run history under its current meaning.
+
+    ``loss_mask.sum(-1)`` is already this repo's response length, compared against exactly
+    this cap in two other places: ``reward_overlong_penalty`` measures overlong-ness with
+    ``data["loss_mask"].sum(dim=-1)`` against ``max_response_length=config.max_new_tokens``,
+    and ``selfevo.observability.group_features`` counts a response of exactly
+    ``max_response_len`` as truncated (``ln >= max_response_len``). This uses the same
+    comparison so a row cannot be truncated by one of them and not the other.
+
+    It matters because a truncated rollout grades WRONG, so it earns a negative
+    group-normalised advantage that the routed SFT constant then overwrites with a positive
+    one -- over more tokens than any other row in its group, since the token-mean loss gives
+    a row at the cap ~2.5x the gradient mass of a terminating one. An earlier version of this
+    docstring rested instead on the EOS hazard eroding under routing; that was measured
+    directly on 2026-09-01 and REFUTED (the hazard strengthens monotonically, 0.99754 ->
+    0.99979, body hazard <5e-7). The advantage being overwritten survives that refutation;
+    the eroding-termination story does not.
+
+    It is also the missing instrument in its own right. Every routed arm should be logging a
+    truncation rate whether or not it acts on one, and until now none could.
+
+    Raises:
+        ValueError: If ``max_new_tokens`` is not at least 1. Without a cap there is no
+            truncation to detect, and answering "nothing is truncated" would report an
+            exclusion arm that excluded nothing. ``group_features`` refuses the same input
+            for the same reason.
+    """
+    if max_new_tokens is None or int(max_new_tokens) < 1:
+        raise ValueError(
+            f"max_new_tokens must be >= 1 to detect truncation, got {max_new_tokens}: "
+            "without a cap every row would report as terminated, and an exclusion arm that "
+            "excluded nothing would be indistinguishable from one that was never enabled"
+        )
+    return loss_mask.sum(dim=-1) >= int(max_new_tokens)
+
+
+def _recentre_advantages(
+    advantages: torch.Tensor, loss_mask: torch.Tensor
+) -> tuple[torch.Tensor, float, float]:
+    """Subtract the batch's masked-mean advantage, restoring GRPO's zero-mean invariant.
+
+    Args:
+        advantages: ``(B, T)`` advantage field, AFTER every routing write.
+        loss_mask: ``(B, T)`` in EMITTER coordinates -- the rolled mask
+            ``_compute_advantages`` writes to ``data["loss_mask"]`` and ``grpo_loss_fn``
+            reads. The mean has to be taken over the positions the loss will actually sum,
+            or the number corrected is not the number that misbehaved.
+
+    Returns:
+        ``(advantages, mean_before, mean_after)``. The input is not modified in place.
+        ``mean_after`` is returned rather than assumed to be 0.0 so a run LOGS the residual
+        instead of a constant: it is the only evidence on the panel that the subtraction
+        actually landed on the field the loss reads.
+
+    GRPO advantages are zero-mean by construction; a constant written over whole groups
+    breaks that. Measured 2026-08-31 the mean advantage was -0.0004 and +0.0136 for two
+    unrouted arms against +0.1579, +0.1675 and +0.8979 for three routed ones, and all three
+    routed arms broke off their length plateau while none of the three unrouted ones ever
+    did. The dose-response that once accompanied this -- larger offset, earlier knee -- was
+    RETRACTED on 2026-09-01: 0.5 gave onsets at 132 and 144 and 2.0 gave 131, so magnitude
+    does not shift onset at n=3. Presence still separates 3/3 from 0/3, and the invariant is
+    the argument regardless. Nothing bounded the constant either way: the PPO clip is inert
+    at ``ppo_n_minibatches=1`` with ``recompute_logprob`` and ``use_decoupled_loss``, where
+    the importance ratio is exactly 1.0.
+
+    Subtracting a CONSTANT preserves every relative difference between two advantages, which
+    is the entire content of a policy gradient, so this removes the DC offset without
+    touching what routing decided. It is applied to the masked positions ONLY: the actor
+    leaves real GAE values on prompt positions (measured -0.87 for an informative group),
+    the loss never reads them, and shifting them would silently alter a tensor other code
+    still inspects.
+
+    The reduction runs in float64. The quantity being measured is a near-cancelling sum over
+    ~5e5 elements whose informative digits are at 1e-4 to 1e-1, which is where a float32
+    accumulation loses them.
+    """
+    keep = loss_mask != 0
+    if not bool(keep.any()):
+        # No response tokens anywhere: there is no mean to subtract, and inventing one would
+        # write NaN across the batch.
+        return advantages, 0.0, 0.0
+    before = float(advantages[keep].to(torch.float64).mean())
+    shift = torch.tensor(before, dtype=advantages.dtype, device=advantages.device)
+    out = torch.where(keep, advantages - shift, advantages)
+    after = float(out[keep].to(torch.float64).mean())
+    return out, before, after
+
+
 class PPOActor:
     def __init__(self, config: PPOActorConfig, engine: TrainEngine):
         self.config = config
@@ -190,7 +300,7 @@ class PPOActor:
     def compute_advantages(self, data: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return batched_call(self._compute_advantages, data, pass_meta=True)
 
-    def _route_groups(self, gr, data, raw_reward, advantages, sizes):
+    def _route_groups(self, gr, data, raw_reward, advantages, sizes, *, sft_rows=None):
         """Route every group with a configured Router and apply the decisions.
 
         Built once and cached on ``self``: a learned router carries state between batches, so
@@ -204,6 +314,10 @@ class PPOActor:
                 does not.
             advantages: Current advantage tensor.
             sizes: Row counts per group.
+            sft_rows: Optional ``(B,)`` per-row veto on the SFT constant, forwarded verbatim
+                to the apply seam. ``None`` -- the default -- means every row is eligible,
+                which is what every run before ``group_routing.exclude_truncated_from_sft``
+                existed did.
 
         Returns:
             The advantage tensor after applying one decision per group. Under
@@ -378,6 +492,7 @@ class PPOActor:
                 list(sizes),
                 mixtures,
                 sft_weight=float(gr.solved_advantage),
+                sft_rows=sft_rows,
             )
         else:
             routed, stats = apply_decisions(
@@ -386,6 +501,7 @@ class PPOActor:
                 list(sizes),
                 modes,
                 sft_weight=float(gr.solved_advantage),
+                sft_rows=sft_rows,
             )
         stats_tracker.scalar(**stats.as_metrics())
         # How many decisions were genuinely mixed. Logged on BOTH branches -- it is 0 by
@@ -394,6 +510,15 @@ class PPOActor:
         # decisions is an argmax run wearing a mixture label, and this is the only number
         # that says so.
         stats_tracker.scalar(**{"route/mixed_groups": float(stats.mixed_groups)})
+        # Rows routed to SFT that did NOT receive the constant because they never
+        # terminated. Logged on BOTH branches and whether or not the exclusion is switched
+        # on -- it is 0.0 when it is off -- so the two arms emit the SAME key set, and the
+        # fixed-rule branch in _compute_advantages emits this key too. A knob whose effect
+        # cannot be seen in the logs is untestable in a real run, and this is the only
+        # number that says whether the exclusion reached anything.
+        stats_tracker.scalar(
+            **{"route/sft_excluded_rows": float(stats.sft_excluded_rows)}
+        )
         if not use_prompt_credit and hasattr(router, "observe"):
             self._selfevo_pending = (
                 {f"{step}:{i}": m for i, m in enumerate(modes)},
@@ -645,27 +770,82 @@ class PPOActor:
                 # A solved group's advantages are identically zero, so ADDING a positive
                 # constant to them is exactly SFT on that group's own correct samples: the
                 # policy-gradient step maximising log p(y) for a sampled y is the supervised
-                # step on y, and on-policy the importance ratio is 1. PPO's clip still
-                # bounds how far one update can sharpen an already-correct policy, which is
-                # the failure mode this is most likely to provoke.
+                # step on y, and on-policy the importance ratio is 1. NOTHING BOUNDS IT:
+                # an earlier version of this comment claimed PPO's clip still limits how far
+                # one update can sharpen an already-correct policy, and that is FALSE in this
+                # configuration. With ppo_n_minibatches=1, recompute_logprob and
+                # use_decoupled_loss the ratio is exactly 1, so importance_weight was
+                # avg=min=max=1.0 and clip_ratio 0.0 at every step of four runs. These are
+                # unclipped REINFORCE updates, which is the reason group_routing.zero_mean
+                # below exists at all.
                 #
                 # The weights default to 0.0 and the feature defaults to disabled, so
                 # rollback is exact: adding 0.0 to a zero tensor changes no bit.
                 gr = getattr(self.config, "group_routing", None)
-                if gr is not None and getattr(gr, "enabled", False) and getattr(gr, "router", None):
+                # Whether routing runs at all. Bound to a local rather than spelled out
+                # inline a second time: selfevo/tests/mutate_group_routing.py anchors on the
+                # enabled-flag test below as a literal string and skips the mutation, silently,
+                # if that string stops being unique in this file.
+                routing_on = gr is not None and getattr(gr, "enabled", False)
+                sft_rows = None
+                sft_excluded = 0
+                if routing_on:
+                    # Which rows never terminated. Computed whether or not the exclusion is
+                    # switched on, and LOGGED either way: no_eos_ratios in the update path
+                    # is measured against the padded batch width and reads 0.002-0.005, so
+                    # this is the only correct training-time truncation rate a routed run
+                    # emits -- and the exclusion count below is uninterpretable without it.
+                    #
+                    # Emitted from HERE rather than from the apply seam, so it reaches the
+                    # fixed-rule arm too. That arm previously emitted no route/* key at all
+                    # (sa2 is a routed run with an empty route/ namespace), which is recorded
+                    # in EXPERIMENTS.md as a trap: routing status had to be read from the
+                    # config because the metrics could not be trusted to show it. These three
+                    # keys are emitted on BOTH branches for that reason.
+                    truncated = _truncated_rows(
+                        data["loss_mask"], self.config.max_new_tokens
+                    )
+                    stats_tracker.scalar(
+                        **{
+                            "route/truncated_row_fraction": float(
+                                truncated.float().mean()
+                            )
+                        }
+                    )
+                    # The veto on the positive SFT constant. A truncated rollout grades
+                    # wrong and so earns a NEGATIVE group-normalised advantage, which the
+                    # constant overwrites with a positive one, over more tokens than any
+                    # other row in its group. None -- the default -- is what every prior
+                    # run did.
+                    if getattr(gr, "exclude_truncated_from_sft", False):
+                        sft_rows = ~truncated
+                if routing_on and getattr(gr, "router", None):
                     # A Router decides the mode for EVERY group from observability features,
                     # rather than the fixed rule below deciding for the silent ones only.
                     # This is the seam that makes router=contextual and router=code_policy
                     # real arms instead of registry entries.
-                    advantages = self._route_groups(gr, data, raw_reward, advantages, sizes)
+                    advantages = self._route_groups(
+                        gr, data, raw_reward, advantages, sizes, sft_rows=sft_rows
+                    )
                     data["advantages"] = advantages
                 elif gr is not None and getattr(gr, "enabled", False):
                     sizes_t = torch.tensor(sizes, device=advantages.device)
                     row_adv = torch.zeros(bs, device=advantages.device, dtype=advantages.dtype)
                     if gr.solved_advantage != 0.0:
-                        row_adv = row_adv + torch.repeat_interleave(
+                        solved_rows = torch.repeat_interleave(
                             silent * solved, sizes_t
                         ).to(row_adv.dtype) * gr.solved_advantage
+                        if sft_rows is not None:
+                            # Same veto as the router branch, on the same rows, for the same
+                            # measured reason. Only the SOLVED (positive, SFT) component is
+                            # withheld: unsolved_advantage is unlikelihood on known-wrong
+                            # samples and pushes the opposite way, so it is not the constant
+                            # truncated rows carry.
+                            sft_excluded = int(
+                                ((solved_rows != 0) & (~sft_rows)).sum()
+                            )
+                            solved_rows = solved_rows * sft_rows.to(row_adv.dtype)
+                        row_adv = row_adv + solved_rows
                     if gr.unsolved_advantage != 0.0:
                         row_adv = row_adv + torch.repeat_interleave(
                             silent * unsolved, sizes_t
@@ -677,6 +857,52 @@ class PPOActor:
                         data["advantages"] = advantages
                     stats_tracker.scalar(
                         routed_group_fraction=float((row_adv != 0).float().mean()),
+                    )
+                    # Same key the router branch emits, so the rule arm and the router arm
+                    # stay readable on one panel.
+                    stats_tracker.scalar(
+                        **{"route/sft_excluded_rows": float(sft_excluded)}
+                    )
+                if routing_on:
+                    # The DC offset on the advantage field, measured ONCE after every group
+                    # write, over the WHOLE batch, against the EMITTER-coordinate mask --
+                    # the local `loss_mask` rolled at the top of this method, which is what
+                    # is written to data["loss_mask"] below and what grpo_loss_fn reads.
+                    #
+                    # That is deliberately NOT the mask the group writes above were bounded
+                    # by. Those pass data["loss_mask"], still in TOKEN coordinates here
+                    # because the rolled mask is written back further down, so each write
+                    # lands one position out. That off-by-one is left exactly as it is:
+                    # correcting it would change every routed run's numbers with both of
+                    # these flags off, silently redefining the arms the measurements above
+                    # are anchored to. It is an independent defect and wants its own flag
+                    # and its own commit. Re-centring against the mask the LOSS reads is
+                    # correct regardless of it, because the invariant worth restoring is the
+                    # one over the positions the loss actually sums.
+                    recentred, adv_mean_before, adv_mean_after = _recentre_advantages(
+                        advantages, loss_mask
+                    )
+                    if getattr(gr, "zero_mean", False):
+                        # Chained rather than two statements, and that is not cosmetic:
+                        # selfevo/tests/mutate_group_routing.py anchors on a 24-space
+                        # `data["advantages"] = advantages`, and a second one here would make
+                        # that anchor ambiguous, which the harness reports as a SURVIVOR.
+                        advantages = data["advantages"] = recentred
+                    else:
+                        # The field is untouched, so the mean the loss will see is the mean
+                        # it already had. Reported rather than omitted: a key that appears
+                        # only in the corrected arm makes the two unreadable on one panel,
+                        # and the UNCORRECTED offset is the diagnostic that identified this
+                        # failure in the first place -- -0.0004 and +0.0136 for two
+                        # unrouted arms against +0.1579, +0.1675 and +0.8979 for three
+                        # routed ones, all three of which broke off their length plateau
+                        # (onsets 144, 132, 131) while none of the unrouted arms ever did.
+                        adv_mean_after = adv_mean_before
+                    stats_tracker.scalar(
+                        **{
+                            "route/adv_mean_before": adv_mean_before,
+                            "route/adv_mean_after": adv_mean_after,
+                        }
                     )
             else:
                 # A mismatch means the rows were regrouped somewhere between rollout and

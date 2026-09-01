@@ -1821,6 +1821,93 @@ class GroupRoutingConfig:
             to ``"mixture"`` today produces a run bit-identical to ``"argmax"``, with
             ``route/mixed_groups`` at 0.0. The plumbing is real and tested; a router that uses
             it is not yet written.
+        zero_mean: Re-centre the advantage field after ALL routing writes, so the batch
+            returns to zero mean over the tokens the loss actually reads.
+
+            MEASURED 2026-08-31. GRPO advantages are zero-mean by construction and the
+            routed constant breaks that: mean ``advantages/avg`` over a run was -0.0004 and
+            +0.0136 for two UNROUTED arms against +0.1579, +0.1675 and +0.8979 for three
+            routed ones, and all three routed arms broke off their length plateau while none
+            of the three matched unrouted arms ever did.
+
+            REFINED 2026-09-01, and one half of that is retracted. Routing PRESENCE separates
+            crossers from non-crossers perfectly, 3/3 against 0/3. Routing MAGNITUDE does not
+            predict onset: a constant of 0.5 gave onsets at 132 and 144 while a constant of
+            2.0 gave 131. So the earlier "larger offset, earlier knee" dose-response is NOT
+            supported at n=3 and is not the argument for this flag. The argument is the
+            invariant itself -- a routed batch no longer satisfies the zero-mean property
+            every GRPO derivation assumes, and this restores it -- with the offset's
+            correlation with crossing as supporting, not decisive, evidence.
+
+            Nothing else bounds the constant either way: with ``ppo_n_minibatches: 1``,
+            ``recompute_logprob: true`` and
+            ``use_decoupled_loss: true`` the importance ratio is exactly 1, so
+            ``importance_weight`` was avg=min=max=1.0 and ``clip_ratio`` 0.0 across every
+            step of four runs. The PPO clip is INERT and these are unclipped REINFORCE
+            updates.
+
+            Subtracting the batch's masked-mean advantage removes exactly that DC offset and
+            nothing else. It is a CONSTANT shift on the valid positions, so every RELATIVE
+            difference between two advantages -- the entire content of a policy gradient --
+            survives untouched, and a routed group keeps the separation from its neighbours
+            that the routing created.
+
+            Applied ONCE, after every group has been written, and over the WHOLE batch. Not
+            per group: per-group centring would re-zero each SFT group it had just written
+            and erase the between-group differences routing exists to create, which is a
+            different intervention wearing this one's name.
+
+            The mean is taken over ``loss_mask != 0`` in EMITTER coordinates -- the mask
+            ``PPOActor._compute_advantages`` writes back to ``data`` and ``grpo_loss_fn``
+            reads -- because the invariant worth restoring is the one over the positions the
+            loss actually sums. That is deliberately NOT the mask the group writes are
+            bounded by; see the note on the coordinate off-by-one in
+            ``PPOActor._compute_advantages``.
+
+            False by default, which leaves the update bit-identical.
+        exclude_truncated_from_sft: Withhold the positive SFT constant from rows that did
+            NOT terminate, i.e. whose response reached ``actor.max_new_tokens``.
+
+            MEASURED 2026-08-31, then partly REFUTED 2026-09-01. Read both before turning
+            this on, because the second measurement removes the headline reason and leaves a
+            narrower one.
+
+            What was argued: EOS is inside the masked region and DOES receive the constant,
+            so for a TERMINATED rollout the push on its R-1 non-EOS tokens and the push on
+            its EOS roughly cancel to first order. A TRUNCATED rollout contains no EOS at
+            all, so every one of its token-pushes is "keep going" with no counterweight, and
+            under a token-mean loss such a row carries ~2.5x the gradient mass of a
+            terminating one.
+
+            What was then measured, by teacher-forcing 64 frozen responses through 27
+            checkpoints on both ladders: the EOS hazard does NOT erode under routing. It
+            STRENGTHENS monotonically, 0.99754 -> 0.99979, with body hazard below 5e-7 at
+            every step -- the hazard is a spike at a response's semantic end and that spike
+            never moves. So "the constant erodes termination" is refuted, and so is the case
+            for an explicit termination term, which would be correcting a probability that
+            is already 0.9996 and does not budge.
+
+            What survives, and is the whole reason this flag exists: a truncated rollout
+            GRADES WRONG, so it earns a negative group-normalised advantage -- and the SFT
+            constant OVERWRITES that with a positive one. The row the update is least
+            entitled to reinforce is the row the constant reinforces hardest, and it does so
+            over more tokens than any other row in its group. That is a statement about the
+            advantage the constant replaces, not about ``p_eos``, and the 2026-09-01
+            measurement does not touch it.
+
+            Expect this to reach FEW rows on the configs measured here: ``ctx``'s
+            non-terminating rate peaks at 0.0059, six rollouts in 1024. It matters where
+            truncation is actually common -- 15.6% on ``step0b``, ~50% for a 30B reasoning
+            model on MATH-500 at the shipped cap -- and ``route/truncated_row_fraction`` is
+            emitted by every routing-enabled run whether or not this flag is set, so a run
+            says which case it is in before anyone turns this on.
+
+            An excluded row is left ALONE, not skipped. It keeps whatever RL advantage it
+            arrived with, because zeroing it would be a second intervention rather than the
+            absence of one, and that advantage is exactly the negative signal the constant
+            was overwriting.
+
+            False by default, which leaves the update bit-identical.
 
     Raises:
         ValueError: If either weight has the wrong sign, which is a footgun rather than a
@@ -1836,6 +1923,8 @@ class GroupRoutingConfig:
     router: str | None = None
     credit: str = "batch"
     decision: str = "argmax"
+    zero_mean: bool = False
+    exclude_truncated_from_sft: bool = False
 
     def __post_init__(self):
         if self.credit not in ("batch", "prompt", "prompt_centered"):
