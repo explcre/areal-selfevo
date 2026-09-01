@@ -3,6 +3,48 @@
 Measured results and negative results, newest first. A claim only belongs here once it has
 been observed end to end; a prediction belongs in GOAL.md until then.
 
+## 2026-09-01 — The LoRA ladder REPLICATES at a 4x budget, and a confound appears
+
+The 4096 ladder was re-run at 16384 to drop the noise floor. Truncation fell from ~40% to ~13%
+as intended, every rung graded 500/500 with zero failures, and **the shape reproduced**.
+
+| step | acc @4096 | trunc | **acc @16384** | **trunc** |
+|---|---|---|---|---|
+| base | 0.6520 | 41.2% | running | -- |
+| 24 | 0.6600 | 41.0% | 0.8680 | 15.0% |
+| 49 | 0.6660 | 39.2% | 0.8720 | 15.0% |
+| 74 | 0.6720 | 40.2% | 0.8880 | 12.8% |
+| 99 | 0.6700 | 39.8% | 0.8800 | 13.2% |
+| 115 | 0.6680 | 38.6% | 0.8740 | 14.2% |
+| 124 | 0.6720 | 40.4% | 0.8880 | 12.6% |
+| **149** | **0.6840** | 39.4% | **0.9000** | **11.4%** |
+| 174 | 0.6760 | 40.8% | 0.8820 | 13.2% |
+
+**Same peak at 149, same dip at 174, same span of +0.032 from step 24.** Two ladders at
+budgets differing 4x, with truncation differing 3x, producing the same ordering and the same
+magnitude. A replication at a different operating point is worth more than either ladder alone.
+
+**Still not significant as a single pair.** At p~0.88 and n=500 the standard error of one
+accuracy is 0.0145, so a difference of two runs carries ~0.021; +0.032 gives z ~ 1.56. What
+carries the weight is the near-monotone ordering appearing twice independently, not the delta.
+
+### The confound, stated rather than buried
+
+**Truncation falls along the ladder: 15.0% at step 24 to 11.4% at step 149.** Later checkpoints
+are cut off less often, so part of the accuracy gain could be "fewer answers truncated" rather
+than "more answers right". This is a DIFFERENTIAL confound, unlike the constant one at 4096, and
+it is exactly what I said would invalidate the ladder if it appeared.
+
+Two things argue it is not the whole story. The 4096 ladder shows the same +0.032 while its
+truncation moves only 41.0% -> 39.4%, a 1.6-point drift against 3.6 points at 16384; if the gain
+were truncation-driven, the ladder whose truncation moved LESS should show a SMALLER gain, and it
+does not. And the direction is itself a finding: the model is getting **more concise** as training
+proceeds, which is the opposite of the length explosion the routed 1.5B arms produced.
+
+**Settling it needs a cap where truncation is ~0 on every rung.** At 32768 the same base
+truncated 11.4% on MATH-500, so even that is not clean; 65536 would be. That is the measurement
+that converts this from a suggestive replication into a claim.
+
 ## 2026-09-01 — The 30B LoRA ladder, WITH its baseline: the feared degradation is absent
 
 Eight adapter checkpoints plus the adapter-free base, all on held-out MATH-500 at a matched
