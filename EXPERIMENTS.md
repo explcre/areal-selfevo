@@ -3,6 +3,62 @@
 Measured results and negative results, newest first. A claim only belongs here once it has
 been observed end to end; a prediction belongs in GOAL.md until then.
 
+## 2026-08-31 — BOTH credit signals collapse. The cause is the routed SFT constant, and the step-149 nulls were measured on pre-collapse models
+
+The discriminating measurement. `ctx2` and `ctxpcc` both ran 290 steps and differ ONLY in the
+credit signal. Same checkpoint step, same caps, same scorer the base model passed at 1/30.
+
+| arm | credit | MATH-500 | truncated |
+|-----|--------|----------|-----------|
+| `ctx2` | **batch** | 0.1880 | **489/500 (97.8%)** |
+| `ctxpcc` | **prompt_centered** | 0.2560 | **500/500 (100%)** |
+
+AMC23 0.0000 vs 0.0500; AIME 0.0000 for both.
+
+**Both collapse.** So per-prompt credit is NOT the cause -- the cause is what the two share:
+the routed SFT constant written onto solved groups. Batch credit is if anything slightly worse
+on accuracy (0.188 vs 0.256).
+
+### This overturns the headline finding of the day
+
+Result 7 recorded "three credit signals, three very different training trajectories, ONE
+identical capability outcome" from checkpoints at **step 149**. That comparison is now known to
+have been taken on **pre-collapse models**. `ctx` at 149 scored 0.5240 with 39/500 truncation;
+the same arm at 289 scores 0.1880 with 489/500.
+
+So the correct statement is not "the intervention does nothing". It is:
+
+> **The intervention has a large effect that takes ~200 steps to appear, and the effect is to
+> destroy the model's ability to terminate.** Every arm measured at 149 was measured before its
+> own collapse.
+
+### What this retires and what it establishes
+
+* **`solved_advantage=0.5` is not "inert".** It was recorded as inert at 0.5 and harmful at 2.0
+  from short runs. It is slow-acting: harmful at 0.5 too, given enough steps. The earlier
+  scoping was a function of run length, not of the constant.
+* **The credit-assignment work is not the explanation of the nulls.** It remains a correct
+  analysis of why the ROUTER did not learn a preference, but the capability nulls have a
+  different and larger cause.
+* **The seam has more leverage than any measurement suggested.** It can take a model from 0.52
+  to 0.19 on MATH-500. Nothing else in this project moved that benchmark by more than 0.010.
+
+### Mechanism, still hypothesised
+
+SFT here adds a positive constant to the advantages of a solved group's response tokens, which
+raises the likelihood of exactly the tokens that were produced, with **no term anywhere
+rewarding EOS**. Run long enough with a large share of groups routed to SFT, "never stop" is
+consistent with what is being optimised. The collapse being abrupt (truncation 4/60 at step 199,
+59/60 at 224) suggests a threshold rather than pure erosion. NOT established.
+
+### What must now be re-run before anything is claimed
+
+Every arm comparison in this project used step-149 checkpoints. Those are pre-collapse for
+`ctx` and `ctxpcc` and unknown for `rnd`. **`rnd149` is the control and it must be checked at
+289 too** -- if the random-proportions control also collapses, the cause is the SFT constant
+appearing in ANY routed arm; if it does not, the collapse needs the router's specific mode
+distribution. That is the next measurement.
+
 ## 2026-08-31 — The collapse is ABRUPT, and it happens between step 149 and 224
 
 Same checkpoint sweep, same 60-problem MATH-500 slice, same scoring path the base model passed
