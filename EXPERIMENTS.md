@@ -3,6 +3,33 @@
 Measured results and negative results, newest first. A claim only belongs here once it has
 been observed end to end; a prediction belongs in GOAL.md until then.
 
+## 2026-09-01 — The cap-precedence bug was corrupting every frontier number, by 3x on AIME
+
+`resolve_params` applied `BENCH_OVERRIDES` unconditionally, so an explicit `--max-tokens`
+was discarded silently. Every 30B number scored through that path is a property of the token
+budget, not of the model. Re-scored after fixing precedence, same model, same server, same
+concurrency, same grader -- only the cap actually reaching the sampler:
+
+| bench | cap ASKED | cap USED (before) | acc before | cap USED (after) | acc after | trunc before -> after |
+|---|---|---|---|---|---|---|
+| aime24 | 32768 | 8192 | 0.2667 | 32768 | **0.8000** | 73.3% -> 20.0% |
+| aime25 | 32768 | 8192 | 0.2667 | 32768 | **0.7000** | 73.3% -> 20.0% |
+
+A 3x swing from a silently-ignored flag. The `NOTE ... BENCH_OVERRIDES default 8192 not
+applied` line now printed by the fixed code is what proves the value reached the sampler,
+rather than merely appearing on the command line -- which it always did.
+
+**Both numbers are still lower bounds**: 20% of AIME generations hit even the 32768 cap and
+were graded wrong. And olympiadbench carries a second, unrelated lower-bound caveat -- 94 of
+675 problems have multiple gold answers in one string, which exact-match grading marks wrong.
+
+The lesson generalises past this bug. A default table that silently outranks an explicit
+request is indistinguishable from the request being honoured, because the run still succeeds
+and still writes plausible numbers. The only reason this was caught is that the results rows
+record the generation parameters actually used, so the claimed cap could be compared against
+the applied one. Recording the parameters a run used is not bookkeeping; it is the only way a
+cap bug is visible at all.
+
 ## 2026-08-31 — MECHANISM: routing breaks GRPO's zero-mean advantage, and an unrouted control was already in our logs
 
 Code-level analysis. It **refutes my stated hypothesis** while confirming the cause, and it
