@@ -1287,6 +1287,102 @@ mutants. No run reported in this paper enables either. They are code, not result
 makes no measurement of their effect, and the mechanism arguments that motivated them stand
 as arguments.
 
+\subsection{The reporting requirement, and a fourth harness failure that has now recurred}
+\label{sec:reporting}
+
+Sec.~\ref{sec:harness} records three ways this harness produced a number that was not a
+measurement, and Sec.~\ref{sec:noisetrunc} measures how far the same pipeline moves when it
+scores the same checkpoint twice. Read together they settle two things every accuracy in this
+paper depends on: what has to be printed beside a score, and which scores may be compared at
+all. This subsection states both as rules and adds a fourth failure mode --- the only one of
+the four that has now been observed more than once, and on more than one machine.
+
+\paragraph{Comparability is set by truncation, not by a single noise band.} The accidental
+duplicate run of Sec.~\ref{sec:noisetrunc} is the measurement that fixes this: at $\approx
+10\%$ truncation the same checkpoint reproduces to $0.002$--$0.010$, and at $\approx 97\%$
+truncation it moves by $0.024$--$0.026$. Same checkpoints, same matched $16384$ cap, same
+grader; the only thing that differs is how much of the batch the cap is cutting off, and the
+reproducibility differs with it by an order of magnitude. There is therefore no single noise
+floor for this suite to quote, and quoting one would be wrong in both directions at once ---
+too permissive at $10\%$ truncation and far too strict at $97\%$. The operating rule is the
+one Sec.~\ref{sec:noisetrunc} states and this paper applies throughout: \textbf{accuracies
+taken above $\approx 80\%$ truncation are not comparable to one another}, and where two such
+points differ we read the truncation channel instead. The post-transition points of
+Sec.~\ref{sec:transition} are the case that forced the rule, and Sec.~\ref{sec:lora30b} is
+the case where it is comfortably satisfied on both ladders.
+
+\paragraph{(iv) A cap larger than the model's context, recurring across machines.}
+Sec.~\ref{sec:harness}(ii) reports this mode once, on our own re-score of 1.5B checkpoints.
+It has since occurred twice more, inside a single sweep on an independent four-GPU H200 box
+belonging to a collaborator, running a revision of the harness that predates the
+failure-rate abort. That sweep passes a $32768$ cap unconditionally; two of the three models
+it scored have context windows at or below $32768$, one of them $4096$. The server rejected
+every request. Both runs finished in minutes ($5.5$ and $3$), both reported \texttt{acc=nan}
+with \texttt{fail=N/N} on every benchmark in the suite, and the sweep recorded both as
+\textsc{done}. Table~\ref{tab:capcontext} lists the three occurrences.
+
+\begin{table}[t]
+\centering\small
+\caption{Three occurrences of one failure mode: a generation cap larger than the model's
+context window. In every row the server rejected every request, the scorer wrote a
+\texttt{nan} accuracy with a full failure count, and the run was recorded as complete. The
+collaborator's context windows are as recorded in that sweep's models rather than
+re-verified here.}
+\label{tab:capcontext}
+\begin{tabular}{llccl}
+\toprule
+machine & model & context & new tokens asked & reported \\
+\midrule
+ours                        & \texttt{ctx2}/\texttt{rnd} 1.5B ckpts & $32768$      & $32768$ & \texttt{acc=nan}, \texttt{fail=500/500} \\
+collaborator, $4\times$H200 & \texttt{Qwen2.5-32B-Instruct}         & $\le 32768$  & $32768$ & \texttt{acc=nan}, \texttt{fail=N/N}, \textsc{done} \\
+collaborator, $4\times$H200 & \texttt{Qwen2.5-Math-7B-Instruct}     & $4096$       & $32768$ & \texttt{acc=nan}, \texttt{fail=N/N}, \textsc{done} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{The one model in that sweep that did produce numbers is excluded rather than
+reported.} Two independent reasons, either of which is sufficient. Its identity is inferred
+from the ordering and duration of the runs rather than read from a configuration, and this
+paper has already been wrong about what a run was on exactly that kind of evidence
+(Sec.~\ref{sec:lora30b}). And its OlympiadBench row discarded $83$ of $675$ requests
+client-side, $12.3\%$, which makes it the survivor average of Sec.~\ref{sec:survivor} rather
+than a score --- the same construction that overstated our own $65536$ figure by $+0.08$.
+We record the sweep as evidence about the failure mode and take no accuracy from it.
+
+\paragraph{The durable fix is a clamp at startup, not a guard at runtime.} A failure-rate
+abort already exists in this codebase and would have stopped all three runs of
+Table~\ref{tab:capcontext} before either wrote a number: each fails every request, which is
+as far past any threshold as a run can get. It stopped none of them, because in each case the
+machine was running a revision older than the guard. That is now the second time a guard which
+was written, mutation-tested, committed and pushed failed to protect a machine, and the two
+causes have the same shape --- once the scoring box had no credentials with which to fetch the
+repository (Sec.~\ref{sec:harness}), once it had simply not pulled. \textbf{A runtime guard
+protects only the revisions that have pulled it.} The quantity this mode turns on, however, is
+not a runtime observation at all: \texttt{max\_position\_embeddings} sits in the model's own
+\texttt{config.json} and is readable before a single GPU is allocated. A scorer that reads it
+and clamps the requested cap, or refuses to start, is correct on every revision that runs
+afterwards rather than on every revision that has caught up. The clamp is now implemented in
+the scorer and covered by a mutation suite: it reads the context from the model configuration,
+reserves room for the prompt, and prints what it changed and why, while an unreadable or absent
+configuration yields \emph{unknown} and never clamps, since not knowing a context is not
+evidence that it is small. It postdates every run reported in this paper, so no number here was
+protected by it, and the three rows of Table~\ref{tab:capcontext} are what it was written
+against.
+
+\paragraph{What a score has to carry, restated with what these subsections add.}
+Sec.~\ref{sec:harness} requires three things printed beside every benchmark number: the token
+budget, the fraction of generations that reached it, and the number of requests that failed.
+Two additions follow from the subsections above. First, the \emph{denominator} is printed as
+graded over total rather than left to be recovered by subtracting the failure count, because
+Sec.~\ref{sec:survivor} shows that an average over the survivors of a partial run is not a
+noisier estimate of the same quantity but a different and upward-biased one, and a number
+whose denominator a reader must reconstruct is a number whose denominator a reader will not
+check. Second, comparability is gated on truncation by the rule above, so a pair of
+accuracies is a comparison only when both sit below the threshold. Each of the four failure
+modes recorded in this paper produced a plausible number from a process that exited zero, so
+none of them is detectable anywhere downstream of the score; these columns are the only place
+they are visible.
+
 \subsection{Not yet measured}
 
 Stated explicitly so the gap is not mistaken for an omission: whether training on the
