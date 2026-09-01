@@ -312,11 +312,33 @@ OVERRIDES=(
 # restart, and operators use it for one-off overrides). It is spliced in HERE, before the
 # preflight, so the preflight validates the config that will actually run -- an override the
 # preflight never sees is an override nobody checked.
+# ---- routing: OFF by default, so this script's existing behaviour is unchanged ----
+# The run this launcher has produced so far has group_routing null, which makes it plain policy
+# optimisation with an adapter: the matched CONTROL, not the method. That was mis-described for
+# several hours because the run's NAME says lora30b and nothing in the launcher said routing was
+# absent. ROUTE=1 turns on the treatment arm.
+#
+# The two stabilisers default on for the treatment because the unstabilised constant is already
+# measured to be harmful at 1.5B: it breaks the zero-mean advantage property and every arm that
+# carried it crossed into ~99% truncation between steps 174 and 199. Running the treatment
+# without them would reproduce a known failure at twenty times the cost.
+ROUTE_ARGS=()
+if [ "${ROUTE:-0}" = "1" ]; then
+  ROUTE_ARGS=(
+    "+actor.group_routing.enabled=true"
+    "+actor.group_routing.solved_advantage=${SOLVED_ADV:-0.5}"
+    "+actor.group_routing.unsolved_advantage=0.0"
+    "+actor.group_routing.router=${ROUTER:-null}"
+    "+actor.group_routing.zero_mean=${ZERO_MEAN:-true}"
+    "+actor.group_routing.exclude_truncated_from_sft=${EXCLUDE_TRUNC:-true}"
+  )
+fi
+
 read -r -a EXTRA_ARR <<< "${EXTRA_ARGS:-}"
 HYDRA_ARGS=(
   --config examples/math/gsm8k_grpo_lora.yaml
   "${OVERRIDES[@]}"
-  ${EXTRA_ARR[@]+"${EXTRA_ARR[@]}"}
+  ${ROUTE_ARGS[@]+"${ROUTE_ARGS[@]}"} ${EXTRA_ARR[@]+"${EXTRA_ARR[@]}"}
 )
 
 # ---------------------------------------------------------------------------------------
