@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Terminal-Bench 2.1 harness swap at FIXED model.
 #
+#   bash run_tb_swap.sh --install   # set up a BARE box: python3.12, venv, harbor, clone LHH
 #   bash run_tb_swap.sh --smoke     # verify every prerequisite, change nothing, ~2 min
 #   bash run_tb_swap.sh --fetch     # download the Terminal-Bench 2.1 task set, resumable
 #   bash run_tb_swap.sh --run       # run one arm (ARM=A|B)
@@ -37,6 +38,68 @@ FAILED=0
 ok(){   printf '  \033[32mok\033[0m    %s\n' "$1"; }
 bad(){  printf '  \033[31mFAIL\033[0m  %s\n' "$1"; printf '        -> %s\n' "$2"; FAILED=$((FAILED+1)); }
 warn(){ printf '  \033[33mwarn\033[0m  %s\n' "$1"; }
+
+# ---- install mode: bring a BARE box to the point where --smoke can pass ----
+# Written because the collaborator's H200 is a different machine from ours and will have none
+# of this. Everything here is idempotent: re-running it after a partial failure is safe.
+if [ "$MODE" = "--install" ]; then
+  echo "== installing prerequisites =="
+  SUDO=""; [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1 && SUDO="sudo"
+
+  # 1. python3.12. Needed ONLY to create the venv; if a working harbor venv already exists
+  #    this is skipped entirely.
+  if [ -x "$VENV/bin/harbor" ]; then
+    echo "  harbor venv already present at $VENV - skipping python install"
+  elif command -v "$PY" >/dev/null 2>&1; then
+    echo "  $PY already present"
+  else
+    echo "  installing python3.12 ..."
+    if command -v apt-get >/dev/null 2>&1; then
+      $SUDO apt-get update -qq && $SUDO apt-get install -y -qq python3.12 python3.12-venv \
+        || echo "  apt install failed - try deadsnakes PPA, or set TB_PYTHON to any python3.12"
+    else
+      echo "  no apt-get. Install python3.12 yourself, then set TB_PYTHON to it."
+    fi
+  fi
+
+  # 2. venv + harbor.
+  if [ ! -x "$VENV/bin/harbor" ]; then
+    if command -v "$PY" >/dev/null 2>&1; then
+      echo "  creating $VENV and installing harbor==0.18.0 ..."
+      "$PY" -m venv "$VENV" && "$VENV/bin/python" -m pip install -q --upgrade pip \
+        && "$VENV/bin/python" -m pip install -q --no-cache-dir harbor==0.18.0
+    else
+      echo "  SKIP: no python3.12 available to build the venv"
+    fi
+  fi
+  "$VENV/bin/harbor" --help >/dev/null 2>&1 && echo "  harbor OK" || echo "  harbor NOT installed"
+
+  # 3. the harness checkout.
+  if [ -d "$TB_DIR" ]; then
+    echo "  LongHorizon-Harness already at $LHH_DIR"
+  else
+    echo "  cloning LongHorizon-Harness -> $LHH_DIR ..."
+    git clone --depth 1 https://github.com/AMAP-ML/LongHorizon-Harness.git "$LHH_DIR" \
+      || echo "  clone failed"
+  fi
+
+  # 4. docker. Deliberately NOT auto-installed: it needs root, changes a shared machine, and
+  #    the usual failure is group membership rather than absence. Diagnose and instruct.
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "  docker MISSING. Install it (Terminal-Bench runs every task in a container):"
+    echo "    curl -fsSL https://get.docker.com | $SUDO sh"
+  elif docker info >/dev/null 2>&1; then
+    echo "  docker OK"
+  else
+    echo "  docker present but daemon unusable. Almost always group membership:"
+    echo "    $SUDO usermod -aG docker \$USER   # then log out and back in"
+    echo "    (verify with: docker info)"
+  fi
+
+  echo
+  echo "install pass done - now run: bash $0 --smoke"
+  exit 0
+fi
 
 echo "== Terminal-Bench 2.1 harness-swap preflight =="
 
