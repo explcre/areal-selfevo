@@ -3,6 +3,48 @@
 Measured results and negative results, newest first. A claim only belongs here once it has
 been observed end to end; a prediction belongs in GOAL.md until then.
 
+## 2026-09-01 — CORRECTION: the 30B LoRA run has routing DISABLED. It is the control, not the method.
+
+Read from `~/runs/lora30b/resolved_config.yaml`, not from the run's name:
+
+```
+556:  group_routing: null
+557:  token_routing: null
+```
+
+**`lora30b` is plain GRPO with a LoRA adapter on a 30B base. No routing of any kind.** I have
+described it in several reports as the SOTA-beating path and as our method at a fixed strong
+base. That was wrong, and the error is the same one this log keeps recording: **a name is not a
+configuration.** The `lora27b` failure was diagnosed the same way -- a run called `lora27b` with
+three of its four LoRA switches off -- and I repeated it one level up.
+
+### What this does and does not invalidate
+
+**The ladder measurements stand, and their meaning changes.** base 0.8820 and peak 0.9000 at
+16384 are the behaviour of **unrouted** GRPO LoRA at 30B. That is a genuinely useful number --
+it is exactly the matched control a routed arm would need -- but it is not evidence about
+routing, and the "approximately neutral" conclusion is a statement about plain GRPO LoRA, not
+about our method.
+
+**We have no routed arm at 30B at all.** Every routing measurement in this log is at 1.5B. The
+paper's stated claim is a delta at a fixed strong base; the treatment half of that comparison
+has never been run.
+
+### What follows
+
+The run is 392 steps in and is a legitimate matched control, so it continues rather than being
+discarded -- a control measured to 1160 steps is worth having, and stopping it would throw away
+fifteen hours for nothing. What is missing is the treatment, which needs eight GPUs that do not
+exist while the second box is down.
+
+**The stabilisers written yesterday have also never been run**: `zero_mean` and
+`exclude_truncated_from_sft` are implemented, mutation-tested at 39/39, and default off. No
+experiment has yet used either. The routed 30B arm is where they belong.
+
+**Standing check, added because this has now cost twice:** before describing any run as testing
+a feature, grep its resolved config for the switch. `enabled:`, `router:` and `group_routing:`
+are three separate places a routing arm can be silently off.
+
 ## 2026-09-01 — Matched at 65536, Qwen3.8-27B still beats Frontis. And the LoRA gain shrinks with the cap.
 
 ### 1. The fairness question is settled: the ranking survives a matched, less-truncated budget
