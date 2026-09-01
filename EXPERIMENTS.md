@@ -25,6 +25,41 @@ measurements rather than lower bounds. Every Frontis-MA1-30B figure remains a lo
 a Wilson interval of [0.912, 1.000]; the benchmark has no resolving power left at this
 capability and should be dropped from any comparison that needs to separate strong models.
 
+### OlympiadBench too: 0.7733 against 0.7363
+
+Qwen3.8-27B wins all five, but **both models are still cap-limited there** -- 120/675 (17.8%)
+against 135/675 (20.0%).
+
+### A MATCHED cap is not automatically a FAIR cap
+
+Both models truncate at 32768, so neither number is a measurement of capability; both are
+measurements of *capability under a 32768 budget*. That is a legitimate quantity, but it is not
+the quantity the comparison implies. When a cap binds on both sides, part of the gap is
+verbosity rather than skill, and the ranking is only trustworthy if it is **stable as the cap
+grows**.
+
+What we can already see is that neither model has saturated. Frontis-MA1-30B on OlympiadBench:
+
+| cap | accuracy | truncated |
+|---|---|---|
+| 16384 | 0.6237 | 33.3% |
+| 32768 | 0.7363 | 20.0% |
+| 65536 | not yet run | -- |
+
+Accuracy is still climbing steeply with budget, so 32768 is on the slope, not the plateau.
+
+**Both models have `max_position_embeddings: 262144`** (checked, not assumed -- the previous
+re-score attempt asked a 1.5B with a 32768 context for 32768 NEW tokens and every request was
+rejected, returning `fail=500, acc=nan`). So 65536 is available to both and the protocol is:
+
+1. Score both at 65536 on OlympiadBench and MATH-500.
+2. If the ranking holds, the claim is robust to the budget and can be stated plainly.
+3. If it narrows or flips, the 32768 comparison was partly measuring verbosity, and the
+   honest report is an **accuracy-versus-cap curve** rather than a single number per model.
+
+Report truncation beside every accuracy either way. A single number at an unstated cap is the
+bug that already cost this project three benchmarks.
+
 ### Consequence for GOAL.md
 
 The paper's plan is a delta at a FIXED STRONG BASE, which is what makes a result
