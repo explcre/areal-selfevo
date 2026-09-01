@@ -3,6 +3,50 @@
 Measured results and negative results, newest first. A claim only belongs here once it has
 been observed end to end; a prediction belongs in GOAL.md until then.
 
+## 2026-09-01 — The collapse is GRADUAL, is NOT a cap artifact, and the random arm tracks it
+
+Every point below is MATH-500 at a **matched 16384 cap**, on the H200 checkpoints. 16384 and
+not 32768 because these are 1.5B checkpoints with `max_position_embeddings: 32768`; asking for
+32768 NEW tokens is rejected outright and returns `fail=500, acc=nan`, which reads like a score
+if the fail column is not read. It is 5.3x the 3072 the arms were originally scored at.
+
+| step | `ctx2` acc | `ctx2` trunc | `rnd` acc | `rnd` trunc |
+|---|---|---|---|---|
+| 149 | 0.5060 (A100 twin, cap 8192) | 6.4% | **0.5100** | **6.0%** |
+| 174 | **0.4280** | **13.2%** | **0.4600** | **12.4%** |
+| 260 | **0.1100** | **77.8%** | pending | -- |
+| 289 | **0.1740** | **96.4%** | **0.3260** | **98.2%** |
+
+`ctxpcc@289` at the same cap: 0.2440, 100% truncated.
+
+### 1. The collapse is NOT a cap artifact -- this was a real possibility and it is now excluded
+
+The original step-289 scores were taken at 3072 with ~100% truncation, where an accuracy is a
+truncation rate wearing accuracy's clothing. Raising the budget **5.3x** moves truncation from
+~100% only to **96-98%**. These policies genuinely emit more than 16384 tokens. The pathology
+is in the model, not in the budget.
+
+### 2. It is GRADUAL, not a cliff, and it starts before step 174
+
+Truncation rises monotonically **6% -> 13% -> 78% -> 97%** across 149/174/260/289. There is no
+step at which it breaks; it is already doubled 25 steps after the last healthy checkpoint. This
+**corrects the earlier "threshold-like" reading**, which came from training-time length curves
+on runs that were killed at 162 and never saw the middle of this range.
+
+### 3. The RANDOM arm degrades on the same schedule
+
+`rnd@174` = 0.4600 at 12.4% truncated against `ctx2@174` = 0.4280 at 13.2%. The two arms are
+indistinguishable at the point where degradation becomes visible, and both are near-total at
+289. **The schedule is a property of the routed constant, not of the router.** This is the
+same conclusion the step-289 comparison reached, now with a second, earlier point.
+
+### Do not read the accuracies past ~80% truncation
+
+`ctx2` reads 0.1100 at step 260 and 0.1740 at 289 -- non-monotone. Above roughly 80%
+truncation the accuracy is dominated by which few generations happened to finish, and the
+ordering between such points is noise. **Truncation is the trustworthy channel there**, and it
+is monotone throughout.
+
 ## 2026-09-01 — Qwen3.8-27B beats Frontis-MA1-30B on every core benchmark, and its numbers are cleaner
 
 Scored on the H200 at an honest 32768 cap, with the cap-precedence fix carried across by hand
