@@ -1711,7 +1711,23 @@ class GroupRoutingConfig:
     them with a positive constant IS supervised fine-tuning on the group's own correct
     samples. The policy-gradient step that maximises log p(y) for a sampled y is the
     supervised step on y, and for on-policy data the importance ratio is 1, so no separate
-    loss path or teacher is needed. PPO's clip still bounds how far one update can sharpen.
+    loss path or teacher is needed.
+
+    MEASURED 2026-08-31, and it contradicts an earlier claim in this docstring that "PPO's
+    clip still bounds how far one update can sharpen": with ``ppo_n_minibatches: 1``,
+    ``recompute_logprob: true`` and ``use_decoupled_loss: true`` the ratio is exactly 1, so
+    across every step of four runs ``importance_weight`` was avg=min=max=1.0 and both
+    ``clip_ratio`` and ``clipped_tokens`` were 0.0. The clip is INERT in that configuration
+    and these are unclipped REINFORCE updates. Nothing bounds the constant, which is why a
+    positive ``solved_advantage`` is not self-limiting.
+
+    The cost is that a constant on whole groups breaks GRPO's zero-mean advantage property.
+    Mean advantage over a run was -0.0004 and +0.0136 for two unrouted arms against +0.1579,
+    +0.1675 and +0.8979 for three routed ones, whose response length knees at roughly step
+    142, 132 and 120 respectively -- larger offset, earlier knee, and no knee at all near
+    zero. Truncated rollouts carry it: they contain no EOS, so every token push is
+    "keep going" with no counterweight, and a token-mean loss gives them ~2.5x the gradient
+    mass of a terminating rollout.
 
     Both weights default to 0.0, which leaves a zero tensor a zero tensor. With
     ``enabled=False`` -- the default -- nothing is read at all. Either way the update is
