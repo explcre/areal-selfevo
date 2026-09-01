@@ -20,12 +20,36 @@ MODE="${1:-}"
 # directory is often a small overlay while the real volume is mounted elsewhere, and a
 # collaborator whose repo sits on /data would otherwise fill /root with model weights. Set
 # BENCH_ROOT to the volume that actually has the space.
-BENCH_ROOT="${BENCH_ROOT:-$HOME}"
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"  # needed by pick_bench_root below
+# Chosen automatically so a collaborator does not have to know which mount is the big one.
+# Candidates are $HOME and a directory BESIDE the repo -- beside, never inside: a venv plus tens
+# of gigabytes of model weights inside the checkout would pollute `git status` and a `git clean`
+# would delete all of it. The roomier of the two wins, and the decision is printed with the
+# reason. Setting BENCH_ROOT explicitly always overrides this.
+_free_gb() { df -BG --output=avail "$1" 2>/dev/null | tail -1 | tr -dc '0-9'; }
+pick_bench_root() {
+  local beside home_free beside_free
+  beside="$(cd "$REPO/.." 2>/dev/null && pwd)/areal-bench"
+  home_free="$(_free_gb "$HOME")"; beside_free="$(_free_gb "$(dirname "$beside")")"
+  : "${home_free:=0}" "${beside_free:=0}"
+  # Only move off $HOME when the alternative is meaningfully bigger, so a box where both live
+  # on one filesystem keeps its familiar layout instead of sprouting a new directory.
+  if [ "$beside_free" -gt "$(( home_free * 2 ))" ] && [ "$beside_free" -gt 50 ]; then
+    echo "$beside"
+  else
+    echo "$HOME"
+  fi
+}
+if [ -z "${BENCH_ROOT:-}" ]; then
+  BENCH_ROOT="$(pick_bench_root)"
+  BENCH_ROOT_WHY="auto: $(_free_gb "$BENCH_ROOT")G free (set BENCH_ROOT=<dir> to override)"
+else
+  BENCH_ROOT_WHY="set explicitly"
+fi
 VENV="${BENCH_VENV:-$BENCH_ROOT/bench-env}"
 PY="${BENCH_PYTHON:-python3}"
 MODEL="${MODEL:-Qwen/Qwen2.5-Math-7B-Instruct}"
 TAG="${TAG:-$(echo "$MODEL" | tr '/' '_')}"
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 OUTROOT="${OUTROOT:-$BENCH_ROOT/runs/math}"
 # Reasoning models need room; a truncated generation is graded WRONG, so a cap that is too
 # small silently reports a token budget rather than a capability. See BENCH_OVERRIDES.
@@ -111,7 +135,9 @@ make_venv() {
 }
 
 if [ "$MODE" = "--install" ]; then
-  echo "  BENCH_ROOT=$BENCH_ROOT  ($(df -h "$BENCH_ROOT" 2>/dev/null | awk 'NR==2{print $4" free on "$6}'))"
+  echo "  BENCH_ROOT=$BENCH_ROOT  [$BENCH_ROOT_WHY]"
+  mkdir -p "$BENCH_ROOT" 2>/dev/null
+  echo "             $(df -h "$BENCH_ROOT" 2>/dev/null | awk 'NR==2{print $4" free on "$6}')"
   echo "  venv=$VENV  out=$OUTROOT  hf_cache=${HF_HOME:-$BENCH_ROOT/hf_cache}"
   echo "== install: venv + sglang + bench deps (no docker, no root) =="
   make_venv || exit 1
