@@ -123,6 +123,48 @@ def _truncated_rows(loss_mask: torch.Tensor, max_new_tokens: int) -> torch.Tenso
     return loss_mask.sum(dim=-1) >= int(max_new_tokens)
 
 
+def route_all(router, contexts):
+    """Route every unit in a batch, preferring a router's batched entry point.
+
+    This is a module-level function rather than inline code so that it can be driven directly
+    by tests. An earlier version of these tests re-implemented the control flow inside the test
+    file, which meant a mutation to the real seam would have survived every one of them.
+
+    Batching is not an optimisation. A router that PARTITIONS a batch cannot work through a
+    per-unit seam, because ``ClusterRouter.route`` is itself ``route_batch([ctx])`` -- driving
+    it one context at a time gives every cluster exactly one member and the partition becomes a
+    no-op by construction. ``route_batch`` had no caller outside that wrapper; this is it.
+
+    Exactly one call is made per unit either way, because a router may be stateful and routing
+    twice -- once to read the weights and again for the label -- would double every update it
+    makes.
+
+    Args:
+        router: Object exposing ``route_batch(contexts)`` or, failing that, ``route(ctx)``.
+        contexts: Routing contexts, one per unit, in group order.
+
+    Returns:
+        A list of decisions positionally aligned with ``contexts``.
+
+    Raises:
+        ValueError: If ``route_batch`` returns a different number of decisions than it was
+            given. Decisions are positional, so a mismatch would attach each group to another
+            group's mode -- a corruption that is invisible downstream and would silently spoil
+            an entire run.
+    """
+    if hasattr(router, "route_batch"):
+        assignment = router.route_batch(contexts)
+        decisions = list(getattr(assignment, "decisions", assignment))
+        if len(decisions) != len(contexts):
+            raise ValueError(
+                f"{type(router).__name__}.route_batch returned {len(decisions)} decisions "
+                f"for {len(contexts)} contexts; decisions are positional and a mismatch "
+                f"would attach each group to another group's mode"
+            )
+        return decisions
+    return [router.route(ctx) for ctx in contexts]
+
+
 def _recentre_advantages(
     advantages: torch.Tensor, loss_mask: torch.Tensor
 ) -> tuple[torch.Tensor, float, float]:
@@ -394,8 +436,8 @@ class PPOActor:
 
         modes = []
         mixtures = []
-        for i, (f, g) in enumerate(zip(feats, sizes)):
-            ctx = RoutingContext(
+        contexts = [
+            RoutingContext(
                 solve_rate=f.solve_rate,
                 group_size=int(g),
                 # No teacher is wired, so a teacher-requiring mode is available only where the
@@ -404,9 +446,21 @@ class PPOActor:
                 unit_id=f"{step}:{i}",
                 extra=f.as_extra(),
             )
-            # ONE call per unit: a router may be stateful, and routing twice to read the
-            # weights and then the label would double every update it makes.
-            decision = router.route(ctx)
+            for i, (f, g) in enumerate(zip(feats, sizes))
+        ]
+
+        # Batch the routing call when the router offers one. This is not an optimisation: a
+        # router that partitions the batch CANNOT work through a per-unit seam, because
+        # ClusterRouter.route is itself `route_batch([ctx])`, so driving it one context at a
+        # time gives every cluster exactly one member and the partition is a no-op by
+        # construction. route_batch had no caller outside its own wrapper -- GOAL.md lists it
+        # as dead code -- and this is the caller.
+        #
+        # ONE call per unit either way: a router may be stateful, and routing twice to read the
+        # weights and then the label would double every update it makes.
+        decisions = route_all(router, contexts)
+
+        for decision in decisions:
             # The RAW weights. apply_mixtures normalises, and normalising here as well would
             # round twice and, worse, make every rejection message quote weights the router
             # never emitted: a mixture whose components overflow to an infinite sum
