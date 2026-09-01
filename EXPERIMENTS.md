@@ -45,6 +45,46 @@ experiment has yet used either. The routed 30B arm is where they belong.
 a feature, grep its resolved config for the switch. `enabled:`, `router:` and `group_routing:`
 are three separate places a routing arm can be silently off.
 
+## 2026-09-01 — Collaborator H200 sweep: one model measured, two returned nan and were marked DONE
+
+An independent 4x H200 box ran the sweep. **One model produced real numbers; two produced
+`acc=nan, fail=N/N` on every benchmark and the sweep recorded both as DONE** -- the identical
+failure our own box hit, on a revision predating the abort guard.
+
+**Usable (longest runtime, so almost certainly Qwen2.5-Math-72B-Instruct -- the model identity
+is inferred from ordering and duration, NOT confirmed, and must be confirmed before citing):**
+
+| benchmark | acc | graded | trunc |
+|---|---|---|---|
+| MATH-500 | 0.9140 | 500/500 | 21/500 |
+| AMC23 | 0.9250 | 40/40 | 3/40 |
+| AIME24 | 0.6000 | 30/30 | 6/30 |
+| AIME25 | 0.6000 | 30/30 | 8/30 |
+| OlympiadBench | 0.7145 | **592/675, fail 83** | 4 |
+
+**The OlympiadBench figure is survivor-biased and should not be cited.** 83 client-side failures
+is 12.3%, above the 10% abort threshold, and our own measurement of this bias showed it inflates
+the result by around +0.08 because the discarded generations are the slowest and the slowest are
+the hardest.
+
+**The two nan models completed in 5.5 and 3 minutes** -- Qwen2.5-32B-Instruct and
+Qwen2.5-Math-7B-Instruct. Both have context windows at or below the 32768 cap the sweep passes
+(Math-7B's is 4096), so every request was rejected for asking more new tokens than the model can
+hold. This is the third independent occurrence of the same bug class.
+
+### What this says about the fix
+
+`FAILED_RATE_ABORT` exists and would have stopped all three of these before they were recorded.
+It did not, because the box is on an older revision. **This is the second time a guard that was
+written, mutation-tested, committed and pushed failed to protect a machine, and both times the
+reason was the same: the fix was in git and the machine was not.** For our own H200 the cause
+was missing credentials; here it is simply not having pulled.
+
+**The durable fix is not another guard.** A cap larger than a model's context is knowable before
+any GPU is touched: `config.json` carries `max_position_embeddings`. The scorer should read it
+and clamp, or refuse, at startup -- which protects every revision that runs afterwards rather
+than every revision that has pulled.
+
 ## 2026-09-01 — Matched at 65536, Qwen3.8-27B still beats Frontis. And the LoRA gain shrinks with the cap.
 
 ### 1. The fairness question is settled: the ranking survives a matched, less-truncated budget
