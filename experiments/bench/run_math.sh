@@ -1,7 +1,15 @@
 #!/usr/bin/env bash
 # Serve a model and score it on the frozen math suite. Kills the server on every exit path.
 set -u
-export PATH="$HOME/.local/bin:$PATH"; source "$HOME/venv312b/bin/activate"
+export PATH="$HOME/.local/bin:$PATH"
+# Which interpreter serves and scores. Hardcoding one box's venv made this script unusable
+# on any other machine, which is exactly what a collaborator hit.
+BENCH_VENV="${BENCH_VENV:-$HOME/venv312b}"
+if [ -f "$BENCH_VENV/bin/activate" ]; then
+  source "$BENCH_VENV/bin/activate"
+else
+  echo "no venv at $BENCH_VENV (set BENCH_VENV=<path>); falling back to $(command -v python3)" >&2
+fi
 ulimit -n 131072 || true
 MODEL="${1:?model path or hf id}"; TAG="${2:?tag}"; GPUS="${3:-0,1}"; PORT="${4:-8404}"
 OUT="$HOME/runs/math/$TAG"; mkdir -p "$OUT"
