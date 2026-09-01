@@ -144,10 +144,24 @@ if [ "$MODE" = "--install" ]; then
   P="$(py_of_venv)"
   # sglang pulls a matching torch. Pinning the pair is what keeps a fresh box reproducible;
   # letting pip resolve freely is how a box ends up with a torch its driver cannot use.
+  # Torch BEFORE sglang, on purpose. sglang[all] resolves its own torch, and on an H200 it
+  # picks a CUDA build whose device_count under-reports the machine -- so the old order
+  # downloaded ~2.5GB of the wrong torch and then replaced it with ~2.5GB of the right one.
+  # Installing the pinned build first leaves sglang's requirement already satisfied, which
+  # halves the largest download in this step.
+  TORCH_WANT="${TORCH_VER:-2.9.1}"; TORCH_CU="${TORCH_CUDA:-cu128}"
+  if [ "$("$P" -c 'import torch;print(torch.__version__)' 2>/dev/null)" = "${TORCH_WANT}+${TORCH_CU}" ]; then
+    ok "torch ${TORCH_WANT}+${TORCH_CU} already present"
+  else
+    echo "  installing torch==${TORCH_WANT}+${TORCH_CU} first (~2.5GB; sglang then reuses it)"
+    "$P" -m pip install -q "torch==${TORCH_WANT}" \
+      --index-url "https://download.pytorch.org/whl/${TORCH_CU}" 2>&1 | tail -8
+  fi
+
   if "$P" -c "import sglang" >/dev/null 2>&1; then
     ok "sglang already importable ($("$P" -c 'import sglang;print(sglang.__version__)' 2>/dev/null))"
   else
-    echo "  installing sglang==${SGL_VER:-0.5.10.post1} (this pulls torch; several minutes)"
+    echo "  installing sglang==${SGL_VER:-0.5.10.post1} (torch is already satisfied; several minutes)"
     if ! "$P" -m pip install -q "sglang[all]==${SGL_VER:-0.5.10.post1}" 2>&1 | tail -25; then
       bad "sglang install failed" "Scroll up for the pip error. If it is a TLS failure, set: $P -m pip config set global.cert /path/to/corp-ca.pem"
     fi
@@ -157,7 +171,7 @@ if [ "$MODE" = "--install" ]; then
   # our own H200 that produced a torch that imports fine and then reports FEWER GPUs than the
   # machine has, so a run silently uses a fraction of the box. Pin the pair that is known to
   # work here and verify the device count against the driver rather than trusting the import.
-  TORCH_WANT="${TORCH_VER:-2.9.1}"; TORCH_CU="${TORCH_CUDA:-cu128}"
+  # Safety net: sglang can still drag torch sideways during its own resolve, so re-check after.
   HAVE="$("$P" -c 'import torch;print(torch.__version__)' 2>/dev/null || echo none)"
   case "$HAVE" in
     "${TORCH_WANT}+${TORCH_CU}") ok "torch $HAVE" ;;
