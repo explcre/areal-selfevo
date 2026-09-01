@@ -29,6 +29,10 @@ LHH_DIR="${LHH_DIR:-$HOME/LongHorizon-Harness}"
 TB_DIR="$LHH_DIR/eval/TB-harness"
 VENV="${TB_VENV:-$HOME/tb-env}"
 PY="${TB_PYTHON:-python3.12}"
+HARBOR_VER="${HARBOR_VER:-0.18.0}"
+# The command that runs harbor on THIS box. Set by resolve_harbor/install_harbor, because a
+# venv at $VENV is only one of the routes that can supply it.
+HARBOR=""
 ARM="${ARM:-}"
 # Default to EVERY visible GPU. Only used under SERVE=1 (the harness itself talks to a remote
 # endpoint and uses no GPU), so defaulting wide is safe and matches an 8-GPU box out of the box.
@@ -43,24 +47,107 @@ warn(){ printf '  \033[33mwarn\033[0m  %s\n' "$1"; }
 # Install harbor into $VENV and, on failure, SHOW WHY. An earlier version piped this to
 # /dev/null and told the user to "run it manually to see the error" -- which is the script
 # withholding the one thing that would let them fix it. A collaborator hit exactly that.
+resolve_harbor() {
+  # Locate an already-working harbor without installing anything. Sets HARBOR and returns 0,
+  # or returns 1 if none is runnable. Checked in the same order install_harbor creates them.
+  HARBOR=""
+  if [ -x "$VENV/bin/harbor" ] && "$VENV/bin/harbor" --help >/dev/null 2>&1; then
+    HARBOR="$VENV/bin/harbor"; return 0
+  fi
+  if [ -x "$VENV/bin/python" ] && "$VENV/bin/python" -c "import harbor" >/dev/null 2>&1; then
+    HARBOR="$VENV/bin/python -m harbor"; return 0
+  fi
+  if command -v harbor >/dev/null 2>&1 && harbor --help >/dev/null 2>&1; then
+    HARBOR="$(command -v harbor)"; return 0
+  fi
+  local cur; cur="$(command -v python3 || command -v python)"
+  if [ -n "$cur" ] && "$cur" -c "import harbor" >/dev/null 2>&1; then
+    HARBOR="$cur -m harbor"; return 0
+  fi
+  return 1
+}
+
 install_harbor() {
+  # Get a runnable `harbor` by whatever route this box actually supports, in order of
+  # cleanliness. A stock python3-venv is preferred, but plenty of real boxes lack it:
+  # Debian/Ubuntu split ensurepip into a separate python3.N-venv package, and conda
+  # pythons routinely build venvs with no pip. Falling back is the difference between a
+  # collaborator running the experiment and a collaborator filing a bug.
   local log="${TMPDIR:-/tmp}/harbor_install.$$.log"
-  rm -rf "$VENV" 2>/dev/null
-  if ! "$PY" -m venv "$VENV" > "$log" 2>&1; then
-    echo "  venv creation FAILED:"; sed 's/^/      /' "$log" | tail -12
-    echo "      hint: on conda pythons try   $PY -m venv --without-pip $VENV   or use python3.12-venv"
+  : > "$log"
+  HARBOR=""
+
+  _try_pip_into() {   # $1 = python to install with, $2 = label
+    echo "  trying: $2" | tee -a "$log"
+    if "$1" -m pip install --disable-pip-version-check -q "harbor==${HARBOR_VER}" >> "$log" 2>&1; then
+      local hb; hb="$(dirname "$1")/harbor"
+      if [ -x "$hb" ] && "$hb" --help >/dev/null 2>&1; then HARBOR="$hb"; return 0; fi
+      if "$1" -c "import harbor" >/dev/null 2>&1; then HARBOR="$1 -m harbor"; return 0; fi
+    fi
     return 1
+  }
+
+  # 1. stock venv, with ensurepip in case the venv came up without pip
+  if "$PY" -m venv "$VENV" >> "$log" 2>&1; then
+    "$VENV/bin/python" -m ensurepip --upgrade >> "$log" 2>&1 || true
+    _try_pip_into "$VENV/bin/python" "venv at $VENV" && { echo "  harbor: $HARBOR"; return 0; }
+  else
+    echo "  note: '$PY -m venv' failed (this box likely lacks python3-venv/ensurepip)" | tee -a "$log"
   fi
-  "$VENV/bin/python" -m ensurepip --upgrade >> "$log" 2>&1 || true
-  "$VENV/bin/python" -m pip install --upgrade pip >> "$log" 2>&1 || true
-  if "$VENV/bin/python" -m pip install --no-cache-dir harbor==0.18.0 >> "$log" 2>&1; then
-    return 0
+
+  # 2. virtualenv, which vendors its own pip and needs no ensurepip
+  if command -v virtualenv >/dev/null 2>&1; then
+    rm -rf "$VENV"
+    if virtualenv -q -p "$PY" "$VENV" >> "$log" 2>&1; then
+      _try_pip_into "$VENV/bin/python" "virtualenv at $VENV" && { echo "  harbor: $HARBOR"; return 0; }
+    fi
   fi
-  echo "  pip install harbor==0.18.0 FAILED. Last 20 lines:"
-  sed 's/^/      /' "$log" | tail -20
-  echo "      full log: $log"
-  echo "      common causes: no network/proxy (set HTTPS_PROXY), a conda python whose venv"
-  echo "      lacks pip (the ensurepip above should fix that), or a pip too old for the wheel."
+
+  # 3. uv, a single static binary that brings its own python
+  if command -v uv >/dev/null 2>&1; then
+    rm -rf "$VENV"
+    if uv venv "$VENV" >> "$log" 2>&1; then
+      _try_pip_into "$VENV/bin/python" "uv venv at $VENV" && { echo "  harbor: $HARBOR"; return 0; }
+    fi
+  fi
+
+  # 4. conda, which can materialise a 3.12 without apt or root. On a box that is already
+  #    sitting in a conda base -- common for shared notebook images -- this is usually the
+  #    only route that works, because harbor requires Python >=3.12 and the base env is older.
+  if command -v conda >/dev/null 2>&1; then
+    rm -rf "$VENV"
+    echo "  trying: conda create -p $VENV python=3.12" | tee -a "$log"
+    if conda create -y -q -p "$VENV" python=3.12 >> "$log" 2>&1; then
+      _try_pip_into "$VENV/bin/python" "conda env at $VENV" && { echo "  harbor: $HARBOR"; return 0; }
+    fi
+  fi
+
+  # 4. the interpreter we are already standing in. On a conda base this is usually the one
+  #    that works, and an isolated venv was only ever a nicety.
+  local cur; cur="$(command -v python3 || command -v python)"
+  if [ -n "$cur" ] && ! "$cur" -c 'import sys; sys.exit(0 if sys.version_info >= (3,12) else 1)'; then
+    echo "  skipping direct install: $cur is $("$cur" -V 2>&1), and harbor requires >=3.12" | tee -a "$log"
+    cur=""
+  fi
+  if [ -n "$cur" ]; then
+    _try_pip_into "$cur" "direct install into $cur (no venv)" && {
+      echo "  harbor: $HARBOR"
+      echo "  note: installed into the CURRENT interpreter because no venv route worked."
+      return 0
+    }
+  fi
+
+  echo "  every install route failed. Last 25 lines of $log:"
+  sed 's/^/      /' "$log" | tail -25
+  echo "  full log: $log"
+  echo "  likely causes, in order:"
+  echo "    - python too old:    harbor requires >=3.12. With conda already on the box:"
+  echo "                           conda create -y -p $VENV python=3.12"
+  echo "                           $VENV/bin/pip install harbor==${HARBOR_VER}"
+  echo "    - no ensurepip:      apt-get install -y python3.12-venv   (needs root+apt)"
+  echo "    - blocked PyPI:      pip config set global.index-url <your internal mirror>"
+  echo "    - TLS interception:  pip install --cert /path/to/corp-ca.pem, or"
+  echo "                         pip config set global.cert /path/to/corp-ca.pem"
   return 1
 }
 
@@ -73,7 +160,7 @@ if [ "$MODE" = "--install" ]; then
 
   # 1. python3.12. Needed ONLY to create the venv; if a working harbor venv already exists
   #    this is skipped entirely.
-  if [ -x "$VENV/bin/harbor" ]; then
+  if resolve_harbor; then
     echo "  harbor venv already present at $VENV - skipping python install"
   elif command -v "$PY" >/dev/null 2>&1; then
     echo "  $PY already present"
@@ -88,15 +175,15 @@ if [ "$MODE" = "--install" ]; then
   fi
 
   # 2. venv + harbor.
-  if [ ! -x "$VENV/bin/harbor" ]; then
+  if ! resolve_harbor; then
     if command -v "$PY" >/dev/null 2>&1; then
-      echo "  creating $VENV and installing harbor==0.18.0 ..."
+      echo "  creating $VENV and installing harbor==${HARBOR_VER} ..."
       install_harbor || echo "  (see the error above - this is the blocker, not a symptom)"
     else
       echo "  SKIP: no python3.12 available to build the venv"
     fi
   fi
-  "$VENV/bin/harbor" --help >/dev/null 2>&1 && echo "  harbor OK" || echo "  harbor NOT installed"
+  if resolve_harbor; then echo "  harbor OK ($HARBOR)"; else echo "  harbor NOT installed"; fi
 
   # 3. the harness checkout.
   if [ -d "$TB_DIR" ]; then
@@ -149,17 +236,17 @@ fi
 # irrelevant -- an earlier version of this check failed the whole preflight on a box where
 # harbor was already installed and fine, which is the kind of false blocker that makes people
 # ignore preflights.
-if [ -x "$VENV/bin/harbor" ] && "$VENV/bin/harbor" --help >/dev/null 2>&1; then
-  ok "harbor already installed and runnable ($("$VENV/bin/python" -m pip show harbor 2>/dev/null | awk '/^Version/{print $2}')) at $VENV"
+if resolve_harbor; then
+  ok "harbor already installed and runnable: $HARBOR"
 elif ! command -v "$PY" >/dev/null 2>&1; then
   bad "no working harbor, and $PY not found to build one" \
       "Either point TB_VENV at a venv that has harbor, or set TB_PYTHON to a python3.12 binary."
 else
   ok "$PY present"
-  echo "        creating venv at $VENV and installing harbor==0.18.0 ..."
+  echo "        creating venv at $VENV and installing harbor==${HARBOR_VER} ..."
   install_harbor || true
-  if "$VENV/bin/harbor" --help >/dev/null 2>&1; then
-    ok "harbor installed and runnable ($("$VENV/bin/python" -m pip show harbor 2>/dev/null | awk '/^Version/{print $2}'))"
+  if resolve_harbor; then
+    ok "harbor installed and runnable: $HARBOR"
   else
     bad "harbor not runnable - the pip error is printed above" \
         "Fix that error first. Everything downstream (agent imports, task fetch, both arms) depends on harbor."
@@ -201,7 +288,7 @@ if [ -d "$TASKS" ] || [ -L "$TASKS" ]; then
   [ "$n" -gt 0 ] && ok "task set present ($n tasks)" \
     || bad "task dir exists but is empty" "Populate $TASKS (a symlink is fine)."
 else
-  bad "task set missing" "Put Terminal-Bench 2.1 tasks at $TASKS. Try: $VENV/bin/harbor download --help"
+  bad "task set missing" "Put Terminal-Bench 2.1 tasks at $TASKS. Try: $HARBOR download --help"
 fi
 
 # 6. Both arms must be defined. Upstream ships ONLY the LHH arm; the baseline is the work.
@@ -269,7 +356,7 @@ if [ "$MODE" = "--fetch" ]; then
   # so retrying is cheap and resumable.
   for attempt in 1 2 3 4 5; do
     echo "fetch attempt $attempt ..."
-    if "$VENV/bin/harbor" download "terminal-bench@2.1" -o "$DEST"; then
+    if $HARBOR download "terminal-bench@2.1" -o "$DEST"; then
       break
     fi
     echo "  attempt $attempt failed; retrying in $((attempt*20))s"
@@ -278,7 +365,7 @@ if [ "$MODE" = "--fetch" ]; then
   n=$(find -L "$DEST" -maxdepth 2 -mindepth 1 -type d 2>/dev/null | wc -l)
   if [ "$n" -eq 0 ]; then
     echo "FETCH FAILED: no tasks under $DEST after 5 attempts."
-    echo "  The registry name may have changed. Try: $VENV/bin/harbor download --help"
+    echo "  The registry name may have changed. Try: $HARBOR download --help"
     echo "  and list what is available, then set TB_TASKS to a manually obtained task tree."
     exit 4
   fi
@@ -331,7 +418,7 @@ cd "$TB_DIR" || exit 1
 # transient container/registry hiccup; a second identical failure is information, not noise.
 RC=1
 for attempt in 1 2; do
-  "$VENV/bin/harbor" run -c "$CFG" 2>&1 | tee -a "$OUT/run.log"
+  $HARBOR run -c "$CFG" 2>&1 | tee -a "$OUT/run.log"
   RC=${PIPESTATUS[0]}
   [ "$RC" -eq 0 ] && break
   echo "attempt $attempt exited $RC" | tee -a "$OUT/run.log"
