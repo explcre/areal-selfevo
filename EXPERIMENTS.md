@@ -229,6 +229,13 @@ A 3x swing from a silently-ignored flag. The `NOTE ... BENCH_OVERRIDES default 8
 applied` line now printed by the fixed code is what proves the value reached the sampler,
 rather than merely appearing on the command line -- which it always did.
 
+**OlympiadBench, the third benchmark the bug corrupted.** Re-scored at a genuine 32768:
+**0.7363** (n=675, Wilson [0.702,0.768]), against **0.6237** at the wrongly-applied 16384 --
+**+0.113**, with truncation falling 33.3% -> 20.0%. Still a lower bound twice over: 135 of 675
+hit even the 32768 cap, and 94 of 675 have multiple gold answers in one string that exact-match
+grading marks wrong. Note the shard exited 2 despite writing complete results, which is not yet
+explained and should not be read as a failed measurement.
+
 **Run-to-run jitter at n=30 is around 0.1.** An earlier entry records 30B aime24 at an
 effective 8192 cap as 0.1667 with 83% truncation, where the controlled re-score records
 0.2667 with 73.3%. The 0.2667 -> 0.8000 effect is far larger than that spread, so it
