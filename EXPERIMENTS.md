@@ -3,6 +3,44 @@
 Measured results and negative results, newest first. A claim only belongs here once it has
 been observed end to end; a prediction belongs in GOAL.md until then.
 
+## 2026-09-01 — An accidental repeat run measures the noise floor, and it depends on truncation
+
+`narrow.sh` was launched twice by mistake, so four checkpoints were each scored twice on
+MATH-500 at a matched 16384 cap. The duplication is a gift: it measures the run-to-run spread
+directly, on this exact pipeline, rather than by assertion.
+
+| checkpoint | run A | run B | **spread** | truncation |
+|---|---|---|---|---|
+| `rnd@173` | 0.4600 | 0.4580 | **0.002** | 10% |
+| `ctx2@173` | 0.4580 | 0.4480 | **0.010** | 11% |
+| `ctx2@199` | 0.2660 | 0.2420 | **0.024** | 96% |
+| `rnd@199` | 0.3480 | 0.3220 | **0.026** | 99% |
+
+**The noise floor is a function of truncation.** At ~10% truncated the same checkpoint
+reproduces to 0.002-0.010; at ~97% truncated it moves by 0.024-0.026, an order of magnitude
+worse. This is the empirical basis for a caveat that had until now only been argued: **above
+~80% truncation the accuracy is dominated by which few generations happened to finish**, and
+differences of that size between such points are not results.
+
+Concretely, it retires the reading that `rnd` "retains more accuracy" than `ctx2` after the
+transition. At 289 the gap was 0.3260 against 0.1740; the repeat spread at comparable truncation
+is 0.025, so the gap is real in sign but its magnitude cannot be trusted, and neither can any
+ordering among the post-transition points.
+
+### The transition narrows to 174-199
+
+Adding step 173 and 199 to both arms:
+
+| step | 149 | 173 | 174 | **199** | 202 | 231 | 260 | 289 |
+|---|---|---|---|---|---|---|---|---|
+| `ctx2` trunc | 6.4% | **11%** | 13.2% | **96%** | 99.4% | 92.2% | 77.8% | 96.4% |
+| `rnd` trunc | 6.0% | **10%** | 12.4% | **99%** | 99.6% | 99.6% | 97.4% | 98.2% |
+
+**The unmeasured window is now 174 to 199, twenty five steps**, and both arms cross inside it
+together -- 13.2 -> 96 for the contextual arm and 12.4 -> 99 for the random one. Two independent
+arms crossing in the same 25-step window is the strongest form yet of the conclusion that the
+timing belongs to the routed constant rather than to any controller.
+
 ## 2026-09-01 — A GPU-day of work generated, then thrown away by a client timeout I created
 
 Three failures compounded, and the first was mine.
