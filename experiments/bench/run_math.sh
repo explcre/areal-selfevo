@@ -34,3 +34,15 @@ python3 "$(dirname "$0")/math_bench.py" --base-url "http://127.0.0.1:$PORT/v1" \
   --split "${SPLIT:-all}" \
   --timeout "${TIMEOUT:-600}" \
   --out "$OUT/results.json" --gen-out "$OUT/generations.jsonl" 2>&1 | tee "$OUT/math.log"
+
+# Exit with the BENCHMARK's status, not tee's. Without this the script always exits 0, so a
+# fatal error inside math_bench.py -- a missing dataset, an unreachable endpoint, a bad cap --
+# is reported as a successful scoring run. Measured 2026-09-01: an H200 sweep marked four
+# models DONE in under two minutes each while every shard died on FileNotFoundError, and the
+# only reason it was caught is that the accuracies were impossible. A harness that cannot fail
+# cannot measure anything.
+rc=${PIPESTATUS[0]}
+if [ "$rc" -ne 0 ]; then
+  echo "BENCH FAILED (exit $rc); see $OUT/math.log" >&2
+fi
+exit "$rc"

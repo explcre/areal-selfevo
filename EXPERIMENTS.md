@@ -3,6 +3,49 @@
 Measured results and negative results, newest first. A claim only belongs here once it has
 been observed end to end; a prediction belongs in GOAL.md until then.
 
+## 2026-09-01 — RECOVERED from the H200: all three routed arms collapse at step 289, RANDOM INCLUDED
+
+The H200 was never down. It is a vast.ai instance and its address had changed; I reported it
+unreachable for several cycles and treated these results as lost. They were on disk the whole
+time. Routing read from each run's `config.yaml`, never from its name.
+
+| arm | `router` | `solved_advantage` | MATH-500 | truncated | AMC23 | OlympiadBench |
+|---|---|---|---|---|---|---|
+| `ctx2` | contextual | 0.5 | 0.1880 | **489/500 (97.8%)** | 0.0000 | 0.0193 (643/675 trunc) |
+| `ctxpcc` | prompt_centered | 0.5 | 0.2560 | **500/500 (100%)** | 0.0500 | 0.0696 (673/675 trunc) |
+| `rnd` | **random** | 0.5 | 0.3080 | **499/500 (99.8%)** | 0.1000 | -- |
+
+### The control collapses too, and that settles the mechanism question
+
+I named this measurement hours ago as the one that decides whether the collapse needs the
+learned router's specific mode distribution or follows from the routed constant in any arm.
+**It is the constant.** The RANDOM router -- which has no learning, no credit signal and no
+preference -- collapses just as completely (99.8%) as the contextual one (97.8%). Nothing about
+the learned controller is required.
+
+### This CORRECTS the earlier "no routed run has collapsed"
+
+That statement was drawn from the A100 ladders, and it was true of them: `ctx` there peaks at
+0.0059 no-EOS and its last checkpoint is step 149. **The A100 runs were killed at 162, before
+the collapse.** The H200 runs continued to 289 and collapsed. Both observations are correct;
+the earlier conclusion generalised from a truncated window. The A100 A/B at step 149 showing
+routing merely *neutral* is consistent with this: **routing is neutral early and catastrophic
+late**, with the transition somewhere in 162-289, which nothing has yet localised.
+
+### A fourth negative for the learned controller
+
+At step 289 the ordering is **random 0.3080 > prompt_centered 0.2560 > contextual 0.1880**.
+The unlearned control is the LEAST damaged. Do not read the magnitudes -- every arm is
+~100% truncated at caps of 3072/8192, so these are truncation rates wearing accuracy's
+clothing -- but the ordering is at a matched cap and does not favour learning.
+
+### Caveats
+
+Single seed per arm. All three at pre-fix caps (3072 core / 8192 aime / 16384 olympiadbench),
+so the absolute values are properties of the token budget, not of the models; only the
+comparison is meaningful. No unrouted control was scored at 289 on this box, so "all routed
+arms collapse" is established, "no unrouted arm would" is not.
+
 ## 2026-09-01 — CRITICAL PATH ITEM 1: the unrouted control, scored at last. Routing does not help.
 
 Every previously scored checkpoint (`ctx149`, `ctxpc149`, `rnd149`) is a ROUTED arm. The
