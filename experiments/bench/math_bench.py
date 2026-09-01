@@ -164,6 +164,73 @@ _EXPLICIT: set = set()
 _UNSET = object()
 
 
+# Room left for the prompt when clamping a cap to a model's context. MATH-500 prompts run a few
+# hundred tokens; 2048 is generous and still leaves almost all of a large context for output.
+PROMPT_HEADROOM = 2048
+
+
+def model_context_limit(model_path: str):
+    """Largest position a model can attend to, read from its own ``config.json``.
+
+    Asking a server for more NEW tokens than the model's context makes it reject EVERY request.
+    The run then completes normally and reports ``acc=nan`` with ``fail=N/N``, which reads like
+    a score. That has now happened three times on three machines, so it is worth catching from
+    data the model ships rather than from a rule someone has to remember.
+
+    Args:
+        model_path: Directory holding ``config.json``, or an identifier that is not a local
+            path.
+
+    Returns:
+        The context length, or ``None`` when it cannot be determined -- an unreadable config is
+        not evidence of a small context, so the caller must not clamp on ``None``.
+    """
+    import json as _json
+    import os as _os
+
+    for name in ("config.json",):
+        f = _os.path.join(str(model_path), name)
+        if not _os.path.isfile(f):
+            continue
+        try:
+            cfg = _json.load(open(f))
+        except Exception:
+            return None
+        for key in ("max_position_embeddings", "n_positions", "seq_length", "max_seq_len"):
+            v = cfg.get(key)
+            if isinstance(v, int) and v > 0:
+                return v
+        text = cfg.get("text_config") or {}
+        v = text.get("max_position_embeddings") if isinstance(text, dict) else None
+        return v if isinstance(v, int) and v > 0 else None
+    return None
+
+
+def clamp_max_tokens(requested: int, ctx_limit, headroom: int = PROMPT_HEADROOM):
+    """Reduce a generation cap that cannot fit inside a model's context.
+
+    Args:
+        requested: The cap the caller asked for.
+        ctx_limit: The model's context length, or ``None`` if unknown.
+        headroom: Tokens reserved for the prompt.
+
+    Returns:
+        ``(effective_cap, reason)``. ``reason`` is ``None`` when nothing was changed, so a
+        caller can report the clamp rather than applying it silently -- a cap that quietly
+        differs from the one requested is the bug this file already carries a fix for.
+    """
+    if not isinstance(ctx_limit, int) or ctx_limit <= 0:
+        return requested, None
+    usable = ctx_limit - headroom
+    if usable <= 0 or requested <= usable:
+        return requested, None
+    return usable, (
+        f"max_tokens={requested} exceeds the model's context of {ctx_limit} "
+        f"(reserving {headroom} for the prompt); clamped to {usable}. Without this every "
+        f"request is rejected and the run reports acc=nan with fail=N/N."
+    )
+
+
 def explicit_gen_keys(parser, argv) -> set:
     """Which :data:`GEN_KEYS` the caller named on the command line.
 
@@ -231,6 +298,15 @@ def resolve_params(bench: str, args, explicit=frozenset()) -> dict:
                 flush=True,
             )
     out.update(applied)
+    # Clamp against the model's OWN declared context. This runs before any GPU work and
+    # protects every revision that executes it, unlike a runtime abort which only protects a
+    # machine that has pulled it -- three separate boxes have now reported acc=nan because a
+    # cap exceeded a context, twice on revisions that predated the abort guard.
+    _ctx = model_context_limit(getattr(args, "model_path", "") or "")
+    _eff, _why = clamp_max_tokens(int(out.get("max_tokens") or 0), _ctx)
+    if _why:
+        print(f"NOTE {bench}: {_why}", file=sys.stderr, flush=True)
+        out["max_tokens"] = _eff
     return out
 
 
