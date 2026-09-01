@@ -167,6 +167,12 @@ def explicit_gen_keys(parser, argv) -> set:
     try:
         parser.parse_known_args(list(argv), namespace=ns)
     except SystemExit:
+        # Unreachable from main(), which calls parse_args() first and would already
+        # have exited. Reachable for any other caller -- and an empty set here IS the
+        # pre-fix behaviour, so failing open silently would restore the bug this
+        # function exists to prevent. Say so instead of returning quietly.
+        print("WARNING: could not determine which generation flags were explicit; "
+              "BENCH_OVERRIDES will win over every one of them", file=sys.stderr)
         return set()
     return {k for k in GEN_KEYS if getattr(ns, k, _UNSET) is not _UNSET}
 
@@ -425,7 +431,22 @@ async def generate(session, url: str, model: str, prompt: str, params: dict) -> 
     return {"text": "", "finish_reason": None, "status": "failed"}
 
 
-async def run_bench(bench: str, args, gen_fh=None) -> dict:
+async def run_bench(bench: str, args, gen_fh=None, explicit=None) -> dict:
+    """Score one benchmark against the served model and return its results row.
+
+    Args:
+        bench: Benchmark name.
+        args: Parsed CLI namespace.
+        gen_fh: Open file handle; every completion is written to it as JSONL.
+        explicit: Generation keys the caller named on the command line, from
+            :func:`explicit_gen_keys`. Passed rather than read off :data:`_EXPLICIT`
+            so the precedence fix travels with the call: an importer that never runs
+            main() would otherwise get an empty set, and the table would silently
+            win again. None falls back to the global for backwards compatibility.
+
+    Returns:
+        The results row, including the parameters this benchmark actually ran with.
+    """
     import aiohttp
 
     probs = load(bench, getattr(args, "split", "all"))
@@ -433,7 +454,7 @@ async def run_bench(bench: str, args, gen_fh=None) -> dict:
         probs = probs[: args.limit]
     # Resolved ONCE per benchmark and threaded through, so every completion in this
     # benchmark provably used the same parameters and the results row can report them.
-    params = resolve_params(bench, args, _EXPLICIT)
+    params = resolve_params(bench, args, _EXPLICIT if explicit is None else explicit)
     url = args.base_url.rstrip("/") + "/chat/completions"
     sem = asyncio.Semaphore(params["concurrency"])
     conn = aiohttp.TCPConnector(limit=params["concurrency"])
@@ -500,7 +521,17 @@ async def run_bench(bench: str, args, gen_fh=None) -> dict:
     }
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
+    """The command-line parser this script actually runs with.
+
+    Kept as a function so :func:`explicit_gen_keys` and the tests exercise the SAME
+    parser main() uses. A test that rebuilt an equivalent parser of its own would go
+    on passing while the real one drifted -- and the precedence rule under test is
+    defined entirely by which flags this parser saw.
+
+    Returns:
+        The configured parser.
+    """
     ap = argparse.ArgumentParser()
     ap.add_argument("--base-url", default="http://127.0.0.1:8404/v1")
     ap.add_argument("--model", default="evalmodel")
@@ -518,6 +549,12 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=0, help="passed to the server; None to omit")
     ap.add_argument("--out", type=str, default="")
     ap.add_argument("--gen-out", type=str, default="", help="JSONL of every completion")
+    return ap
+
+
+def main() -> int:
+    """Run the requested benchmarks and return a process exit status."""
+    ap = build_parser()
     args = ap.parse_args()
     # Explicit CLI generation flags outrank BENCH_OVERRIDES; see resolve_params.
     global _EXPLICIT
@@ -536,7 +573,7 @@ def main() -> None:
     try:
         for b in [x.strip() for x in args.benchmarks.split(",") if x.strip()]:
             t0 = time.time()
-            r = asyncio.run(run_bench(b, args, gen_fh))
+            r = asyncio.run(run_bench(b, args, gen_fh, _EXPLICIT))
             r["seconds"] = round(time.time() - t0, 1)
             rows.append(r)
             print(

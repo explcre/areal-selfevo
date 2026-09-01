@@ -19,9 +19,14 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from math_bench import (  # noqa: E402
+    BENCH_OVERRIDES,
+    GEN_KEYS,
+    build_parser,
+    explicit_gen_keys,
     extract_boxed,
     grade,
     load,
+    resolve_params,
     run_bench,
     wilson,
 )
@@ -449,3 +454,184 @@ def test_extract_boxed_strips_surrounding_whitespace():
     """Models emit \\boxed{ 42 }; an unstripped answer fails string comparison."""
     assert extract_boxed(r"\boxed{ 42 }") == "42"
     assert extract_boxed("\\boxed{\n  7\n}") == "7"
+
+
+# ------------------------------------------------- explicit CLI vs BENCH_OVERRIDES
+#
+# The bug these close: BENCH_OVERRIDES was applied unconditionally, so an explicit
+# `--max-tokens 32768` was discarded in silence. A full 30B re-score therefore ran
+# olympiadbench at 16384 and aime at 8192 -- the exact caps it was launched to raise --
+# and reported success. Nothing in the results row said the cap had been overruled.
+
+
+def _explicit(argv):
+    """Parse `argv` with the REAL parser and return (namespace, explicit key set)."""
+    ap = build_parser()
+    args = ap.parse_args(argv)
+    return args, explicit_gen_keys(ap, argv)
+
+
+def test_explicit_gen_keys_reports_a_flag_that_was_named():
+    _, keys = _explicit(["--max-tokens", "32768"])
+    assert keys == {"max_tokens"}
+
+
+def test_explicit_gen_keys_reports_nothing_when_a_flag_was_defaulted():
+    """A default is not a request, and must not outrank the per-benchmark table."""
+    _, keys = _explicit([])
+    assert keys == set()
+    _, keys = _explicit(["--benchmarks", "aime24", "--limit", "3", "--out", "x.json"])
+    assert keys == set()
+
+
+def test_explicit_gen_keys_handles_the_equals_form():
+    """`--max-tokens=32768` is how run_math.sh and the shell chains often write it."""
+    _, keys = _explicit(["--max-tokens=32768"])
+    assert keys == {"max_tokens"}
+
+
+def test_explicit_gen_keys_handles_an_unambiguous_abbreviation():
+    """argparse accepts `--max-tok`, so a scan of raw argv strings would miss it."""
+    args, keys = _explicit(["--max-tok", "32768"])
+    assert keys == {"max_tokens"} and args.max_tokens == 32768
+
+
+def test_explicit_gen_keys_covers_every_generation_key():
+    """Each key in GEN_KEYS must be detectable on its own, and only itself.
+
+    A key that has no flag, or whose flag spells its dest differently, would be
+    silently undetectable and would go on being overridden by the table.
+    """
+    values = {"max_tokens": "1234", "temperature": "0.7", "top_p": "0.9", "n": "3",
+              "concurrency": "8", "timeout": "77", "seed": "5"}
+    assert set(values) == set(GEN_KEYS)
+    for key, val in values.items():
+        _, keys = _explicit([f"--{key.replace('_', '-')}", val])
+        assert keys == {key}, key
+
+
+def test_explicit_gen_keys_reports_several_flags_at_once():
+    _, keys = _explicit(["--max-tokens", "32768", "--seed", "7", "--limit", "5"])
+    assert keys == {"max_tokens", "seed"}
+
+
+def test_explicit_gen_keys_does_not_disturb_the_parser():
+    """It re-parses argv; a later parse_args must see exactly what it saw before."""
+    ap = build_parser()
+    before = vars(ap.parse_args(["--max-tokens", "32768"]))
+    explicit_gen_keys(ap, ["--max-tokens", "32768"])
+    assert vars(ap.parse_args(["--max-tokens", "32768"])) == before
+
+
+def test_an_explicit_cap_outranks_the_table():
+    """The exact bug: `--max-tokens 32768` on a benchmark the table caps at 8192."""
+    args, keys = _explicit(["--max-tokens", "32768"])
+    assert BENCH_OVERRIDES["aime24"]["max_tokens"] != 32768
+    assert resolve_params("aime24", args, keys)["max_tokens"] == 32768
+    assert resolve_params("olympiadbench", args, keys)["max_tokens"] == 32768
+
+
+def test_the_table_outranks_the_cli_default():
+    """Without an explicit flag the per-benchmark cap is the point of the table."""
+    args, keys = _explicit([])
+    assert args.max_tokens == 4096
+    assert resolve_params("aime24", args, keys)["max_tokens"] == 8192
+    assert resolve_params("olympiadbench", args, keys)["max_tokens"] == 16384
+
+
+def test_the_cli_default_is_used_where_the_table_is_silent():
+    args, keys = _explicit([])
+    assert "math500" not in BENCH_OVERRIDES
+    assert resolve_params("math500", args, keys)["max_tokens"] == 4096
+
+
+def test_the_table_never_touches_a_key_it_does_not_name():
+    """An override for max_tokens must not disturb temperature, seed or the rest."""
+    args, keys = _explicit(["--temperature", "0.7", "--seed", "9"])
+    p = resolve_params("aime24", args, keys)
+    assert p["temperature"] == 0.7 and p["seed"] == 9 and p["max_tokens"] == 8192
+
+
+def test_an_unknown_override_key_is_rejected(monkeypatch):
+    """A typo in the table would otherwise run at the default while the results row
+    claimed the override -- a number that documents a cap it never used."""
+    monkeypatch.setitem(BENCH_OVERRIDES, "aime24", {"max_toknes": 8192})
+    args, keys = _explicit([])
+    with pytest.raises(ValueError, match="max_toknes"):
+        resolve_params("aime24", args, keys)
+
+
+def test_every_shipped_override_names_a_real_generation_key():
+    """Guards the table as committed, not just the checking code."""
+    args, keys = _explicit([])
+    for bench in BENCH_OVERRIDES:
+        resolve_params(bench, args, keys)
+
+
+def test_skipping_the_table_is_announced(capsys):
+    """Silence is what made the 30B re-score look fine; the skip has to be visible."""
+    args, keys = _explicit(["--max-tokens", "32768"])
+    resolve_params("aime24", args, keys)
+    out = capsys.readouterr().out
+    assert "aime24" in out and "32768" in out and "8192" in out
+
+
+def test_no_note_when_the_explicit_value_matches_the_table(capsys):
+    args, keys = _explicit(["--max-tokens", "8192"])
+    assert resolve_params("aime24", args, keys)["max_tokens"] == 8192
+    assert capsys.readouterr().out == ""
+
+
+def test_resolve_params_returns_exactly_the_generation_keys():
+    """The results row's provenance block is these keys; a missing one is a lie."""
+    args, keys = _explicit([])
+    assert set(resolve_params("aime24", args, keys)) == set(GEN_KEYS)
+
+
+def test_run_bench_records_the_cap_it_actually_used():
+    """The table's cap has to reach the results row, not just the local variable."""
+    r = _run(_reply(r"\boxed{1}"))
+    assert r["params"]["max_tokens"] == BENCH_OVERRIDES["aime24"]["max_tokens"]
+
+
+def test_run_bench_honours_an_explicit_cap_passed_to_it():
+    """`explicit` is threaded through the call, not read off a module global."""
+    async def go():
+        runner, url = await _serve(_reply(r"\boxed{1}"))
+        try:
+            return await run_bench("aime24", _Args(url, max_tokens=32768), None,
+                                   {"max_tokens"})
+        finally:
+            await runner.cleanup()
+
+    r = asyncio.run(go())
+    assert r["params"]["max_tokens"] == 32768
+
+
+def test_main_threads_the_explicit_flags_into_every_benchmark(monkeypatch, capsys):
+    """The global has to be set BEFORE the first benchmark resolves its parameters.
+
+    Reading the call order is not enough: this drives the real main() and asserts on
+    what run_bench was actually handed, so moving the assignment after the loop, or
+    dropping the argument at the call site, fails here.
+    """
+    import math_bench
+
+    seen = []
+
+    async def fake_run_bench(bench, args, gen_fh=None, explicit=None):
+        seen.append((bench, explicit))
+        return {"benchmark": bench, "n_problems": 1, "n_graded": 1, "n_failed": 0,
+                "n_truncated": 0, "n_no_box": 0, "accuracy": 1.0, "wilson_lo": 0.2,
+                "wilson_hi": 1.0, "params": {"max_tokens": 32768}, "cap_limited": False,
+                "truncation_rate": 0.0, "seed": 0, "temperature": 0.0}
+
+    monkeypatch.setattr(math_bench, "run_bench", fake_run_bench)
+    monkeypatch.setattr(math_bench, "_EXPLICIT", set())
+    monkeypatch.setattr(sys, "argv",
+                        ["math_bench.py", "--benchmarks", "aime24,aime25",
+                         "--max-tokens", "32768"])
+    assert math_bench.main() == 0
+    capsys.readouterr()
+    assert seen == [("aime24", {"max_tokens"}), ("aime25", {"max_tokens"})]
+    assert math_bench._EXPLICIT == {"max_tokens"}
