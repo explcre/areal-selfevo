@@ -139,7 +139,10 @@ checkpoint, and nothing here can see it. Probes are greedy while training sample
 temperature 1.0; greedy length at 149 (455) tracks training seq_len at 145 (478), so it is a
 fair proxy, but the sampled tail is unmeasured.
 
-## 2026-09-01 — The 27B LoRA run failed on config, not capacity, and two obvious causes were wrong
+## 2026-09-01 — The 27B LoRA run: my diagnosis was wrong, the real cause is an fp32 load
+
+(Original heading: "failed on config, not capacity, and two obvious causes were wrong". It
+WAS partly capacity, in a way no config knob expresses -- see the retraction below.)
 
 `lora27b` died at engine init with CUDA OOM and stranded nothing. Diagnosed from its config
 and log. It is worth writing down because two natural explanations are FALSE, and acting on
@@ -152,6 +155,40 @@ either would have wasted a day.
 * A full-precision reference model looks like the obvious 54GB. It was never built:
   `rl_trainer.py:206` creates `ref` only when `kl_ctl > 0`, and the run had `kl_ctl: 0.0`,
   so `self.ref` was `None`.
+
+**RETRACTED 2026-09-01: the colocation diagnosis below is WRONG.** Reading the resolved
+config rather than reasoning from the OOM message shows `rollout.scheduling_strategy.type:
+separation` (line 317) and `actor.scheduling_strategy.type: separation` (line 523) -- both
+were ALREADY separated. The only `colocation` is on `ref` (line 717), which by the point
+above was never built. Two further facts kill it outright: the run died in **actor** init,
+and the `rollout` role was never created in any of the four attempts (`grep "workers for
+role 'rollout'"` returns zero hits across all four logs) -- so the 57.93 GiB process on
+GPU 0 was **not this run's sglang server at all**. It was a foreign co-tenant from another
+job on a shared box. Forcing separation is still correct hygiene, but it would not have
+saved this run, and I asserted it twice as the cause.
+
+**The actual cause, which nobody had named: a float32 full-model materialisation per rank.**
+`fsdp_engine.py:1036` loads in `optimizer_dtype` -- **float32, not `actor.dtype`** -- and with
+`fsdp.memory_efficient_load: false` (the default, and what this run used) `loading_device` is
+the CUDA device. So every rank materialises the entire model in fp32 on its own card BEFORE
+FSDP2 shards it. For 30.5B that is **113.7 GiB against 79.25 GiB usable**. It cannot fit on
+any number of GPUs under any rollout configuration. The traceback confirms the site
+(`core_model_loading.py:789 _materialize_copy -> tensor.to(device)`, one worker at 70.77 GiB
+and still climbing). The fix is `actor.fsdp.memory_efficient_load=true`, which builds on CPU
+at rank 0, `meta` elsewhere, and broadcasts after sharding (`fsdp_engine.py:411-465`).
+
+**A fourth defect, also missed: LoRA weight transfer must go through disk.** The run inherited
+`weight_update_mode: xccl` from `gsm8k_grpo.yaml`. The repo ships
+`examples/math/gsm8k_grpo_lora.yaml` with `weight_update_mode: disk  # must be disk`, and
+`rl_trainer.py:378-381` states why: P2P transports cannot carry PEFT-wrapped tensors. Any
+LoRA run derived from the non-LoRA recipe is wrong before it starts.
+
+**The half-enabled LoRA finding stands, and the mechanism is worse than stated.**
+`get_py_cmd` (`cli_args.py:2286-2300`) skips any flag whose value is `None`/`False`/`""`/`[]`,
+so `enable_lora: null` does not mean "passed as null" -- it means **`--enable-lora` never
+appears on the server command line at all**.
+
+**Superseded text follows, kept for the record:**
 
 **The actual cause: rollout and trainer were colocated on the same cards.** At the OOM, GPU 0
 held one process at **57.93 GiB** (sglang, `mem_fraction_static: 0.6`) plus three trainer
