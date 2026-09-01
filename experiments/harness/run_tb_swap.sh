@@ -111,17 +111,6 @@ install_harbor() {
     fi
   fi
 
-  # 4. conda, which can materialise a 3.12 without apt or root. On a box that is already
-  #    sitting in a conda base -- common for shared notebook images -- this is usually the
-  #    only route that works, because harbor requires Python >=3.12 and the base env is older.
-  if command -v conda >/dev/null 2>&1; then
-    rm -rf "$VENV"
-    echo "  trying: conda create -p $VENV python=3.12" | tee -a "$log"
-    if conda create -y -q -p "$VENV" python=3.12 >> "$log" 2>&1; then
-      _try_pip_into "$VENV/bin/python" "conda env at $VENV" && { echo "  harbor: $HARBOR"; return 0; }
-    fi
-  fi
-
   # 4. the interpreter we are already standing in. On a conda base this is usually the one
   #    that works, and an isolated venv was only ever a nicety.
   local cur; cur="$(command -v python3 || command -v python)"
@@ -135,6 +124,17 @@ install_harbor() {
       echo "  note: installed into the CURRENT interpreter because no venv route worked."
       return 0
     }
+  fi
+
+  # 5. conda, which can materialise a 3.12 without apt or root. On a box that is already
+  #    sitting in a conda base -- common for shared notebook images -- this is usually the
+  #    only route that works, because harbor requires Python >=3.12 and the base env is older.
+  if command -v conda >/dev/null 2>&1; then
+    rm -rf "$VENV"
+    echo "  trying: conda create -p $VENV python=3.12" | tee -a "$log"
+    if conda create -y -q -p "$VENV" python=3.12 >> "$log" 2>&1; then
+      _try_pip_into "$VENV/bin/python" "conda env at $VENV" && { echo "  harbor: $HARBOR"; return 0; }
+    fi
   fi
 
   echo "  every install route failed. Last 25 lines of $log:"
