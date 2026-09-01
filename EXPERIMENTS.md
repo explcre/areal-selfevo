@@ -70,7 +70,10 @@ the hardest.
 **The two nan models completed in 5.5 and 3 minutes** -- Qwen2.5-32B-Instruct and
 Qwen2.5-Math-7B-Instruct. Both have context windows at or below the 32768 cap the sweep passes
 (Math-7B's is 4096), so every request was rejected for asking more new tokens than the model can
-hold. This is the third independent occurrence of the same bug class.
+hold. This is the third occurrence of the same bug class -- **across two machines, not three**:
+one on our own H200 and two models inside a single sweep on the collaborator's box. An
+earlier commit message of mine said "three machines", which overstates how widely it
+has been seen.
 
 ### What this says about the fix
 
@@ -204,7 +207,13 @@ assumed, because the routed arms taught that training can change response length
 
 **The feared degradation is absent, and the sign is opposite.** The run uses `eps_clip: 0.4` and
 `lr: 1.0e-05`, the recipe `step0l.sh` records as destroying held-out capability: `step0d` fell
-**0.528 -> 0.316 monotonically**, a drop of 0.21. Here the ladder **rises** 0.6520 -> 0.6840.
+**0.528 -> 0.334**, a drop of 0.194. Here the ladder **rises** 0.6520 -> 0.6840.
+(Corrected 2026-09-01: this entry twice said "0.316 monotonically, a drop of 0.21".
+Both halves were wrong. `results.tex` `tab:ab`, which carries per-step McNemar p-values
+and so is backed by per-problem data, reads base 0.528, then 0.454, 0.440, **0.466**,
+0.364, 0.334 across steps 28/57/86/115/144. The last value is 0.334, not 0.316 -- a
+number that appears nowhere in that table -- and the series is NOT monotone, because it
+rises at step 86. My figure was recollection; the table is the artifact.)
 Whatever that recipe does to a 1.5B under full fine-tuning, it is not doing it to a 30B under
 LoRA -- which is why the finding was flagged rather than acted on, and why the checkpoints were
 scored instead of the run being restarted.
@@ -411,7 +420,7 @@ fine-tuning, so 1e-5 is conservative by LoRA standards rather than aggressive. T
 that has produced three wrong claims here already.
 
 **The way to settle it is the five checkpoints**: score 24/49/74/99/115 on held-out MATH-500 and
-look at the direction. `step0d` degraded 0.528 -> 0.316 monotonically under the bad recipe, so
+look at the direction. `step0d` degraded 0.528 -> 0.334 under the bad recipe (see correction above), so
 the signature is unmistakable if it is present. Queued behind the GPUs currently in use.
 
 ## 2026-09-01 — Scoring throughput: the 80GB memory rule was being applied to 140GB cards
