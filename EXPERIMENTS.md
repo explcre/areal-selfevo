@@ -21,7 +21,11 @@ teacher-forced argmax must reproduce it, and agreement at the generator is **0.9
 | 99 | 0.99975 | 0.99976 | <5e-7 | **1.20534** | **0.20538** |
 | 149 | 0.99958 | 0.99958 | <5e-7 | 1.09105 | 0.09110 |
 
-`ctx` rises monotonically 0.99754 -> 0.99979, min across prompts 0.850 -> 0.994. Body hazard
+`ctx` rises 0.99754 -> 0.99979 across the full 27-checkpoint ladder, min across prompts
+0.850 -> 0.994. **Correction (2026-09-01): do not call this monotonic.** The six steps
+displayed above are not themselves ordered -- 0.99975 at step 99 exceeds 0.99958 at step
+149 -- and 0.99979 appears in no displayed row. The supported claim is that the hazard
+does not erode; monotonicity is not established by this table. Body hazard
 below 5e-7 at every step: the hazard is a spike at the response's semantic end and that spike
 never moves. **Mechanism A (smooth erosion) is refuted. Mechanism B is refuted at its premise
 -- the hazard is not the failing state variable at all.**
@@ -51,10 +55,16 @@ stale-text artifact.
 ### What does survive
 
 **Length moves like a threshold, and routing presence separates cleanly.** All three
-configured-routing runs sit on the same ~424-token plateau for >120 steps then break: onset
+configured-routing runs hold a flat plateau (reported as ~424 tokens, but **this figure is
+UNRECONCILED**: the 2026-08-31 length table gives ctx 304 at step 30 and 340 at step 140,
+below 424 right up to its own onset -- do not use 424 until the two are reconciled) for >120 steps then break: onset
 (5 consecutive steps above baseline+4sd) at **ctx 144, ctxpc 132, sa2 131**, slope 0.34-0.57
-tok/step before and 5.6-9.2 after. **Zero of the matched unrouted runs ever cross**
-(step0l 273 steps, step0j 178, g16 116). Free greedy generation: `ctx` 327 -> 455 tokens,
+tok/step before and 5.6-9.2 after. **Zero of the matched runs without GROUP routing ever cross** -- and note `step0j` is the
+TOKEN-level routing arm, so it is unrouted only at the group level; calling all three
+simply "unrouted" overstates the control
+(step0l 273 steps, step0j 178, g16 116; note an earlier entry here says step0l ran 219
+steps -- 273 is from the newer scan and is what the paper uses, but the disagreement is
+unresolved and one of the two is wrong). Free greedy generation: `ctx` 327 -> 455 tokens,
 `step0l` 330 -> 316 and flat over 202 steps.
 
 So routing presence predicts crossing; routing MAGNITUDE does not predict onset.
@@ -134,6 +144,11 @@ concurrency, same grader -- only the cap actually reaching the sampler:
 A 3x swing from a silently-ignored flag. The `NOTE ... BENCH_OVERRIDES default 8192 not
 applied` line now printed by the fixed code is what proves the value reached the sampler,
 rather than merely appearing on the command line -- which it always did.
+
+**Run-to-run jitter at n=30 is around 0.1.** An earlier entry records 30B aime24 at an
+effective 8192 cap as 0.1667 with 83% truncation, where the controlled re-score records
+0.2667 with 73.3%. The 0.2667 -> 0.8000 effect is far larger than that spread, so it
+survives, but no AIME difference below ~0.15 at n=30 should be called real.
 
 **Both numbers are still lower bounds**: 20% of AIME generations hit even the 32768 cap and
 were graded wrong. And olympiadbench carries a second, unrelated lower-bound caveat -- 94 of
