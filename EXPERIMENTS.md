@@ -3,6 +3,37 @@
 Measured results and negative results, newest first. A claim only belongs here once it has
 been observed end to end; a prediction belongs in GOAL.md until then.
 
+## 2026-09-01 — Cap saturation: doubling the budget to 65536 buys essentially nothing
+
+The fairness objection was that comparing two models at a cap which truncates BOTH partly
+measures verbosity rather than skill, and that a ranking is only trustworthy if it survives a
+larger budget. Qwen3.8-27B, same model, same grader, only the cap changed:
+
+| benchmark | @32768 | trunc | @65536 | trunc | delta |
+|---|---|---|---|---|---|
+| MATH-500 | 0.9760 | 0.8% | **0.9800** | **0.2%** | +0.004 |
+| AIME24 | 0.9000 | 13.3% | **0.9333** | **6.7%** | +0.033 (1 problem) |
+| AIME25 | 0.9000 | 10.0% | **0.9333** | **3.3%** | +0.033 (1 problem) |
+| OlympiadBench | 0.7733 | 17.8% | running | -- | -- |
+
+**All three are saturated at 32768.** MATH-500 moves +0.004 on n=500, where the standard error
+is ~0.006 -- inside noise. Each AIME set moves by exactly one problem out of 30, well inside the
+~0.1 run-to-run jitter already recorded at that n. Truncation more than halves on every
+benchmark and the accuracy barely follows, which is the signature of a budget that was already
+sufficient: the generations being cut off were ones that were going to be wrong anyway.
+
+**Consequence for the comparison.** For MATH-500 and both AIME sets, the 32768 numbers are
+measurements rather than lower bounds, and the ranking against Frontis-MA1-30B (0.8980 / 0.8000
+/ 0.7000) can be stated plainly. **OlympiadBench remains open** -- it is the one benchmark where
+truncation was high enough (17.8% against Frontis's 20.0%) for verbosity to matter, and it is
+the one still running.
+
+**A caveat that belongs with these numbers.** The 65536 run used concurrency 40 against the
+earlier run's 24, so the batch composition differed. Greedy decoding makes each answer
+independent of its neighbours, but batched matmuls do not associate identically across batch
+sizes, so a one-problem AIME difference is at the resolution where that could contribute. It
+does not affect the conclusion, which rests on the accuracy NOT moving while truncation halved.
+
 ## 2026-09-01 — The 30B LoRA run is healthy, and two alarms I raised about it were both false
 
 I reported twice that the run emitted "no metrics of any kind" and then that its reward was
