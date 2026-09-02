@@ -2,6 +2,7 @@
 
 import functools
 import math
+import os
 from typing import Any
 
 import torch
@@ -391,6 +392,101 @@ class PPOActor:
     def compute_advantages(self, data: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return batched_call(self._compute_advantages, data, pass_meta=True)
 
+    def _arm_unrouted_cluster_batch(self, gr, data, n_groups: int) -> dict[str, float]:
+        """Arm -- or refuse -- a cluster-LoRA batch on a run whose routing cannot carry one.
+
+        A cluster-LoRA arm is switched on by TWO variables read at two seams that never
+        checked each other. ``SELFEVO_CLUSTER_LORA_ADAPTERS`` is read in
+        ``FSDPEngine._apply_peft_wrapper`` and creates every expert, which happens on every
+        run that sets it. ``SELFEVO_CLUSTER_LORA`` is read in :meth:`_route_groups` and arms
+        the partition, and ``_route_groups`` is reached only under ``group_routing.enabled``
+        with a ``group_routing.router`` set. So a run with both variables set and
+        ``group_routing`` left at its default created every expert, armed nothing, trained
+        the first expert for the whole batch and emitted no ``cluster_lora/*`` key at all --
+        the arm reporting itself while running the shared-LoRA baseline, bit for bit, since
+        LoRA initialises ``B = 0`` and the untouched experts add exactly zero to the merge.
+
+        This is the same decision taken where ``_route_groups`` cannot take it, and it has
+        two outcomes because there are two honest ones.
+
+        ``partition=none`` is the vanilla shared-LoRA arm expressed in the method's type. It
+        needs no features, no router and no clustering, so it is ARMED here: every group goes
+        to the shared adapter, which is what that arm means, and the baseline then runs the
+        identical engine path as the method rather than a second path that resembles it.
+
+        ``partition=meds`` and ``partition=random_matched`` need the behavioural vectors, and
+        the vectors reach the partitioner only through the routing seam -- ``extra`` is
+        ``Mapping[str, float]`` and cannot carry one. There is nothing to arm, so the run is
+        REFUSED, exactly as ``PartitionUnavailable`` refuses those modes when the extra
+        forward is off, and for the identical reason: the only alternative is one adapter for
+        everything under the method's label.
+
+        Args:
+            gr: The ``GroupRoutingConfig``, or ``None``. Read only to say in the refusal
+                which half of the routing configuration is missing.
+            data: The batch dict, stamped with this batch's identity so the engine can tell
+                the plan armed for it from a plan left over from the previous batch.
+            n_groups: Groups in this batch, which is what the degenerate partition is over.
+
+        Returns:
+            Flat metrics for the run's stats stream, so an unrouted cluster batch is visible
+            on the same panel as a routed one instead of being an absence of keys.
+
+        Raises:
+            ClusterWiringError: If the arm needs a partition this seam cannot form, or if the
+                roster has no shared adapter to put the degenerate partition on.
+        """
+        from selfevo.cluster_lora.partition import SHARED_CLUSTER, no_partition
+        from selfevo.cluster_lora.wiring import (
+            CLUSTER_LORA_ENV,
+            ROSTER_ENV,
+            ClusterLoRAConfig,
+            ClusterPlan,
+            ClusterWiringError,
+            adapter_roster,
+            tag_cluster_batch,
+        )
+
+        cfg = ClusterLoRAConfig.from_env()
+        if cfg is None:  # pragma: no cover - the caller gates on the same variable
+            return {}
+        roster = adapter_roster()
+        if cfg.partition != "none":
+            raise ClusterWiringError(
+                f"{CLUSTER_LORA_ENV}={cfg.partition!r} needs the behavioural feature vectors, "
+                "which reach the partitioner only through the group-routing seam; this run "
+                f"has group_routing.enabled={bool(getattr(gr, 'enabled', False))} and "
+                f"router={getattr(gr, 'router', None)!r}, so no partition can be formed. The "
+                f"engine has already created {list(roster)} from {ROSTER_ENV}, and training "
+                "them with no partition armed is the shared-LoRA baseline under this arm's "
+                "name. Set group_routing.enabled with router='cluster', or set "
+                f"{CLUSTER_LORA_ENV}=none"
+            )
+        if roster and SHARED_CLUSTER not in roster:
+            raise ClusterWiringError(
+                f"{CLUSTER_LORA_ENV}=none puts every group on the {SHARED_CLUSTER!r} adapter "
+                f"and {ROSTER_ENV}={list(roster)} does not have one, so the plan would name "
+                "an expert the model does not carry"
+            )
+        partition = no_partition(n_groups)
+        step = int(getattr(self, "_selfevo_batch", 0))
+        self._selfevo_batch = step + 1
+        tag_cluster_batch(data, step)
+        engine = getattr(self, "engine", None)
+        if engine is not None:
+            engine._selfevo_cluster_plan = ClusterPlan(
+                key_of_group=dict(enumerate(partition.keys)),
+                step=step,
+                basis=partition.basis,
+            )
+        return {
+            "cluster_lora/adapters_available": float(len(roster)),
+            "cluster_lora/plan_groups": float(n_groups),
+            # Zero says the switch is on and the partition did NOT reach an engine, which is
+            # the state this whole method exists to stop being invisible.
+            "cluster_lora/plan_armed": float(engine is not None),
+        }
+
     def _route_groups(self, gr, data, raw_reward, advantages, sizes, *, sft_rows=None):
         """Route every group with a configured Router and apply the decisions.
 
@@ -428,7 +524,16 @@ class PPOActor:
                     f"group_routing.router={gr.router!r} is not a registered router; "
                     f"known: {sorted(ROUTERS)}"
                 )
-            router = factory()
+            # A router that generates its rule from source needs it at CONSTRUCTION,
+            # and `factory()` with no arguments is why `code_policy` was unreachable from
+            # config. The dict is empty when no source is named, so this is the identical
+            # expression for every arm that does not use one.
+            router_kwargs = {}
+            _src_file = getattr(gr, "router_source_file", None)
+            if _src_file:
+                with open(_src_file) as _fh:
+                    router_kwargs["source"] = _fh.read()
+            router = factory(**router_kwargs)
             self._selfevo_router = router
 
         # The harness half of a routing decision finally has a consumer, and this is the one
@@ -525,6 +630,26 @@ class PPOActor:
         #
         # ONE call per unit either way: a router may be stateful, and routing twice to read the
         # weights and then the label would double every update it makes.
+        # SEAM 1 (selfevo/FINDINGS_cluster_lora.md section 9): the behavioural feature
+        # vector that RoutingContext.extra cannot carry. `extra` is Mapping[str, float], so
+        # a MEDS vector reaches the key function only through this call, and without it
+        # cluster_lora.partition=meds REFUSES rather than collapsing to one adapter.
+        #
+        # Gated on the environment variable ALONE, and on nothing else: with cluster-LoRA
+        # unconfigured -- every run to date -- this branch imports nothing, allocates
+        # nothing and leaves the update bit-identical. The literal is duplicated from
+        # selfevo.cluster_lora.wiring.CLUSTER_LORA_ENV precisely so the default path does
+        # not import selfevo.cluster_lora at all; a test asserts the two agree.
+        if os.environ.get("SELFEVO_CLUSTER_LORA", "").strip():
+            from selfevo.cluster_lora.wiring import begin_cluster_batch
+
+            # Emitted into the same stream as the route/* keys, so an arm's log says what
+            # the partition did: how many clusters, how much noise, how much churn, and the
+            # size of every adapter separately.
+            stats_tracker.scalar(
+                **begin_cluster_batch(self, router, data, contexts, list(sizes))
+            )
+
         decisions = route_all(router, contexts, harness_consumer=dispatcher is not None)
 
         # Consume the harness coordinate. Declared as a consumer above on the presence of the
@@ -919,6 +1044,18 @@ class PPOActor:
                 # enabled-flag test below as a literal string and skips the mutation, silently,
                 # if that string stops being unique in this file.
                 routing_on = gr is not None and getattr(gr, "enabled", False)
+                # SEAM 1b: the same switch, read where the routing branch cannot swallow it.
+                # _route_groups reads SELFEVO_CLUSTER_LORA and is reached only under
+                # `routing_on and gr.router`, while the engine creates the experts from
+                # SELFEVO_CLUSTER_LORA_ADAPTERS unconditionally; with the two out of step the
+                # run was the baseline wearing the method's name and no metric said so. Read
+                # into a local rather than tested inline, so the gate literal below stays the
+                # unique anchor selfevo/tests/mutate_cluster_lora_wired.py mutates.
+                cluster_arm = os.environ.get("SELFEVO_CLUSTER_LORA", "").strip()
+                if cluster_arm and not (routing_on and getattr(gr, "router", None)):
+                    stats_tracker.scalar(
+                        **self._arm_unrouted_cluster_batch(gr, data, len(sizes))
+                    )
                 sft_rows = None
                 sft_excluded = 0
                 if routing_on:
