@@ -462,6 +462,22 @@ class PPOTrainer:
 
         # Set up statistics logging (wandb, tensoboard, etc.)
         self.stats_logger = StatsLogger(config, ft_spec)
+        # selfevo: periodic benchmark evaluation on the committed `search` split, plus the
+        # feedback/inference budget counters. DEFAULT-OFF: with SELFEVO_PERIODIC_EVAL unset
+        # this is one environment lookup and the run is unchanged. Constructed here so a
+        # misconfiguration (an unsplit benchmark, a missing model id, a bad cadence) fails at
+        # trainer start rather than an hour into the run. Deliberately NOT wired through
+        # AReaL's own Evaluator: A0's preflight records that path as deadlocking this stack.
+        # An ImportError disables the feature (which is off by default anyway) rather than
+        # killing the run; a ValueError from resolving the config is a deliberate refusal of
+        # a misconfiguration the operator asked for, and MUST propagate.
+        try:
+            from selfevo.periodic_eval import PeriodicEvalHook
+        except ImportError as _selfevo_exc:
+            logger.warning(f"selfevo periodic eval unavailable, continuing without it: {_selfevo_exc}")
+            self._selfevo_periodic_eval = None
+        else:
+            self._selfevo_periodic_eval = PeriodicEvalHook(logger=logger)
 
         # Set up checkpointing for recover
         self.recover_info = self.recover_handler.load(
@@ -1844,6 +1860,22 @@ class PPOTrainer:
         stats.update(self.rollout.export_stats())
         if self.eval_rollout is not None:
             stats.update(self.eval_rollout.export_stats())
+        # selfevo: the periodic search-split evaluation and the budget counters, merged into
+        # the SAME commit so they land at this step's x-position on the existing W&B run
+        # rather than opening a second one. This point is still inside the paused-rollout
+        # window (after rollout.pause(), before rollout.resume()) and the checkpoint for this
+        # step has already been written, so the evaluation scores the checkpoint it names.
+        # Only the logging rank evaluates: several ranks each running a benchmark before the
+        # barrier below would deadlock.
+        _selfevo_hook = getattr(self, "_selfevo_periodic_eval", None)
+        if _selfevo_hook is not None:
+            stats.update(
+                _selfevo_hook.maybe_run(
+                    global_step=global_step,
+                    checkpoint=f"epoch{epoch}epochstep{epoch_step}globalstep{global_step}",
+                    is_primary=not (dist.is_initialized() and dist.get_rank() != 0),
+                )
+            )
         self.stats_logger.commit(epoch, epoch_step, global_step, stats)
 
         if not is_single_controller():

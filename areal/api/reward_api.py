@@ -145,6 +145,16 @@ class AsyncRewardWrapper:
                 raise RuntimeError("ProcessPoolExecutor has been shut down")
 
             is_last = attempt == self.max_retries
+            # selfevo: one increment per DISPATCH. This is the whole reason the counter is
+            # not `batch_size x group_size`: a timeout costs two or more dispatches for one
+            # reward, and the arithmetic undercounts exactly where the verifier misbehaves.
+            # Exception-proof by construction; instrumentation must never break a run.
+            try:
+                from selfevo import feedback_budget as _selfevo_budget
+
+                _selfevo_budget.record_call(attempt)
+            except Exception:
+                pass
             try:
                 future = asyncio.get_running_loop().run_in_executor(
                     executor,
@@ -158,6 +168,14 @@ class AsyncRewardWrapper:
                     f"{'Returning 0.' if is_last else 'Retrying...'}"
                 )
                 if is_last:
+                    # selfevo: a 0.0 reward that is NOT a judgement about the completion.
+                    # Counted separately so it cannot be read as the verifier saying "wrong".
+                    try:
+                        from selfevo import feedback_budget as _selfevo_budget
+
+                        _selfevo_budget.record_refusal()
+                    except Exception:
+                        pass
                     return 0.0
             except BrokenProcessPool:
                 logger.warning(

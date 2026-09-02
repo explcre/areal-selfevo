@@ -130,9 +130,32 @@ class RLVRWorkflow(RolloutWorkflow):
         async with atrace_session_phase("generate"):
             resp = await engine.agenerate(req)
 
+        # selfevo: bracket the verifier call so the dispatches THIS reward consumed --
+        # retries included -- are attributable to it. GOAL.md section 4, matched feedback
+        # budget. Published through the scope the reward already uses, so it rides the
+        # existing rollout stats export rather than needing a second transport.
+        try:
+            from selfevo import feedback_budget as _selfevo_budget
+
+            _selfevo_before = _selfevo_budget.snapshot()
+        except Exception:
+            _selfevo_budget = _selfevo_before = None
+
         reward = await self._compute_rewards(resp, prompt_str, task_data)
 
         stats_tracker.get(workflow_context.stat_scope()).scalar(reward=reward)
+        if _selfevo_budget is not None:
+            try:
+                _selfevo_budget.record_generated_tokens(len(resp.output_tokens))
+                _selfevo_now = _selfevo_budget.snapshot()
+                stats_tracker.get(workflow_context.stat_scope()).scalar(
+                    budget_verifier_calls=_selfevo_now.calls - _selfevo_before.calls,
+                    budget_verifier_retries=_selfevo_now.retries - _selfevo_before.retries,
+                    budget_verifier_refusals=_selfevo_now.refusals - _selfevo_before.refusals,
+                    budget_generated_tokens=len(resp.output_tokens),
+                )
+            except Exception:
+                pass
 
         return resp, reward
 

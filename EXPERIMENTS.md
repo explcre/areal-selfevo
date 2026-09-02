@@ -3380,3 +3380,234 @@ Generation. The prompt is BIRD's own, transcribed from `llm/src/prompt.py` and
 `math_bench`'s, already exercised by the other two domains — but no token has been generated
 against this benchmark and no BIRD score exists. `bird_mini_dev` is the default `SUITE` entry:
 500 questions, and the release our 43.8% anchor is comparable to.
+
+
+## 2026-09-02 — Periodic in-training evaluation on the `search` split, with an adapter-liveness series
+
+Until now no run produced a benchmark number while it was running. Getting one meant stopping
+training, serving the checkpoint by hand and restarting, which happened exactly once (A0
+`globalstep149`, above). A 12853-step-per-epoch run could therefore train to completion before
+anyone discovered the adapter had never moved. This closes that.
+
+**Files.** `selfevo/periodic_eval.py`, `selfevo/feedback_budget.py`,
+`selfevo/tests/test_periodic_eval.py`, `selfevo/tests/test_feedback_budget.py`,
+`selfevo/tests/mutate_periodic_eval.py`, `selfevo/tests/mutate_feedback_budget.py`, plus
+**66 inserted lines and 0 deleted** across three vendor files (`areal/api/reward_api.py`,
+`areal/workflow/rlvr.py`, `areal/trainer/rl_trainer.py`).
+
+### What it does
+
+One scorer, not two. Generation and grading go through `experiments/bench/math_bench.run_bench`
+— the same function that produced the 0.4696 above — so the periodic curve and the final number
+cannot disagree. Nothing in `experiments/bench/` was edited; it is imported.
+
+The hook runs in `_export_and_commit_stats`, **not** through AReaL's `Evaluator`. A0's own
+preflight records the reason: *"in-training evaluator disabled ... it deadlocks this stack"*.
+That point is still inside the paused-rollout window (after `rollout.pause()`, before
+`rollout.resume()`), the checkpoint for the step has already been written, and the metrics
+merge into the existing `StatsLogger.commit` — so they land on the existing W&B run at the
+right step rather than opening a second one. Only the logging rank evaluates.
+
+Default-off. With `SELFEVO_PERIODIC_EVAL` unset the trainer does one environment lookup
+(**measured 2.6 us per step**, against a 28.0 s step) and nothing else.
+
+### The `report` half is unreachable, by construction and then by check
+
+`EVAL_SPLIT = "search"` is a module constant, not a config field. Two independent guards:
+
+* **Before generation** — `require_committed_split(bench)` refuses a benchmark with no
+  committed split rather than falling through to `split="all"`, which *contains* `report`.
+  This is the shape of the retracted `partition_from_config` bug, where an unlisted name
+  silently ran the control's mechanism under a new label.
+* **After generation** — `assert_search_only(bench, records)` reads the committed indices off
+  `olympiadbench_split.json` and compares them against the `idx` of every generation the
+  harness returned. Neither side is derived from the other.
+
+Verified end to end in a one-sample CPU dry run before any GPU: graded source-file index `[2]`,
+subset of `search` True, intersects `report` False.
+
+### Adapter liveness: the brief asked for the probe that already gave a false alarm
+
+The brief specified *"the fraction of greedy generations that differ between the adapter and
+the base model"*. **That is exactly the probe that failed at step 149**, recorded above: 0 of 3
+greedy outputs differed, it printed `adapter indistinguishable from base`, and it was WRONG —
+logprobs differed by up to 0.041. A small LoRA delta moves the distribution long before it
+moves the argmax.
+
+So `greedy_differ_frac` is still emitted, because it is what a reader looks for first, but the
+**verdict series `liveness/is_live` is decided on per-token logprob differences**, against a
+threshold of 1e-4 (three orders of magnitude below the smaller of the two step-149
+measurements). The probe prompts are long-form rather than trivial arithmetic, for the same
+reason. `test_liveness_sees_an_adapter_that_moves_logprobs_but_not_the_argmax` reconstructs the
+step-149 state exactly and asserts the verdict is LIVE.
+
+Missing logprobs are refused (`LivenessUnavailable`), never defaulted: "assume live" and
+"assume inert" are both answers nobody measured.
+
+**Reading the curve.** `periodic_eval/diagnosis` codes the two-signal read into one series:
+0 = adapter inert (*not learning yet*), 1 = live but accuracy inside the run's own first
+measurement's Wilson interval (*learning but not helping*), 2 = live and above it, 3 = live and
+below it, -1 = unknown. The comparison is against the stored first measurement's interval, not
+a threshold picked afterwards.
+
+### Measured cost — 4.0% of training throughput at the default cadence
+
+Every number below was measured on this box; none is an estimate.
+
+| quantity | value | how measured |
+|---|---|---|
+| A0 training step | **28.0 s** | A0's own StatsLogger lines, steps 195→202 (195.9 s / 7) |
+| OlympiadBench generation | **0.858 s/problem** | `runs/eval_a0_step149/olympiadbench.json`: 578.9 s / 675, same model, same box, sglang tp=2, greedy, cap 16384, concurrency 32 |
+| harness + guards + liveness, no model | **1.34 s** | median of 5 full 64-problem evals against an instant local stub |
+| per-step hook, feature OFF | **2.6 us** | median of 2000 |
+| per-step hook, feature ON, non-eval step | **2.4 us** | median of ~1960 |
+| `feedback_budget.record_call` | **0.37 us** | 100,000 calls |
+
+Default `freq_steps=50`, `limit=64`:
+**64 x 0.858 + 1.34 = 56.2 s per evaluation, against 50 x 28.0 = 1400 s of training = 4.01%.**
+
+`freq_steps=50` rather than 25 for two reasons: at 25 the same evaluation costs 8.0%, and 50 is
+a multiple of `saver.freq_steps=25`, so every evaluation step is also a checkpoint step and
+best-val selection always names a checkpoint that exists.
+
+**What 64 problems buys, stated plainly.** The Wilson interval at n=64 is roughly +/-12 points,
+which **cannot resolve a small gain** — the accuracy curve is for gross trend and collapse, not
+for arm decisions. The liveness series, which costs seconds, is the sensitive early warning.
+That division of labour is the design, not a limitation discovered afterwards.
+
+### Best-validation selection
+
+`BestValTracker` selects on the same `search`-split signal every arm decision uses, with
+patience, and persists to JSON so a resumed run does not forget. Strictly greater-than, so a
+tie keeps the EARLIER checkpoint: with greater-or-equal a plateau walks `best` forward to the
+latest, which is indistinguishable from no selection at all.
+
+### Feedback and inference budget (`GOAL.md` section 4, "Matched feedback budget — NOT MET")
+
+Verifier invocations are counted **at the dispatch site**, one increment per iteration of
+`AsyncRewardWrapper.__call__`'s retry loop, not inferred as `batch_size x group_size`. The
+arithmetic is wrong precisely where it matters: a timeout costs two or more dispatches for one
+reward. `budget/*` is emitted on **every** step, cumulative and per-step. Cache hits are counted
+separately from calls, and `budget/cache_enabled` reads 0 because **no cache exists on this
+path** — a `cache_hits` of zero would otherwise be ambiguous. `budget/generated_tokens_*` is
+free at the reward call site and closes the cheap half of the *matched inference budget* row;
+prompt tokens and rollout-internal retries are NOT counted, because that would mean
+instrumenting the rollout path, which this deliberately does not touch.
+
+`budget/counter_visible` exists because the counter is process-local: if the publishing process
+never sees a verifier call, the series is NaN with the flag at 0, never a confident zero.
+
+### Two findings produced while building this
+
+**A0 IS NOT RUNNING, and has not been since 10:38:55 today.** `runs/a0_outer.log` ends
+`Terminated / A0_EXIT=143` (SIGTERM). The last checkpoint is `globalstep199` (09:40); the
+process list holds no trainer, only orphaned `proxy-rollout` workers from four earlier launch
+attempts. All four GPUs are held by an unrelated `sglang.launch_server --tp-size 4` serving
+Qwen3.8-27B, started 10:41 — two minutes after A0's last engine-init line. The brief describing
+A0 as "running right now" on GPUs 0 and 1 was already out of date.
+
+**`AsyncRewardWrapper`'s timeout branch is dead code on this box.** The venv named `venv312b` is
+**Python 3.10.12** (`lib/python3.10` is the only one present). On python<3.11
+`asyncio.TimeoutError` is neither the builtin `TimeoutError` nor a subclass of it, and
+`reward_api.py` catches the builtin — so a verifier timeout falls through to `except Exception`
+and **RAISES on the last attempt instead of degrading to reward 0.0**, which is what the code
+intends. Consequences: `budget/verifier_refusals_total` is structurally zero here (recorded,
+not papered over), and more importantly a slow verifier propagates an exception into the
+rollout rather than being absorbed. Not fixed — changing reward semantics is out of scope for
+this change — but `test_a_slow_verifier_does_not_silently_become_a_zero_reward_on_this_
+interpreter` pins the behaviour so a python upgrade cannot change it silently.
+
+### Test and mutation results
+
+Counts observed from the runs themselves, not from a pytest cache.
+
+**New tests.** `test_periodic_eval.py` **56 passed**. `test_feedback_budget.py` **19 passed,
+1 skipped** (the skip is the python-3.10 unreachable-branch case above, with the reason on the
+`skipif`). 75 new tests; 149 new functions and classes, all with docstrings.
+
+**Full `selfevo/tests/` suite (`-m "not slow"`), observed from the run:**
+
+| run | tree | failed | passed | skipped | deselected | xfailed | wall |
+|---|---|---|---|---|---|---|---|
+| 1 | live, WITH this change | 55 | 1881 | 4 | 5 | 4 | 281.5 s |
+| 1 | same tree, my delta reverted | 54 | 1807 | 3 | 5 | 4 | 264.7 s |
+| 2 | live, WITH this change | **54** | 1882 | 4 | 5 | 4 | 285.7 s |
+| 2 | same tree, my delta reverted | **54** | 1807 | 3 | 5 | 4 | 266.4 s |
+
+In run 2 the two **failure sets are identical** — `comm` over the sorted `FAILED` lines returns
+nothing unique to either side. The delta this change makes to the suite is exactly
+**+75 passed, +1 skipped, +0 failed**.
+
+The 54 failures in the second row are **other agents' work in progress** and predate this
+change: 20 in `test_cluster_lora_export.py`, 14 in `test_cluster_lora_engine.py`, 11 in
+`test_harness_route_trainer.py`, 3 in `test_gold_batch_path.py`, 3 in
+`test_audit_2026_09_02.py`, 2 in `test_code_policy.py`, 1 in `test_cluster_lora_wired.py`.
+**No failure in either row is in a file this change adds.** The comparison tree is the live
+checkout with only my three vendor edits reverted and my six files removed, so it isolates my
+delta and leaves everyone else's staged work in place.
+
+**The one extra failure in run 1 was chased down rather than waved away.**
+`test_dapo_baseline.py::test_rejected_groups_are_regenerated_under_the_shipped_dynamic_bs`
+failed once with `assert 10 == 8`. It asserts an exact count of groups accepted by
+`BatchTaskDispatcher.active_submit_and_wait` pulling from an *unbounded* generator, so the
+number of extra groups submitted before the batch fills is a function of thread scheduling.
+Evidence it is not this change: it passes **25/25 in isolation under load in BOTH trees**, it
+did not recur in run 2 in either tree, and my two test files sort *after* `test_dapo_baseline`
+so they cannot perturb its in-process state. Recorded here as a pre-existing flaky assertion,
+not fixed — it is another agent's file.
+
+**Mutation testing.** Both harnesses run against a *copy* of the tree and refuse to run against
+`~/areal-selfevo`; the earlier generation of harnesses in this tree write to the live checkout,
+which a training job imports. Three columns, because a SKIP is neither a kill nor a survival.
+
+`mutate_periodic_eval.py` — **killed 20, survived 0, skipped 0, of 20.**
+
+`mutate_feedback_budget.py` — **killed 13, survived 0, skipped 0, expected-survivor 2, of 15.**
+
+Two of the brief's four suggested mutations plus two of the coordinator's are in these lists and
+all four are killed: reading `report`, scoring zero and reporting success, liveness pinned to
+1.0, best-val keeping the latest checkpoint, and the counter never incrementing at the real call
+site.
+
+**Two expected survivors, each with a measurement rather than an excuse.**
+
+* *"the final-timeout refusal is not counted"* — the mutated line is **unreachable** on python
+  3.10 (the finding above). No test can kill a mutation in code that cannot execute. Expected
+  to be killed on python>=3.11 by the test that skips here.
+* *"the counter drops increments under concurrency (the lock is removed)"* — **behaviourally
+  inert** on CPython 3.10, measured directly: 64 threads x 50,000 unlocked increments at a 1e-9
+  switch interval lost **0** increments across 3 trials, as did 32x20,000 and 16x5,000. The lock
+  is kept because it is correct under free-threaded builds, not because a test proves it here.
+
+Both are declared in `EXPECTED_SURVIVORS` with those reasons, so neither is silently dropped nor
+counted as a gap in the tests.
+
+**A process mistake worth recording.** The first mutation run was invalid: two harnesses were
+run concurrently against the *same* copy, and both mutate `selfevo/periodic_eval.py`. One was
+killed mid-test and left a mutant on disk in the copy. The live checkout was verified byte-identical
+throughout (md5 against the deployed source), which is the entire reason the copy-not-live rule
+exists. Both harnesses were re-run serially in two independent trees; only those results are
+reported above.
+
+### To switch it on
+
+A0 must be restarted to pick this up; **nothing was stopped, started or reconfigured here.**
+
+```
+SELFEVO_PERIODIC_EVAL=1
+SELFEVO_PERIODIC_EVAL_FREQ_STEPS=50
+SELFEVO_PERIODIC_EVAL_LIMIT=64
+SELFEVO_PERIODIC_EVAL_MODEL=a0_math                     # the adapter id sglang serves
+SELFEVO_PERIODIC_EVAL_BASE_MODEL=/home/ubuntu/hf_cache/hub/models--Qwen--Qwen2.5-32B-Instruct/snapshots/5ede1c97bbab6ce5cda5812749b4c0bdf79b18dd
+SELFEVO_PERIODIC_EVAL_BASE_URL=http://<rollout-server>:<port>/v1
+SELFEVO_PERIODIC_EVAL_STATE=/home/ubuntu/areal-runs/a0_math_best_val.json
+SELFEVO_PERIODIC_EVAL_OUT_DIR=/home/ubuntu/runs/a0_periodic
+MATH_EVAL_DATA=/home/ubuntu/evaldata
+```
+
+The one thing to confirm at restart: that A0's rollout sglang server registers the adapter as
+its own model id and lists it at `/v1/models`. The step-149 server did exactly that (its
+`served_models.json` carries both the base snapshot and `a0_step149`), and the harness refuses
+to generate against an unlisted id — but it has not been exercised against the *training*
+server, only against a hand-launched one. This is the only part of the path that a CPU dry run
+cannot prove.
