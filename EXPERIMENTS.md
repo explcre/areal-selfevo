@@ -45,6 +45,54 @@ experiment has yet used either. The routed 30B arm is where they belong.
 a feature, grep its resolved config for the switch. `enabled:`, `router:` and `group_routing:`
 are three separate places a routing arm can be silently off.
 
+## 2026-09-02 — Both LiveCodeBench generation bugs fixed; one instruction correctly refused
+
+Commit `14b370ad`. Both fixes pinned by tests that fail without them.
+
+**Bug 1, `extract_code`.** Precedence, now explicit in the docstring: within a level the LAST
+candidate wins, and **an empty candidate is never returned and never ends the search** —
+(1) python-tagged fences (`python`/`py`/`python3`), last non-empty; (2) fenced blocks of any other
+tag or none, last non-empty, reached also when EVERY python block is empty; (3) otherwise `None`,
+graded `no_code`. The empty-block guard is untouched: `"```python\n```"` is still `None`.
+
+**I instructed a four-level rule including a `[PYTHON]`-tag level and an unfenced level. That was
+wrong and the agent refused it, correctly.** Neither path exists in this file — `grep` for
+`PYTHON]` finds only an unrelated enum — and an unfenced fallback would directly contradict a
+committed, verified guard (mutant `E01` "a completion with no fence is executed as if it were
+code", and `test_prose_without_a_fence_is_not_code`). It would make more PROSE executable, on
+evidence that does not exist (0/35 completions were unfenced). Both are documented as refusals
+rather than omissions and pinned with tests asserting `None`. The earlier report's "those paths
+are untested against real output" described what models COULD emit, not what the code handles —
+I misread it as the latter.
+
+Effect on the 35-problem slice: not reconstructible here (the generations are on the other box),
+but `abc390_e`'s blocks were `[1102, 0]`, so the fix moves exactly one problem out of `no_code`
+into a real verdict — the stdin slice becomes 0.30 if it fails or times out, 0.35 if it passes.
+**It can only be neutral or upward.**
+
+**Bug 2, model attribution — all three parts, in shared plumbing used by both benches.**
+(a) REFUSE: `verify_model` GETs `<base-url>/models` before any generation and exits if the id is
+absent, naming what was asked for and what is available and explaining the HTTP-200/base-model
+trap; an endpoint that cannot answer is also a hard stop, not a warning. (b) RECORD: `params`
+gains `model`, `endpoint` (the exact chat-completions URL posted to) and `served_models` (the full
+list); a `--from-generations` regrade records these as `None` rather than inheriting an id it
+never called. (c) NO DEFAULT: `--model` defaults to `None` in both parsers and a generating run
+without it refuses before a session is opened; `run_math.sh` now derives both
+`--served-model-name` and `--model` from one variable so the two literals cannot drift.
+
+Also: `snapshot_dir` searches `$HF_HOME/hub/...` first and the old `~/.cache/huggingface` path
+second, naming every root tried on a miss — the mismatch that forced `LCB_DATA` by hand.
+
+**Mutation: 17/17 killed on a new model-attribution harness (0 survivors), and the code-bench
+harness grew 28 -> 34/34**, including `E03` "an empty choice ends the search", which is Bug 1's
+exact defect. One declared SKIP (`MODELS_TIMEOUT` -> a params key): it applies and compiles but is
+observationally equivalent here, since only the hold time of a WEDGED endpoint changes and no
+assertion can see that without hanging for minutes. Reported SKIP, never SURVIVED.
+
+Tests +27, all failing without their fix (`experiments/bench` 181 -> 208). Full suite
+1773 -> 1875 passed, 3 skipped, 0 failures — only +27 of that is this work; two other agents were
+committing tests concurrently.
+
 ## 2026-09-02 — Cluster-routed adapters built; the label-stability finding that changes the method
 
 Commit `63a085d5`, `selfevo/cluster_lora/` + `selfevo/FINDINGS_cluster_lora.md`. All CPU. Three
