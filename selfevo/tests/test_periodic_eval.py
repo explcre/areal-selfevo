@@ -1009,6 +1009,33 @@ def test_a_window_that_holds_still_is_scored_normally(endpoint, tmp_path):
     assert not math.isnan(m["periodic_eval/olympiadbench/accuracy"])
 
 
+@needs_data
+def test_a_failed_evaluation_still_names_the_weights_it_was_pinned_to(endpoint, tmp_path):
+    """A gap in the curve must say which adapter it was probing, not `UNRESOLVED`.
+
+    Observed on A0 at step 50 with the first version of this code: the evaluation resolved
+    `a0_math-vN` perfectly well, every generation then failed for an unrelated reason, and the
+    log line read `model=UNRESOLVED` — because the pin travelled only in the return value,
+    which the failure destroyed. The failure points are precisely the ones whose weights a
+    reader needs named, so the pin is now recovered on every path out.
+
+    The discriminating pair is with `test_a_resolution_failure_is_a_status_code_and_a_nan_
+    not_a_zero`, where nothing was ever pinned and the version is genuinely NaN.
+    """
+    url, policy = endpoint
+    policy.models = _window(13)
+    policy.on_models = lambda served, n: _window(19) if n == 2 else None
+    cfg = _config(url, out_dir=str(tmp_path / "out"), state_path=str(tmp_path / "best.json"))
+    tracker = pe.BestValTracker(cfg.patience, cfg.state_path)
+
+    m = pe.run_periodic_eval(cfg, 5, tracker)
+    assert m["periodic_eval/status_code"] == pe.STATUS["adapter_evicted"]
+    assert math.isnan(m["periodic_eval/olympiadbench/accuracy"]), "a failure is not a score"
+    assert m["periodic_eval/adapter/version"] == 13.0, "the failed point forgot its weights"
+    saved = json.loads((tmp_path / "out" / "step5" / "results.json").read_text())
+    assert saved["resolved_adapter"]["model"] == f"{ADAPTER}-v13"
+
+
 # --------------------------------------------- a refusal is not a score of anything ----
 
 

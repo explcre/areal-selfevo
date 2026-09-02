@@ -1391,7 +1391,7 @@ def metrics_from(
 
 
 async def _evaluate_async(
-    cfg: PeriodicEvalConfig,
+    cfg: PeriodicEvalConfig, pin: dict | None = None
 ) -> tuple[dict[str, dict], dict[str, list], LivenessReport, int, ResolvedAdapter]:
     """Pin one adapter version, run every benchmark and the probe against it, then re-check.
 
@@ -1409,6 +1409,12 @@ async def _evaluate_async(
 
     Args:
         cfg: The resolved configuration.
+        pin: Optional mapping the pinned adapter is written into under ``"adapter"`` the
+            moment it is resolved. Every other channel out of this function is the return
+            value, which a later failure destroys -- and a failed point is exactly the one
+            whose weights a reader needs named. Observed on A0 at step 50: the evaluation
+            resolved an adapter, every generation then failed for an unrelated reason, and
+            the log line said ``model=UNRESOLVED`` about weights that had been resolved fine.
 
     Returns:
         ``(rows, records, liveness, grader_calls, pinned)``.
@@ -1433,6 +1439,8 @@ async def _evaluate_async(
     conn = aiohttp.TCPConnector(limit=max(2, min(8, cfg.concurrency)))
     async with aiohttp.ClientSession(connector=conn) as session:
         pinned = await resolve_adapter(session, cfg)
+        if pin is not None:
+            pin["adapter"] = pinned
         for bench in cfg.benchmarks:
             row, recs, calls = await run_one_benchmark(cfg, bench, pinned.model)
             rows[bench], records[bench] = row, recs
@@ -1477,8 +1485,9 @@ def run_periodic_eval(
     status = STATUS["ok"]
     records: dict[str, list] = {}
     grader_calls = 0
+    pin: dict = {}
     try:
-        rows, records, liveness, grader_calls, resolved = asyncio.run(_evaluate_async(cfg))
+        rows, records, liveness, grader_calls, resolved = asyncio.run(_evaluate_async(cfg, pin))
     except AdapterUnresolved as exc:
         status = STATUS["adapter_unresolved"]
         _log(logger, "error", f"periodic eval could not resolve an adapter at step {global_step}: {exc}")
@@ -1509,6 +1518,12 @@ def run_periodic_eval(
         status = STATUS["endpoint_error"]
         _log(logger, "error", f"periodic eval failed at step {global_step}: {type(exc).__name__}: {exc}")
 
+    # A failure destroys the return value but not what was pinned before it. Recovering it
+    # here is the difference between a gap in the curve that names its weights and one that
+    # says UNRESOLVED about an adapter that resolved perfectly well. `status_code` still says
+    # whether resolution itself was the thing that failed.
+    if resolved is None:
+        resolved = pin.get("adapter")
     primary = cfg.benchmarks[0]
     accuracy = float(rows.get(primary, {}).get("accuracy", float("nan")))
     if status == STATUS["ok"]:

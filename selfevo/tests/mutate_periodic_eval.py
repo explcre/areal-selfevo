@@ -244,6 +244,12 @@ MUTATIONS = [
         repl="        if self._rollout is None:",
     ),
     Mutation(
+        label="a failed evaluation forgets the adapter it was pinned to (the step-50 wart)",
+        rel="selfevo/periodic_eval.py",
+        find="    if resolved is None:\n        resolved = pin.get(\"adapter\")",
+        repl="    if False:\n        resolved = pin.get(\"adapter\")",
+    ),
+    Mutation(
         label="declared keys are not filled in, leaving invisible gaps in the W&B series",
         rel="selfevo/periodic_eval.py",
         find="    for key in cfg.metric_keys():\n        metrics.setdefault(key, float(\"nan\"))",
