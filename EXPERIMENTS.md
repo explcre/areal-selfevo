@@ -45,6 +45,46 @@ experiment has yet used either. The routed 30B arm is where they belong.
 a feature, grep its resolved config for the switch. `enabled:`, `router:` and `group_routing:`
 are three separate places a routing arm can be silently off.
 
+## 2026-09-02 — Loss-weighting audit: the 2604.23747 bug class cannot occur here, but length silently reweights
+
+Commit `603230a8`, `selfevo/FINDINGS_loss_weighting.md` + 15 tests. Read-only audit ahead of the
+gold-row arms (A4 LSPO-style, A5 DyME-style), which put SFT-like and RL rows in one batch.
+
+**One reduction, per TOKEN, over the global batch.** `functional.py:506` (`loss_mask_count`),
+`:571` (`sum / loss_mask_count`), `actor.py:1230` (`loss_weight_fn = count_nonzero`),
+`fsdp_engine.py:2216-2217` (`local_weight / total_loss_weight`) — the division and the rescale
+cancel, so the objective is `sum_over_all_tokens(surrogate) / total_tokens`. No
+`token_mean`/`seq_mean` flag; `mb_spec` only partitions the sum. Both modes reach it as plain
+numbers in one advantage tensor, so at the live config `dL/dlogprob_t = -A_t / N` for both.
+
+**The specific published bug cannot occur** (it needs inconsistent per-token vs per-sequence
+normalisation BETWEEN modes; there is only one reduction). **The effect still applies:** a
+systematic length difference between injected and sampled rows is a silent reweighting.
+Measured, c=0.5 constant against +/-1.0 RL rows of 4 tokens:
+
+| injected row length | 4 | 8 | 16 |
+|---|---|---|---|
+| gradient ratio | 0.500 | 1.000 | 2.000 |
+
+Mutation-checked: substituting a per-sequence mean pins the ratio at 0.5 for all three and kills
+both tests. So A4/A5 must log **token mass** (`sft_tokens / total_tokens` — no existing `route/*`
+key reports it) and match on token mass or reweight by `mean_len / row_len`.
+
+**Why `mean_level=group` breaks the routing rule, mechanically:** `data.py:1686-1688` forms
+`(x*mask).sum()/mask.sum()`, a TOKEN-weighted mean, which equals the per-row mean only when all
+lengths match. Subtracting it destroys `sum(a_i) = 0` — the recorded residuals 0.0 / 2.139 / 0.867.
+
+**The gold-row landmine.** `actor.py:741` reads `data["logprobs"]` for the KL reward and
+**`kl_ctl=0.0` does not save it, because `-0.0 * NaN = NaN`.** With `adv_norm=None` a NaN stays on
+its row (1/8); with the live `adv_norm: mean_level=batch` (`gsm8k_grpo_lora.yaml:85-87`)
+**all 8/8 rows go NaN.** Adjacent: NaN in `logprobs` under rejection sampling is silently
+rewritten to ratio 1 (`functional.py:233`, `filtered_fraction` stays 0.0) — a silent pass; NaN in
+`prox_logp` does raise; a 0.0 placeholder is silently down-weighted by `exp(prox_logp)`. So gold
+rows must carry a FINITE logprob equal to the recomputed `prox_logp`. The gold-path builder has
+been redirected accordingly.
+
+Suite 1529 passed, 1 skipped.
+
 ## 2026-09-02 — LiveCodeBench v6 wired with sandboxed grading; gold self-verifies 175/175
 
 Commit `11757e61`. `livecodebench/code_generation_lite` v6, whole release: **175 problems / 7000
