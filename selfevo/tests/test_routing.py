@@ -17,6 +17,7 @@ from selfevo.routing.base import (
     RoutingDecision,
     Router,
     TrainingMode,
+    applicable_modes,
     known_modes,
     register_mode,
 )
@@ -170,12 +171,36 @@ def test_routing_context_validates():
 
 
 def test_register_mode_rejects_inconsistent_reregistration():
-    register_mode("probe_mode", needs_teacher=True)
-    register_mode("probe_mode", needs_teacher=True)  # idempotent
+    # applicable=False deliberately: the registry is process-global and nothing applies
+    # `probe_mode`, so registering it as applicable would leave the application seam and the
+    # registry disagreeing for every module imported after this test runs.
+    register_mode("probe_mode", needs_teacher=True, applicable=False)
+    register_mode("probe_mode", needs_teacher=True, applicable=False)  # idempotent
     with pytest.raises(ValueError):
-        register_mode("probe_mode", needs_teacher=False)
+        register_mode("probe_mode", needs_teacher=False, applicable=False)
     with pytest.raises(ValueError):
         register_mode("", needs_teacher=False)
+
+
+def test_register_mode_rejects_a_changed_applicability():
+    """Same reason as needs_teacher: applicability decides whether a router may select the
+    mode at all, so a second registration quietly flipping it would make one call site
+    refuse the mode and another emit it, with no error anywhere."""
+    register_mode("probe_applicable", needs_teacher=False, applicable=False)
+    register_mode("probe_applicable", needs_teacher=False, applicable=False)  # idempotent
+    with pytest.raises(ValueError, match="already registered with applicable=False"):
+        register_mode("probe_applicable", needs_teacher=False, applicable=True)
+    assert "probe_applicable" in known_modes()
+    assert "probe_applicable" not in applicable_modes()
+
+
+def test_applicable_modes_is_a_subset_of_known_modes():
+    """A mode can be registered and unappliable; it cannot be appliable and unregistered."""
+    assert set(applicable_modes()) <= set(known_modes())
+    assert set(applicable_modes()) >= {
+        TrainingMode.RL, TrainingMode.SFT, TrainingMode.SKIP
+    }
+    assert TrainingMode.DISTILL not in applicable_modes()
 
 
 def test_hard_distillation_is_not_a_separate_mode():

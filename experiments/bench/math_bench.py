@@ -483,8 +483,14 @@ def wilson(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
     Used instead of a normal binomial SE because at these counts the SE misleads: at 1/30
     the normal interval runs negative, and at 0/30 or 30/30 it is exactly 0, asserting
     certainty from a single unanimous sample.
+
+    ``n <= 0`` is NOT a measurement and returns NaN. Two copies of this function used to
+    return ``(0.0, 0.0)`` there, which prints ``[0.000, 0.000]`` for an EMPTY benchmark --
+    a confident interval around zero, indistinguishable in the table from a real result of
+    zero. A negative n is refused for the same reason: the clamp inside the square root
+    hides it and the interval comes back with ``lo > hi``, outside [0, 1].
     """
-    if n == 0:
+    if n <= 0:
         return (float("nan"), float("nan"))
     p = k / n
     d = 1 + z * z / n

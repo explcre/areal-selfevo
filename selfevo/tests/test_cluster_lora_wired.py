@@ -520,6 +520,28 @@ def test_group_sizes_that_do_not_partition_the_batch_are_refused():
         behaviour_features(tiny_lm(), make_batch(MIXED), [G], cfg)
 
 
+@pytest.mark.parametrize(
+    "sizes",
+    [[-1, B + 1], [B + 1, -1], [0, B], [B, 0]],
+    ids=["negative-first", "negative-second", "zero-first", "zero-second"],
+)
+def test_a_group_size_below_one_is_refused_before_the_walk(sizes):
+    """The sum check alone lets a non-positive size through, and then the walk lies.
+
+    ``[-1, 5]`` over four rows sums to four, so the partition check passes; the slice walk
+    ``per_row[start:start + size]`` then hands group 0 the mean of rows 0-2 and group 1 row
+    3, i.e. one group's rollouts pooled into another's behavioural vector, with two vectors
+    of the right shape returned and nothing raised. Its four sibling validators
+    (``group_apply``, ``observability``, ``gold.substitute``) all check ``g < 1``; this one
+    did not.
+    """
+    from selfevo.cluster_lora.wiring import behaviour_features
+
+    cfg = ClusterLoRAConfig(partition="none", features=True)
+    with pytest.raises(ValueError, match="every group size must be >= 1"):
+        behaviour_features(tiny_lm(), make_batch(MIXED), sizes, cfg)
+
+
 def test_a_sequence_whose_answer_token_cannot_be_found_is_counted(monkeypatch, emitted):
     """A feature read at a different position is not comparable with its peers.
 

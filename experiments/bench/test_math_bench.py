@@ -141,6 +141,80 @@ def test_wilson_empty_is_nan_not_zero():
     assert lo != lo and hi != hi  # NaN
 
 
+def _wilson_copies():
+    """The three shipped copies of ``wilson``, extracted without importing the scripts.
+
+    ``analyze_sweep.py`` and ``regrade.py`` read ``sys.argv[1]`` at module scope, so they
+    cannot be imported at all. Compiling just their ``wilson`` FunctionDef pins the source
+    that actually ships in each file, which is the thing that disagreed.
+
+    Returns:
+        ``{module_name: (ast_node, callable)}``.
+    """
+    import ast
+    import math as _math
+
+    here = Path(__file__).resolve().parent
+    out = {}
+    for name in ("math_bench", "analyze_sweep", "regrade"):
+        path = here / f"{name}.py"
+        node = next(
+            n
+            for n in ast.parse(path.read_text()).body
+            if isinstance(n, ast.FunctionDef) and n.name == "wilson"
+        )
+        ns = {"math": _math}
+        exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), ns)
+        out[name] = (node, ns["wilson"])
+    assert len(out) == 3
+    return out
+
+
+def test_every_wilson_copy_refuses_to_measure_an_empty_benchmark():
+    """``[0.000, 0.000]`` is a CONFIDENT interval around zero, not an absence of data.
+
+    Two of the three copies returned it, so an empty benchmark printed a tight interval at
+    zero in the sweep and regrade tables -- a false precision that reads as a measurement.
+    """
+    for name, (_, fn) in _wilson_copies().items():
+        lo, hi = fn(0, 0)
+        assert lo != lo and hi != hi, f"{name}.wilson(0, 0) = {(lo, hi)}, expected NaN"
+
+
+def test_every_wilson_copy_is_undefined_for_a_non_positive_n():
+    """``n < 0`` used to survive the clamp and return ``lo > hi`` outside [0, 1]."""
+    for name, (_, fn) in _wilson_copies().items():
+        for n in (0, -1, -30):
+            lo, hi = fn(0, n)
+            assert lo != lo and hi != hi, f"{name}.wilson(0, {n}) = {(lo, hi)}"
+
+
+def test_every_wilson_copy_is_wide_at_n_equals_one():
+    """One sample is not evidence. The interval must cover most of [0, 1], not collapse."""
+    for name, (_, fn) in _wilson_copies().items():
+        lo, hi = fn(0, 1)
+        assert lo == 0.0 and hi > 0.75, f"{name}.wilson(0, 1) = {(lo, hi)}"
+        lo, hi = fn(1, 1)
+        assert hi == 1.0 and lo < 0.25, f"{name}.wilson(1, 1) = {(lo, hi)}"
+
+
+def test_the_three_wilson_copies_are_one_function_in_three_places():
+    """Not style: they disagreed at n=0 AND in the 5th decimal at every other n, because
+    two used z=1.959963985 and one z=1.96. Two scripts reporting different 95% intervals
+    for the same counts is the drift that a later consolidation into one shared function
+    has to be able to assume away, so pin it now."""
+    import ast
+
+    copies = _wilson_copies()
+    dumps = {name: ast.dump(node) for name, (node, _) in copies.items()}
+    assert len(set(dumps.values())) == 1, f"source differs: {sorted(dumps)}"
+    grid = [(0, 0), (0, 1), (1, 1), (0, 30), (1, 30), (15, 30), (30, 30), (3, 7), (500, 500)]
+    for k, n in grid:
+        vals = {name: fn(k, n) for name, (_, fn) in copies.items()}
+        uniq = {repr(v) for v in vals.values()}
+        assert len(uniq) == 1, f"wilson({k}, {n}) differs: {vals}"
+
+
 # ------------------------------------------------------------------------------ load
 
 

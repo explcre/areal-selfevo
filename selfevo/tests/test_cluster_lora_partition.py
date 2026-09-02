@@ -227,6 +227,51 @@ def test_an_unknown_partition_name_names_the_ones_that_exist():
         partition_from_config("kmeans", n_groups=4)
 
 
+def test_a_registered_partition_with_no_dispatch_branch_is_refused(monkeypatch):
+    """The arm-mislabelling trap: a name in TRAINING_PARTITIONS with no branch here.
+
+    The dispatch ended in an unconditional ``return random_matched_partition(...)``, so a
+    third arm added to the registry ran the CONTROL's mechanism under its own label. The
+    partition it returns is bit-identical to ``random_matched`` and every metric downstream
+    carries the new arm's name, so nothing afterwards could tell the two apart -- which is
+    exactly the failure this module's docstring exists to prevent.
+    """
+    from selfevo.cluster_lora import partition as pmod
+
+    monkeypatch.setattr(
+        pmod, "TRAINING_PARTITIONS", ("meds", "random_matched", "none", "meds_frozen")
+    )
+    feats = np.arange(12, dtype=float).reshape(6, 2)
+    ids = tuple(f"p{i}" for i in range(6))
+    with pytest.raises(ValueError, match="no branch"):
+        pmod.partition_from_config(
+            "meds_frozen",
+            n_groups=6,
+            features=feats,
+            partitioner=pmod.MEDSPartitioner(),
+            seed=1,
+            group_ids=ids,
+        )
+
+
+@pytest.mark.parametrize("mode", ["meds", "random_matched", "none"])
+def test_every_registered_partition_still_dispatches(mode):
+    """The guard above must refuse only the undispatched names, not the real arms."""
+    from selfevo.cluster_lora import partition as pmod
+
+    feats = np.arange(12, dtype=float).reshape(6, 2)
+    ids = tuple(f"p{i}" for i in range(6))
+    got = pmod.partition_from_config(
+        mode,
+        n_groups=6,
+        features=feats,
+        partitioner=pmod.MEDSPartitioner(),
+        seed=1,
+        group_ids=ids,
+    )
+    assert len(got.labels) == 6
+
+
 @pytest.mark.parametrize("mode", ["meds", "random_matched"])
 def test_a_partition_without_features_refuses_instead_of_collapsing_to_one_adapter(mode):
     """The silent no-op this whole design exists to prevent.

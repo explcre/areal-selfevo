@@ -38,6 +38,7 @@ from selfevo.routing.base import (
     RoutingContext,
     RoutingDecision,
     TrainingMode,
+    applicable_modes,
     known_modes,
 )
 
@@ -189,9 +190,17 @@ class CodePolicyRouter:
     def __post_init__(self) -> None:
         if self.fallback not in known_modes():
             raise ValueError(f"unknown fallback mode {self.fallback!r}")
-        # ``None`` means every mode; an empty tuple is a caller whose filter returned
-        # nothing, and reading it as "all modes" would be the widest possible silent failure.
-        modes = tuple(known_modes()) if self.allowed_modes is None else tuple(self.allowed_modes)
+        # ``None`` means every mode an update can be made from -- NOT every registered
+        # mode. It used to mean the latter, which put `distill` in the default allowed set:
+        # a generated policy returning it was honoured, the unit paid a full rollout, and the
+        # run then died inside _compute_advantages. An empty tuple is a caller whose filter
+        # returned nothing, and reading it as "all modes" would be the widest possible silent
+        # failure, so it is refused rather than defaulted.
+        modes = (
+            tuple(applicable_modes())
+            if self.allowed_modes is None
+            else tuple(self.allowed_modes)
+        )
         if not modes:
             raise ValueError("allowed_modes must name at least one mode, or be None for all")
         for m in modes:

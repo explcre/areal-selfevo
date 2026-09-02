@@ -23,12 +23,30 @@ TAGS = ["base", "gs028", "gs057", "gs086", "gs115", "gs144", "gs173"]
 ENT = {"base": None, "gs028": 0.2533, "gs057": 0.1344, "gs086": 0.1436,
        "gs115": 0.0989, "gs144": 0.0253, "gs173": 0.0182}
 
-def wilson(k, n):
-    if n == 0: return (0.0, 0.0)
-    z = 1.959963985; p = k/n; d = 1 + z*z/n
-    c = (p + z*z/(2*n))/d
-    h = z*math.sqrt(p*(1-p)/n + z*z/(4*n*n))/d
-    return (max(0.0, c-h), min(1.0, c+h))
+# Kept byte-identical to math_bench.wilson and analyze_sweep.wilson: the three copies disagreed
+# at n=0 (this one printed a confident [0.000, 0.000] for an empty benchmark) and in the
+# fifth decimal everywhere else. selfevo/ARCHITECTURE.md 4.2 consolidates them; until then
+# any edit here belongs in all three.
+def wilson(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    """Wilson score interval for k successes in n trials.
+
+    Used instead of a normal binomial SE because at these counts the SE misleads: at 1/30
+    the normal interval runs negative, and at 0/30 or 30/30 it is exactly 0, asserting
+    certainty from a single unanimous sample.
+
+    ``n <= 0`` is NOT a measurement and returns NaN. Two copies of this function used to
+    return ``(0.0, 0.0)`` there, which prints ``[0.000, 0.000]`` for an EMPTY benchmark --
+    a confident interval around zero, indistinguishable in the table from a real result of
+    zero. A negative n is refused for the same reason: the clamp inside the square root
+    hides it and the interval comes back with ``lo > hi``, outside [0, 1].
+    """
+    if n <= 0:
+        return (float("nan"), float("nan"))
+    p = k / n
+    d = 1 + z * z / n
+    c = (p + z * z / (2 * n)) / d
+    h = z * math.sqrt(max(p * (1 - p) / n + z * z / (4 * n * n), 0.0)) / d
+    return (max(0.0, c - h), min(1.0, c + h))
 
 def norm_cdf(x): return 0.5*(1+math.erf(x/math.sqrt(2)))
 

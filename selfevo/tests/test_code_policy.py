@@ -42,6 +42,7 @@ from selfevo.routing.base import (
     Router,
     RoutingContext,
     TrainingMode,
+    applicable_modes,
     known_modes,
 )
 from selfevo.routing.code_policy import (
@@ -531,7 +532,25 @@ def test_an_empty_allowed_modes_is_refused_rather_than_read_as_all_of_them():
     everything, which is the widest silent failure this file can pin."""
     with pytest.raises(ValueError, match="at least one mode"):
         CodePolicyRouter(source=body('return "rl"'), allowed_modes=())
-    assert CodePolicyRouter(source=body('return "rl"')).allowed_modes == tuple(known_modes())
+    assert CodePolicyRouter(source=body('return "rl"')).allowed_modes == tuple(
+        applicable_modes()
+    )
+
+
+def test_the_default_allowed_set_cannot_select_a_mode_nothing_applies():
+    """``allowed_modes=None`` used to mean every REGISTERED mode, ``distill`` included.
+
+    That is the one path on which a model-generated policy emits a mode the application
+    seam refuses without anybody having asked for it: the unit pays a full rollout and the
+    run then dies inside ``_compute_advantages``. An unappliable mode is now an invalid
+    return like any other -- counted, reported in ``reason``, and routed to the fallback.
+    """
+    r = CodePolicyRouter(source=body('return "distill"'))
+    assert TrainingMode.DISTILL in known_modes()
+    assert TrainingMode.DISTILL not in r.allowed_modes
+    d = r.route(ctx())
+    assert mode_of(d) == TrainingMode.SKIP
+    assert r.health()["invalid_returns"] == 1
 
 
 def test_allowed_modes_is_honoured_for_every_mode_it_leaves_out():

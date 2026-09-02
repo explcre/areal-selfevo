@@ -373,7 +373,7 @@ def behaviour_features(
         else.
 
     Raises:
-        ValueError: If the group sizes do not partition the batch.
+        ValueError: If any group size is below 1, or if the sizes do not partition the batch.
     """
     import torch
 
@@ -381,6 +381,16 @@ def behaviour_features(
 
     sizes = [int(s) for s in group_sizes]
     n_rows = int(batch["input_ids"].shape[0])
+    # Before the sum check, in the same order group_apply.py uses and for the reason its
+    # comment gives: a non-positive size still passes the sum check, and the
+    # per_row[start:start + size] walk below then pools one group's rows into another. With
+    # sizes [-1, 5] over four rows this returned two vectors of the right shape where the
+    # first was the mean of rows 0-2 and the second was row 3, and raised nothing.
+    if any(g < 1 for g in sizes):
+        raise ValueError(
+            f"every group size must be >= 1, got {sizes}: a size of 0 or less passes the "
+            "sum check below and the slice walk then gives one group another group's rows"
+        )
     if sum(sizes) != n_rows:
         raise ValueError(
             f"group sizes sum to {sum(sizes)} but the batch has {n_rows} rows; a mismatch "

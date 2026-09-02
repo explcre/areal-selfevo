@@ -25,6 +25,7 @@ __all__ = [
     "Router",
     "register_mode",
     "known_modes",
+    "applicable_modes",
 ]
 
 
@@ -63,9 +64,14 @@ class Granularity(Enum):
 # Modes are an open set: a name plus whether it needs an external target. Registering is
 # how a new mode becomes routable without touching this module's logic.
 _MODES: dict[str, bool] = {}
+# Whether anything downstream can turn this mode into an update. Kept here, rather than read
+# from selfevo.integration.group_apply, because this module is deliberately torch-free and
+# importing the seam would drag torch into every routing test. group_apply asserts the two
+# agree at import, so the flag cannot quietly become a lie.
+_APPLICABLE: dict[str, bool] = {}
 
 
-def register_mode(name: str, *, needs_teacher: bool) -> str:
+def register_mode(name: str, *, needs_teacher: bool, applicable: bool = True) -> str:
     """Register a training mode.
 
     Args:
@@ -73,14 +79,20 @@ def register_mode(name: str, *, needs_teacher: bool) -> str:
         needs_teacher: Whether the mode requires an external target (gold text or teacher
             distribution). Routers use this to avoid selecting a mode that cannot be
             supplied for a given unit.
+        applicable: Whether the application seam can turn this mode into an update.
+            Defaults to True so that FORGETTING is loud: ``group_apply`` refuses to import
+            when a mode is declared applicable and has no branch there. Pass False for a
+            mode that is named and reasoned about but not yet implemented -- a router will
+            then refuse to select it by default instead of spending a full rollout on a
+            unit that cannot learn.
 
     Returns:
         The registered name, so this can be used at class definition sites.
 
     Raises:
         ValueError: If the name is empty, or is re-registered with a different
-            ``needs_teacher`` (silently changing it would make routing decisions
-            inconsistent across call sites).
+            ``needs_teacher`` or ``applicable`` (silently changing either would make
+            routing decisions inconsistent across call sites).
     """
     if not name:
         raise ValueError("mode name must be non-empty")
@@ -88,13 +100,29 @@ def register_mode(name: str, *, needs_teacher: bool) -> str:
         raise ValueError(
             f"mode {name!r} already registered with needs_teacher={_MODES[name]}"
         )
+    if name in _APPLICABLE and _APPLICABLE[name] != applicable:
+        raise ValueError(
+            f"mode {name!r} already registered with applicable={_APPLICABLE[name]}"
+        )
     _MODES[name] = needs_teacher
+    _APPLICABLE[name] = applicable
     return name
 
 
 def known_modes() -> Mapping[str, bool]:
     """Registered modes as ``{name: needs_teacher}``."""
     return dict(_MODES)
+
+
+def applicable_modes() -> Mapping[str, bool]:
+    """Registered modes an update can actually be made from, as ``{name: needs_teacher}``.
+
+    The subset of :func:`known_modes` a router may select without buying a rollout that
+    cannot become a gradient. ``distill`` is the one that is registered and not in here: it
+    is a real axis of the design, the seam has no target tensor for it, and a unit routed to
+    it therefore pays full cost and never learns.
+    """
+    return {m: t for m, t in _MODES.items() if _APPLICABLE.get(m, True)}
 
 
 class TrainingMode:
@@ -108,7 +136,12 @@ class TrainingMode:
 
     RL = register_mode("rl", needs_teacher=False)
     SFT = register_mode("sft", needs_teacher=True)
-    DISTILL = register_mode("distill", needs_teacher=True)
+    # applicable=False: registered, reasoned about, and NOT implemented by
+    # selfevo.integration.group_apply, which has no target tensor to distil against. Left
+    # registered rather than deleted because routers gate on `needs_teacher` and this is the
+    # only mode that exercises that gate independently of the name "sft"; declared
+    # inapplicable so no default-configured router can spend a rollout on it.
+    DISTILL = register_mode("distill", needs_teacher=True, applicable=False)
     SKIP = register_mode("skip", needs_teacher=False)
 
 

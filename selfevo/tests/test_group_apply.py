@@ -19,7 +19,10 @@ refactor on silent groups and a decision only on informative ones.
 
 from __future__ import annotations
 
+import pathlib
 import random
+import subprocess
+import sys
 
 import pytest
 import torch
@@ -341,6 +344,58 @@ def test_invalid_input_is_refused(kwargs, needle):
             kwargs["advantages"], kwargs["loss_mask"], kwargs["group_sizes"],
             kwargs["modes"], sft_weight=kwargs["sft_weight"],
         )
+
+
+def test_the_seam_and_the_mode_registry_cannot_drift():
+    """``_APPLIED`` exists so an unimplemented mode cannot reach the update. It was a
+    hand-maintained literal, so a mode registered without a branch here stayed fully
+    routable: it cost a whole rollout and then killed the run at the seam.
+
+    Applicability is now declared on the registry, and this equality is what keeps the two
+    honest. It is checked at import in ``group_apply`` as well; asserting it here is what
+    makes a future ``register_mode`` without a branch fail in the suite rather than only in
+    whoever imports the seam next.
+    """
+    from selfevo.integration.group_apply import _APPLIED
+    from selfevo.routing.base import applicable_modes
+
+    assert set(_APPLIED) == set(applicable_modes()), (
+        f"seam implements {sorted(_APPLIED)} but the registry declares "
+        f"{sorted(applicable_modes())} applicable"
+    )
+
+
+def test_registering_an_applicable_mode_with_no_branch_here_fails_at_import():
+    """The drift check itself, in a fresh interpreter.
+
+    Asserting ``set(_APPLIED) == set(applicable_modes())`` in this process only says the two
+    agree today; it does not say anything notices when they stop. This registers a mode the
+    seam has never heard of and imports the seam, which must refuse rather than leave a
+    routable mode that cannot become an update.
+    """
+    repo = pathlib.Path(__file__).resolve().parents[2]
+    code = (
+        "from selfevo.routing.base import register_mode\n"
+        "register_mode('teleport', needs_teacher=False)\n"
+        "import selfevo.integration.group_apply\n"
+    )
+    r = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, cwd=str(repo)
+    )
+    assert r.returncode != 0, "the seam imported cleanly with an unimplemented mode declared"
+    assert "teleport" in r.stderr and "no branch for them" in r.stderr, r.stderr[-800:]
+
+
+def test_distill_is_registered_but_declared_inapplicable():
+    """The one registered mode nothing applies. Both halves matter: it stays registered
+    (routers still gate on ``needs_teacher``, and it documents the axis) and it is declared
+    unappliable, which is what stops a default-configured router from selecting it."""
+    from selfevo.routing.base import applicable_modes
+
+    assert known_modes()[TrainingMode.DISTILL] is True
+    assert TrainingMode.DISTILL not in applicable_modes()
+    for mode in (TrainingMode.RL, TrainingMode.SFT, TrainingMode.SKIP):
+        assert mode in applicable_modes()
 
 
 def test_distill_raises_rather_than_being_silently_skipped():

@@ -61,6 +61,10 @@ SHARED_CLUSTER = "shared"
 #: partitions -- they need vectors or labels a training step does not have -- so they are
 #: not offered as a training mode.
 TRAINING_PARTITIONS = ("meds", "random_matched", "none")
+# What partition_from_config actually has a branch for. Separate from the registry above so
+# the two can be COMPARED: a name in one and not the other is the arm-mislabelling bug, and
+# the refusal at the end of partition_from_config is what makes the gap visible.
+DISPATCHED_PARTITIONS = ("none", "meds", "random_matched")
 
 
 class PartitionUnavailable(RuntimeError):
@@ -686,7 +690,8 @@ def partition_from_config(
         The batch's :class:`Partition`.
 
     Raises:
-        ValueError: On an unknown mode, naming the ones that exist.
+        ValueError: On an unknown mode, naming the ones that exist, and on a mode that IS
+            registered in :data:`TRAINING_PARTITIONS` but has no dispatch branch below.
         PartitionUnavailable: If the mode needs inputs that were not supplied. The control
             is REFUSED rather than approximated: a "size-matched" control whose sizes were
             guessed rather than matched is not a control.
@@ -706,7 +711,18 @@ def partition_from_config(
     meds = partitioner.partition(features, group_ids=group_ids)
     if mode == "meds":
         return meds
-    return random_matched_partition(meds, seed=seed)
+    if mode == "random_matched":
+        return random_matched_partition(meds, seed=seed)
+    # No unconditional fallthrough. This used to end in `return random_matched_partition(...)`,
+    # so a fourth name added to TRAINING_PARTITIONS without a branch here ran the CONTROL's
+    # mechanism under the new arm's label -- and since the returned Partition is bit-identical
+    # to the control's, nothing downstream could tell afterwards which one produced the table.
+    raise ValueError(
+        f"partition={mode!r} is registered in TRAINING_PARTITIONS but partition_from_config "
+        f"has no branch for it; dispatched here: {DISPATCHED_PARTITIONS!r}. Add a branch "
+        "rather than letting it fall through to the size-matched control, which would report "
+        "this arm's label for the control's mechanism."
+    )
 
 
 def label_churn(

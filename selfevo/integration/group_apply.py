@@ -39,11 +39,28 @@ from typing import Mapping, Sequence
 
 import torch
 
-from selfevo.routing.base import TrainingMode
+from selfevo.routing.base import TrainingMode, applicable_modes
 
 __all__ = ["ApplyStats", "apply_decisions", "apply_mixtures"]
 
 _APPLIED = (TrainingMode.RL, TrainingMode.SFT, TrainingMode.SKIP)
+
+# _APPLIED exists so an unimplemented mode cannot silently reach the update, but it was a
+# hand-maintained literal: a mode registered without a branch below stayed fully routable and
+# died here after a whole rollout had been paid for. The registry now carries the same fact
+# (register_mode(..., applicable=...)) and this is the check that keeps the two from drifting
+# -- registering an applicable mode without implementing it here fails at IMPORT, not at
+# whichever batch first routes to it. selfevo.routing is torch-free and cannot import this
+# module, which is why the flag lives there and the assertion lives here.
+_UNIMPLEMENTED = sorted(set(applicable_modes()) - set(_APPLIED))
+_UNDECLARED = sorted(set(_APPLIED) - set(applicable_modes()))
+if _UNIMPLEMENTED or _UNDECLARED:
+    raise RuntimeError(
+        f"mode registry and application seam disagree: {_UNIMPLEMENTED} are registered as "
+        f"applicable but this seam has no branch for them, and {_UNDECLARED} are applied "
+        "here but not declared applicable. Either implement the mode below or register it "
+        "with applicable=False, which makes routers refuse to select it."
+    )
 
 
 @dataclass(frozen=True)
