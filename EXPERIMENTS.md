@@ -290,6 +290,62 @@ clusters there may separate "truncated vs not" rather than anything semantic.
 Blocked: `selfevo/cluster_lora/interference_dump.py` is not on origin, so the dump did not run;
 `hdbscan`/`sklearn` confirmed absent from the H100 venv and deliberately NOT installed.
 
+## 2026-09-02 — GATE 0: MEDS clusters do NOT separate GRPO gradients. The method's mechanism is not there.
+
+Dump `dump_hard_step49.npz` (sha `5475b9a1…`), `globalstep49` of the harness pilot, 153 groups,
+**100% non-unanimous** so the plan's >=60% precondition is satisfied, `zero_block_fraction` 0.0000
+throughout, projection check **PASSED** (`max_abs_error` 0.0322 <= floor 0.0331).
+
+**The resolution problem was solved by aggregation, not by a bigger sketch.** Per-pair sketch noise
+is 0.0331, and the effect is ~0.0025, so no individual cosine is readable. But averaged over
+thousands of pairs the noise falls as `1/sqrt(n)`: over 3,264 between-cluster pairs the noise-derived
+SE is **0.00058**, below the signal. The permutation control uses the SAME sketches, so any
+systematic sketch bias cancels rather than needing to be modelled.
+
+**Result — between-cluster minus within-cluster mean cosine, GRPO gradient:**
+
+| min_cluster_size | K | separation | +/- | permutation p |
+|---|---|---|---|---|
+| 5 | 2 | **-0.00032** | 0.00087 | **0.740** |
+| 8 | 2 | **-0.00009** | 0.00084 | **0.650** |
+| 12 | 2 | **-0.00028** | 0.00085 | **0.715** |
+| 20 | 2 | **+0.00028** | 0.00092 | **0.4375** |
+
+Every separation is within one SE of zero, the sign flips across settings, and every permutation
+p-value against a size-matched random partition is 0.44-0.74. **MEDS is indistinguishable from
+random on the quantity the method exists to exploit.** The hypothesis required MEDS clusters to be
+MORE mutually conflicting than random ones; they are not distinguishable at all.
+
+**Corroborated on exact gradients, with no floor at all.** The 8 stored full gradients (67,108,864
+params each) give 28 exact pairs: mean cosine **+0.002491**, median +0.001902, range -0.0369 to
++0.0607, **13/28 = 46.4% negative**. That is near-orthogonality with about half the pairs mildly
+opposed — what independent high-dimensional vectors look like. It **replicates** the published
+finding (2608.03573) that RL updates are near-orthogonal, rather than contradicting it, which
+strengthens the null rather than casting doubt on the instrument.
+
+**A second, independent problem: MEDS finds only K=2 at every setting tried** (min_cluster_size 5,
+8, 12, 20 -> K=2, noise 15-22, one cluster always holding 102-111 of 153). `FINDINGS_cluster_lora.md`
+already required K>=4 for discrimination. The method cannot produce the partition it needs.
+
+**What is NOT null, and is the one thread left.** The ELREA prompt-gradient side shows cosines of
+**~0.42** — two orders of magnitude above the GRPO gradients' ~0.0005 — and a separation that grows
+with cluster size, reaching **-0.00747 +/- 0.00294** at min_cluster_size 20 (~2.5 SE). So the MEDS
+features do carry structure that is visible in PROMPT space while carrying none in GRPO-gradient
+space. That is worth understanding before anything is concluded about the features themselves.
+
+**Also: the exact-gradient comparison could not be made as designed.** All 8 stored groups landed in
+the same MEDS cluster (the 102-member one), so there is no between-cluster exact pair. Storing the
+first N informative groups does not sample the partition. A rerun wanting an exact between/within
+contrast must select stored groups to SPAN clusters, which is a third distinct selection bug in the
+same flag.
+
+**Scope, stated plainly.** One checkpoint, one batch, from the harness pilot trained briefly on
+MATH Level 5 — not from A0's DeepMath run. It establishes that MEDS clusters carry no
+gradient-interference signal on THIS checkpoint and batch. Whether a longer-trained policy on a
+harder corpus develops such structure is untested, and the drift already observed in A0
+(informative 53.9% -> 47.7% by step 49) is a reason to test it on a later checkpoint rather than
+assume either way.
+
 ## 2026-09-02 — Loss-weighting audit: the 2604.23747 bug class cannot occur here, but length silently reweights
 
 Commit `603230a8`, `selfevo/FINDINGS_loss_weighting.md` + 15 tests. Read-only audit ahead of the
