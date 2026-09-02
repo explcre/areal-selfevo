@@ -45,6 +45,88 @@ experiment has yet used either. The routed 30B arm is where they belong.
 a feature, grep its resolved config for the switch. `enabled:`, `router:` and `group_routing:`
 are three separate places a routing arm can be silently off.
 
+## 2026-09-02 — The harness axis is NOT vacuous on single-turn math, once it drives generation budget
+
+The risk flagged before launch was that `HarnessVariant.step_limit` documents itself as "maximum
+agent steps" while this is single-turn math — no agent steps — so two arms could be byte-identical
+and the whole axis a silent no-op. **Resolved by measurement, not assumption.**
+
+`step_limit` is indeed read by nothing here. The axis was moved to **generation budget** via
+`settings["max_new_tokens"]` -> `max_completion_tokens` — the only one of the three cap fields
+that survives the stack (`MathAgent.__init__` pops `max_tokens`; `ArealOpenAI` refuses both set).
+Rungs chosen from a measurement: 60 rollouts at a 1024 cap where nothing truncated give truncation
+**0.83 / 0.42 / 0.07 at caps 96 / 160 / 256**.
+
+Two 4-step runs, identical in model, seed, data order and code, differing only in the pinned rung:
+
+| | cap 96 | cap 256 |
+|---|---|---|
+| mean response length | 93.7 | 194.1 |
+| longest response | 96 | 256 |
+| observed truncation | 0.885 | 0.375 |
+| **mean reward** | **0.156** | **0.615** |
+
+`PROOF PASS`, 6/6 checks (no response exceeded its declared cap; neither run moved, so budget was
+the only difference). **8/8 mutants killed**, including "the budget is never written into the
+kwargs" and "truncation is measured against a config constant". A four-fold reward difference is
+not a no-op.
+
+**Where `observe()` had to go, and why it is not a preference.** `PPOTrainer.train`
+(`areal/trainer/rl_trainer.py`), once per step, BEFORE the rollout the decision governs — not in
+`_route_groups`. `self.actor` is a `TrainController` dispatching `compute_advantages` over RPC, so
+at `fsdp:d2p1t1` the actor-side path builds TWO dispatchers, each seeing half a batch with its own
+active variant; and `workflow_kwargs` (what `RolloutController.submit` serialises into every
+rollout task) is driver-side and unreachable from a worker. On the driver there is one dispatcher,
+it sees the whole batch, and what it writes is on the path to the next rollout. The decision epoch
+IS the training step.
+
+Config surface: `GroupRoutingConfig.harness_selector` + `harness_selector_args`, resolved through a
+`SELECTORS` registry; validation refuses an unregistered selector, a selector over fewer than two
+rungs, and args with no selector, all before a GPU is touched. `harness_variants` now requires a
+router OR a selector — requiring a router would make a harness arm rewrite advantages too, so the
+arms would differ in two things.
+
+## 2026-09-02 — Truncated single-arm pilot: the controller acts on the right units, with no control
+
+`harnessT_trunc`, Qwen2.5-32B-Instruct + LoRA r=32, 2 train + 2 rollout TP=2, stopped by
+instruction at **step 68 of 150** (~8.1 s/step; 6m29s startup incl. a 65 GB load).
+
+67 decisions, **49 moves (25 longer, 24 shorter), 18 refusals (1 blocked at a ladder end), 0
+repeated observations -> realised switch rate 0.7313.** Budget occupancy: 160 for 27 steps, 256 for
+41; the 96 rung was never reached. **Observed truncation 0.776 under the 160 rung vs 0.131 under
+the 256 rung** — the controller is acting on the feature it claims to act on.
+
+Reward 0.462 @160 vs 0.506 @256. **That comparison is OBSERVATIONAL and carries no claim**: the
+rung is chosen from the previous step's truncation, so it is not randomly assigned. **There is no
+control arm and no error bar on any difference.** The control was cancelled before launch because
+the re-derived `RateMatchedControlSelector` drew Bernoulli at a NOMINAL rate, whereas the audited
+one replays the treatment's REALISED move/stay multiset on a seeded deck — running it would have
+compared against the wrong control.
+
+**The pilot ran on re-derived code** (origin lacked `da024c4d` at launch; confirmed by direct SHA
+and PR-ref fetch). Reconciled since: `selfevo/` and `experiments/` are now origin's, origin's own
+mutation harness passes **56 killed / 0 survived**, and the config surface is re-applied on top.
+Three behavioural differences, all in the re-derived version: (1) control = nominal-rate Bernoulli
+with blocked directions flipped inward, vs seeded deck replay of the realised multiset; (2)
+refusal = a return value the caller mapped to NONE, vs a typed `HarnessSelectionRefused` raised
+through the dispatcher seam; (3) `observe` took a pre-reduced scalar, vs per-group feature rows
+reduced internally that raise `MissingFeatures` rather than defaulting to 0.0. Thresholds,
+one-rung nearest-neighbour moves and one-decision-per-observation matched. The audited rule walks
+`step_limit` and refuses a set whose members share one, so budget variants carry the budget in
+BOTH `step_limit` (ordering only) and `settings`. The two-pass control config now validates on the
+audited code: `harness_selector_args:{moves:49,decisions:67,seed:1}` passed preflight.
+
+**MATH probe batch generated** (step-49 adapter served at TP=2; MATH-lighteval train parquet
+verified by row count 7500; Level 4-5; 128 prompts x G=8 = 1024; temperature 1.0; cap 1024;
+graded by `math_verify`): k histogram **k=0:28, k=1:6, k=2:5, k=3:6, k=4:8, k=5:5, k=6:5, k=7:3,
+k=8:62** — 21.9% fully wrong, **29.7% partially correct**, 48.4% fully correct, 0 grader crashes,
+89 truncated at the cap. Not saturated, so it is a usable clustering input. The GSM8K batches are
+secondary and their non-saturation is partly CAUSED by the harness truncating rollouts, so
+clusters there may separate "truncated vs not" rather than anything semantic.
+
+Blocked: `selfevo/cluster_lora/interference_dump.py` is not on origin, so the dump did not run;
+`hdbscan`/`sklearn` confirmed absent from the H100 venv and deliberately NOT installed.
+
 ## 2026-09-02 — Loss-weighting audit: the 2604.23747 bug class cannot occur here, but length silently reweights
 
 Commit `603230a8`, `selfevo/FINDINGS_loss_weighting.md` + 15 tests. Read-only audit ahead of the
