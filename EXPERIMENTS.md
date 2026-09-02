@@ -2905,3 +2905,40 @@ evidence of a correlation between file order and cluster membership. At 32 store
 0.80^32 = 0.08%, which is why the confirmatory run raises the store rather than reordering the
 batch. If a 32-group store still lands non-spanning, THAT would be evidence of such a
 correlation and is worth knowing.
+
+## Arm notes: the router-source commit, and how a matched control is configured
+
+**`fa7e0f84` does more than its message says.** It wired `router_source_file` and added the
+covariate policy, and it ALSO reverted the `harness_selector` / `harness_selector_args` wiring
+from `GroupRoutingConfig`. That wiring had already been wiped from the working tree by an
+earlier `git checkout origin/selfevo/a100 -- areal/api/cli_args.py`, and committing the file
+carried the deletion along. Nothing is lost: the harness wiring is preserved on origin as
+branch **`selfevo/h100-config`**. A future harness arm must **cherry-pick it from that branch
+rather than assume it is on the mainline**, because `harness_selector` is not a field on
+mainline `GroupRoutingConfig` and a config naming it will be rejected by hydra as an unknown
+key rather than silently ignored.
+
+**How a matched control gets its proportions, and why it is not a config value.**
+`RandomRouter` reads `SELFEVO_RANDOM_PROPORTIONS` from the ENVIRONMENT and refuses to
+construct without it. That refusal is load-bearing: its class default is `{rl: 1.0}`, which is
+bit-identical to the routing-off arm while reporting itself as a control, and the `rnd` arm
+measured on 2026-08-31 ran with `rl_groups=64, sft_groups=0` at every step for exactly that
+reason. A control that silently defaults produces a clean number attached to nothing.
+
+The protocol is therefore three-sided, and each side comes from a different place so that no
+two can agree by construction:
+
+1. **Measure** the criterion arm's realised proportions from its OWN metrics --
+   `route/{mode}_groups` summed over steps divided by summed `route/n_groups`, never its
+   configured or intended mix. If the criterion arm stopped early on the truncation rule, the
+   window is capped at that step and the cap is reported.
+2. **Refuse at preflight** unless the environment variable is set, parses, sums to one, is not
+   the all-RL default, and matches the measured file within 1e-3. The variable comes from the
+   launcher; the expectation comes from the criterion arm's train.log.
+3. **Verify the far end** after the control has run: its own realised mix must agree with what
+   it was configured with, within three binomial standard errors at the configured rate over
+   the realised group count. A control configured correctly but drifting is still not matched,
+   and nothing else in the loop checks that.
+
+All five failure modes are tested and refuse: variable unset, all-RL default, set but not the
+measured values, no measured file, and (passing) the correct measured values.
