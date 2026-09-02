@@ -217,7 +217,30 @@ width. 99.13% of MATH golds are at or under 1024 tokens, but `T` is the max over
 prompt+response, so a group whose eight rollouts were all short gives a small `T` and can
 refuse a gold that is well under the generation cap. The rate is therefore a property of the
 run and not of the corpus, which is why `groups_no_fit` is a per-step metric rather than a
-number quoted here. It is also why a gold longer than the row is REFUSED rather than
+single number.
+
+What CAN be measured without a run is the corpus side of it: the fraction of MATH golds short
+enough to fit, as a function of the realised response width `W` a group happens to have.
+Measured over all 7500 tokenised training golds with the live 30B tokenizer:
+
+| realised width W | golds that fit |
+| --- | --- |
+| 128 | 0.381 |
+| 200 | 0.603 |
+| 256 | 0.707 |
+| 384 | 0.849 |
+| 512 | 0.913 |
+| 768 | 0.970 |
+| 1024 | 0.991 |
+
+At the live `max_new_tokens=1024`, a group in which any rollout ran long enough to set a wide
+`W` can be served 99.1% of the time, and the binding constraint is not the corpus but whether
+the group's own rollouts were long. Combined with the 25.5% of MATH groups that are unsolved,
+the upper bound on reach is about 25% of groups and the realised figure will be lower by
+whatever fraction of unsolved groups produced only short rollouts -- which is exactly what
+`gold/groups_no_fit` reports per step, and it is a number to check on the first run rather
+than to assume now. This is a reach worth measuring, not a 3% mechanism; but it is an upper
+bound, and the honest claim until a run exists is the bound and not the reach. It is also why a gold longer than the row is REFUSED rather than
 truncated: a cut-off derivation is a wrong target that still looks like a target.
 
 ## 5. How the two baselines' rules map on
