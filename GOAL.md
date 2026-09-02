@@ -106,21 +106,61 @@ a comparison is like-for-like rather than a benchmark of our choosing.
 | B1 | MATH-500 | ours/common | **DONE** | saturated at 27B (0.966); usable only at 1.5B/7B |
 | B2 | AIME 24/25 | common | **DONE** | unusable: 0.000 @1.5B, 0.867 @27B with a 24-pt CI on 30 problems |
 | B3 | AMC23, HMMT 24/25 | common | **DONE** | 30-40 problems; indicative only |
-| B4 | **OlympiadBench** | common | **DONE** | **the frontier math target**: 675 problems, 7-pt CI, 27B = 0.825 @8% trunc. Now IN `math_bench.SUITE` (2026-08-31); gold self-verifies **675/675** through our grader, so a low score is the model's. 94/675 carry multiple golds in one string -- exact match marks those wrong, so scores are a LOWER BOUND |
+| B4 | **OlympiadBench** | common | **DONE — MEASURED** | **the frontier math target**: 675 problems, 7-pt CI. **A0 baseline (Qwen2.5-32B-Instruct, adapter step149) = 0.4696, Wilson [0.432,0.507], n=675/675, fail=0, trunc=7, nobox=7 (2026-09-02)** against 27B = 0.825, so a wide separable band. Gold self-verifies 675/675. 94/675 carry multiple golds in one string, so exact match marks those wrong and every score is a LOWER BOUND. Split committed at `data/olympiadbench_split.json` (search 338 / report 337); every arm decision reads `search` |
 | B5 | **Terminal-Bench 2.1** | **Ornith-1.5** | **HARNESS AVAILABLE** | Ornith-397B 86.1, 35B-A3B 67.8. LongHorizon-Harness (MIT) ships `eval/TB-harness` with a conda env file and scripts; only the TASKS must be fetched separately into `datasets/terminal-bench-2-1/tasks`. LHH reports Qwen3.7-Plus 69.7 -> 77.2 here, so a published harness-swap comparison already exists on this benchmark |
-| B6 | **DeepSWE** (Claude Code harness) | **Ornith-1.5** | **NOT BUILT** | Ornith-397B 56.0 |
-| B7 | **Frontier-Bench** | **Ornith-1.5** | **NOT BUILT** | competitors near zero |
-| B8 | **SWE-bench Pro** (+ `-os`) | **BigBang-v1** | **NOT BUILT** | `ScaleAI/SWE-bench_Pro` |
+| B6 | ~~DeepSWE~~ **NOT A BENCHMARK — reclassified 2026-09-02** | — | **DROPPED from this table** | DeepSWE is a MODEL: `agentica-org/DeepSWE-Preview`, base **Qwen3-32B**, SWE-bench Verified **42.2 Pass@1** (59 with TTS Best@16), R2E-Gym scaffold, GRPO variants, **public code (`agentica-project/rllm`, on verl) and public data (`R2E-Gym/R2E-Gym-Subset`, 4.5K)**. It belongs in RELATED WORK as the closest published RL result at our exact scale, NOT here. The old '397B 56.0' came from an Ornith vendor-card row labelled `DeepSWE` whose task set is never defined; the SAME card reports 35B-A3B at **79 on SWE-bench Verified but 22 on that row**, so it is demonstrably not SWE-bench Verified. UNVERIFIED what it measures |
+| B7 | **Frontier-Bench** | **Ornith-1.5** | **DROPPED 2026-09-02** | Terminal-Bench/Harbor team, **v0.1 = 74 tasks**. 'competitors near zero' was directionally right, literally wrong: open competitors sit **5.1-6.1** (Ornith-1.5-35B-A3B 5.1), frontier closed 21.1-23. Fatal on TWO counts: our policy would floor, and at 74 tasks the binomial 95% CI is about ±5pp, so a few-point arm difference is unresolvable even if it did not. Needs a long-horizon Docker/K8s agent harness |
+| B8 | **SWE-bench Pro** (+ `-os`) | **BigBang-v1** | **DROPPED 2026-09-02** | Scale public leaderboard, **731 instances**, one reproducible Docker image PER instance. Top 61.50±3.10. **Best entry at or below ~35B is `gemma-3-27b-it` at 11.38±2.15**, the only sub-35B model on the board. On the EASIER SWE-bench Verified, Qwen2.5-Coder-32B-Instruct scores 5.0; our non-Coder base with LoRA on q/k/v/o and no agentic training would be lower. Predicted **0-3%: floored**. Grading also needs a serving GPU for multi-turn rollouts. If a repo-level SWE row is ever politically required, use SWE-bench Verified (DeepSWE 42.2 is a bar at our scale) and report it as a floor |
 | B9 | **HLE** (Humanity's Last Exam) | **BigBang-v1** | **NOT BUILT** | `cais/hle` |
 | B10 | **FrontierScience** | **BigBang-v1** | **NOT BUILT** | `openai/frontierscience` |
 | B11 | math + competitive programming + repo-level SWE | **EvoTrainer** (2606.03108) | **PARTIAL** | math done; the other two are B8/B12 |
-| B12 | **LiveCodeBench v6** | common | **NOT BUILT** | data obtained; generation + sandboxed grading unwired |
-| B13 | **Spider2 / BIRD** | enterprise SQL | **NOT BUILT** | both on disk, never run |
+| B12 | **LiveCodeBench v6** | common + **Qwen3.8**, **EvoTrainer** | **DONE — MEASURED** | **A0 baseline = 0.3086, Wilson [0.245,0.381], n=175/175 (2026-09-02)**: 54 pass, 100 wrong answer, 11 runtime error, 10 timeout, 0 truncated, 0 no-code, 0 harness error, truncation_rate 0.0, not cap-limited. bwrap grader; gold self-verifies 175/175, known-wrong 31/31, 28/28 mutants. **VERSION TRAP — the one thing to get right**: ours is the BARE `v6` incremental slice, **175 problems, 2025-01-04 to 2025-04-06, 112 AtCoder / 63 LeetCode**. `release_v6` is a DIFFERENT cumulative 1055-problem set back to May 2023. Both get called 'v6'. The dataset repo has no split past `test6`, so this is the newest LCB that exists. Qwen3.8-27B's card reports **90.3** here (Qwen3.6-27B 83.9, Opus4.6 Max 88.8) but does NOT state which set or protocol — resolve before quoting side by side. Saturated at the frontier, wide open at our scale, and post-dates our base model's cutoff so it is genuinely held out for us |
+| B13 | **BIRD** (Spider 2.0 dropped) | enterprise SQL — **the third domain** | **WIRING 2026-09-02** | **CORRECTION: GOAL.md previously claimed 'both on disk'. FALSE on the H100** — `~/evaldata/` held only `olympiadbench`; the 'CLONED' records in `repro/FROZEN_BENCHMARKS.md` describe a different machine, and even there 'cloned' meant the code repo, not the databases. **BIRD passes every selection criterion**: our exact base model has a published **43.8% EX** on Mini-Dev (arXiv 2511.04153; Qwen2.5-Coder-32B 49.4) against a leaderboard top near 82, so a wide separable band; dev.zip is **330 MB, ungated, HTTP 200, no login**; grading is **local SQLite execution, CPU-only, no Docker, no cloud account, no serving GPU**; the official eval script is public. At n=1534 the 95% CI is about ±2.5pp, TIGHTER than OlympiadBench. Single-turn generation with an executable reward is native GRPO territory, and BIRD train (8.9 GB, ~9.4K pairs) is an available RL pool. **CAVEATS: mini_dev carries NO LICENSE (run-and-cite only, never a redistributed dependency), and 2026 work documents pervasive annotation errors in BIRD/Spider, so gold must self-verify through our grader the way OlympiadBench's 675/675 did.** **Spider 2.0 DROPPED**: 32B-class models score 5.48-11.33 (floored) and grading needs Snowflake/BigQuery credentials with per-query billing |
 | B14 | BioMysteryBench | domain | **NOT BUILT** | 90 gated, 155 GB |
 | B15 | GeneBench-Pro | domain | **NOT BUILT** | 10/129 public |
 | B16 | **WeaveBench** | LongHorizon-Harness | **HARNESS AVAILABLE** | `eval/WeaveBench-harness`. The benchmark with the largest reported harness effect: 51.8 -> 80.7 at fixed model. Long-horizon GUI+CLI |
 | B17 | **OSWorld-V2** | LongHorizon-Harness | **HARNESS AVAILABLE** | `eval/OSWorldv2-harness`, with VM providers for vmware/gcp/azure/aliyun/virtualbox/volcengine. Qwen3.7-Plus 2.8 -> 8.3; Claude Opus 4.7 20.0 -> 34.3 on a subset. Low absolute scores make it a poor separator today |
 | B18 | **MLE-Bench Lite** | Frontis-MA1 / OpenRSI | **HARNESS AVAILABLE** | `OpenMLE-Evo` adapters. 12h/task on ONE 12GB card. Base 39.39, Evo 60.61, Evo-Max 71.21 (their own note: Evo-Max changes the search system and is not a pure model gain) |
+
+### 0. STANDING BENCHMARK PREFERENCE (user directive, 2026-09-02)
+
+Prefer the benchmarks reported by the frontier self-evolving systems we position against —
+**Qwen3.8, Ornith-1.5, BigBang-v1, EvoTrainer, Co-Harness** — plus **BIRD** for enterprise SQL.
+That directive was taken seriously and MEASURED against the selection rule below, and the
+result is narrow, so it is recorded rather than re-litigated.
+
+**The selection rule.** A benchmark earns a place only if (a) a published score exists at
+roughly our scale, not only for a 400B-class model, AND (b) our own baseline lands in a
+SEPARABLE band, neither floored nor saturated, AND (c) grading does not compete for a serving
+GPU. A column where every arm scores ~0 separates nothing; that is the AIME-at-1.5B trap and
+it has already burned this project once.
+
+**What the frontier suites actually contain, checked 2026-09-02:**
+
+* **Frontier CODE and AGENTIC work: well covered by them, unreachable by us.** Qwen3.8-27B's
+  and Ornith's software rows (SWE-bench Pro 61.7, Terminal Bench 2.1 73.0, NL2Repo-Bench 42.3,
+  DeepSWE 1.1 42.2, QwenSWEBench 79.0) are all produced **with the Claude Code harness at
+  temperature 1.0, top_p 0.95 and a 256K context window**, driving multi-turn repository
+  agents. We do not have that scaffold. On the ones with public leaderboards the best sub-35B
+  entries sit near 11 and near 5, so our arms would cluster near zero.
+* **Frontier MATH: barely covered by them at all.** Qwen3.8-27B's card carries **no
+  competition math whatsoever** — no AIME, no HMMT, no OlympiadBench, no MATH-500, only visual
+  math (MathVision). The math-adjacent rows on the other cards are frontier-science and
+  last-exam style sets where 32B-class models score in single digits. **So OlympiadBench is
+  not a step down from the frontier suite; it is the competition-math benchmark that still
+  discriminates at our size**, and our measured 0.470 against a frontier 27B's 0.825 proves it.
+* **Exactly ONE benchmark in those five sources our stack can meet on equal terms:
+  LiveCodeBench v6.** It is on Qwen3.8's card, it is in EvoTrainer, and we already have it
+  built, graded, mutation-tested and measured. That is the alignment worth having and we
+  already have it.
+* **Co-Harness published no code**, so there is no protocol of theirs to adopt, only a rule to
+  reimplement from the paper.
+
+**Resulting table: OlympiadBench (math) + LiveCodeBench v6 (code) + BIRD (enterprise SQL)**,
+with DeepSWE-Preview cited in prose as the same-scale published baseline. Both measured
+baselines sit in wide separable bands, which is the empirical justification for this table over
+a more fashionable one.
+
 | B19 | **NatureBench Lite** | Frontis-MA1 / OpenRSI | **HARNESS AVAILABLE** | held-out transfer set; Match-SOTA 50 -> 70 |
 
 **Do we need a frontier CODE benchmark? Yes -- but scale gates which one.** Answering this
@@ -982,6 +1022,111 @@ Standing preference: **use the authors' own repo** where one exists.
 `MatchedPermutationControl` separating "clustering helped" from "the mode proportions
 changed".
 
+## 2e. Data sources, baseline-first ordering, cold start, and reward evolution (directives, 2026-09-02)
+
+### The SOURCE axis must include teacher, self-generated and corpus rows
+
+**The measured hole this closes.** About 61% of the routed channel is UNSOLVED groups that have
+no target by construction. An advantage is a coefficient on tokens the model actually EMITTED,
+and in an unsolved group every emitted token is wrong, so a positive constant there teaches the
+error. `selfevo/tests/test_gold_target_reachability.py` pins that no router and no fixed rule
+can reach that branch through the advantage seam at all.
+
+**The seam already exists.** The only altitude that works is BATCH CONSTRUCTION, and that path
+is built and tested: `selfevo/gold/` (`attach` + `substitute`), carrying counts, typed refusals
+and the off-policy handling the DyME and LSPO baselines need. Today it has exactly ONE supplier,
+the dataset's own gold solution.
+
+**Directive.** Generalise the SUPPLIER behind that same seam so it also accepts (i) a TEACHER
+rollout, (ii) a SELF-GENERATED correct rollout from elsewhere -- a different sample, an earlier
+step, a higher-temperature retry -- and (iii) a CORPUS or scraped row. Reuse
+`selfevo/gold/substitute.py` rather than writing a parallel path; the standing rule is minimal
+edits and DRY.
+
+**Prior measurement that constrains this.** On GSM8K at a high solve rate the external teacher
+reached ~4.5% of groups against ~31.4% for the free self-target, a 7x difference. That is a
+property of GSM8K, not a constant. With the A0 baseline measured at 0.470 on OlympiadBench, far
+more mass sits in the unsolved branch, so RE-MEASURE the split there rather than carrying the
+GSM8K number forward.
+
+### Baseline-first ordering
+
+1. **Reproduce the published rules as arms first.** They set the bar our method must clear.
+2. **"Reproduce" means reimplement, and that is a reviewer risk to pre-empt.** ZERO of the nine
+   tracked methods released weights, and Co-Harness and LSPO released no code at all. So the
+   baseline is our own reading of their method, and the implementation must be documented
+   precisely enough to defend.
+3. **Two of our own citations are WRONG and must be fixed before any arm is built on them.**
+   SIA (2605.27276) is NOT task-level algorithm selection -- it is a Feedback-Agent updating
+   BOTH harness and weights, based on gpt-oss-120b, evaluated on LawBench / AlphaEvolve TriMul /
+   scRNA, with **no math or code benchmark at all**. DyME (2506.23061) is "Dynamic Memorization
+   and Exploration", a **vision-language** paper (cs.CV), not a routing rule.
+4. **Then the upgraded version**: an LLM, code-as-policy, or LoRA router reading MEDS and
+   trajectory observability, routing at TASK, CLUSTER, SAMPLE and TOKEN level, over a choosable
+   LOSS (RL, SFT, forward KL, reverse KL) and a choosable SOURCE (self rollout, teacher rollout,
+   gold, corpus).
+
+### Cold start -- initialise the learned router to REPRODUCE the fixed rule
+
+At step zero our method then equals the baseline BY CONSTRUCTION, and every later difference is
+attributable to learning rather than to two systems differing in many ways at once. This turns a
+fragile between-system comparison into a measurement of one system against its own
+initialisation, which is a far cleaner claim.
+
+**Honesty constraint that ships with it.** Our rule was audited as behaviourally IDENTICAL to a
+single solve-rate predicate in 102/102 constructible contexts under binary graders. The cold
+start is therefore cheap and the delta interpretable, but we CANNOT claim to have beaten a
+sophisticated hand-written policy. We beat one predicate, and the paper must say so plainly.
+
+### Reward as a FIFTH evolution target (BigBang-v1 shaped)
+
+**The loop, as described and NOT YET VERIFIED.** A GENERATE agent emits training data D1;
+post-training on D1 yields a model; the model is evaluated on a UTILITY task giving U1; U1
+calibrates a CRITIC agent; critic and REWARD agent form a closed circle. Being read from
+`https://endlessfrontier.tech/assets/paper.pdf`. Treat this paraphrase as **UNVERIFIED** until
+that read lands, and do not build on the details before then.
+
+**The structural rule that makes such a loop safe, and that we must copy if reward becomes a
+target.** An evolving reward needs a fixed anchor or it means nothing, because the easiest way
+to raise a reward is to make it easier to satisfy.
+
+* The UTILITY metric is FIXED and sits OUTSIDE the circle. Nothing in the loop may modify it.
+  For us that is accuracy on the committed `search` split; `report` stays sealed until write-up.
+* Arms are compared on that fixed metric, **never on their own reward**. An arm that evolved its
+  reward and one that did not are otherwise incomparable.
+* A proposed reward change is accepted by **measured utility, not by reward value**. Accepting an
+  edit because it raised the reward is circular, and is the most likely way we fool ourselves.
+* **Code-defined reward makes this tractable and reuses machinery we already want.** An LLM
+  proposes an edit as a diff; an A/B on held-out accuracy accepts or rejects it. That is the same
+  propose-and-vet loop as code-as-policy routing: ONE mechanism serving TWO axes, not a second
+  subsystem.
+* **Consequence of our own collapse theorem.** Our graders are binary, and under binary rewards
+  every group-relative estimator collapses to alpha(k)*(r - rbar). A reward that STAYS binary has
+  almost no room to evolve into anything behaviourally different. Reward evolution only buys
+  something if it LEAVES binary -- partial credit, process-level scoring, shaping terms. That is
+  a real commitment, not a free axis.
+* **Where it will hack, predictably.** The ~61% of groups with no verifier signal. A shaped
+  reward there can reward confident, plausible, WRONG reasoning and nothing in the loop would
+  notice. Any reward change must be validated on SOLVED groups, where ground truth exists to
+  contradict it.
+* **Scope discipline.** Add reward as a fifth axis ONLY if we can afford an arm that demonstrates
+  it. An axis we claim but never run evidence for weakens the paper rather than strengthening it.
+
+### Ornith-1.5 and OpenRSI as references
+
+* **Ornith-1.5**: per-task SCAFFOLD design and per-task REWARD design, being read for what is
+  concretely reimplementable. Note its 35B-A3B variant is architecturally untrainable here (see
+  the Models section), so it is a design reference, not a comparison arm.
+* **OpenRSI**: `~/openrsi/OpenMLE-Evo` is ON THE H100 -- real code, 146 Python files, HEAD
+  `1f477c4`, from `github.com/FrontisAI/OpenRSI`. Refer to it for the evolution-loop design and
+  the MLE-Bench-Lite harness. Two facts before depending on it: its **LICENCE IS CC BY-NC 4.0 AND
+  IT COVERS THE CODE**, not merely the weights, which is fine for an academic paper but forbids
+  commercial use and constrains anything derived that we release; and it explicitly does NOT ship
+  model serving, MLE-Bench data or sandbox images, so it is a reference design rather than a
+  runnable pipeline. `benchmarks/mle_bench/` contains only README and RUNNING docs.
+
+---
+
 ## 3. Measured constraints — do not rediscover
 
 - **GSM8K train reward MIS-ORDERS checkpoints** vs held-out MATH-500. Never select on it.
@@ -1087,6 +1232,23 @@ difference, and the reverse of the previous ordering.
 5. **A teacher (M7)** -- now a lever on ~4.5% of groups, so it follows rather than leads.
 6. Then M8 learned controller, then the named benchmarks in Sec. 2.
 
+
+**Re-ordered again on 2026-09-02, after the first eval numbers this project has ever produced**
+(OlympiadBench 0.4696, LiveCodeBench v6 0.3086, both at adapter `globalstep149`).
+
+0. **Eval DURING training, logged to W&B online, with an adapter-liveness series.** Promoted to
+   the top because the step149 eval carried a warning that invalidates everything downstream if
+   it holds: **0 of 3 greedy outputs differed between the adapter and the base model**, so those
+   two scores may be BASE-MODEL scores rather than trained ones. Without a val curve we could
+   spend a whole rented box on a run that never learns and not find out until the end.
+7. **Generalise the supplier** behind the `selfevo/gold` batch-construction seam to teacher,
+   self-generated and corpus rows (Sec. 2e). This is the only thing that can make the ~61%
+   unsolved branch learnable at all.
+8. **Baseline arms reimplemented from the papers**, with SIA and DyME corrected first.
+9. **Cold-start the learned router from the rule**, so the method starts at parity by
+   construction.
+10. **Reward as a fifth target** -- only if an arm can be afforded to demonstrate it.
+
 ## 7. Standing operating rules learned the hard way
 
 * **Liveness is log growth, never `nvidia-smi`.** A dead run held 4 GPUs at 100% for 46
@@ -1096,3 +1258,18 @@ difference, and the reverse of the previous ordering.
   `experiments/harness/hf_mirror.py` -- both boxes are rented and may be reclaimed at short
   notice. Skipping is per-file by size; folder-level checks accept partial uploads.
 * **Every capability is flag-gated and rolls back to vanilla AReaL bit-identically.**
+
+* **W&B ONLINE is mandatory for EVAL metrics during training, not only for training statistics.**
+  As of 2026-09-02 runs stream training stats online but have NO eval hook at all, so a run's
+  validation curve is invisible until someone stops training and evaluates by hand. Being fixed.
+  An **adapter-liveness** series ships with it -- the fraction of greedy probe generations that
+  differ between adapter and base -- because at `globalstep149` that fraction was ZERO, and a
+  score from an inert adapter is a base-model score wearing the arm's name.
+* **Every new feature gets a subagent audit with MUTATION TESTING.** Deliberately break the new
+  code several distinct ways, one at a time, and confirm a test fails each time. A mutation
+  nothing catches means the tests do not constrain the code. This project has recorded five
+  defects that survived 350 green tests, and four separate guards that could not fail.
+* **Never derive a check's expected value from the thing being checked**, and never tune a
+  grader, prompt, parser or sampling setting to bring a validation number into its expected band.
+  That converts an instrument into a mirror. A failed validation is a finding worth more than a
+  passed one.
