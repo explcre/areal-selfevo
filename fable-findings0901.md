@@ -326,4 +326,27 @@ cheapest possible test of whether (a) has a mechanism, and it is measurable befo
 per-cluster adapter is built. If the size-matched random control shows the same conflict, do
 not build (a).
 
-### 6.4 Pending: cluster-routed-LoRA novelty search
+### 6.4 Cluster-routed-LoRA novelty search — adjacent, one open cell, motivation contested
+
+| component | status | who owns it |
+|---|---|---|
+| model-internal signal → cluster → one LoRA per cluster → soft merge at inference | **OCCUPIED (SFT)** | **ELREA** [2502.00089](https://arxiv.org/abs/2502.00089) (ICLR 2025): per-example gradient feature, BIRCH, per-cluster LoRA from a base adapter, softmax-weighted logit merge — and it **solves the circularity** by clustering on prompt-token gradients only. Also GradientSpace [2512.06678], TC-LoRA [2508.03999], Mo'LoRA, MoCLE [2312.12379] |
+| several LoRA experts trained WITH RL, then routed or merged | **OCCUPIED (by label)** | **Parallel-RL** in [2608.03573](https://arxiv.org/abs/2608.03573); Hard-Routed MoR-LoRA [2606.31413]; RO-GRPO (OpenReview rhD7ZuFAjU) |
+| parameter separation motivated by gradient conflict during RL | **OCCUPIED** | **MGS** [2602.02301] — module-level, domain-labelled; a direct methodological competitor |
+| clusters discovered from the model's **own rollouts/failure modes**, formed **online inside the RL loop**, driving adapter assignment | **OPEN — nothing found** (9 empty queries; arXiv API 429'd, retry once before claiming) | the gap between MEDS (behavioural clusters, reward shaping only, no adapters) and ELREA |
+
+**The three papers that threaten the motivation** (all 2026):
+- **SFT Conflicts, RL Coexists** [2608.03573](https://arxiv.org/abs/2608.03573) (Aug 4): cross-task ΔW cosine **SFT ~10⁻¹–1.0 vs RL ~10⁻⁵**; RL touches ~20% of params at L2 ~3e-2; interference is variance-limited and near-orthogonal. Then publishes Parallel-RL. *"A reviewer holding both papers can say your mechanism is ELREA's clustering bolted onto Parallel-RL's training, targeting an interference term that paper measured as negligible."*
+- **Enough is as good as a feast** [2607.22039] (ICLR 2026): RL mitigates task conflict; conflicting updates decline as training converges.
+- **To Mix or To Merge** [2602.12566]: little inter-task interference in cross-domain RLVR; **mixing beats merging at 63.7% of the GPU hours.**
+
+**What keeps the method alive:** those measure cross-*task*, post-training ΔW. **Prompt-level** conflict in RL is formalised by *Pass@k prompt interference* [2602.21189](https://arxiv.org/abs/2602.21189) and evidenced by *Unlearnability in RLVR* [2605.16787] (ICML 2026: unlearnable examples have low gradient similarity with the rest). Within-task, per-step, between-failure-mode-cluster conflict is a different quantity, and nobody has measured it. **The interference probe (§6.3) is therefore make-or-break, not a sanity check**, and it now reports four partitions: MEDS, size-matched random, **ELREA-style prompt-gradient clusters (the required ablation — must show rollouts beat prompt-side features or a reviewer asks why rollouts are needed)**, and task-label as calibration against the 10⁻⁵ figure.
+
+**Merge-step warnings:** *When Model Merging Rivals Joint Multi-Task RL* [2607.16062] finds RL task vectors near-orthogonal (cos 0.06–0.10) so every merge method collapses to uniform averaging; *Sparsity Curse* [2606.18521] (KDD 2026) says sparse near-orthogonal RLVR updates make merging fragile — read before choosing an operator. **Circularity dodges in print:** ELREA (prompt gradients), CASCAL [2601.09692] (cluster outputs, route from input, between models), Latent Task Discovery routing [2603.19415].
+
+**Strongest paper a reviewer raises: ELREA. Most likely to kill it: 2608.03573.** The method survives iff the probe shows within-task cluster conflict materially above both the random partition and the cross-task baseline — a measurement, not an argument.
+
+### 6.5 The H100 truncation arms are a pilot only
+
+The H100 agent could not fetch `da024c4d` (unpushed at the time — my sequencing error) and re-implemented the selectors (`ecf97f84`). Diffed: same thresholds and treatment rule, but its control draws **Bernoulli at a nominal `move_rate`** with an `up_share` destination parameter and flips inward at ladder ends while adjusting its counters. Not rate-matched by construction; the audited control replays the realised multiset on a deck. Not rerun — the box's time goes to the probe. Reported as directional.
+
