@@ -1440,9 +1440,20 @@ exists in the batch; it is simply isotropic with respect to any labelling we can
 honest summary is that there is very little structured gradient there to partition, and the
 pre-registered rule therefore closes: we build no per-cluster adapters on this signal.
 
-This does not touch the weaker use of the same clustering as a \emph{targeting} key, which
-requires only that clusters identify consistent error patterns rather than separable
-gradients, and which is tested separately.
+The weaker use of the same clustering as a \emph{targeting} key requires only that clusters
+differ in how often the model succeeds, rather than that their gradients separate, and we test it
+on the same batch. It fails as well. Taking the fraction of variance in per-group solve rate
+explained by the labelling, the behavioural partition reaches $0.179$, $0.160$ and $0.071$ at the
+three settings against $0.189$, $0.190$ and $0.073$ for size-matched random partitions drawn over
+4000 permutations, with $p$ between $0.45$ and $0.67$. It explains \emph{less} than chance at every
+setting.
+
+That result is worth stating in the form that shows why the control is not optional. Cluster mean
+solve rates range from $0.21$ to $0.88$, and the labelling accounts for eighteen percent of the
+variance; reported alone, both numbers read as a finding. They are what feature-blind labels of the
+same sizes produce, because with twenty-two clusters over a hundred and twelve points small groups
+inflate the statistic mechanically. The control is what separates a discovery from an artefact of
+partition size, and here it removes the whole effect.
 
 \subsection{Validating the graders against published numbers}
 \label{sec:harnessvalid}
