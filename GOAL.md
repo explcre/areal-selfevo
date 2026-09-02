@@ -114,7 +114,7 @@ a comparison is like-for-like rather than a benchmark of our choosing.
 | B9 | **HLE** (Humanity's Last Exam) | **BigBang-v1** | **NOT BUILT** | `cais/hle` |
 | B10 | **FrontierScience** | **BigBang-v1** | **NOT BUILT** | `openai/frontierscience` |
 | B11 | math + competitive programming + repo-level SWE | **EvoTrainer** (2606.03108) | **PARTIAL** | math done; the other two are B8/B12 |
-| B12 | **LiveCodeBench v6** | common | **NOT BUILT** | data obtained; generation + sandboxed grading unwired |
+| B12 | **LiveCodeBench v6** | common | **DONE 2026-09-02** | **175 problems / 7000 tests**, whole release, contests 2025-01-04 to 2025-04-06 (window post-dates most training cutoffs). bwrap-isolated execution grader; **gold self-verifies 175/175**, 10/10 hand-written references, 31/31 known-wrong fail; 34/34 mutants. Eight-bucket accounting, crash/hang/unparseable are FAILS in the denominator. Generation path validated live at 32B and two bugs fixed (`14b370ad`): a trailing empty fence discarded a valid 1102-char program, and an unregistered model id returned HTTP 200 while silently serving the BASE model with no `model` field in the results |
 | B13 | **Spider2 / BIRD** | enterprise SQL | **NOT BUILT** | both on disk, never run |
 | B14 | BioMysteryBench | domain | **NOT BUILT** | 90 gated, 155 GB |
 | B15 | GeneBench-Pro | domain | **NOT BUILT** | 10/129 public |
@@ -981,6 +981,43 @@ Standing preference: **use the authors' own repo** where one exists.
 (layer-logit HDBSCAN) clustering becomes a direct ablation, with
 `MatchedPermutationControl` separating "clustering helped" from "the mode proportions
 changed".
+
+## 2c. TRAINING data — the gap this table does not cover (added 2026-09-02, PI direction)
+
+The eighteen rows above are all **evaluation**. Nothing in this file specified what we TRAIN on,
+and the default inherited choice is **MATH-lighteval**, whose test counterpart MATH-500 is
+**saturated at 0.966 on 27B** (B1). That is the same regime error as the retracted M7 teacher
+demotion, applied to training instead of to a supplier:
+
+- A routing method can only route what the data produces. On near-saturated training data most
+  groups are all-correct, the unsolved branch is rare, and both the router and any teacher
+  supplier have almost nothing to reach.
+- Measured on our own probe batch, which was already **Level 4-5 filtered**: 48.4% of groups
+  fully correct, 21.9% fully wrong. A0 trains on the **full** split, so its composition is easier
+  than that.
+- The same logic that retracted M7 applies here: **reach is a function of difficulty**, so a
+  training set that is too easy suppresses the very signal the method exists to exploit.
+
+**Math training corpus — needed.** Nothing harder than MATH-lighteval is on disk. The natural
+choice is **DeepMath-103K**, because it is what **LSPO (2607.27787) trained on**, and LSPO is arm
+A4 in `experiments/m25/PLAN.md` — matching its corpus makes that baseline comparison like-for-like
+rather than confounded by data. Omni-MATH and NuminaMath are alternatives.
+
+**Code training corpus — entirely absent.** We can now EVALUATE code (B12) but have nothing to
+train code on. A frontier code claim needs one; candidates are the usual competitive-programming
+corpora. Until then, any code result is zero-shot transfer from math training, which is a
+different and weaker claim and must be labelled as such.
+
+**Constraint that follows from B12's value.** LiveCodeBench v6's contest window post-dates most
+training cutoffs, which is the whole reason its number means anything. Any training corpus —
+especially a scraped or synthesised one — must declare contamination risk against that window,
+and a run that cannot make that declaration must not report B12.
+
+**Sequencing.** Arms differ only in the partition, so all arms must share one corpus. The moment
+to switch is BEFORE A1/A2 launch; after that a switch invalidates the comparison. A0 is currently
+stopped at step 7, so the cost of switching now is nil.
+
+---
 
 ## 3. Measured constraints — do not rediscover
 
