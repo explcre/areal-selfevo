@@ -35,7 +35,7 @@ from selfevo.routing.rule_policy import (
 
 # Imported rather than re-derived: two definitions of "an actor configured like the live
 # runs" drift, and the drift is silent. Same reasoning as test_actor_router_seam.py.
-from selfevo.tests.test_group_routing import (  # noqa: E402
+from selfevo.tests.conftest import (  # noqa: E402
     G,
     MIXED,
     PROMPT,

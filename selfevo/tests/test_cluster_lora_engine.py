@@ -42,7 +42,6 @@ from areal.api.cli_args import (  # noqa: E402
 from areal.engine.fsdp_engine import FSDPEngine  # noqa: E402
 from areal.engine.fsdp_utils.parallel import ParallelHelper  # noqa: E402
 from areal.utils import logging as areal_logging  # noqa: E402
-from areal.utils.stats_tracker import DEFAULT_TRACKER  # noqa: E402
 from selfevo.cluster_lora.adapters import ClusterAdapterSet  # noqa: E402
 from selfevo.cluster_lora.wiring import ClusterPlan, ClusterWiringError  # noqa: E402
 
@@ -53,11 +52,8 @@ PROMPT = 4
 
 
 @pytest.fixture(autouse=True)
-def _clear_stats_tracker():
-    """Drop the process-global stats between tests, as the loss-weighting audit does."""
-    DEFAULT_TRACKER.stats.clear()
-    yield
-    DEFAULT_TRACKER.stats.clear()
+def _clear_stats_tracker(clear_stats_tracker):
+    """Apply the shared conftest fixture to every test in this module."""
 
 
 @pytest.fixture(scope="module")

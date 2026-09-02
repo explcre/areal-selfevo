@@ -28,16 +28,14 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-import areal.trainer.ppo.actor as actor_mod
-
 from areal.api.cli_args import GroupRoutingConfig
-from selfevo import compose
 from selfevo.routing.base import HarnessAction, RoutingDecision, TrainingMode
 
-from selfevo.tests.test_group_routing import (  # noqa: E402
+from selfevo.tests.conftest import (  # noqa: E402
     MIXED,
     advantages,
     make_actor,
+    registered_router,
 )
 
 STUB = "_harness_seam_stub"
@@ -101,34 +99,8 @@ def router_factory():
         kwargs.update(kw)
         return made
 
-    previous = compose.ROUTERS.get(STUB, KeyError)
-    compose.ROUTERS[STUB] = factory
-    try:
+    with registered_router(STUB, factory):
         yield configure
-    finally:
-        if previous is KeyError:
-            compose.ROUTERS.pop(STUB, None)
-        else:
-            compose.ROUTERS[STUB] = previous
-
-
-class Recorder:
-    """Captures ``stats_tracker.scalar`` kwargs so the LOGGED values can be asserted."""
-
-    def __init__(self) -> None:
-        self.seen: dict = {}
-
-    def scalar(self, **kw) -> None:
-        """Accumulate every logged key, last write winning."""
-        self.seen.update(kw)
-
-
-@pytest.fixture
-def recorder(monkeypatch):
-    """Swap the actor's module-level stats tracker for one that records."""
-    r = Recorder()
-    monkeypatch.setattr(actor_mod, "stats_tracker", r)
-    return r
 
 
 def actor_with(variants, **kw):

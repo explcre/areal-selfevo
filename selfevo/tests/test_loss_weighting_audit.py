@@ -37,11 +37,10 @@ from areal.api.cli_args import NormConfig, RejectionSamplingConfig  # noqa: E402
 from areal.trainer.ppo.actor import grpo_loss_fn  # noqa: E402
 from areal.utils.data import Normalization  # noqa: E402
 from areal.utils.functional.functional import apply_rejection_sampling  # noqa: E402
-from areal.utils.stats_tracker import DEFAULT_TRACKER  # noqa: E402
 
 # The actor fixture is imported rather than rebuilt: it already mirrors the live config, and
 # a second copy would drift from the first without either copy failing.
-from selfevo.tests.test_group_routing import (  # noqa: E402
+from selfevo.tests.conftest import (  # noqa: E402
     B,
     PROMPT,
     T,
@@ -51,17 +50,13 @@ from selfevo.tests.test_group_routing import (  # noqa: E402
 )
 
 @pytest.fixture(autouse=True)
-def _clear_stats_tracker():
-    """Drop the process-global stats between tests.
+def _clear_stats_tracker(clear_stats_tracker):
+    """Apply the shared conftest fixture to every test in this module.
 
-    ``grpo_loss_fn`` appends every microbatch's per-token statistics to a module-level
-    ``DistributedStatsTracker``, which asserts that a stat and its denominator have the same
-    shape. These tests deliberately vary the token count, so without this the second batch of
-    a different width fails inside the tracker and the failure looks like a loss bug.
+    These tests deliberately vary the token count, which is the case that fixture exists
+    for: without it the second batch of a different width fails inside the stats tracker,
+    and the failure looks like a loss bug rather than leaked state.
     """
-    DEFAULT_TRACKER.stats.clear()
-    yield
-    DEFAULT_TRACKER.stats.clear()
 
 
 # The SFT constant the M19 self-target writes (group_routing.solved_advantage) and the

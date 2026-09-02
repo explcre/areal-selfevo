@@ -35,6 +35,7 @@ from selfevo.routing.base import (
     known_modes,
 )
 from selfevo.routing.harness import CoHarnessRouter
+from selfevo.tests.conftest import mode_of
 
 GRANS = tuple(Granularity)
 RATES = (0.0, 0.25, 0.5, 0.75, 1.0)
@@ -46,12 +47,6 @@ def ctx(p, *, teacher=False, evolve=False, g=4, gran=Granularity.SAMPLE):
         solve_rate=p, group_size=g, granularity=gran,
         has_teacher=teacher, can_evolve_harness=evolve,
     )
-
-
-def mode_of(d):
-    """The single mode a hard routing decision selected."""
-    assert len(d.weights) == 1, f"expected a one-hot decision, got {d.weights}"
-    return next(iter(d.weights))
 
 
 # ------------------------------------------------------------------- the decision table

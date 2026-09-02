@@ -68,7 +68,7 @@ from selfevo.gold import (  # noqa: E402
     substitute_gold_rows,
     substitute_in_place,
 )
-from selfevo.tests.test_group_routing import G, make_actor  # noqa: E402
+from selfevo.tests.conftest import G, make_actor  # noqa: E402
 
 logging.disable(logging.INFO)
 

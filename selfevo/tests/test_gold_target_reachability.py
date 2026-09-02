@@ -67,7 +67,7 @@ torch = pytest.importorskip("torch")
 from areal.api.cli_args import GroupRoutingConfig  # noqa: E402
 from selfevo import compose  # noqa: E402
 from selfevo.integration import group_apply  # noqa: E402
-from selfevo.tests.test_group_routing import (  # noqa: E402
+from selfevo.tests.conftest import (  # noqa: E402
     G,
     SOLVED_AND_UNSOLVED,
     advantages,

@@ -21,7 +21,7 @@ from areal.api.cli_args import GroupRoutingConfig
 from selfevo import compose
 from selfevo.routing.base import RoutingDecision, TrainingMode
 
-from selfevo.tests.test_group_routing import (  # noqa: E402
+from selfevo.tests.conftest import (  # noqa: E402
     G,
     MIXED,
     make_actor,

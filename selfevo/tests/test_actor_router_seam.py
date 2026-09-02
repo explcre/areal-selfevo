@@ -25,12 +25,13 @@ from areal.api.cli_args import GroupRoutingConfig
 from selfevo import compose
 from selfevo.routing.base import RoutingDecision, TrainingMode
 
-from selfevo.tests.test_group_routing import (  # noqa: E402
+from selfevo.tests.conftest import (  # noqa: E402
     G,
     MIXED,
     PROMPT,
     advantages,
     make_actor,
+    registered_router,
 )
 
 STUB = "_seam_stub"
@@ -66,9 +67,10 @@ class RecordingRouter:
 def stub_router():
     """Register a recording router and restore the registry afterwards.
 
-    The registry is module-level state shared with every other test in the process, so a
-    test that mutates it without restoring makes an unrelated test fail later, in a
-    different file, with no visible connection.
+    The restore is ``conftest.registered_router``: the registry is module-level state
+    shared with every other test in the process, so a test that mutates it without
+    restoring makes an unrelated test fail later, in a different file, with no visible
+    connection.
     """
     made: list[RecordingRouter] = []
 
@@ -77,15 +79,8 @@ def stub_router():
         made.append(r)
         return r
 
-    previous = compose.ROUTERS.get(STUB, KeyError)
-    compose.ROUTERS[STUB] = factory
-    try:
+    with registered_router(STUB, factory):
         yield made
-    finally:
-        if previous is KeyError:
-            compose.ROUTERS.pop(STUB, None)
-        else:
-            compose.ROUTERS[STUB] = previous
 
 
 class AlternatingRouter(RecordingRouter):
@@ -113,15 +108,8 @@ def alternating_router():
         made.append(r)
         return r
 
-    previous = compose.ROUTERS.get(STUB, KeyError)
-    compose.ROUTERS[STUB] = factory
-    try:
+    with registered_router(STUB, factory):
         yield made
-    finally:
-        if previous is KeyError:
-            compose.ROUTERS.pop(STUB, None)
-        else:
-            compose.ROUTERS[STUB] = previous
 
 
 def routed_actor(**kw):

@@ -45,7 +45,7 @@ from selfevo.tests.test_group_apply import (  # noqa: E402
     random_partition,
     silent,
 )
-from selfevo.tests.test_group_routing import (  # noqa: E402
+from selfevo.tests.conftest import (  # noqa: E402
     G,
     MIXED,
     PROMPT,
