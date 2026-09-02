@@ -80,5 +80,16 @@ noise floor. A3 next (decides the "rollouts needed" claim). A4/A5 need the gold 
 - 3.3 GB actor headroom at 32B: no batch increase, no `kl_ctl>0`; `DRY_RUN=1` before any
   config change.
 - Orphans reaped before diagnosing any second attempt; artifacts read, never echoes.
-- Loss-weighting audit against arXiv 2604.23747 before any SFT/RL-mixing number (A4, A5) is
-  reported.
+- **Loss-weighting: audit DONE (`603230a8`, `selfevo/FINDINGS_loss_weighting.md`).** The
+  published bug class cannot occur here (one reduction, one tensor). But the reduction is a
+  per-TOKEN mean over the global batch, so **A4 and A5 must match on TOKEN MASS, not row
+  counts** — an injected row at 2x the sampled length carries 2x the gradient weight (measured
+  0.5 / 1.0 / 2.0 at 4 / 8 / 16 tokens). Every arm logs `sft_tokens / total_tokens` (new key,
+  nothing existing reports it); A4/A5 either match token mass to A0 or reweight by
+  `mean_len / row_len`, and the choice is stated with the number.
+- **Gold rows carry a FINITE logprob** equal to the trainer's recomputed `prox_logp`. NEVER NaN:
+  `kl_ctl=0.0` does not neutralise it (`-0.0 * NaN = NaN`), and under the live
+  `adv_norm: mean_level=batch` one NaN row spreads to all 8/8. A 0.0 placeholder is silently
+  down-weighted instead. Any batch reaching the loss with an unfilled gold row must raise.
+- Keep `adv_norm=None` and `kl_ctl=0` for routed arms; `mean_level=group` is forbidden (its
+  token-weighted mean destroys `sum(a_i)=0` unless all rows match in length).
