@@ -329,3 +329,49 @@ def test_the_result_carries_the_floor_and_the_knob_so_it_cannot_be_read_without_
     res = analyse_dump(str(path), n_boot=20, seed=0, min_cluster_size=4)
     assert res["resolution_floor"] == pytest.approx(3 / np.sqrt(DIM))
     assert res["sketch_dim"] == DIM and res["min_cluster_size"] == 4
+
+
+def test_the_analysis_reports_how_many_groups_carried_no_gradient(tmp_path):
+    """The MEDS side rests only on informative groups, and the count has to be visible.
+
+    On the real batch 90 of 128 groups are unanimous, so every cosine rests on 38 groups. A
+    reader who does not know that will over-read the result.
+    """
+    sketch, feats, prompt, labels = planted()
+    sketch = sketch.copy()
+    sketch[:6] = 0.0                      # six unanimous groups, as a real batch has
+    path = tmp_path / "d.npz"
+    np.savez_compressed(
+        path, sketch=sketch, prompt_sketch=prompt, meds_feature=feats,
+        group_id=np.array([f"p{i}" for i in range(N)], dtype=object),
+        task=np.array(["math"] * (N // 2) + ["code"] * (N - N // 2), dtype=object),
+        group_size=np.full(N, 4, dtype=np.int64), reward_mean=np.zeros(N),
+        zero_block_fraction=np.zeros(N), full_grad=np.zeros((0, 0), dtype=np.float32),
+        meta=np.array(json.dumps({"n_groups": N}), dtype=object),
+    )
+    res = analyse_dump(str(path), n_boot=20, seed=0, min_cluster_size=4)
+    assert res["n_zero_grpo_sketches"] == 6
+    assert res["n_informative_groups"] == N - 6
+    # The ELREA feature does not depend on the rewards, so a silent batch leaves it intact --
+    # the asymmetry a reader has to know about.
+    assert res["n_zero_prompt_sketches"] == 0
+
+
+def test_an_unvalidated_sketch_carries_a_machine_readable_status(tmp_path):
+    """"every stored gradient is zero" was a sentence a reader had to notice, and did not."""
+    path, _ = write_npz(tmp_path)
+    res = analyse_dump(str(path), n_boot=20, seed=0, min_cluster_size=4)
+    assert res["sketch_validation"]["status"] == "IMPOSSIBLE"
+
+    sketch, _f, _p, _l = planted()
+    path2, _ = write_npz(tmp_path, full_grad=sketch[:4].astype(np.float32))
+    res2 = analyse_dump(str(path2), n_boot=20, seed=0, min_cluster_size=4)
+    assert res2["sketch_validation"]["status"] == "ok"
+
+
+def test_a_store_of_only_zero_gradients_says_UNVALIDATED(tmp_path):
+    """The exact condition the real run hit, reported as a status rather than a note."""
+    path, _ = write_npz(tmp_path, full_grad=np.zeros((4, DIM), dtype=np.float32))
+    res = analyse_dump(str(path), n_boot=20, seed=0, min_cluster_size=4)
+    v = res["sketch_validation"]
+    assert v["status"] == "IMPOSSIBLE" and "UNVALIDATED" in v["note"]

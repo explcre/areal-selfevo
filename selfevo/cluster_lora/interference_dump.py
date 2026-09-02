@@ -511,6 +511,22 @@ class Group:
         """Samples in this group."""
         return len(self.response_ids)
 
+    @property
+    def is_silent(self) -> bool:
+        """True when every sample scored alike, so the GRPO gradient is exactly zero.
+
+        Tested on the reward standard deviation rather than on a k threshold, because that is
+        the actual condition: group-level normalisation centres the rewards, so a unanimous
+        group has advantages identically zero whatever the rewards were.
+
+        MEASURED on the probe batch: 90 of 128 groups are unanimous (k=0 or k=8), so 70% of
+        the batch contributes no gradient at all. That is a property of the batch, not a
+        defect, but anything that samples groups WITHOUT consulting this ends up sampling
+        mostly zeros.
+        """
+        r = np.asarray(self.rewards, dtype=np.float64)
+        return bool(r.std() == 0.0)
+
     def advantages(self) -> np.ndarray:
         """GRPO advantages: rewards centred and scaled within the group.
 
@@ -1176,7 +1192,21 @@ def run_dump(cfg: DumpConfig) -> dict[str, Any]:
         cfg.rollouts, tokenizer=tok, max_len=cfg.max_len, group_key=cfg.group_key,
         task_key=cfg.task_key, reward_key=cfg.reward_key,
     )
-    n_full = min(int(cfg.full_grad_groups), len(groups))
+    # WHICH groups get their full gradient stored, and it must not be "the first N".
+    #
+    # MEASURED on the real batch: 90 of 128 groups are unanimous, so taking the first 8 in
+    # file order stored k = [8, 0, 0, 4, 8, 8, 8, 0] -- seven groups with an exactly zero
+    # gradient and one with a norm of 1.28e-4. ``_sketch_validation`` needs TWO non-zero
+    # gradients to form a single pair, found one, and correctly reported that every stored
+    # gradient was zero. The sketch therefore went unvalidated, and no rerun of that
+    # selection could have validated it: drawing 8 arbitrary groups from a 70%-silent batch
+    # yields two non-zero about 0.5% of the time.
+    #
+    # Selecting from the informative groups makes two enough, which is also why the store
+    # stopped being a memory decision.
+    informative = [i for i, g in enumerate(groups) if not g.is_silent]
+    n_full = min(int(cfg.full_grad_groups), len(informative))
+    full_idx = {i: k for k, i in enumerate(informative[:n_full])}
     gb = n_full * n_params * 4 / 1e9
     if gb > cfg.max_full_grad_gb:
         raise RuntimeError(
@@ -1253,10 +1283,23 @@ def run_dump(cfg: DumpConfig) -> dict[str, Any]:
             sum(1 for _n, gr in grads if not bool(gr.any())) / max(1, len(grads))
         )
         sketches.append(sketch_torch(grads, plan))
-        if gi < n_full:
+        if gi in full_idx:
+            # Moved to the host in the gradient's OWN dtype and upcast there. The previous
+            # order -- ``.float().cpu()`` -- built a full fp32 copy ON THE CARD first, which
+            # is twice the transfer and, at 33.5M LoRA parameters, 134 MB of device memory
+            # per stored group that the run needed for its chunk. Free memory was measured
+            # falling 4.60 -> 3.44 -> 2.44 GB across budget attempts, almost exactly
+            # 8 x 268 MB, which is what forced the budget down to 1.5 GiB and the chunk to
+            # 882 tokens. The store is only read at the very end, so it has no business
+            # living on the accelerator at all.
             full_grads.append(
-                torch.cat([gr.detach().reshape(-1).float().cpu() for _n, gr in grads]).numpy()
+                torch.cat([gr.detach().reshape(-1).cpu().float() for _n, gr in grads]).numpy()
             )
+            if torch.cuda.is_available():
+                # Return the transient blocks to the driver rather than to torch's cache, so
+                # the freed memory is visible to the guard's next free-memory check. Called
+                # only on the few groups that store, so it costs nothing per batch.
+                torch.cuda.empty_cache()
         model.zero_grad(set_to_none=True)
         group_backward(
             model, g, which="nll", device=cfg.device,
@@ -1300,6 +1343,29 @@ def run_dump(cfg: DumpConfig) -> dict[str, Any]:
         sizes.append(g.size)
         rewards.append(float(np.mean(g.rewards)))
 
+    # The condition that silently disabled the validation last time, computed and NAMED.
+    # Reporting it only as a note inside the analysis meant a reader had to notice a sentence;
+    # a status string in the metadata is something a script can refuse on.
+    n_nonzero_full = sum(1 for v in full_grads if float(np.abs(v).max()) > 0.0)
+    n_zero_sketch = sum(1 for v in sketches if float(np.abs(v).max()) == 0.0)
+    if n_nonzero_full >= 2:
+        validation_status = f"ok: {n_nonzero_full} non-zero stored gradients"
+    else:
+        validation_status = (
+            f"IMPOSSIBLE: only {n_nonzero_full} of {len(full_grads)} stored gradients are "
+            f"non-zero, and a pair needs two. The sketch is UNVALIDATED for this run. "
+            f"{len(informative)} of {len(groups)} groups are informative; raise "
+            f"--full-grad-groups, or use a batch with more non-unanimous groups"
+        )
+    print(f"cluster_lora probe: sketch validation {validation_status}", flush=True)
+    if n_zero_sketch:
+        print(
+            f"cluster_lora probe: {n_zero_sketch} of {len(sketches)} GRPO sketches are "
+            f"exactly zero (unanimous groups); the MEDS side of the comparison rests on "
+            f"{len(sketches) - n_zero_sketch} groups",
+            flush=True,
+        )
+
     meta = {
         "model": cfg.model,
         "adapter": cfg.adapter or "",
@@ -1315,6 +1381,14 @@ def run_dump(cfg: DumpConfig) -> dict[str, Any]:
         "seconds_features": round(t_feat, 3),
         "seconds_total": round(time.time() - t0, 3),
         "full_grad_groups": n_full,
+        # Which groups, and why those. A store selected without consulting silence is a
+        # store of zeros on any batch like this one.
+        "full_grad_selection": "informative groups only (reward std > 0), in file order",
+        "full_grad_group_ids": [groups[i].group_id for i in full_idx],
+        "full_grad_nonzero": n_nonzero_full,
+        "sketch_validation_status": validation_status,
+        "n_groups_informative": len(informative),
+        "n_zero_grpo_sketches": n_zero_sketch,
         "denominator": "global: batch response tokens for GRPO, batch prompt tokens for NLL",
         "vocab": vocab,
         "chunk_tokens": plan_chunk,

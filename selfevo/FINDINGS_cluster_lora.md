@@ -254,6 +254,28 @@ number. This is the honest answer to the reviewer citing 2608.03573: our instrum
 "below our floor", and the exact cosines for the stored full-gradient pairs are the only
 place a 1e-5 claim could be checked at all. Raise `--sketch-dim` to trade memory for floor.
 
+### 6.1b The probe is only as informative as the batch's k-spread
+
+**MEASURED on the first real run, 2026-09-02.** Of the probe batch's 128 groups, **90 are
+unanimous** (k=0 or k=8). A unanimous group has advantages identically zero under group-level
+normalisation, so its GRPO gradient is exactly zero and it contributes NOTHING to any cosine.
+Every MEDS-side number the probe reports therefore rests on **38 groups, not 128**, and a
+reader who does not know that will over-read it.
+
+This is a property of the BATCH, not of the code, and it is not something the probe should
+paper over -- the 29-44% RL-silent share is a real measurement this project already tracks,
+and rescuing those groups with a different normalisation would invent the signal under test.
+What the probe owes the reader is the count, so `run_dump` prints it and both the dump
+metadata (`n_zero_grpo_sketches`, `n_groups_informative`) and the analysis carry it.
+
+**The damage is asymmetric, and that matters for the ELREA comparison.** The prompt-gradient
+sketch is a plain likelihood over prompt tokens and does not depend on the rewards at all, so
+0 of 128 were zero. A silent batch therefore weakens the MEDS side of the contrast while
+leaving the ELREA side at full strength -- which biases `meds_minus_elrea` in a specific
+direction and is exactly the sort of thing that reads as a finding. `experiments/m25/PLAN.md`
+now carries a precondition of at least 60% non-unanimous groups before Gate 0 may be read;
+this file records why that precondition exists.
+
 ### 6.2 Two properties of the statistics worth knowing before reading a result
 
 * **The numerator of `cancellation` is partition-invariant.** `sum_c g_c` is the batch
@@ -463,6 +485,41 @@ smaller chunk fits in the headroom a concurrent TRAINING run leaves, so the prob
 need the card to itself. The probe now runs at `--logits-budget-gb 2.5` alongside the A0
 baseline.
 
+#### The full-gradient store took the wrong groups, and that silently disabled the validation
+
+Two defects, both found only by running the probe on the real batch.
+
+**It stored the FIRST N groups.** With 90 of 128 unanimous, `--full-grad-groups 8` stored
+k = [8, 0, 0, 4, 8, 8, 8, 0]: seven exactly-zero gradients and one of norm 1.28e-4.
+`_sketch_validation` needs two non-zero gradients to form a single pair, found one, and
+correctly reported that it could not validate -- so **the sketch went unvalidated, and that
+selection could not have validated it on any rerun**: drawing 8 arbitrary groups from a
+70%-silent batch yields two non-zero about 0.5% of the time. The store now selects from the
+INFORMATIVE groups (`Group.is_silent`, tested on the reward spread rather than on a k
+threshold, since k=0 and k=G are the same case), which makes N=2 sufficient.
+
+The failure is now a named condition rather than a sentence to notice: the dump computes
+`sketch_validation_status`, prints it, and writes it to the metadata as either
+`ok: N non-zero stored gradients` or `IMPOSSIBLE: ... the sketch is UNVALIDATED for this run`,
+so a script can refuse on it. The analysis carries a matching `status` field.
+
+**It was upcast on the card before being moved.** `gr.float().cpu()` builds a full fp32 copy
+on the accelerator first -- twice the transfer, and 134 MB of device memory per stored group
+at 33.5M LoRA parameters. Free memory was measured falling 4.60 -> 3.44 -> 2.44 GB across
+budget attempts, almost exactly 8 x 268 MB, which is what forced the budget down to 1.5 GiB,
+the chunk to 882 tokens and the run to 16 minutes per adapter. The store is read only at the
+very end, so `gr.cpu().float()` transfers in the gradient's own dtype and upcasts on the host,
+and `empty_cache()` is called on the few groups that store so the freed blocks are visible to
+the guard's next check. That frees ~2.1 GB.
+
+The two levers used to point in opposite directions -- storing fewer gradients freed memory
+but made validation less likely to have anything to validate. With the store off the card and
+selected from informative groups, `--full-grad-groups` is a statistical choice again.
+
+The ordering cannot be observed on a CPU box by DEVICE, but it can by DTYPE: under the correct
+order `.cpu()` is called on a bfloat16 tensor, under the wrong one it only ever sees float32.
+That is the test.
+
 **Not done, deliberately.** All eight sequences in a group share an identical prompt prefix, so
 at id=11 the same 1,330 tokens are forwarded eight times; sharing that prefix would cut the
 worst group by most of its cost but needs KV-cache reuse across the eight continuations, and it
@@ -505,7 +562,9 @@ another rollout's reward.
 Two behaviours to know before reading a first result:
 
 * **At a fresh LoRA init `B = 0`, so `dL/dA = 0` exactly and half of every gradient vanishes.**
-  Measured `zero_block_fraction` = 0.50 on the CPU fixture. The cosines are then taken over the
+  Measured `zero_block_fraction` = 0.50 on the CPU fixture, and **confirmed at exactly 0.500
+  on `initial_lora` in the first real run** -- that is the predicted effect, not a defect, and
+  the trained adapters sit below it. The cosines are then taken over the
   `B` blocks alone -- still a real gradient, but not a mid-training one. **Pass `--adapter` with
   a trained checkpoint** (`globalstep24`, `globalstep49`); the dump records
   `zero_block_fraction` either way so a degenerate run cannot be read as a trained one.
@@ -552,12 +611,15 @@ arms because the two halves live in two venvs, and a mutation whose tests cannot
 chosen interpreter is reported NOT APPLICABLE rather than killed -- a mutation that was never
 exercised is not a passing one. Kill table in section 10.
 
-Ten tests exist only because the mutation harness found survivors or a run on the box did, and each pins a
+Eighteen tests exist only because the mutation harness found survivors or a run on the box
+did, and each pins a
 property no other test could see: bit-equality in `unchanged()`, the merge verification
 actually firing, per-parameter hashing in the sketch, the control's own size-match assertion,
 the prompt loss covering the prompt positions, the trunk actually splitting into sub-batches,
 the harness's own anchors still matching, the refusal pointing the reader the right way, the
-suggested value actually satisfying the check, and the budget following measured free memory.
+suggested value actually satisfying the check, the budget following measured free memory, the
+store selecting informative groups, the unvalidatable case being named, and the store reaching
+the host before it is upcast.
 
 `git status --porcelain` shows only files in this agent's territory:
 `selfevo/cluster_lora/`, eight `selfevo/tests/test_cluster_lora_*.py`,
@@ -617,20 +679,20 @@ See section 8 for the harness. Results are appended below when both arms have ru
 
 Run against `/home/ubuntu/mutcopy` and `/home/ubuntu/mutcopy2`, each verified sha256-identical
 to the originals for every `cluster_lora` module before starting and verified restored clean
-afterwards. **82 distinct mutations, two arms, every one killed and no SKIPs.**
+afterwards. **90 distinct mutations, two arms, every one killed and no SKIPs.**
 
 | arm | interpreter | applicable | killed | survivors |
 |---|---|---|---|---|
-| `torch` | `~/venv312b` | 72 | **72** | none |
-| `cluster` | `~/venv_probe` | 27 | **27** | none |
+| `torch` | `~/venv312b` | 78 | **78** | none |
+| `cluster` | `~/venv_probe` | 29 | **29** | none |
 
-17 mutations run on both arms, so the union is 82: every mutation is exercised somewhere. By
-area: the dump 38, the partition and control 15, adapter isolation 11, the analysis 7, the
-sketch 6, the merge 5. Nine of the dump's cover the memory guard's ADVICE and the derived
-budget, and were added after the guard was run on the box -- including one that restores the
-inverted clause it shipped with.
+17 mutations run on both arms, so the union is 90: every mutation is exercised somewhere. By
+area: the dump 44, the partition and control 15, adapter isolation 11, the analysis 9, the
+sketch 6, the merge 5. Seventeen of them were added only after the probe was RUN on the real
+box -- covering the memory guard's advice, the derived budget, the full-gradient store's
+selection and its paging -- and four of those restore a clause the code actually shipped with.
 
-**Eight defects survived a first pass and each produced a new test.** They are recorded
+**Ten defects survived a first pass and each produced a new test.** They are recorded
 because the tests that missed them all looked entirely reasonable, and because five of the
 seven would have produced a plausible number rather than an error:
 
@@ -666,12 +728,26 @@ seven would have produced a plausible number rather than an error:
    invisible until a person followed it. The message is now checked for direction, and a
    round-trip test feeds the value it suggests back into the guard and requires it to pass.
 
-Lessons 6, 7 and 8 are the general ones. An optimisation whose whole purpose is to use less
+9. *The full-gradient store took the first N groups, and every test of it used a fixture
+   whose groups were all informative.* The selection was never wrong on any batch the tests
+   built, so nothing failed until a batch that was 70% unanimous reached it -- and then the
+   symptom was not an error but a validation that quietly could not run. The fixtures now
+   include a mostly-silent batch with its informative groups placed LAST, which is the shape
+   that breaks a first-N selection.
+10. *The store was upcast on the accelerator before being moved to the host.* No test could
+   see it, because on a CPU box the device is the same either way. It is observable by DTYPE
+   rather than by device: under the correct order the host transfer sees bfloat16, under the
+   wrong one only float32.
+
+Lessons 6, 7, 8 and 9 are the general ones. An optimisation whose whole purpose is to use less
 memory cannot be validated by asserting the answer is unchanged, because the answer is
 unchanged when the optimisation does not happen -- the mechanism has to be observed, not the
 result. And a mutation harness silently decays as the code it points at is rewritten. The third:
 a guard is not finished when it refuses correctly -- what it says next is part of it, and
-asserting only that it raised leaves the half a human actually reads untested.
+asserting only that it raised leaves the half a human actually reads untested. The fourth:
+a fixture built from healthy data cannot test a selection rule, because every selection looks
+right on a batch where every choice is a good one -- the fixture has to contain the pathology
+the rule exists to handle.
 
 ### 10.1 A process failure worth recording
 

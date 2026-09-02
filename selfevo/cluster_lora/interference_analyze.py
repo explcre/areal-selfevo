@@ -249,6 +249,7 @@ def _sketch_validation(dump, sketches: np.ndarray) -> dict[str, Any]:
     if full is None or getattr(full, "size", 0) == 0 or full.shape[0] < 2:
         return {
             "n_groups": 0,
+            "status": "IMPOSSIBLE",
             "note": "no full gradients in the dump, so the sketch is unvalidated on this run",
         }
     m = full.shape[0]
@@ -262,9 +263,19 @@ def _sketch_validation(dump, sketches: np.ndarray) -> dict[str, Any]:
             exact.append(float(np.dot(full[i], full[j]) / (na * nb)))
             approx.append(float(np.dot(sketches[i], sketches[j]) / (sa * sb)))
     if not exact:
-        return {"n_groups": m, "note": "every stored full gradient is zero"}
+        return {
+            "n_groups": m,
+            "status": "IMPOSSIBLE",
+            "note": (
+                "every stored full gradient is zero, so the sketch is UNVALIDATED. On a batch "
+                "with many unanimous groups this is what a store selected without consulting "
+                "silence produces; the dump now selects informative groups and names the "
+                "condition in its own metadata as sketch_validation_status"
+            ),
+        }
     err = np.abs(np.array(exact) - np.array(approx))
     return {
+        "status": "ok",
         "n_groups": m,
         "n_pairs": len(exact),
         "mean_abs_error": float(err.mean()),
@@ -371,6 +382,20 @@ def analyse_dump(
         "min_cluster_size": int(min_cluster_size),
         "resolution_floor": floor,
         "sketch_validation": _sketch_validation(dump, sketches),
+        # How much of the batch carried a gradient at all. A unanimous group has advantages
+        # identically zero, so its GRPO sketch is exactly zero and it contributes NOTHING to
+        # any cosine here -- while still being counted in n_groups. MEASURED on the probe
+        # batch: 90 of 128 groups are unanimous, so every MEDS-side number below rests on 38
+        # groups, not 128. The ELREA prompt-gradient sketch is unaffected (0 of 128 zero),
+        # because a prompt likelihood does not depend on the rewards, so a silent batch
+        # damages the two sides of the comparison ASYMMETRICALLY.
+        "n_zero_grpo_sketches": int(sum(1 for v in sketches if float(np.abs(v).max()) == 0.0)),
+        "n_zero_prompt_sketches": int(
+            sum(1 for v in prompt_sketches if float(np.abs(v).max()) == 0.0)
+        ),
+        "n_informative_groups": int(
+            sum(1 for v in sketches if float(np.abs(v).max()) > 0.0)
+        ),
         "zero_block_fraction_mean": (
             float(np.mean(dump["zero_block_fraction"]))
             if "zero_block_fraction" in dump else None

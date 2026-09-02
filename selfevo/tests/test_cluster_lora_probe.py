@@ -1304,3 +1304,131 @@ def test_the_dump_records_which_budget_branch_it_took(ckpt, rollouts, tmp_path,
     meta2 = run_dump(cfg_for(ckpt, rollouts, out, logits_budget_gb=1.0))
     assert "explicit" in meta2["logits_budget_why"]
     assert meta2["logits_budget_bytes"] == 1024**3
+
+
+# =========================================================================================
+# The full-gradient store. Found by running the probe on the real batch: 90 of its 128 groups
+# are unanimous, so taking the FIRST N groups stored seven exactly-zero gradients and one of
+# norm 1.28e-4. The validation needs two non-zero to form a pair, found one, and reported
+# that it could not validate -- correctly, but the run had no way to have validated it.
+# =========================================================================================
+
+
+def silent_rollouts(tmp_path, n_groups=10, n_informative=3):
+    """A batch shaped like the real one: mostly unanimous, a few informative, silent first.
+
+    The informative groups are placed LAST so a store that takes the first N gets nothing but
+    zeros, which is exactly what happened on the box.
+    """
+    path = tmp_path / "silent.jsonl"
+    rows = []
+    for g in range(n_groups):
+        informative = g >= n_groups - n_informative
+        for s in range(4):
+            rows.append({
+                "group_id": f"p{g}", "task": "math",
+                "prompt": f"solve problem number {g} carefully ",
+                "response": f"think {s} then \\boxed{{{s}}}",
+                # Unanimous unless informative: all 1.0 (k=G) or all 0.0 (k=0).
+                "reward": float(s % 2) if informative else float(g % 2),
+            })
+    path.write_text("\n".join(json.dumps(r) for r in rows))
+    return str(path)
+
+
+def test_a_unanimous_group_is_reported_as_silent():
+    """The predicate the store selects on: reward spread, not a k threshold.
+
+    Group-level normalisation centres the rewards, so a unanimous group has advantages
+    identically zero whatever the rewards were -- k=0 and k=G are the same case.
+    """
+    assert Group("g", "m", [1], [[2], [3]], [0.0, 0.0]).is_silent
+    assert Group("g", "m", [1], [[2], [3]], [1.0, 1.0]).is_silent
+    assert not Group("g", "m", [1], [[2], [3]], [1.0, 0.0]).is_silent
+
+
+def test_the_store_selects_INFORMATIVE_groups_not_the_first_N(ckpt, tmp_path,
+                                                              patched_tokenizer):
+    """The defect. On a 70%-silent batch, "the first N" is a store of zeros.
+
+    The fixture puts every informative group last, so a selection that ignores silence stores
+    nothing usable and a selection that respects it stores exactly the right groups.
+    """
+    rj = silent_rollouts(tmp_path, n_groups=10, n_informative=3)
+    out = tmp_path / "dump.npz"
+    meta = run_dump(cfg_for(ckpt, rj, out, full_grad_groups=2))
+    assert meta["n_groups_informative"] == 3
+    # The informative groups are p7, p8, p9 -- never p0.
+    assert meta["full_grad_group_ids"] == ["p7", "p8"], meta["full_grad_group_ids"]
+    assert "informative" in meta["full_grad_selection"]
+
+
+def test_two_stored_gradients_are_enough_once_they_are_the_right_two(ckpt, tmp_path,
+                                                                     patched_tokenizer):
+    """With the selection fixed, N=2 validates -- which is why the store stopped being a
+    memory decision and became a statistical one."""
+    rj = silent_rollouts(tmp_path, n_groups=10, n_informative=3)
+    out = tmp_path / "dump.npz"
+    meta = run_dump(cfg_for(ckpt, rj, out, full_grad_groups=2))
+    assert meta["full_grad_nonzero"] == 2
+    assert meta["sketch_validation_status"].startswith("ok:")
+    d = np.load(out, allow_pickle=True)
+    assert d["full_grad"].shape[0] == 2
+    assert float(np.abs(d["full_grad"]).max()) > 0
+
+
+def test_a_batch_with_too_few_informative_groups_names_the_condition_loudly(ckpt, tmp_path,
+                                                                            patched_tokenizer):
+    """The failure must be a named status, not a sentence the reader has to notice.
+
+    On the real run the analysis said "every stored full gradient is zero" and the sketch went
+    unvalidated. A status string in the metadata is something a script can refuse on.
+    """
+    rj = silent_rollouts(tmp_path, n_groups=6, n_informative=1)
+    out = tmp_path / "dump.npz"
+    meta = run_dump(cfg_for(ckpt, rj, out, full_grad_groups=4))
+    assert meta["sketch_validation_status"].startswith("IMPOSSIBLE")
+    assert "UNVALIDATED" in meta["sketch_validation_status"]
+    assert meta["n_groups_informative"] == 1
+    assert meta["full_grad_nonzero"] < 2
+
+
+def test_the_dump_records_how_much_of_the_batch_carries_no_gradient_at_all(ckpt, tmp_path,
+                                                                           patched_tokenizer):
+    """The measurement rests on the informative groups only, so the count has to be visible.
+
+    On the real batch that is 38 of 128, and a reader who does not know that will over-read
+    the result.
+    """
+    rj = silent_rollouts(tmp_path, n_groups=10, n_informative=3)
+    meta = run_dump(cfg_for(ckpt, rj, tmp_path / "d.npz", full_grad_groups=2))
+    assert meta["n_zero_grpo_sketches"] == 7
+    assert meta["n_groups"] - meta["n_zero_grpo_sketches"] == 3
+
+
+def test_the_store_is_moved_to_the_host_BEFORE_it_is_upcast(ckpt, rollouts, tmp_path,
+                                                            patched_tokenizer):
+    """Order matters, and dtype makes it observable without a GPU.
+
+    ``.float().cpu()`` builds a full fp32 copy on the accelerator first -- twice the transfer,
+    and 134 MB of device memory per stored group at 33.5M LoRA parameters, which is what ate
+    the run's headroom. ``.cpu().float()`` transfers in the gradient's own dtype and upcasts
+    on the host. On a CPU box the DEVICE cannot distinguish them, but the DTYPE crossing
+    ``.cpu()`` can: under the correct order ``.cpu()`` is called on a bfloat16 tensor, under
+    the wrong one it only ever sees float32.
+    """
+    seen = []
+    real_cpu = torch.Tensor.cpu
+
+    def recording(self, *a, **kw):
+        """Record the dtype at the moment of the host transfer."""
+        seen.append(self.dtype)
+        return real_cpu(self, *a, **kw)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(torch.Tensor, "cpu", recording)
+        run_dump(cfg_for(ckpt, rollouts, tmp_path / "d.npz", dtype="bfloat16",
+                         full_grad_groups=2))
+    assert torch.bfloat16 in seen, (
+        "every host transfer saw float32, so the gradient was upcast before it was moved"
+    )
