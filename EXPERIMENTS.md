@@ -2983,3 +2983,119 @@ effect and must not be written as one.**
 same realised proportions and differs only in WHICH unit gets which mode. A0 differs in routing
 entirely, so an R-learned-versus-A0 gap confounds "routing collapses termination" with "this
 router collapses termination". All three series are reported; the R pair carries the meaning.
+
+---
+
+## Gate 0, confirmatory dump on a hard, all-informative batch (2026-09-02)
+
+The three earlier dumps could not be read: 90 of 128 groups were unanimous, so 7 of 8 stored
+gradients were exactly zero and the projection check had almost no population to check. This
+run fixes the batch rather than the script.
+
+**Batch.** Exported from A0 at `globalstep199` on decontaminated DeepMath. 304 groups sampled,
+164 unanimous dropped, **140 kept** (keep ratio 0.4605, 2.17 sampled per keeper), k histogram
+k=1:20 k=2:19 k=3:20 k=4:14 k=5:15 k=6:17 k=7:35, all groups of size 8. This batch is
+deliberately **not representative of what training sees**: filtering to non-unanimous groups
+changes the composition. It is a mechanism probe over the groups that HAVE gradients, and any
+rate read off it would be wrong.
+
+**Dump.** `/home/ubuntu/runs/probe/dump_a0_step199.npz`, sha256
+`84edfe7db148d36979378d56ec0ec74c0ae57adb677efd1e36c30541a5bbd21f`, 8,019,490,633 bytes.
+140 groups, sketch dim 8192, 32 full gradients of 67,108,864 parameters each. Wall clock 1205.5 s
+(gradients 1045.3, features 144.2). Logits budget **derived, not forced**: 17.3 GiB free / 1.5x
+headroom = 11.5 GiB, capped at the script's 4.0 GiB ceiling, giving 6819 tokens per chunk at
+vocab 152064. Deriving the budget after `empty_cache` is what made this run fit where four
+earlier attempts raised `LogitsBudgetExceeded`.
+
+**All 32 stored gradients are non-zero and 0 of 140 sketches are zero**, so both checks below
+rest on a real population for the first time.
+
+**Projection check PASSED.** Over 496 pairs, max |sketched - exact| = **0.0314**, at or just
+inside the resolution floor 3/sqrt(8192) = **0.0331**; mean |error| 0.0087. The sketch is
+therefore usable at dim 8192, but only just: the margin is 5%, so any conclusion that depends on
+resolving cosines below ~0.03 is not supported by this sketch.
+
+**The two measurements that matter, and they agree.**
+
+| quantity | value |
+|---|---|
+| exact mean pairwise cosine, 496 pairs | **-0.000506** |
+| sketched mean pairwise cosine, all 140 | 0.0000375 |
+| exact GRPO gradient norms, 32 groups | min 7.23e-05, median 1.06e-04, p90 1.32e-04, max 1.47e-04 |
+| max/min norm spread | **2.03x** |
+| sketched GRPO norms, 140 groups | min 6.33e-05, median 1.12e-04, max 1.98e-04 |
+| prompt-NLL norms, 140 groups | min 4.69e-03, median 7.27e-03, max 1.66e-02 |
+| NLL / GRPO median norm ratio | **65x** |
+
+The per-group GRPO gradients are **mutually orthogonal to within measurement error** and
+**uniform in magnitude to within 2x**. A partition of these groups has almost nothing to
+partition: there is no direction that several groups share and others oppose, and no subset
+carries materially more of the update than any other. The prompt-NLL gradient on the same rows
+is 65x larger, which says the smallness is specific to the GRPO term and is not a property of
+the model, the adapter or the probe.
+
+These are two independent measurements pointing the same way, on a batch chosen to be maximally
+favourable to finding structure. That is the strongest form of this negative result so far.
+
+## A0 baseline at globalstep149 on both benchmarks (2026-09-02)
+
+First eval number this project has for anything. Greedy, n=1, max_tokens 16384, concurrency 32,
+served by sglang tp=2 with the adapter registered as `a0_step149`; both result files record
+`model: a0_step149` and a `served_models` list containing the base snapshot and the adapter, so
+attribution is read from the artifact rather than assumed.
+
+**OlympiadBench.** The split was fixed and committed (`f2fcab7d`) before any score existed, so
+only the arithmetic below is post-hoc.
+
+| view | n | correct | accuracy | Wilson 95% |
+|---|---|---|---|---|
+| all | 675 | 317 | 0.4696 | [0.432, 0.507] |
+| **search** | 338 | 163 | **0.4822** | [0.429, 0.535] |
+| report | 337 | 154 | 0.4570 | [0.405, 0.510] |
+
+The halves differ by 0.025, far inside either interval, which is the expected behaviour of the
+stratification and not evidence about anything. From here on every arm DECISION quotes **search**;
+`report` is quoted once, in the write-up.
+
+**This accuracy is a LOWER BOUND, not a capability.** 94 of 675 problems carry multiple gold
+answers in a single string and exact-match grading marks all of them wrong. 7 generations hit the
+16384 cap and 7 produced no boxed answer; `cap_limited` is false and truncation is 1.0%, so the
+cap is not what is binding.
+
+**LiveCodeBench v6.** accuracy 0.3086, `accuracy_all` 0.3086, Wilson [0.245, 0.381], 175/175
+graded in 62.8 s (0.36 s per problem wall at concurrency 32). Eight-bucket accounting closes
+exactly: pass 54, wrong_answer 100, runtime_error 11, timeout 10, output_limit 0, **no_code 0**,
+harness_error 0, gen_failed 0, summing to 175. `cap_limited` false, truncation 0.0. Sandbox tier
+**bwrap**: new user/net/ipc/pid/uts namespaces, read-only root, rw scratch only, no network
+route; it is not a VM and is not seccomp-filtered. Dataset md5 `7e54179572530b58002d14178c19886b`.
+
+**Known limitation of the code slice, recorded rather than fixed.** Our 175 problems are the bare
+v6 *incremental* slice covering 2025-01-04 to 2025-04-06 (112 AtCoder, 63 LeetCode). This is NOT
+`release_v6`, which is a cumulative 1055-problem set. The Qwen2.5 report's LiveCodeBench score
+uses a window ending September 2024 and is therefore **fully disjoint** from our slice, and the
+official leaderboard carries no Qwen2.5 entry at any size. There is consequently **no published
+number to validate the code grader against**, and the paper should say so rather than imply an
+external anchor exists.
+
+### Two defects found while producing these numbers
+
+**The adapter-live probe raised a false alarm and the eval ran on anyway.** The probe compared
+greedy TEXT on three trivial prompts (12*13, the 7th prime, sqrt(72)), found all three identical
+to base, printed `WARNING: adapter indistinguishable from base`, and did not halt. Comparing
+LOGPROBS instead settles it: on two hard prompts the adapter and base differ by max |dlogprob|
+0.041 and 0.012, while trivial arithmetic is bit-identical. **The adapter is live**; the probe was
+too weak to see it, because a small LoRA delta moves the distribution without moving the argmax.
+Two consequences. The probe must test logprobs, not text, and it must halt rather than warn.
+And substantively: 149 steps of RL have moved this policy very little, which is the same story
+the 1.06e-04 gradient norms tell.
+
+**The exporter mislabelled the probe corpus.** Every exported record carried
+`"dataset": "openai/gsm8k"` from a hardcoded literal left over from the MATH-era exporter, so the
+npz metadata names GSM8K while the batch is DeepMath. Verified by matching prompts rather than
+trusting either label: **140 of 140 probe prompts are present in
+`/home/ubuntu/data/deepmath_decontam`** (102,835 rows). The gradients are unaffected, since the
+probe reads prompts, responses and rewards and never the label, but the artifact's own metadata
+is wrong and anyone reading it later would conclude the wrong corpus. The exporter now reads
+`train_dataset.path` from the run's own `config.yaml` and refuses to label a batch it cannot
+resolve. Fire-tested five ways, including that a superseded run resolves to a DIFFERENT corpus,
+which is what proves the function reads its argument instead of returning a constant.
