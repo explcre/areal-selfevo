@@ -388,8 +388,8 @@ def test_a_dead_endpoint_does_not_produce_a_score(endpoint, tmp_path):
     tracker = pe.BestValTracker(cfg.patience, cfg.state_path)
     m = pe.run_periodic_eval(cfg, 5, tracker)
     assert m["periodic_eval/status_code"] != pe.STATUS["ok"]
-    assert math.isnan(m["periodic_eval/olympiadbench/accuracy"])
-    assert m["periodic_eval/olympiadbench/accuracy"] != 0.0
+    assert math.isnan(m["periodic_eval/olympiadbench/trend_score"])
+    assert m["periodic_eval/olympiadbench/trend_score"] != 0.0
     assert tracker.best_step == -1, "a failed evaluation must not become the best checkpoint"
 
 
@@ -968,7 +968,7 @@ def test_an_eviction_between_resolving_and_generating_is_refused_not_scored(endp
 
     m = pe.run_periodic_eval(cfg, 5, tracker)
     assert m["periodic_eval/status_code"] == pe.STATUS["adapter_evicted"]
-    assert math.isnan(m["periodic_eval/olympiadbench/accuracy"])
+    assert math.isnan(m["periodic_eval/olympiadbench/trend_score"])
     assert tracker.best_step == -1, "an evicted evaluation must not become the best checkpoint"
 
 
@@ -990,7 +990,7 @@ def test_an_eviction_after_generating_is_refused_by_the_post_check(endpoint, tmp
     m = pe.run_periodic_eval(cfg, 5, tracker)
     assert policy.n_chat > 0, "premise: the benchmark must have generated before the eviction"
     assert m["periodic_eval/status_code"] == pe.STATUS["adapter_evicted"]
-    assert math.isnan(m["periodic_eval/olympiadbench/accuracy"])
+    assert math.isnan(m["periodic_eval/olympiadbench/trend_score"])
     assert tracker.best_step == -1
 
 
@@ -1006,7 +1006,7 @@ def test_a_window_that_holds_still_is_scored_normally(endpoint, tmp_path):
     cfg = _config(url, state_path=str(tmp_path / "best.json"))
     m = pe.run_periodic_eval(cfg, 5, pe.BestValTracker(cfg.patience, cfg.state_path))
     assert m["periodic_eval/status_code"] == pe.STATUS["ok"]
-    assert not math.isnan(m["periodic_eval/olympiadbench/accuracy"])
+    assert not math.isnan(m["periodic_eval/olympiadbench/trend_score"])
 
 
 @needs_data
@@ -1030,7 +1030,7 @@ def test_a_failed_evaluation_still_names_the_weights_it_was_pinned_to(endpoint, 
 
     m = pe.run_periodic_eval(cfg, 5, tracker)
     assert m["periodic_eval/status_code"] == pe.STATUS["adapter_evicted"]
-    assert math.isnan(m["periodic_eval/olympiadbench/accuracy"]), "a failure is not a score"
+    assert math.isnan(m["periodic_eval/olympiadbench/trend_score"]), "a failure is not a score"
     assert m["periodic_eval/adapter/version"] == 13.0, "the failed point forgot its weights"
     saved = json.loads((tmp_path / "out" / "step5" / "results.json").read_text())
     assert saved["resolved_adapter"]["model"] == f"{ADAPTER}-v13"
@@ -1049,7 +1049,7 @@ def test_a_resolution_failure_is_a_status_code_and_a_nan_not_a_zero(endpoint, tm
 
     m = pe.run_periodic_eval(cfg, 5, tracker)
     assert m["periodic_eval/status_code"] == pe.STATUS["adapter_unresolved"]
-    assert math.isnan(m["periodic_eval/olympiadbench/accuracy"])
+    assert math.isnan(m["periodic_eval/olympiadbench/trend_score"])
     assert math.isnan(m["periodic_eval/adapter/version"])
     assert policy.n_chat == 0, "a token was generated against an unresolved adapter"
     assert tracker.best_step == -1
@@ -1078,9 +1078,9 @@ def test_a_refusal_and_a_genuine_zero_are_different_points_in_the_series(endpoin
     )
 
     assert genuine["periodic_eval/status_code"] == pe.STATUS["ok"]
-    assert genuine["periodic_eval/olympiadbench/accuracy"] == 0.0
+    assert genuine["periodic_eval/olympiadbench/trend_score"] == 0.0
     assert refusal["periodic_eval/status_code"] == pe.STATUS["adapter_unresolved"]
-    assert math.isnan(refusal["periodic_eval/olympiadbench/accuracy"])
+    assert math.isnan(refusal["periodic_eval/olympiadbench/trend_score"])
 
 
 # ------------------------------------------------------------ where to evaluate ----
@@ -1133,7 +1133,7 @@ def test_a_missing_endpoint_is_a_status_code_not_a_crash():
     hook = pe.PeriodicEvalHook(env=env, rollout=_FakeEngine([]))
     m = hook.maybe_run(global_step=1)
     assert m["periodic_eval/status_code"] == pe.STATUS["endpoint_error"]
-    assert math.isnan(m["periodic_eval/olympiadbench/accuracy"])
+    assert math.isnan(m["periodic_eval/olympiadbench/trend_score"])
 
 
 def test_the_base_url_is_still_required_outside_a_trainer():

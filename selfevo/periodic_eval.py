@@ -49,6 +49,33 @@ FIVE THINGS THIS MODULE REFUSES TO DO, each because the tree already records the
    labelling it with the arm's name is the exact failure this project has already recorded --
    and a resolution failure emits a status code and NaN, never a zero.
 
+A SIXTH THING, and it decides more of the design than the plumbing does. The rollout
+server this evaluates against is configured for TRAINING, not for evaluation. It caps a
+request far below the headline evaluation's budget -- A0's is launched with
+``--context-length 4096`` against a headline cap of 16384 -- and the run generates short
+completions by design. A benchmark score is not interpretable without the budget that
+produced it: measured here on 2026-09-02, the same model on the same problems through the
+same grader moved FIFTY POINTS when the cap changed by under four times. So a number produced
+against the training server is NOT comparable with the headline number and must never be
+plotted beside it, and that is built in rather than left to memory:
+
+* the score series is called ``trend_score``, not ``accuracy``. There is no ``accuracy``
+  series in this namespace at all, so there is nothing here that a reader can line up
+  against a headline accuracy by name;
+* every point carries ``max_tokens`` (the budget that produced it), ``headline_max_tokens``
+  (the budget the headline evaluation used, read from ``math_bench.BENCH_OVERRIDES`` rather
+  than written down again) and ``budget_matches_headline``, which is 0 whenever the two
+  differ -- so a reader who sees only the number can still tell it is a different
+  measurement;
+* :func:`assert_points_record_budget` refuses to emit a score whose budget is missing, and
+  :func:`assert_row_records_budget` refuses the results row it would have come from. Two
+  independent checks, neither derived from the other.
+
+WHAT THE TREND SERIES IS FOR, and what it is not for. It is for detecting a run that is not
+learning, and for watching the trend of one run against itself. It is NOT an estimate of the
+model's accuracy, and it is not a number to quote. At 64 problems its Wilson interval is
+about +/-12 points before the budget difference is even considered.
+
 READING THE CURVE. Two series answer two different questions and both are needed:
 ``liveness/is_live`` says whether the adapter is doing anything at all, and
 ``<bench>/accuracy`` says whether what it is doing helps. :func:`diagnose` combines them into
@@ -98,6 +125,7 @@ __all__ = [
     "AdapterUnresolved",
     "BestValDecision",
     "BestValTracker",
+    "BudgetUnrecorded",
     "EmptyEvaluation",
     "LivenessReport",
     "LivenessUnavailable",
@@ -105,11 +133,14 @@ __all__ = [
     "PeriodicEvalHook",
     "ReportSplitTouched",
     "ResolvedAdapter",
+    "assert_points_record_budget",
+    "assert_row_records_budget",
     "assert_scored_something",
     "assert_search_only",
     "assert_still_served",
     "base_url_from_rollout",
     "bench_namespace",
+    "budget_record",
     "diagnose",
     "metrics_from",
     "require_committed_split",
@@ -157,6 +188,7 @@ STATUS = {
     "endpoint_error": 6,
     "adapter_unresolved": 7,  # /v1/models lists no version of the configured adapter
     "adapter_evicted": 8,  # the pinned version disappeared while this evaluation ran
+    "budget_unrecorded": 9,  # a score arrived without the token budget that produced it
 }
 
 #: Every key this module can emit. Declared, and asserted against the real emission in
@@ -212,7 +244,10 @@ EVAL_GRADER_KEY = "periodic_eval/eval_grader_calls"
 #: from :data:`METRIC_KEYS` because the benchmark set is configurable; :func:`metric_keys_for`
 #: is the single place either shape is spelled.
 BENCH_METRIC_SUFFIXES = (
-    "accuracy",
+    "trend_score",
+    "max_tokens",
+    "headline_max_tokens",
+    "budget_matches_headline",
     "wilson_lo",
     "wilson_hi",
     "n_truncated",
@@ -220,6 +255,19 @@ BENCH_METRIC_SUFFIXES = (
     "n_problems",
     "seconds",
 )
+
+#: Where each suffix comes from in a ``run_bench`` results row, for the suffixes whose series
+#: name deliberately differs from the row's. Anything absent is read under its own name.
+#:
+#: WHY ``accuracy`` IS NOT A SERIES HERE. The name is the only part of a W&B point most
+#: readers ever see, and this project has already proved what that costs: a benchmark score is
+#: not interpretable without the budget that produced it, and this one is produced at the
+#: TRAINING server's budget rather than the headline evaluation's. A series called
+#: ``periodic_eval/olympiadbench/accuracy`` sits happily on the same axis as a headline
+#: accuracy and nothing in the plot says the two were measured differently. ``trend_score``
+#: cannot: it is not an accuracy, it does not claim to be one, and the three budget series
+#: beside it say what it was measured at.
+_ROW_KEY = {"trend_score": "accuracy"}
 
 #: Probe prompts for the liveness measurement. Deliberately NOT the trivial arithmetic the
 #: step-149 probe used ("Compute 12*13"): those are prompts where base and adapter agree to
@@ -255,6 +303,16 @@ class EmptyEvaluation(RuntimeError):
     The failure this exists for does not crash: a benchmark that grades nothing still
     returns a results row, and ``accuracy`` of NaN or 0.0 plotted on a curve reads as a model
     that got everything wrong rather than a harness that asked nothing.
+    """
+
+
+class BudgetUnrecorded(RuntimeError):
+    """A score was about to be recorded without the token budget that produced it.
+
+    Not a formality. The comparison this prevents is the one the project measured on
+    2026-09-02: the same model, the same problems and the same grader moved fifty points when
+    the token cap changed by under four times. A score with no budget beside it is therefore
+    not a measurement of the model, and a reader who cannot see the budget cannot know that.
     """
 
 
@@ -623,6 +681,93 @@ def assert_scored_something(row: dict, requested: int) -> None:
         )
 
 
+def budget_record(bench: str, row: dict) -> dict:
+    """The token budget one benchmark's score was produced at, and whether it is comparable.
+
+    The budget is read from the results row's own ``params``, i.e. from what the harness
+    ACTUALLY generated with after every override and clamp, not from the configuration that
+    asked for it. Those differ exactly when it matters: the server clamps a cap it will not
+    honour, and a point recorded with the requested cap would name a budget that never ran.
+
+    Args:
+        bench: Benchmark name.
+        row: A ``run_bench`` results row.
+
+    Returns:
+        ``{"max_tokens", "headline_max_tokens", "budget_matches_headline"}``. ``max_tokens``
+        and the flag are None when the row does not say -- a missing budget is reported as
+        missing and then refused by :func:`assert_points_record_budget`, never defaulted to
+        the headline value, which would silently mark an unknown budget as comparable.
+    """
+    used = (row.get("params") or {}).get("max_tokens")
+    used = None if used is None else int(used)
+    headline = _math_bench().headline_max_tokens(bench)
+    return {
+        "max_tokens": used,
+        "headline_max_tokens": headline,
+        "budget_matches_headline": None if used is None else int(used == headline),
+    }
+
+
+#: Said once, wherever a budget mismatch is reported, so the two places cannot drift.
+BUDGET_MISMATCH_NOTE = (
+    "This score was produced at the TRAINING server's token budget, which is not the budget "
+    "the headline evaluation used. It is a trend signal for this run against itself and for "
+    "detecting a run that is not learning; it is NOT an estimate of the model's accuracy and "
+    "must not be plotted beside, or compared with, a headline number."
+)
+
+
+def assert_row_records_budget(bench: str, row: dict) -> None:
+    """Refuse a results row that does not say what token budget produced it.
+
+    The pre-condition half of the budget guard, run before the row can reach the tracker or
+    the logger. :func:`assert_points_record_budget` is the post-condition half and checks the
+    emitted mapping instead; neither is derived from the other.
+
+    Args:
+        bench: Benchmark name.
+        row: A ``run_bench`` results row.
+
+    Raises:
+        BudgetUnrecorded: If the row carries no ``params.max_tokens``.
+    """
+    used = (row.get("params") or {}).get("max_tokens")
+    if used is None:
+        raise BudgetUnrecorded(
+            f"{bench}: the results row carries no params.max_tokens, so the score in it "
+            f"cannot be attributed to a token budget. {BUDGET_MISMATCH_NOTE}"
+        )
+
+
+def assert_points_record_budget(metrics: dict, benchmarks) -> None:
+    """Refuse to emit a score whose token budget is not emitted with it.
+
+    Checked on the mapping that is about to be committed, not on the row it came from, so it
+    fires even if the budget is lost somewhere between the two.
+
+    Args:
+        metrics: The metric mapping about to be returned.
+        benchmarks: The benchmark names that produced scores.
+
+    Raises:
+        BudgetUnrecorded: If any benchmark has a real ``trend_score`` while any of its three
+            budget series is missing or NaN. A point with NO score is not refused -- a failed
+            evaluation has nothing to be misread.
+    """
+    for bench in benchmarks:
+        score = metrics.get(f"periodic_eval/{bench}/trend_score")
+        if score is None or (isinstance(score, float) and math.isnan(score)):
+            continue
+        for suffix in ("max_tokens", "headline_max_tokens", "budget_matches_headline"):
+            v = metrics.get(f"periodic_eval/{bench}/{suffix}")
+            if v is None or (isinstance(v, float) and math.isnan(v)):
+                raise BudgetUnrecorded(
+                    f"{bench}: about to emit trend_score={score} with "
+                    f"periodic_eval/{bench}/{suffix} missing. {BUDGET_MISMATCH_NOTE}"
+                )
+
+
 def _env_int(env, name: str, default: int) -> int:
     """One integer environment setting, refusing a value it cannot parse.
 
@@ -645,6 +790,49 @@ def _env_int(env, name: str, default: int) -> int:
         return int(raw)
     except ValueError as exc:
         raise ValueError(f"{ENV_PREFIX}{name}={raw!r} is not an integer") from exc
+
+
+def _has_tokenizer_files(path: str) -> bool:
+    """Whether a model id is a local directory that really holds a tokenizer.
+
+    Args:
+        path: A model id, which may or may not be a path.
+
+    Returns:
+        True only when the directory exists and one of the tokenizer files is in it. Checked
+        rather than assumed, so a path that merely looks like a snapshot is not accepted.
+    """
+    if not path:
+        return False
+    d = Path(path)
+    return d.is_dir() and any(
+        (d / n).exists() for n in ("tokenizer.json", "tokenizer_config.json", "tokenizer.model")
+    )
+
+
+def _resolve_model_path(env, base_model: str) -> str:
+    """Where the local tokenizer comes from when the server has none.
+
+    NOT a fallback to something else, which is the shape this project refuses. On a training
+    rollout server the base model id IS the snapshot directory the server was launched from --
+    that is literally what ``/v1/models`` lists -- and a LoRA adapter's tokenizer is the base
+    model's tokenizer. So this resolves the one place the right tokenizer can be, and only
+    when that place exists and actually holds tokenizer files. If the server turns out to have
+    a tokenizer of its own, the value is never read at all.
+
+    Args:
+        env: The environment mapping.
+        base_model: The configured base model id.
+
+    Returns:
+        The explicitly configured path, else the base model snapshot when it holds a
+        tokenizer, else the empty string -- which :meth:`math_bench.TokenIO.from_model_path`
+        refuses with a message naming the variable to set.
+    """
+    explicit = env.get(ENV_PREFIX + "MODEL_PATH", "").strip()
+    if explicit:
+        return explicit
+    return base_model if _has_tokenizer_files(base_model) else ""
 
 
 def _env_float(env, name: str, default: float) -> float:
@@ -827,7 +1015,7 @@ class PeriodicEvalConfig:
             base_url=base_url,
             model=model,
             base_model=base_model,
-            model_path=env.get(ENV_PREFIX + "MODEL_PATH", "").strip(),
+            model_path=_resolve_model_path(env, base_model),
             probe_max_tokens=_env_int(env, "PROBE_MAX_TOKENS", 32),
             live_eps=_env_float(env, "LIVE_EPS", DEFAULT_LIVE_EPS),
             patience=_env_int(env, "PATIENCE", 10),
@@ -977,6 +1165,7 @@ async def run_one_benchmark(
     Raises:
         ReportSplitTouched: If any graded problem was outside the ``search`` half.
         EmptyEvaluation: If the evaluation graded nothing usable.
+        BudgetUnrecorded: If the row does not say what token budget produced it.
     """
     mb = _math_bench()
     require_committed_split(bench)  # before any generation is paid for
@@ -991,6 +1180,7 @@ async def run_one_benchmark(
     # has already spent the reporting half whether or not it also graded enough problems.
     assert_search_only(bench, records)
     assert_scored_something(row, int(row.get("n_problems") or 0))
+    assert_row_records_budget(bench, row)
     return row, records, counter.calls
 
 
@@ -1070,6 +1260,84 @@ async def _greedy_with_logprobs(session, url: str, model: str, prompt: str, cfg)
     return text, [float(x) for x in lps]
 
 
+async def _greedy_with_logprobs_by_token_ids(session, cfg, model, prompt, caps, tio):
+    """The same greedy probe against a server that holds no tokenizer.
+
+    Identical measurement, different transport: the prompt is tokenised here, the reply comes
+    back as token ids and is decoded here. What :func:`measure_liveness` compares -- the text
+    and the per-token logprobs -- is the same in both cases, so the verdict does not depend on
+    which path produced it.
+
+    Args:
+        session: An open ``aiohttp.ClientSession``.
+        cfg: The resolved configuration.
+        model: The model id to route to.
+        prompt: The probe prompt.
+        caps: What the server said about itself.
+        tio: The local tokenizer.
+
+    Returns:
+        ``(text, logprobs)``.
+
+    Raises:
+        LivenessUnavailable: If the endpoint would not answer, or answered without logprobs.
+            Same refusal as the text path and for the same reason: "assume live" and "assume
+            inert" are each an answer nobody measured.
+    """
+    mb = _math_bench()
+    params = {
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "max_tokens": cfg.probe_max_tokens,
+        "seed": cfg.seed,
+        "timeout": cfg.timeout,
+    }
+    lora = mb.adapter_route(model, caps)
+    r = await mb.generate_ids(
+        session,
+        cfg.base_url,
+        tio.encode_chat(prompt),
+        params,
+        tio,
+        lora_path=lora,
+        return_logprob=True,
+    )
+    if r.get("status") != "ok":
+        raise LivenessUnavailable(
+            f"{mb.root_url(cfg.base_url)}{mb.GENERATE_PATH} returned no usable completion "
+            f"for model {model!r}"
+        )
+    lps = r.get("logprobs") or []
+    if not lps:
+        raise LivenessUnavailable(
+            f"{mb.root_url(cfg.base_url)}{mb.GENERATE_PATH} returned no per-token logprobs "
+            f"for model {model!r}. The liveness verdict is decided on logprobs because greedy "
+            f"text alone raised a FALSE ALARM on a live adapter at A0 step 149; without them "
+            f"there is no verdict to report."
+        )
+    return r.get("text") or "", [float(x) for x in lps]
+
+
+async def _greedy_probe(session, cfg, model, prompt, caps, tio):
+    """One greedy completion and its logprobs, on whichever path this server needs.
+
+    Args:
+        session: An open ``aiohttp.ClientSession``.
+        cfg: The resolved configuration.
+        model: The model id to route to.
+        prompt: The probe prompt.
+        caps: What the server said about itself; None means the text path, unconditionally.
+        tio: The local tokenizer, or None on the text path.
+
+    Returns:
+        ``(text, logprobs)``.
+    """
+    if caps is None or caps.has_tokenizer:
+        url = _math_bench().chat_url(cfg.base_url)
+        return await _greedy_with_logprobs(session, url, model, prompt, cfg)
+    return await _greedy_with_logprobs_by_token_ids(session, cfg, model, prompt, caps, tio)
+
+
 async def measure_liveness(session, cfg: PeriodicEvalConfig, model: str) -> LivenessReport:
     """Compare the adapter against the base model on a fixed probe set.
 
@@ -1089,14 +1357,20 @@ async def measure_liveness(session, cfg: PeriodicEvalConfig, model: str) -> Live
         LivenessUnavailable: If the endpoint would not answer, or answered without logprobs,
             or no token position could be compared at all.
     """
-    url = _math_bench().chat_url(cfg.base_url)
+    mb = _math_bench()
+    caps = await mb.server_capabilities(session, cfg.base_url)
+    tio = (
+        None
+        if caps.has_tokenizer
+        else mb.TokenIO.from_model_path(cfg.model_path, caps.tokenizer_path)
+    )
     differ = 0
     max_d = 0.0
     sum_d = 0.0
     n_tok = 0
     for prompt in cfg.probe_prompts:
-        a_text, a_lp = await _greedy_with_logprobs(session, url, model, prompt, cfg)
-        b_text, b_lp = await _greedy_with_logprobs(session, url, cfg.base_model, prompt, cfg)
+        a_text, a_lp = await _greedy_probe(session, cfg, model, prompt, caps, tio)
+        b_text, b_lp = await _greedy_probe(session, cfg, cfg.base_model, prompt, caps, tio)
         if a_text != b_text:
             differ += 1
         # Compare only positions both sides produced. When the argmax paths diverge the
@@ -1360,6 +1634,9 @@ def metrics_from(
 
     Returns:
         A flat mapping of metric key to float.
+
+    Raises:
+        BudgetUnrecorded: If a benchmark produced a score with no token budget beside it.
     """
     nan = float("nan")
     out: dict[str, float] = {
@@ -1384,9 +1661,13 @@ def metrics_from(
         "periodic_eval/best_val/should_stop": float(decision.should_stop) if decision else nan,
     }
     for bench, row in rows.items():
+        budget = budget_record(bench, row)
         for suffix in BENCH_METRIC_SUFFIXES:
-            v = row.get(suffix)
+            v = budget[suffix] if suffix in budget else row.get(_ROW_KEY.get(suffix, suffix))
             out[f"periodic_eval/{bench}/{suffix}"] = nan if v is None else float(v)
+    # The post-condition. Placed here, at the one function every emission goes through, so a
+    # point cannot be emitted without its budget by any caller -- including a future one.
+    assert_points_record_budget(out, rows)
     return out
 
 
@@ -1508,6 +1789,10 @@ def run_periodic_eval(
     except EmptyEvaluation as exc:
         status = STATUS["empty_evaluation"]
         _log(logger, "error", f"periodic eval graded nothing at step {global_step}: {exc}")
+    except BudgetUnrecorded as exc:
+        status = STATUS["budget_unrecorded"]
+        rows = {}
+        _log(logger, "error", f"periodic eval REFUSED an unattributable score at step {global_step}: {exc}")
     except LivenessUnavailable as exc:
         status = STATUS["liveness_unavailable"]
         _log(logger, "error", f"periodic eval liveness unavailable at step {global_step}: {exc}")
@@ -1542,9 +1827,19 @@ def run_periodic_eval(
     )
     seconds = time.time() - t0
     frac = throughput_fraction(seconds, cfg.freq_steps, step_seconds)
-    metrics = metrics_from(
-        global_step, rows, liveness, decision, seconds, frac, status, diagnosis, resolved
-    )
+    try:
+        metrics = metrics_from(
+            global_step, rows, liveness, decision, seconds, frac, status, diagnosis, resolved
+        )
+    except BudgetUnrecorded as exc:
+        # The post-condition fired. The score is DROPPED rather than emitted without its
+        # budget, and rather than raised into a training loop that must survive it.
+        _log(logger, "error", f"periodic eval refused to emit at step {global_step}: {exc}")
+        status = STATUS["budget_unrecorded"]
+        decision = None
+        metrics = metrics_from(
+            global_step, {}, liveness, None, seconds, frac, status, DIAGNOSIS["unknown"], resolved
+        )
     metrics[EVAL_GRADER_KEY] = float(grader_calls)
     # Every key the configuration declares is emitted every time, NaN included. A key that
     # appears only on the steps where it succeeded produces a W&B series with invisible gaps.
@@ -1557,12 +1852,39 @@ def run_periodic_eval(
         "info",
         f"periodic eval step={global_step} status={status} diagnosis={diagnosis} "
         f"model={'UNRESOLVED' if resolved is None else resolved.model} "
-        f"acc={accuracy:.4f} live={getattr(liveness, 'is_live', 'na')} "
+        f"trend={accuracy:.4f}@{_budget_phrase(cfg, rows)} "
+        f"live={getattr(liveness, 'is_live', 'na')} "
         f"maxdlogp={getattr(liveness, 'max_abs_dlogprob', float('nan')):.5f} "
         f"best={getattr(decision, 'best_score', float('nan'))}@{getattr(decision, 'best_step', -1)} "
         f"{seconds:.1f}s ({frac:.1%} of throughput)",
     )
     return metrics
+
+
+def _budget_phrase(cfg: PeriodicEvalConfig, rows: dict) -> str:
+    """The token budget of the primary benchmark, and whether it is the headline one.
+
+    In the human-readable line as well as in the metrics, because the line is what anyone
+    watching a run actually reads, and a bare number in it would be quoted.
+
+    Args:
+        cfg: The resolved configuration.
+        rows: Benchmark results rows; empty on a failed evaluation.
+
+    Returns:
+        A short phrase naming the budget and its comparability.
+    """
+    bench = cfg.benchmarks[0]
+    row = rows.get(bench)
+    if not row:
+        return "max_tokens=UNKNOWN"
+    b = budget_record(bench, row)
+    if b["budget_matches_headline"]:
+        return f"max_tokens={b['max_tokens']} (the headline budget)"
+    return (
+        f"max_tokens={b['max_tokens']} NOT-COMPARABLE-WITH-HEADLINE"
+        f"({b['headline_max_tokens']})"
+    )
 
 
 def _persist(cfg, global_step, rows, records, liveness, decision, metrics, resolved=None) -> None:
@@ -1592,6 +1914,19 @@ def _persist(cfg, global_step, rows, records, liveness, decision, metrics, resol
                 "split": EVAL_SPLIT,
                 "configured_model": cfg.model,
                 "resolved_adapter": None if resolved is None else resolved.__dict__,
+                # The budget sits NEXT TO the score in the artifact as well as in the metrics,
+                # because the artifact is what gets re-read months later when nobody remembers
+                # which server produced it.
+                "token_budget": {
+                    b: dict(
+                        budget_record(b, r),
+                        not_comparable_with_headline=not budget_record(b, r)[
+                            "budget_matches_headline"
+                        ],
+                        note=BUDGET_MISMATCH_NOTE,
+                    )
+                    for b, r in rows.items()
+                },
                 "rows": rows,
                 "liveness": None if liveness is None else liveness.__dict__,
                 "best_val": None if decision is None else decision.__dict__,

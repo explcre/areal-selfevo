@@ -1,0 +1,82 @@
+{
+ "generations": [
+  {
+   "benchmark": "olympiadbench",
+   "boxed": "42",
+   "correct": false,
+   "finish_reason": "stop",
+   "gold": "$2^{1009}$",
+   "idx": 2,
+   "run_pos": 0,
+   "sample": 0,
+   "status": "ok",
+   "text": "Reasoning. The answer is \\boxed{42}"
+  },
+  {
+   "benchmark": "olympiadbench",
+   "boxed": "42",
+   "correct": false,
+   "finish_reason": "stop",
+   "gold": "2",
+   "idx": 3,
+   "run_pos": 1,
+   "sample": 0,
+   "status": "ok",
+   "text": "Reasoning. The answer is \\boxed{42}"
+  },
+  {
+   "benchmark": "olympiadbench",
+   "boxed": "42",
+   "correct": false,
+   "finish_reason": "stop",
+   "gold": "$2n-2$",
+   "idx": 4,
+   "run_pos": 2,
+   "sample": 0,
+   "status": "ok",
+   "text": "Reasoning. The answer is \\boxed{42}"
+  },
+  {
+   "benchmark": "olympiadbench",
+   "boxed": "42",
+   "correct": false,
+   "finish_reason": "stop",
+   "gold": "$69$,$84$",
+   "idx": 13,
+   "run_pos": 3,
+   "sample": 0,
+   "status": "ok",
+   "text": "Reasoning. The answer is \\boxed{42}"
+  }
+ ],
+ "row": {
+  "accuracy": 0.0,
+  "benchmark": "olympiadbench",
+  "cap_limited": false,
+  "n_failed": 0,
+  "n_graded": 4,
+  "n_no_box": 0,
+  "n_problems": 4,
+  "n_truncated": 0,
+  "params": {
+   "concurrency": 4,
+   "endpoint": "http://127.0.0.1:PORT/v1/chat/completions",
+   "max_tokens": 64,
+   "model": "a0_math-v7",
+   "n": 1,
+   "seed": 0,
+   "served_models": [
+    "/models/qwen2.5-32b-instruct",
+    "a0_math-v7"
+   ],
+   "temperature": 0.0,
+   "timeout": 30,
+   "top_p": 1.0
+  },
+  "seed": 0,
+  "temperature": 0.0,
+  "truncation_rate": 0.0,
+  "wilson_hi": 0.48990002040399916,
+  "wilson_lo": 0.0
+ }
+}

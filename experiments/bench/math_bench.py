@@ -22,6 +22,13 @@ The uncertainties that DO matter, all surfaced by that audit and handled below:
   score. Each is now counted and surfaced separately.
 * **Nothing was persisted**, so no reported number could be re-audited without regenerating
   it. Every completion is now written to disk.
+* **Which weights answered was neither checked nor recorded.** The payload names a MODEL ID
+  and nothing else -- sglang routes a LoRA adapter by that id, because `--lora-paths
+  NAME=path` registers NAME as one -- and an id the server does not have is answered HTTP
+  200 by the BASE model. The harness default was exactly such a name and no results row
+  recorded the id, so a run left on the default would have scored the base model in
+  silence. Every run now verifies the id against `<base-url>/models` BEFORE generating, and
+  records the id, the endpoint and the whole served list.
 
 Why not AZR's runner: `math_eval/eval/math_eval.py` does `from vllm import LLM`, and vLLM
 is not installed here. Installing it risks the torch/sglang environment. The runner is the
@@ -47,6 +54,7 @@ import re
 import statistics
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 import os
 
@@ -476,14 +484,676 @@ def wilson(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
     Used instead of a normal binomial SE because at these counts the SE misleads: at 1/30
     the normal interval runs negative, and at 0/30 or 30/30 it is exactly 0, asserting
     certainty from a single unanimous sample.
+
+    ``n <= 0`` is NOT a measurement and returns NaN. Two copies of this function used to
+    return ``(0.0, 0.0)`` there, which prints ``[0.000, 0.000]`` for an EMPTY benchmark --
+    a confident interval around zero, indistinguishable in the table from a real result of
+    zero. A negative n is refused for the same reason: the clamp inside the square root
+    hides it and the interval comes back with ``lo > hi``, outside [0, 1].
     """
-    if n == 0:
+    if n <= 0:
         return (float("nan"), float("nan"))
     p = k / n
     d = 1 + z * z / n
     c = (p + z * z / (2 * n)) / d
     h = z * math.sqrt(max(p * (1 - p) / n + z * z / (4 * n * n), 0.0)) / d
     return (max(0.0, c - h), min(1.0, c + h))
+
+
+# --------------------------------------------------------------- endpoint identity ----
+#
+# WHICH WEIGHTS ANSWERED is not something the request payload says. The chat payload below
+# carries no `lora_path`; an adapter is reachable only because sglang's
+# `--lora-paths NAME=path` registers NAME as a MODEL ID, so `--model NAME` IS the routing
+# decision. And an id the server has never heard of is not an error: sglang answers HTTP
+# 200 and silently serves the BASE model. A run left on a plausible-looking default would
+# therefore score the base weights while every line of its output looked normal.
+#
+# So: ask the endpoint what it serves, refuse to generate against an id that is not on the
+# list, and record the id, the URL and the whole list in the results row. A score nobody
+# can attribute afterwards is not a measurement.
+
+CHAT_PATH = "/chat/completions"
+MODELS_PATH = "/models"
+# Seconds allowed for the model-list query. Deliberately NOT the generation timeout, which
+# is minutes: this is one small GET, and a stuck endpoint should fail fast rather than hold
+# a run open for the full generation budget before refusing.
+MODELS_TIMEOUT = 60.0
+
+
+def chat_url(base_url: str) -> str:
+    """The chat-completions URL for an OpenAI-compatible base url.
+
+    Args:
+        base_url: The ``/v1`` base url, with or without a trailing slash.
+
+    Returns:
+        The exact URL every completion in a run is POSTed to.
+    """
+    return base_url.rstrip("/") + CHAT_PATH
+
+
+def models_url(base_url: str) -> str:
+    """The model-list URL for an OpenAI-compatible base url.
+
+    Args:
+        base_url: The ``/v1`` base url, with or without a trailing slash.
+
+    Returns:
+        The URL listing the model ids this endpoint will route.
+    """
+    return base_url.rstrip("/") + MODELS_PATH
+
+
+async def list_served_models(session, base_url: str, timeout: float = MODELS_TIMEOUT):
+    """Model ids the endpoint declares it serves.
+
+    Args:
+        session: An open ``aiohttp.ClientSession`` (or anything with the same ``get``).
+        base_url: The ``/v1`` base url.
+        timeout: Seconds to wait for the reply.
+
+    Returns:
+        The ids, in the order the endpoint reported them.
+
+    Raises:
+        RuntimeError: If the endpoint cannot be reached, answers non-200, or returns
+            anything but a non-empty list of ids. It never returns an empty list, because
+            "this endpoint serves nothing" and "we could not tell what it serves" must not
+            both come out looking like a name that simply is not registered.
+    """
+    return [m["id"] for m in await list_served_model_records(session, base_url, timeout)]
+
+
+async def list_served_model_records(session, base_url: str, timeout: float = MODELS_TIMEOUT):
+    """Every record ``/v1/models`` reported, not only the ids.
+
+    Split out of :func:`list_served_models` rather than duplicated, so the refusals below are
+    the only copy and the two functions cannot answer differently about the same endpoint.
+
+    Args:
+        session: An open ``aiohttp.ClientSession``.
+        base_url: The ``/v1`` base url.
+        timeout: Seconds to wait for the reply.
+
+    Returns:
+        The model records, in the order the endpoint reported them.
+
+    Raises:
+        RuntimeError: Under exactly the conditions :func:`list_served_models` documents.
+    """
+    url = models_url(base_url)
+    try:
+        async with session.get(url, timeout=timeout) as r:
+            if r.status != 200:
+                raise RuntimeError(f"{url} answered HTTP {r.status}")
+            payload = await r.json()
+    except RuntimeError:
+        raise
+    except Exception as exc:  # transport error, timeout, non-JSON body
+        raise RuntimeError(
+            f"{url} could not be queried: {type(exc).__name__}: {exc}"
+        ) from exc
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, list):
+        raise RuntimeError(f"{url} returned no model list: {str(payload)[:200]!r}")
+    recs = [m for m in data
+            if isinstance(m, dict) and isinstance(m.get("id"), str)]
+    if not recs:
+        raise RuntimeError(f"{url} listed no model ids: {str(payload)[:200]!r}")
+    return recs
+
+
+async def verify_model(session, base_url: str, model, timeout: float = MODELS_TIMEOUT):
+    """Refuse to generate unless the endpoint really serves ``model``, and describe the run.
+
+    This is the whole point of the endpoint-identity block above: it turns a silent
+    wrong-weights run into a loud failure before a single token is generated, and it
+    returns the provenance that makes the resulting score attributable.
+
+    Args:
+        session: An open ``aiohttp.ClientSession``.
+        base_url: The ``/v1`` base url.
+        model: The requested model id. Falsy is itself a refusal -- there is no safe
+            default, because an unregistered name is served by the base model.
+        timeout: Seconds to wait for the model list.
+
+    Returns:
+        The attribution block to record in the results row: ``model`` (the resolved id),
+        ``endpoint`` (the exact URL the completions are POSTed to) and ``served_models``
+        (every id the endpoint listed, so a wrong id is diagnosable after the fact).
+
+    Raises:
+        SystemExit: If no model was named, if the id is not served, or if the list could
+            not be fetched at all. Every one of those must stop the run: continuing means
+            scoring whatever the server happens to have loaded.
+    """
+    if not model:
+        raise SystemExit(
+            "REFUSING TO RUN: no model id was given. The model id is the routing "
+            f"decision -- {models_url(base_url)} lists what this endpoint serves, and an "
+            "UNREGISTERED name is answered HTTP 200 by the BASE model, so there is no "
+            "safe default. Pass --model with an id from that list."
+        )
+    try:
+        served = await list_served_models(session, base_url, timeout)
+    except RuntimeError as exc:
+        raise SystemExit(
+            f"REFUSING TO RUN: cannot verify that model {model!r} is served -- {exc}. "
+            "Generating without this check risks silently scoring the BASE model, so an "
+            "unverifiable endpoint is a hard stop, not a warning."
+        ) from exc
+    if model not in served:
+        raise SystemExit(
+            f"REFUSING TO RUN: {models_url(base_url)} does not serve the requested model.\n"
+            f"  asked for: {model!r}\n"
+            f"  available: {served}\n"
+            "sglang answers HTTP 200 for an unregistered id and silently serves the BASE "
+            "model, so this run would have scored the wrong weights with nothing in "
+            "results.json to say so. A LoRA adapter registers as its own id via "
+            "--lora-paths NAME=path; use an id exactly as printed above."
+        )
+    return {"model": model, "endpoint": chat_url(base_url), "served_models": list(served)}
+
+
+# ------------------------------------------------------- servers with no tokenizer ----
+#
+# A TRAINING rollout server is not an evaluation server. AReaL launches sglang with
+# `--skip-tokenizer-init`, which is right for the trainer because the trainer speaks token
+# ids, and the consequence for us is total: the server holds no tokenizer at all, so EVERY
+# text request fails for EVERY model id it serves, base snapshot included. Measured against
+# A0's live server on 2026-09-02:
+#
+#   POST /v1/chat/completions {"messages": [...]}   -> HTTP 500
+#       "Internal server error: 'NoneType' object has no attribute 'apply_chat_template'"
+#   POST /v1/completions      {"prompt": "hello"}   -> HTTP 400
+#       "The engine initialized with skip_tokenizer_init=True cannot accept text prompts.
+#        Please provide input_ids or re-initialize the engine with skip_tokenizer_init=False."
+#   POST /v1/completions      {"prompt": [ids...]}  -> HTTP 500 "Internal server error: 'text'"
+#
+# The third line decides the design, and is the reason this speaks `/generate` rather than
+# `/v1/completions`. Token ids ARE accepted by `/v1/completions` -- the request gets as far as
+# the length check, which is what produces the HTTP 400 for an over-budget cap -- but the
+# OpenAI RESPONSE serialiser reads `ret["text"]` unconditionally and a tokenizer-less engine
+# never produces it, so the reply cannot be built. `stream`, `echo` and `logprobs` were each
+# tried and none of them changes it: the OpenAI surface of this server is unusable in BOTH
+# directions.
+#
+# sglang's native `/generate` is not. It takes `input_ids`, returns `output_ids`, routes a
+# LoRA adapter by `lora_path`, and returns per-token logprobs. It is also the endpoint AReaL's
+# own bridge uses (`areal/v2/inference_service/sglang/bridge.py`), so this is the interface
+# the training run is itself generating through rather than a second path invented for the
+# evaluation.
+#
+# WHAT IS ADDITIVE AND WHAT IS NOT. Everything below engages only when the SERVER SAYS it has
+# no tokenizer, and the server is asked rather than guessed at. On an ordinary tokenising
+# endpoint -- every headline number now in the paper -- `server_capabilities` reports
+# `has_tokenizer=True`, `build_generator` returns the same `generate` closure this file has
+# always used, and the results row is byte-identical. `test_math_bench.py` asserts that on a
+# fixed input rather than taking it on trust.
+
+#: sglang's native generation endpoint. At the server ROOT, not under `/v1`.
+GENERATE_PATH = "/generate"
+#: sglang's own description of how it was launched. This is the only place the flags the
+#: SERVER was started with are readable; a model's `config.json` cannot see any of them.
+SERVER_INFO_PATH = "/get_server_info"
+
+
+def root_url(base_url: str) -> str:
+    """The server root behind an OpenAI-compatible ``/v1`` base url.
+
+    Args:
+        base_url: The ``/v1`` base url, with or without a trailing slash.
+
+    Returns:
+        The same url with a trailing ``/v1`` removed, because :data:`GENERATE_PATH` and
+        :data:`SERVER_INFO_PATH` are served at the root and not under ``/v1``.
+    """
+    u = base_url.rstrip("/")
+    return u[: -len("/v1")].rstrip("/") if u.endswith("/v1") else u
+
+
+@dataclass(frozen=True)
+class ServerCapabilities:
+    """What one endpoint can do with TEXT, and how long a request it will accept.
+
+    Read from the server, never inferred from the model. The two disagree here and the
+    disagreement is the bug: A0's Qwen2.5-32B declares ``max_position_embeddings: 32768``
+    while its rollout server was launched with ``--context-length 4096``.
+
+    Attributes:
+        has_tokenizer: False when the server was launched with ``--skip-tokenizer-init``,
+            i.e. when no text request of any kind can succeed. Defaults to True for an
+            endpoint that does not publish this, so an unknown server behaves exactly as it
+            did before this class existed.
+        context_limit: The largest total (prompt + completion) the server will accept, or
+            None when it does not say.
+        tokenizer_path: The tokenizer the server WOULD have used, so a local tokenizer that
+            is a different model can be refused instead of silently building a wrong prompt.
+        base_model: The served id of the base model, so an id that is NOT it can be routed as
+            a LoRA adapter without a second request.
+        source: Where the verdict came from, in words, for the results row and the logs.
+    """
+
+    has_tokenizer: bool
+    context_limit: object
+    tokenizer_path: str
+    base_model: str
+    source: str
+
+
+async def server_capabilities(session, base_url: str, timeout: float = MODELS_TIMEOUT):
+    """Ask the endpoint how it was launched.
+
+    Deliberately does NOT read ``/v1/models``: that list is already fetched by
+    :func:`verify_model`, its contents move between requests on a training server, and
+    several tests pin the exact number of times it is read.
+
+    Args:
+        session: An open ``aiohttp.ClientSession``.
+        base_url: The ``/v1`` base url.
+        timeout: Seconds to wait.
+
+    Returns:
+        The capabilities. An endpoint that does not answer, or answers without the flag, is
+        reported as tokenising with no known limit -- which is the behaviour every caller had
+        before this function existed, so an unknown server is not degraded by its presence.
+    """
+    url = root_url(base_url) + SERVER_INFO_PATH
+    info = None
+    source = f"{SERVER_INFO_PATH} not available on this endpoint"
+    try:
+        async with session.get(url, timeout=timeout) as r:
+            if r.status == 200:
+                info = await r.json()
+            else:
+                source = f"{SERVER_INFO_PATH} answered HTTP {r.status}"
+    except Exception as exc:  # transport error, timeout, non-JSON body
+        source = f"{SERVER_INFO_PATH} could not be read: {type(exc).__name__}"
+    if not isinstance(info, dict):
+        return ServerCapabilities(True, None, "", "", source)
+    skip = info.get("skip_tokenizer_init")
+    has_tok = not skip if isinstance(skip, bool) else True
+    ctx = info.get("context_length")
+    return ServerCapabilities(
+        has_tokenizer=has_tok,
+        context_limit=ctx if isinstance(ctx, int) and ctx > 0 else None,
+        tokenizer_path=str(info.get("tokenizer_path") or ""),
+        base_model=str(info.get("model_path") or ""),
+        source=f"{SERVER_INFO_PATH}: skip_tokenizer_init={skip!r} context_length={ctx!r}",
+    )
+
+
+class TokenIO:
+    """The tokenizer the EVALUATION holds, for a server that holds none.
+
+    One object so the encode and the decode provably come from the same tokenizer: a prompt
+    built by one tokenizer and a completion read by another is a score of something nobody
+    asked for, and it would look completely normal in the output.
+    """
+
+    def __init__(self, tokenizer, path: str = ""):
+        """Wrap a loaded tokenizer.
+
+        Args:
+            tokenizer: A loaded HuggingFace tokenizer.
+            path: Where it was loaded from, recorded in the results row.
+        """
+        self.tok = tokenizer
+        self.path = str(path)
+
+    @classmethod
+    def from_model_path(cls, model_path: str, server_tokenizer_path: str = "") -> "TokenIO":
+        """Load the tokenizer from a local snapshot, refusing one that is not the server's.
+
+        Args:
+            model_path: Directory holding ``tokenizer.json`` / ``tokenizer_config.json``.
+            server_tokenizer_path: What the server says it would tokenise with, from
+                :func:`server_capabilities`. Empty when the server does not say, in which
+                case no comparison is possible and none is invented.
+
+        Returns:
+            The wrapper.
+
+        Raises:
+            ValueError: If no path was given, or if it names a DIFFERENT tokenizer from the
+                server's. The second is the dangerous one: a different chat template turns
+                the same problem into a different prompt, the model answers the prompt it was
+                actually given, and the score is of a question nobody meant to ask.
+        """
+        if not model_path:
+            raise ValueError(
+                "this endpoint holds no tokenizer (it was launched with "
+                "--skip-tokenizer-init), so the evaluation has to tokenise locally and needs "
+                "the model snapshot on disk. Pass --model-path, or set "
+                "SELFEVO_PERIODIC_EVAL_MODEL_PATH, to the directory holding tokenizer.json."
+            )
+        if server_tokenizer_path:
+            mine = os.path.realpath(str(model_path))
+            theirs = os.path.realpath(server_tokenizer_path)
+            if mine != theirs:
+                raise ValueError(
+                    f"the server tokenises with {theirs} and this evaluation would tokenise "
+                    f"with {mine}. A different tokenizer builds a different prompt out of the "
+                    f"same problem, so the model would answer a question nobody asked and the "
+                    f"score would look entirely normal. Refusing."
+                )
+        from transformers import AutoTokenizer
+
+        return cls(AutoTokenizer.from_pretrained(str(model_path)), model_path)
+
+    def encode_chat(self, content: str) -> list:
+        """The token ids a tokenising server would have built from this user message.
+
+        The same chat template, applied on this side of the wire. It is the server's own
+        template because :meth:`from_model_path` refuses a tokenizer that is not the one the
+        server named.
+
+        Args:
+            content: The user message, i.e. exactly what :data:`PROMPT` produced.
+
+        Returns:
+            The prompt token ids.
+        """
+        text = self.tok.apply_chat_template(
+            [{"role": "user", "content": content}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        return list(self.tok(text, add_special_tokens=False)["input_ids"])
+
+    def decode(self, ids) -> str:
+        """Text for a list of generated token ids.
+
+        Args:
+            ids: The completion's token ids.
+
+        Returns:
+            The completion as text, which is what the grader is handed -- unchanged, and
+            unaware that this path exists.
+        """
+        return self.tok.decode(list(ids), skip_special_tokens=True)
+
+
+#: Distinct refusals already printed, so a rejection is announced once rather than once per
+#: problem. A run that is being refused by the server must SAY so: the failure mode this
+#: replaces is 64 silent retries followed by a NaN that reads like a score.
+_TOKEN_ID_PROBLEMS: set = set()
+
+
+def _report_token_id_problem(url: str, status: int, body: str) -> None:
+    """Print one distinct token-id transport problem, once.
+
+    Args:
+        url: The endpoint that answered.
+        status: Its HTTP status.
+        body: The first part of its body, which carries the server's own explanation.
+    """
+    key = (status, body[:120])
+    if key in _TOKEN_ID_PROBLEMS:
+        return
+    _TOKEN_ID_PROBLEMS.add(key)
+    print(f"TOKEN-ID PATH {url} HTTP {status}: {body}", file=sys.stderr, flush=True)
+
+
+async def generate_ids(
+    session,
+    base_url: str,
+    prompt_ids,
+    params: dict,
+    tio: "TokenIO",
+    lora_path: str = "",
+    return_logprob: bool = False,
+) -> dict:
+    """One completion from a tokenizer-less server, spoken and read in token ids.
+
+    Returns exactly the shape :func:`generate` returns, so everything downstream -- the
+    extraction, the grader, the counters -- is handed TEXT and is unchanged.
+
+    Args:
+        session: An open ``aiohttp.ClientSession``.
+        base_url: The ``/v1`` base url; the native endpoint is derived with :func:`root_url`.
+        prompt_ids: Prompt token ids from :meth:`TokenIO.encode_chat`.
+        params: The resolved generation parameters.
+        tio: The tokenizer that produced ``prompt_ids``, used to decode the reply.
+        lora_path: The adapter id to route to, or empty for the base model.
+        return_logprob: Whether to ask for per-token logprobs, which the liveness probe needs.
+
+    Returns:
+        ``{"text", "finish_reason", "status"}``, plus ``"logprobs"`` when asked. ``status`` is
+        ``ok`` when the server answered and the reply decoded, else ``failed``. A reply with
+        no ``output_ids``, a decode that raises, and a generation the server ABORTED are all
+        ``failed`` and NOT an empty ``ok``: an empty completion is a WRONG ANSWER that counts
+        in the denominator, and charging a harness fault to the model as a wrong answer is a
+        silent zero.
+    """
+    url = root_url(base_url) + GENERATE_PATH
+    sampling = {
+        "temperature": params["temperature"],
+        "top_p": params["top_p"],
+        "max_new_tokens": params["max_tokens"],
+    }
+    if params.get("seed") is not None:
+        sampling["sampling_seed"] = params["seed"]
+    payload = {
+        "input_ids": list(prompt_ids),
+        "sampling_params": sampling,
+        "stream": False,
+    }
+    if lora_path:
+        payload["lora_path"] = lora_path
+    if return_logprob:
+        payload["return_logprob"] = True
+    failed = {"text": "", "finish_reason": None, "status": "failed"}
+    if return_logprob:
+        failed["logprobs"] = []
+    for attempt in range(3):
+        try:
+            async with session.post(url, json=payload, timeout=params["timeout"]) as r:
+                if r.status != 200:
+                    _report_token_id_problem(url, r.status, (await r.text())[:400])
+                    await asyncio.sleep(1 + attempt)
+                    continue
+                d = await r.json()
+        except Exception:
+            await asyncio.sleep(1 + attempt)
+            continue
+        ids = d.get("output_ids")
+        if not isinstance(ids, list):
+            _report_token_id_problem(url, 200, f"reply carried no output_ids: {str(d)[:200]}")
+            return dict(failed)
+        try:
+            text = tio.decode(ids)
+        except Exception as exc:
+            _report_token_id_problem(
+                url, 200, f"could not decode {len(ids)} output ids: {type(exc).__name__}: {exc}"
+            )
+            return dict(failed)
+        meta = d.get("meta_info") or {}
+        reason = (meta.get("finish_reason") or {}).get("type")
+        if reason == "abort":
+            # THE SERVER THREW THE REQUEST AWAY. `pause_generation`, which AReaL sends around
+            # every weight update, does exactly this: it drops the requests in flight and
+            # waits until they are gone. Graded as an answer, an abort is a WRONG one -- and
+            # measured against A0 on 2026-09-02, six of eight generations came back aborted
+            # after as few as 75 characters and every one of them scored zero. A curve built
+            # from that reads "the model gets everything wrong" when what happened is that
+            # the run interrupted its own evaluation.
+            #
+            # So it is a FAILED request, exactly like a transport error: excluded from the
+            # denominator, counted in n_failed, and refused outright by
+            # `assert_scored_something` once it happens to more than half the problems. The
+            # record keeps finish_reason="abort", so the artifact says how many and which.
+            _report_token_id_problem(
+                url,
+                200,
+                "the server ABORTED this generation (finish_reason=abort). Requests in "
+                "flight are dropped by pause_generation, which AReaL sends around every "
+                "weight update. Counted as a failed request, NOT graded as a wrong answer.",
+            )
+            aborted = dict(failed)
+            aborted["finish_reason"] = "abort"
+            return aborted
+        out = {
+            "text": text,
+            "finish_reason": reason,
+            "status": "ok",
+        }
+        if return_logprob:
+            out["logprobs"] = [
+                float(t[0])
+                for t in (meta.get("output_token_logprobs") or [])
+                if isinstance(t, (list, tuple)) and t and t[0] is not None
+            ]
+        return out
+    return dict(failed)
+
+
+def apply_server_context_limit(params: dict, caps: "ServerCapabilities", bench: str) -> bool:
+    """Clamp the token budget against the limit the SERVER was launched with.
+
+    THE GUARD THIS FIXES, stated plainly because the existing one looks like it covers this
+    and does not. :func:`resolve_params` clamps against :func:`model_context_limit`, which
+    reads the model's own ``config.json``. A ``config.json`` cannot see ``--context-length``,
+    because that is a SERVER flag: A0's Qwen2.5-32B declares ``max_position_embeddings:
+    32768`` while its rollout server was launched with ``--context-length 4096``. So the
+    existing guard passes, and then every request is rejected with HTTP 400 and the run
+    reports ``acc=nan`` with ``fail=N/N`` -- exactly the shape that guard exists to prevent.
+    The number the server will honour is the one the server publishes, and that is this one.
+
+    Args:
+        params: The resolved generation parameters, modified in place.
+        caps: What the server said about itself.
+        bench: Benchmark name, for the note.
+
+    Returns:
+        True when the budget was reduced. Nothing is written into ``params`` when it was not,
+        so a run against a server that never needed clamping produces the row it always did.
+    """
+    eff, why = clamp_max_tokens(int(params.get("max_tokens") or 0), caps.context_limit)
+    if not why:
+        return False
+    print(
+        f"NOTE {bench}: {why} This limit is the SERVER's, not the model's ({caps.source}); "
+        f"the model's own config.json cannot see it, which is why the existing clamp passed.",
+        file=sys.stderr,
+        flush=True,
+    )
+    params["max_tokens_requested"] = params["max_tokens"]
+    params["max_tokens"] = eff
+    params["server_context_limit"] = caps.context_limit
+    return True
+
+
+def build_generator(args, params: dict, caps: "ServerCapabilities"):
+    """The single function every completion in one benchmark is produced by.
+
+    THE ADDITIVE GUARANTEE lives here and nowhere else. When the server has a tokenizer this
+    returns a closure over the unchanged :func:`generate` and writes nothing into ``params``,
+    so the standalone path -- which produced the numbers in the paper -- is bit for bit what
+    it was. The token-id path is reachable only when the SERVER said it has no tokenizer.
+
+    Args:
+        args: The parsed namespace, for ``base_url``, ``model`` and ``model_path``.
+        params: The resolved generation parameters, modified in place on the token-id path so
+            the results row records that it was taken and what it tokenised with.
+        caps: What the server said about itself.
+
+    Returns:
+        ``async (session, prompt_text) -> {"text", "finish_reason", "status"}``.
+
+    Raises:
+        ValueError: From :meth:`TokenIO.from_model_path`, when the server has no tokenizer and
+            this side cannot supply one.
+    """
+    model = getattr(args, "model", "") or ""
+    if caps.has_tokenizer:
+        url = chat_url(args.base_url)
+
+        async def gen_text(session, prompt):
+            """One completion over the OpenAI chat endpoint, unchanged.
+
+            Args:
+                session: An open ``aiohttp.ClientSession``.
+                prompt: The user message.
+
+            Returns:
+                The generation record.
+            """
+            return await generate(session, url, model, prompt, params)
+
+        return gen_text
+
+    tio = TokenIO.from_model_path(getattr(args, "model_path", "") or "", caps.tokenizer_path)
+    lora = adapter_route(model, caps)
+    params["token_id_path"] = True
+    params["tokenizer_path"] = tio.path
+    params["lora_path"] = lora
+    params["server_context_limit"] = caps.context_limit
+    params["server_capabilities"] = caps.source
+
+    async def gen_ids(session, prompt):
+        """One completion over the native token-id endpoint.
+
+        Args:
+            session: An open ``aiohttp.ClientSession``.
+            prompt: The user message, tokenised here and decoded on the way back.
+
+        Returns:
+            The generation record, in the same shape the text path returns.
+        """
+        return await generate_ids(
+            session, args.base_url, tio.encode_chat(prompt), params, tio, lora_path=lora
+        )
+
+    return gen_ids
+
+
+def adapter_route(model: str, caps: "ServerCapabilities") -> str:
+    """The ``lora_path`` one served id must be sent under, or the empty string for the base.
+
+    ``/generate`` has no model field: an adapter is reached by ``lora_path`` or not at all,
+    and sglang REFUSES a ``lora_path`` it has never loaded -- so sending one for the base
+    model fails every request, and omitting one for an adapter silently scores the base. Both
+    the benchmark and the liveness probe have to make this decision, so it is made once here
+    rather than twice; two copies of a routing rule that must agree is how one of them drifts.
+
+    Decided from what the SERVER called its base model, so it needs no second ``/v1/models``
+    read of a list that moves between requests.
+
+    Args:
+        model: The served id to route to.
+        caps: What the server said about itself.
+
+    Returns:
+        The ``lora_path`` to send, or ``""`` when the id is the base model (or unknown, in
+        which case ``/generate``'s own default -- the base -- is the only safe choice).
+    """
+    base = getattr(caps, "base_model", "") or ""
+    if not model:
+        return ""
+    if base and os.path.realpath(model) == os.path.realpath(base):
+        return ""
+    return model
+
+
+def headline_max_tokens(bench: str) -> int:
+    """The token budget the HEADLINE evaluation of this benchmark ran at.
+
+    Read from the same two places a headline run reads it -- :data:`BENCH_OVERRIDES` first,
+    then the parser's own default -- rather than written down a second time, so "the headline
+    budget" cannot drift away from the budget the headline runs actually used.
+
+    Args:
+        bench: Benchmark name.
+
+    Returns:
+        The cap in tokens.
+    """
+    v = BENCH_OVERRIDES.get(bench, {}).get("max_tokens")
+    if isinstance(v, int) and v > 0:
+        return v
+    return int(build_parser().get_default("max_tokens"))
 
 
 async def generate(session, url: str, model: str, prompt: str, params: dict) -> dict:
@@ -547,14 +1217,30 @@ async def run_bench(bench: str, args, gen_fh=None, explicit=None) -> dict:
     # Resolved ONCE per benchmark and threaded through, so every completion in this
     # benchmark provably used the same parameters and the results row can report them.
     params = resolve_params(bench, args, _EXPLICIT if explicit is None else explicit)
-    url = args.base_url.rstrip("/") + "/chat/completions"
     sem = asyncio.Semaphore(params["concurrency"])
     conn = aiohttp.TCPConnector(limit=params["concurrency"])
 
     async with aiohttp.ClientSession(connector=conn) as session:
+        # BEFORE any generation: refuse an id this endpoint does not serve, and fold the
+        # resolved id, the URL and the served list into the parameters this row reports.
+        # Without the first half a run scores whatever weights happen to be loaded; without
+        # the second half nobody can tell afterwards which ones those were.
+        params.update(await verify_model(session, args.base_url,
+                                         getattr(args, "model", None)))
+
+        # What the SERVER says about itself, which is the only place its launch flags are
+        # readable. Two things come out of it: the real context limit (the model's own
+        # config.json cannot see --context-length, and on a training server the two differ by
+        # 8x), and whether text requests can succeed at all. Both leave `params` untouched on
+        # an ordinary tokenising server that needs no clamp, so the standalone path's results
+        # row is unchanged.
+        caps = await server_capabilities(session, args.base_url)
+        apply_server_context_limit(params, caps, bench)
+        gen_one = build_generator(args, params, caps)
+
         async def one(idx: int, p: dict, k: int) -> dict:
             async with sem:
-                r = await generate(session, url, args.model, PROMPT.format(problem=p["problem"]), params)
+                r = await gen_one(session, PROMPT.format(problem=p["problem"]))
             boxed = extract_boxed(r["text"])
             correct = grade(r["text"], p["answer"]) if r["status"] == "ok" else None
             return {
@@ -664,7 +1350,12 @@ def build_parser() -> argparse.ArgumentParser:
     """
     ap = argparse.ArgumentParser()
     ap.add_argument("--base-url", default="http://127.0.0.1:8404/v1")
-    ap.add_argument("--model", default="evalmodel")
+    ap.add_argument("--model", default=None,
+                    help="model id to score, as listed by <base-url>/models. REQUIRED and "
+                         "deliberately without a default: an unregistered id is answered "
+                         "HTTP 200 by the BASE model, so a default silently scores the "
+                         "wrong weights. A LoRA adapter registered with "
+                         "--lora-paths NAME=path is addressed as NAME.")
     ap.add_argument("--benchmarks", default=",".join(SUITE))
     ap.add_argument("--limit", type=int, default=0, help="problems per benchmark, 0 = all")
     ap.add_argument("--split", default="all", choices=["all", "search", "report"],
@@ -696,6 +1387,15 @@ def main() -> int:
     if args.n > 1 and args.temperature == 0.0:
         print("ERROR: --n > 1 at temperature 0 measures nondeterminism, not uncertainty. "
               "Raise --temperature or set --n 1.", file=sys.stderr)
+        raise SystemExit(2)
+
+    # Refused here as well as in run_bench, and before any dataset or endpoint work: the
+    # message a user sees for a missing flag should name the flag, not arrive as a failed
+    # lookup against a model list.
+    if not args.model:
+        print("ERROR: --model is required. It names which weights answer: an id the "
+              "server does not serve is answered HTTP 200 by the BASE model, so there is "
+              "no safe default. Pass an id from <base-url>/models.", file=sys.stderr)
         raise SystemExit(2)
 
     gen_fh = open(args.gen_out, "w") if args.gen_out else None
