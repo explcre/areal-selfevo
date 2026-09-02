@@ -3824,3 +3824,34 @@ model on the identical harness is what makes it credible.
 Artifacts: `~/runs/validate_v3/noncap2_livecodebench_v6_seed0.json` and its `.records.jsonl`.
 Only seed 0 was run: the question was binary (does the grader agree with an external measurement)
 and further seeds would add precision to a number we will never report.
+
+## Periodic eval cannot yet point at the training rollout server: the adapter id is a moving target
+
+Checked before enabling it, as instructed, and the check fails. Reported rather than worked
+around, because the workaround would have produced a plausible-looking wrong curve.
+
+**The server does list adapter ids.** A0's rollout server exposes an OpenAI-compatible endpoint at
+`http://172.28.127.18:32735/v1` -- note it binds the host interface, not `127.0.0.1`, so a probe of
+localhost finds nothing and could easily be misread as "no endpoint". `/v1/models` returns five
+entries: the base snapshot path and four LoRA adapter ids of the form `a0_math-vN`.
+
+**But there is no stable id, and no alias.** The versions advance about every 10 to 20 seconds and
+sglang keeps only a rolling window of four; observed `v6..v9`, then 45 s later `v8..v11`, then
+`v10..v13`. `v6` and `v7` were gone. `selfevo/periodic_eval.py` takes `SELFEVO_PERIODIC_EVAL_MODEL`
+as a fixed string and passes it through -- it never queries `/v1/models` -- so any id written into
+the environment at launch is evicted within about a minute, long before the first evaluation at
+step 50. Every eval point would fail for the life of the run.
+
+**The failure would at least be loud.** Asking the server for an evicted id (`a0_math-v0`) returns
+**HTTP 500**, not a silent base-model completion, so this particular case does not reproduce the
+"unregistered id serves BASE silently" trap. That is worth knowing but does not make it usable.
+
+**What it needs** is to resolve the newest `a0_math-v*` from `/v1/models` at each evaluation rather
+than at trainer start, or for AReaL to publish a stable alias for "current adapter". Until one of
+those exists, periodic eval stays off for A0 and the module's other two flagged points are untested
+against a training server. The liveness verdict's logprob criterion is right and should be kept:
+the greedy-text probe it replaced returned zero of three differing at step 149 on an adapter that
+logprobs showed to be live.
+
+A0 itself is running: step 15 of a 2000-step bound at the time of writing, W&B online, four cards
+busy, `recover.mode=auto` at `freq_steps=25`.
