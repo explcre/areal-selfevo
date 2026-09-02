@@ -1961,3 +1961,42 @@ rather than a zero, so a broken evaluation and a genuinely inert adapter stayed
 distinguishable; mode (vi) was not survivable that way, because it scored. The convention we
 adopt is therefore that every evaluation point carries a status alongside its score, and that
 a plotted curve shows refusals as gaps rather than omitting them.
+
+\subsection{Correction, same day, to Secs.~\ref{sec:pereval} and~\ref{sec:evalfailures}}
+\label{sec:perevalfix}
+
+Both corrections below were forced by the same fact, which is worth stating before them: the
+periodic evaluation writes each point to a directory keyed \emph{only} by the training step, so
+a relaunch overwrites the previous launch's point at the same step in place. Within half an
+hour of the two subsections above being written, the running arm reached step $200$ and
+overwrote a file one of them cited. An artifact that a live run can overwrite is not a citable
+artifact, and the durable record is the training log, which is rotated rather than replaced.
+
+\paragraph{A fourth point, and the retraction of the trend reading.} At step $200$ the arm
+scored $0.1094$ on the same $64$ problems at the same $2048$-token budget, served adapter
+\texttt{a0\_math-v201}, $64$ of $64$ graded with no failures. That is exactly the step-$50$
+value, so the series over four points is $0.1094$, $0.1250$, $0.1406$, $0.1094$: it rises for
+three points and returns to where it started. Sec.~\ref{sec:pereval} describes the first three
+as rising monotonically, and while that sentence is true of those three it invites a reading
+the fourth point removes, so we retract the framing and keep only the disclaimer that went with
+it --- at $n=64$ these intervals overlap almost entirely and no trend was claimed. The
+truncation count is also not constant as stated there: it is $3$, $3$, $3$, $2$ of $64$.
+The adapter-version check continues to hold exactly, $51$, $101$, $151$, $201$.
+
+\paragraph{The citation in mode (viii), redirected and strengthened.} That paragraph cites
+\texttt{runs/a0\_periodic/step200/results.json} for a \texttt{status\_code 6} refusal. That
+path now holds the step-$200$ point described above, because the running arm overwrote it. The
+durable artifact for the same failure is the previous launch's rotated training log,
+\texttt{runs/a0\_math/train.log.1788377789}, and it records the failure four times rather than
+once --- at steps $50$, $100$, $150$ and $200$, each as a matched pair of lines:
+
+\begin{quote}\small\ttfamily
+periodic eval cannot read the rollout endpoint at step $N$: RuntimeError:
+RolloutController exposes no inference server address, so there is no endpoint to
+evaluate against.\\
+periodic eval step=$N$ status=6 diagnosis=-1 model=UNRESOLVED trend=nan@max\_tokens=UNKNOWN
+live=na best=nan@-1 0.0s (0.0\% of throughput)
+\end{quote}
+
+Four consecutive refusals, none of them scoring, at no measurable cost to throughput. The
+substance of mode (viii) is unchanged and its evidence is four times larger than reported.
