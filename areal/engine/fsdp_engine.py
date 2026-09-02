@@ -893,8 +893,23 @@ class FSDPEngine(TrainEngine):
         )
 
         # Over the whole batch, before it is split by cluster. See the docstring.
+        #
+        # ``device`` is passed rather than moving the microbatch list, which is what that
+        # parameter exists for: the reduction below is a collective, and on a batch that is
+        # still on the host -- which is where a staged batch sits -- an NCCL all_reduce over
+        # a CPU scalar fails. The unrouted path gets the same placement by moving its whole
+        # microbatch list to the device first; here the list is only ever read for its token
+        # counts, so only the scalar needs to move.
+        #
+        # This is one extra packing pass per step, on top of the per-cluster ones. It buys
+        # the guarantee that the denominator is computed by exactly the shipped function
+        # over exactly the whole batch, for any loss_weight_fn -- deriving it from the
+        # per-cluster lists instead would assume the weight is additive over rows, which is
+        # true of the live ``loss_mask.count_nonzero()`` and is not a property the signature
+        # promises.
         total_loss_weight = compute_total_loss_weight(
-            self._prepare_mb_list(input_batched), loss_weight_fn, self.dp_group
+            self._prepare_mb_list(input_batched), loss_weight_fn, self.dp_group,
+            device=self.device,
         )
         n_micro_batches = 0
 

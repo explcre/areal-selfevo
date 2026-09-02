@@ -540,3 +540,64 @@ def test_the_engine_step_still_reports_grad_norm_and_the_learning_rate(world, tm
     assert stats["update_successful"] == 1.0
     assert stats["grad_norm"] > 0.0
     assert stats["cluster_lora/clusters_skipped"] == 1.0
+
+
+# ------------------------------------------------------------------- the expert roster ---
+
+
+def _peft_engine(tmp_path, tag):
+    """An engine ready for ``_apply_peft_wrapper``, with LoRA switched on as a run has it."""
+    from transformers import AutoModelForCausalLM
+
+    hf = tiny_hf_config()
+    path = tmp_path / f"peft_{tag}"
+    path.mkdir(parents=True, exist_ok=True)
+    hf.save_pretrained(path)
+    cfg = PPOActorConfig(
+        path=str(path),
+        mb_spec=MicroBatchSpec(n_mbs=1),
+        optimizer=OptimizerConfig(lr=1e-2, weight_decay=0.01),
+        use_lora=True,
+        lora_rank=4,
+        lora_alpha=8,
+        target_modules=["q_proj", "v_proj"],
+    )
+    engine = FSDPEngine(cfg)
+    torch.manual_seed(0)
+    engine.model = AutoModelForCausalLM.from_config(tiny_hf_config())
+    engine.rank = 0
+    return engine
+
+
+def test_without_a_roster_the_engine_wraps_exactly_one_adapter(tmp_path, monkeypatch):
+    """The default: the single ``get_peft_model`` call this file has always made."""
+    monkeypatch.delenv("SELFEVO_CLUSTER_LORA_ADAPTERS", raising=False)
+    engine = _peft_engine(tmp_path, "off")
+    engine._apply_peft_wrapper()
+    assert set(engine.model.peft_config) == {"default"}
+    assert not hasattr(engine, "_selfevo_adapters")
+
+
+def test_with_a_roster_every_expert_exists_before_the_optimizer_does(tmp_path, monkeypatch):
+    """All experts created here, from ONE config, and nothing left over.
+
+    From one config because experts that differ in rank differ in capacity, and a capacity
+    difference between clusters is an uncontrolled second axis in every comparison the
+    method makes. Nothing left over because a stray ``default`` adapter would sit in
+    ``model.parameters()`` -- and therefore in the optimizer -- and never be trained.
+
+    The placement is the point: ``_apply_peft_wrapper`` runs before FSDP sharding and before
+    ``_create_optimizer``, which takes ``self.model.parameters()``, so every expert here is
+    sharded and optimised alike. One added after that point would have neither.
+    """
+    monkeypatch.setenv("SELFEVO_CLUSTER_LORA_ADAPTERS", "cluster_0,cluster_1,shared")
+    engine = _peft_engine(tmp_path, "on")
+    engine._apply_peft_wrapper()
+    assert set(engine.model.peft_config) == set(NAMES)
+    assert engine._selfevo_adapters.names == NAMES
+    ranks = {c.r for c in engine.model.peft_config.values()}
+    assert ranks == {4}, ranks
+    optimised = {id(p) for p in engine.model.parameters()}
+    for name in NAMES:
+        for _k, param in engine._selfevo_adapters.parameters(name):
+            assert id(param) in optimised, f"{name} is outside model.parameters()"
