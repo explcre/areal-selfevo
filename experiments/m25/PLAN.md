@@ -128,6 +128,46 @@ noise floor. A3 next (decides the "rollouts needed" claim). A4/A5 need the gold 
 | beats the published rules at matched budget | A1 − A4, A1 − A5 |
 | mechanism | probe: MEDS cosine < random cosine, on the arm's own checkpoints |
 
+## Launch blockers for A1/A2 — established 2026-09-02, must be cleared BEFORE the arms run
+
+1. **`max_lora_rank` must be raised.** A merged adapter has rank `sum_c r_c`, but every shipped
+   config sets `sglang.max_lora_rank: ${actor.lora_rank}` and `experiments/harness/lora30b.sh:500`
+   **asserts** `sg.max_lora_rank == a.lora_rank`. That assertion must become
+   `== actor.lora_rank * len(roster)` or **the rollout server will reject the merged adapter** and
+   the arm cannot serve at all.
+2. **The roster must be sized with headroom.** `MEDSPartitioner._resync` allocates a fresh stable
+   id for any raw label matching nothing and `_next_stable` grows without limit, while
+   `adapter_roster()` is fixed at process start. `begin_cluster_batch` raises `ClusterWiringError`
+   — loud, but **fatal mid-training**, and FINDINGS 5.1/5.2 say a blob splitting off a fragment as
+   the buffer grows is EXPECTED. So either size the roster with headroom or raise
+   `min_cluster_size`, or the run stops at an arbitrary step hours in.
+3. **`fsdp.per_layer_optim_step` must stay False.** `PerLayerOptimWrapper` selects param groups by
+   `p.requires_grad` **at construction**, when only `names[0]` requires grad — every other expert
+   would accumulate gradients that are never applied, silently. Latent (defaults False), but it
+   must not be turned on for these arms.
+
+## Constraints the arms inherit, which shape what can be claimed
+
+- **Gradient clipping is global.** One `fsdp2_clip_grad_norm` over all parameters, once, after every
+  cluster has accumulated — so the clip factor is shared and one cluster's large gradient scales
+  down every other expert's update. Worse, `if not math.isfinite(grad_norm): zero_grad()` discards
+  **every** expert's update for that step when one cluster goes non-finite. **Per-cluster learning
+  rates are not independent and cannot be** while there is one clip and one step. Any claim about
+  per-cluster adaptation must be read against this.
+- **Read `grad_norm`, never `cluster_lora/loss/<name>`**, whenever a cluster spans more than one
+  microbatch: `cluster_loss` returns `held[0]`, so the logged loss is the LAST microbatch's, while
+  `norms[name]` accumulates over all of them.
+- **The merge operator is `sum` with weights 1.0 and is HELD FIXED across arms.** Each expert
+  already carries the whole batch as its denominator, so summing reconstitutes what a single shared
+  adapter would have accumulated — exactly A0. A mean would divide the deployed update by K, and
+  `A1 - A0` would then read a K-fold learning-rate difference as a method effect. The operator moves
+  the deployed scale without moving any training metric, so it must never vary between arms.
+- **The training forward deliberately sees ONE expert; only inference forwards see the sum.** In
+  process the sum is reached by ACTIVATION rather than merging (`LoraLayer.forward` adds each
+  active adapter's contribution; measured equal to the merged adapter at 1.19e-7 against a 0.597
+  single-expert difference). Applying it to the training forward would make the arm its own
+  baseline.
+
 ## Discipline
 
 - Config asserted from `process_env.json` inside every run, never the launcher line.
