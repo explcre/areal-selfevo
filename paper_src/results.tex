@@ -1438,6 +1438,16 @@ failure to separate anything. What it does not do is separate \emph{gradients}. 
 sits between $0.24$ and $0.41$ for both the behavioural and the random partition, so conflict
 exists in the batch; it is simply isotropic with respect to any labelling we can compute. The
 honest summary is that there is very little structured gradient there to partition, and the
+The null is not an artefact of the sketching used to make the comparison affordable. Thirty-two
+gradients were also stored exactly, and across their 496 pairs the largest disagreement between
+sketched and exact cosine is $0.0314$ against a resolution floor of $0.0331$, so the sketch
+resolves what it is being asked to resolve with margin to spare. The exact mean pairwise cosine is
+$-0.000506$, agreeing with the sketched figure. Two further measurements point the same way: the
+per-cluster gradient norms span only about a factor of two, so no cluster dominates the average,
+and the prompt-side negative log-likelihood gradient is roughly $65$ times larger than any of
+them, which is where the structure in this batch actually lives.
+
+The honest summary stands: there is very little structured gradient there to partition, and the
 pre-registered rule therefore closes: we build no per-cluster adapters on this signal.
 
 The weaker use of the same clustering as a \emph{targeting} key requires only that clusters
@@ -1481,12 +1491,13 @@ generations truncated; at $61{,}440$ it scores $0.749$, $[0.679, 0.807]$, with t
 $23.4\%$. Nothing about the grader changed between those two runs. The entire difference is the
 token budget.
 
-That corroborates the code grader rather than reproducing the published figure exactly, and the
-residual gap is accounted for. Forty-one generations still exhausted even the raised cap and were
-scored as failures, so $0.749$ is a lower bound and the attainable ceiling on this run is
-$172/175 = 0.983$. The published $0.903$ sits inside that band, and reaching it requires about
-two thirds of the truncated generations to have been correct, which is unremarkable given that
-only $12$ of the $134$ that finished were wrong. We therefore treat the code path as externally
+Conditioning on completion settles it more sharply than that bound does. At the canonical cap,
+\emph{all} 131 failures were truncations and the grader rejected nothing that finished. At
+$61{,}440$, of the 134 generations that terminated normally, 124 passed: $92.5\%$, against a
+published $90.3$. Conditioning on completion selects the easier problems, so $92.5\%$ is not an
+unbiased estimate of the model's score and we do not report it as one. It does answer the binary
+question the check was for. Nothing our grader saw finish was wrongly rejected, and what it
+rejected, it rejected for running out of tokens. We therefore treat the code path as externally
 corroborated, alongside its internal checks: gold self-verifying on all 175 problems, a
 known-wrong set failing on all of them, and every mutant killed.
 
@@ -1500,7 +1511,10 @@ is a property of the policy, but that is a fact we had to measure rather than as
 \label{sec:baseline}
 
 Table~\ref{tab:baseline} gives the vanilla arm at \texttt{globalstep149}, which is the
-reference every later comparison is relative to. Both sit in wide separable bands: the math
+reference every later comparison is relative to. The split is committed and content-pinned, and
+\emph{every arm decision reads the search half}, so $0.482$ rather than $0.470$ is the operative
+figure; the full set and the reserved half are shown once here and the reserved half is not
+consulted again until the final write-up. Both sit in wide separable bands: the math
 score against roughly $0.83$ for a frontier 27B, and the code score against the $90.3$ discussed
 above. Neither is floored and neither is saturated, which is the property that makes an arm
 difference detectable at all.
@@ -1511,7 +1525,9 @@ difference detectable at all.
 \toprule
 benchmark & problems & accuracy & Wilson 95\% \\
 \midrule
-OlympiadBench & 675 & $0.470$ & $[0.432, 0.507]$ \\
+OlympiadBench, all & 675 & $0.470$ & $[0.432, 0.507]$ \\
+\quad \emph{search half} & 338 & $\mathbf{0.482}$ & $[0.429, 0.535]$ \\
+\quad report half & 337 & $0.457$ & $[0.405, 0.510]$ \\
 LiveCodeBench (v6 slice) & 175 & $0.309$ & $[0.245, 0.381]$ \\
 \bottomrule
 \end{tabular}
