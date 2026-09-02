@@ -493,18 +493,19 @@ comparison. Measured backend under `~/venv_probe`: `hdbscan`.
 after. The three skips are the two clustering-dependent modules and the cross-venv test, all of
 which RUN for real under `~/venv_probe` -- they are not tests that never execute.
 
-Mutation testing is `selfevo/tests/mutate_cluster_lora.py`, run against a COPY at
-`/home/ubuntu/mutcopy` whose `cluster_lora` modules were asserted sha256-identical to the
-originals before starting; every target's sha256 is re-checked after every restore and again
+Mutation testing is `selfevo/tests/mutate_cluster_lora.py`, run against COPIES at
+`/home/ubuntu/mutcopy` and `/home/ubuntu/mutcopy2` whose `cluster_lora` modules were asserted
+sha256-identical to the originals before starting; every target's sha256 is re-checked after every restore and again
 at the end. The harness refuses to start unless imports resolve inside the copy. It runs in two
 arms because the two halves live in two venvs, and a mutation whose tests cannot run under the
 chosen interpreter is reported NOT APPLICABLE rather than killed -- a mutation that was never
 exercised is not a passing one. Kill table in section 10.
 
-Four tests exist only because the mutation harness predicted survivors, and each pins a
+Seven tests exist only because the mutation harness found survivors, and each pins a
 property no other test could see: bit-equality in `unchanged()`, the merge verification
-actually firing, per-parameter hashing in the sketch, and the control's own size-match
-assertion.
+actually firing, per-parameter hashing in the sketch, the control's own size-match assertion,
+the prompt loss covering the prompt positions, the trunk actually splitting into sub-batches,
+and the harness's own anchors still matching.
 
 `git status --porcelain` shows only files in this agent's territory:
 `selfevo/cluster_lora/`, eight `selfevo/tests/test_cluster_lora_*.py`,
@@ -514,22 +515,28 @@ edited: `ClusterRouter.key_fn` is already `Callable[[RoutingContext], str]` and
 
 ## 9. What still needs a GPU, and what does not yet reach the trainer
 
-**Not wired, and this is the honest statement of reach.** Two seams are satisfied and tested
-but not connected, both because the files that would connect them are other agents' territory:
+**Reach, as of 2026-09-02.** This agent built two seams and deliberately did not connect
+them, because the files that connect them belong to other agents. They have since been wired
+by the agent that owns those files, in `selfevo/cluster_lora/wiring.py`; what follows is what
+this agent established, and the wiring's own reach is that agent's to report.
 
-1. **`ClusterLoRAKeyFn` reaches `ClusterRouter` but the actor never supplies features.**
+1. **`ClusterLoRAKeyFn` satisfies the `ClusterRouter.key_fn` seam.**
    `test_the_key_fn_partitions_a_batch_through_the_real_ClusterRouter` drives a real
-   `ClusterRouter.route_batch` and gets this partition back, so the seam works. But
-   `PPOActor._route_groups` builds `RoutingContext.extra` from `group_features(...)` only, and
-   `extra` is `Mapping[str, float]` and cannot carry a vector. A run needs one call to
-   `key_fn.begin_batch(unit_ids, features)` added at that seam in
-   `areal/trainer/ppo/actor.py`, plus the extra forward that produces the features. Until then
-   `partition=meds` in a config would REFUSE (it raises rather than collapsing to one adapter),
-   which is the intended behaviour and not a working arm.
-2. **`ClusterAdapterSet` is not called by `FSDPEngine.train_batch`.** The isolation guard is
-   proved on a real PEFT model with a real optimizer, but the engine still runs one adapter for
-   the whole batch. Wiring it means microbatching by cluster inside the engine, which is
-   `areal/engine/fsdp_engine.py`.
+   `ClusterRouter.route_batch` and gets this partition back. What was missing was the
+   features: `PPOActor._route_groups` builds `RoutingContext.extra` from `group_features(...)`
+   only, and `extra` is `Mapping[str, float]` and cannot carry a vector, so a run needed one
+   `begin_batch(unit_ids, features)` call at that seam. Until that existed `partition=meds`
+   REFUSED rather than collapsing to one adapter -- the intended behaviour, and not a working
+   arm.
+2. **`ClusterAdapterSet` was not called by `FSDPEngine.train_batch`.** The isolation guard is
+   proved on a real PEFT model with a real optimizer, but the engine ran one adapter for the
+   whole batch; wiring it means microbatching by cluster inside the engine.
+
+Two things this agent did NOT verify and which the wiring must carry on its own evidence: that
+the features reaching `begin_batch` in a live run are the ones this module computes, and that
+the engine's own gradient clipping and scheduler still see each cluster's update correctly.
+The isolation guard here is proved against a plain `AdamW`, not against the engine's optimizer
+path.
 
 Needing a GPU:
 
@@ -557,67 +564,69 @@ Needing a GPU:
 See section 8 for the harness. Results are appended below when both arms have run.
 
 Run against `/home/ubuntu/mutcopy` and `/home/ubuntu/mutcopy2`, each verified sha256-identical
-to the originals for all nine `cluster_lora` modules before starting and verified restored
-clean afterwards. 53 distinct mutations, two arms, **every applicable mutation killed and no
-SKIPs** -- an anchor that stopped being unique is reported as NOT a kill, and one was
-(`combination_type="cat"` appeared twice) until the anchor was made specific.
+to the originals for every `cluster_lora` module before starting and verified restored clean
+afterwards. **73 distinct mutations, two arms, every one killed and no SKIPs.**
 
-| arm | interpreter | mutations applicable | killed | survivors |
+| arm | interpreter | applicable | killed | survivors |
 |---|---|---|---|---|
-| `torch` | `~/venv312b` | 63 (10 not applicable) | **63** | none |
-| `cluster` | `~/venv_probe` | 27 (45 not applicable) | **27** | none |
+| `torch` | `~/venv312b` | 63 | **63** | none |
+| `cluster` | `~/venv_probe` | 27 | **27** | none |
 
-72 distinct mutations by area: adapter isolation 11, merge 5, partition and control 15,
-sketch 6, dump 26 (of which 19 cover the OOM fix), analysis 7. All six mutation targets were
-verified sha256-identical in both copies after the run.
+17 mutations run on both arms, so the union is 73: every mutation is exercised somewhere. By
+area: the dump 29, the partition and control 15, adapter isolation 11, the analysis 7, the
+sketch 6, the merge 5.
 
-**A seventh survivor, from the OOM fix, and a stale anchor.** Rewriting the dump's loss made
-one mutation's anchor match zero lines, which the harness reported as `anchor appears 0x --
-NOT a kill` rather than as a pass; it is re-anchored, and
-`test_every_mutation_anchor_still_occurs_exactly_once` now fails loudly on a stale anchor
-instead of leaving a silent SKIP for someone to notice in a log. The survivor was
-*"sub-batching is disabled, restoring the trunk activation cost"*: every test of
-`group_backward` asserted the GRADIENT was unchanged, and it is unchanged when the split never
-happens -- so all of them passed on a version that runs one forward over the whole group and
-OOMs exactly as before. What had to be checked was the number of trunk forwards, which is now
-asserted directly. That is the third defect in this file whose symptom was a correct answer.
+**Seven defects survived a first pass and each produced a new test.** They are recorded
+because the tests that missed them all looked entirely reasonable, and because five of the
+seven would have produced a plausible number rather than an error:
 
-**Five defects survived the first pass and each produced a new test.** They are recorded
-because the tests that missed them looked entirely reasonable:
+1. *`zero_grad(set_to_none=False)` survived the isolation guard.* The guard trained only one
+   expert, so the others never held a gradient at all and the optimizer skipped them either
+   way. The leak needs an expert that was trained and is then IDLE -- the normal case, since
+   most clusters are absent from most batches.
+2. *The `requires_grad` check inside `only()` survived.* It is defensive, so nothing fires it
+   while PEFT behaves; a stand-in that activates without freezing now fires it.
+3. *Masking the prompt NLL to the RESPONSE survived* a test that only asked whether the two
+   sketches were parallel -- an advantage-weighted loss and a plain likelihood are never
+   parallel even over identical tokens. Now checked against an independent reference over the
+   prompt positions.
+4. *Dropping the CountSketch's random signs survived*, because the unsigned estimator is still
+   unbiased on zero-mean vectors. Caught on two non-negative vectors with disjoint supports,
+   where every hash collision adds.
+5. *A bootstrap that stopped resampling survived*, because the two standard deviations were
+   `0.0` and `5.6e-17` and the ratio compared float noise. Now checked on interval WIDTH.
+6. *Disabling the trunk sub-batching survived every gradient-equality test*, because one
+   forward over the whole group gives exactly the same gradient -- and OOMs at 32B exactly as
+   before. Equality tests cannot see it; the number of trunk forwards can, so that is now
+   asserted directly at five sub-batch sizes.
+7. *Rewriting the loss for the OOM fix left one anchor matching zero lines.* The harness
+   reported `anchor appears 0x` and counted it as NOT a kill, which is the correct discipline
+   -- but only because someone read the output. A guard that is never exercised looks exactly
+   like a guard that passes, so `test_every_mutation_anchor_still_occurs_exactly_once` now
+   parses the harness and requires every anchor to occur exactly once in its target. It is
+   source-only, so it runs under both interpreters.
 
-1. *`zero_grad(set_to_none=False)` survived the isolation guard.* The two-step test trained
-   only `cluster_1`, so `cluster_0` never had a `.grad` at all and was skipped by the
-   optimizer either way. The leak needs an expert that was trained and is then IDLE -- the
-   normal case, since most clusters are absent from most batches. `test_an_expert_that_is_
-   IDLE_this_step_does_not_decay` trains every expert once and then leaves one idle for three
-   steps.
-2. *The `requires_grad` leak check inside `only()` survived.* It is defensive, so nothing
-   fires it while PEFT behaves. `test_the_leak_check_fires_if_PEFT_stops_freezing_the_other_
-   experts` replaces `set_adapter` with one that activates without freezing and requires the
-   refusal -- the semantics belong to PEFT, not to this project, and an upgrade could change
-   them.
-3. *Masking the prompt NLL to the RESPONSE survived.* The test only asserted the two sketches
-   were not parallel, and they still were not -- the GRPO loss is advantage-weighted and the
-   NLL is not, so a response-masked NLL is a different vector from the RL gradient while being
-   useless as the ELREA feature. `test_the_prompt_nll_covers_exactly_the_prompt_positions`
-   checks against an independent reference over the prompt positions.
-4. *Dropping the CountSketch's random signs survived.* On zero-mean random vectors the
-   unsigned estimator is still unbiased, only noisier, so the angle-preservation test could
-   not see it. It breaks on non-negative vectors, where every hash collision ADDS:
-   `test_the_random_signs_are_what_keep_disjoint_vectors_orthogonal` sketches two exactly
-   orthogonal non-negative vectors and requires the cosine to stay near zero.
-5. *A bootstrap that stopped resampling survived.* Every replicate identical gives
-   `std = 0.0` for one partition and `5.6e-17` for the other, so the ratio assertion compared
-   float noise and passed. Now checked on interval WIDTH, which is what a degenerate bootstrap
-   actually gets wrong: a zero-width interval claims a precision the estimate does not have.
+Lessons 6 and 7 are the general ones. An optimisation whose whole purpose is to use less
+memory cannot be validated by asserting the answer is unchanged, because the answer is
+unchanged when the optimisation does not happen -- the mechanism has to be observed, not the
+result. And a mutation harness silently decays as the code it points at is rewritten.
 
-Two of those five (1 and 4) are defects that would have produced a plausible, publishable
-number rather than an error. The OOM fix added a sixth of the same kind -- see the survivor
-note above -- and the running theme is now explicit: **on this feature, the dangerous defects
-do not raise; they return a reasonable-looking number.** Every guard here is therefore written
-to be falsifiable by a mutation, and the ones that could not be (the `only()` leak check, the
-merge verification, the budget refusals) have tests that break the surrounding machinery on
-purpose to make them fire.
+### 10.1 A process failure worth recording
+
+Commit `31ca3056` contains nine files that are not this agent's -- another agent's gold
+batch-construction work, which was staged in the same shared checkout at that moment.
+
+The brief said to stage by name, and `git add` WAS given explicit paths. That was not
+sufficient, and the reason is worth writing down: **`git commit` commits the INDEX, not the
+paths you added.** On a checkout three agents share, another agent's `git add` between your
+`status` and your `commit` puts their files into your commit whatever you named. The defence
+is a pathspec-limited commit -- `git commit -F msg -- <paths>` -- which commits only those
+paths regardless of what else is staged, and which this agent used for every commit after the
+incident.
+
+The mistake was not repaired. No content was lost, the worktree matched HEAD, and by the time
+it was noticed two other agents had already committed on top; rewriting shared history to fix
+an attribution error is how a race becomes lost work.
 
 ## 11. How to run it on the H100 box
 
