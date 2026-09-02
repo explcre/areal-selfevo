@@ -17,7 +17,9 @@ import numpy as np
 import pytest
 
 from selfevo.cluster_lora.partition import (
+    DEFAULT_CONTROL_MEMORY,
     SHARED_CLUSTER,
+    MatchedControlMemory,
     Partition,
     PartitionUnavailable,
     balanced_assign,
@@ -102,20 +104,155 @@ def test_the_control_is_actually_feature_blind():
     Asserted over many seeds rather than one: a single seed can permute to the identity by
     chance, and a test that happened to draw it would enshrine a control that controls
     nothing.
+
+    Each seed draws into its OWN memory. Feature-blindness is a property of the DRAW, and
+    since the control became identity-stable the draw happens once per group identity; fifty
+    seeds sharing one memory would measure the carry rather than the draw, and would pass
+    even if the draw had stopped being blind. That the CARRY is blind too is a property of
+    where its labels come from -- they are labels this same draw produced -- and is asserted
+    against a moving reference in the size-match test below.
     """
     ref = part([0, 0, 0, 0, 1, 1, 1, 1])
     differs = sum(
-        random_matched_partition(ref, seed=s).labels != ref.labels for s in range(50)
+        random_matched_partition(ref, seed=s, memory=MatchedControlMemory()).labels
+        != ref.labels
+        for s in range(50)
     )
     assert differs >= 45, f"only {differs}/50 seeds moved any label"
 
 
 def test_the_control_is_reproducible_under_its_seed():
-    ref = part([0, 0, 1, 1, -1, -1])
-    assert random_matched_partition(ref, seed=3).labels == \
-        random_matched_partition(ref, seed=3).labels
-    assert random_matched_partition(ref, seed=3).labels != \
-        random_matched_partition(ref, seed=4).labels
+    """The seed governs the DRAW. What has already been drawn is governed by the memory.
+
+    Against a fresh memory the seed decides everything, which is what this test has always
+    asserted and what still has to hold: two seeds that produced the same control would make
+    a seed sweep of the control arm one run repeated. Against a memory that has already
+    placed these groups the seed deliberately does NOT move them -- that is the churn fix,
+    and it is asserted in
+    ``test_the_control_keeps_a_group_on_its_adapter_when_the_seed_moves``.
+    """
+
+    def draw(seed):
+        """One control over the same reference, from an empty memory."""
+        return random_matched_partition(
+            part([0, 0, 1, 1, -1, -1]), seed=seed, memory=MatchedControlMemory()
+        ).labels
+
+    assert draw(3) == draw(3)
+    assert draw(3) != draw(4)
+
+
+# The control's THIRD property, and the one it did not have. Sizes and feature-blindness are
+# asserted above; both passed while the control re-permuted every batch, so neither could see
+# that the control also destroyed expert identity -- the axis findings 5.1 makes the whole
+# method rest on. See MatchedControlMemory.
+
+
+def test_the_control_keeps_a_group_on_its_adapter_when_the_seed_moves():
+    """A group the control has placed stays there, however the per-batch seed advances.
+
+    ``ClusterLoRAKeyFn.begin_batch`` passes ``seed + self.batches``, so the seed moves every
+    batch by construction. Before the memory existed that alone re-permuted every group.
+    """
+    ref = part([0, 0, 0, 1, 1, 1, -1, -1])
+    memory = MatchedControlMemory()
+    first = random_matched_partition(ref, seed=0, memory=memory)
+    for batch in range(1, 6):
+        later = random_matched_partition(ref, seed=batch, memory=memory)
+        assert later.labels == first.labels, f"batch {batch} re-permuted the control"
+    assert len(memory) == ref.n_groups
+
+
+def test_the_control_churns_no_more_than_the_method_it_controls_for():
+    """Churn parity: the mandatory control may not differ from the arm on stability.
+
+    Two references with the same identities. The first never changes, so the method's churn
+    is 0.0 and the control's must be too. In the second the METHOD moves every group to a
+    different cluster while keeping its size multiset -- the control must not follow it
+    (that would make the control feature-sighted) and must not be shaken loose by it either.
+
+    This is the assertion that stops the defect coming back: re-permuting per batch passes
+    the size test and the feature-blindness test, and fails only here.
+    """
+    ids = tuple(f"parity{i}" for i in range(12))
+    stable = [part([0, 0, 0, 1, 1, 1, 2, 2, 2, -1, -1, -1], ids=ids) for _ in range(4)]
+    memory = MatchedControlMemory()
+    control = [random_matched_partition(p, seed=k, memory=memory) for k, p in enumerate(stable)]
+    method_churn = [label_churn(stable[k - 1], stable[k])[0] for k in (1, 2, 3)]
+    control_churn = [label_churn(control[k - 1], control[k])[0] for k in (1, 2, 3)]
+    assert max(method_churn) == 0.0, "the fixture is not stable, so it proves nothing"
+    assert control_churn == method_churn, (
+        f"the control churned {control_churn} against the method's {method_churn} on a "
+        "partition whose membership never changed"
+    )
+
+    reshuffled = part([2, 2, 2, -1, -1, -1, 0, 0, 0, 1, 1, 1], ids=ids)
+    after = random_matched_partition(reshuffled, seed=99, memory=memory)
+    assert label_churn(control[-1], after)[0] == 0.0, (
+        "the control moved when the METHOD's labels moved; the control does not see the "
+        "method's assignment and must not track it"
+    )
+
+
+def test_the_control_stays_size_matched_when_the_memory_cannot_be_honoured():
+    """A carried label the new batch has no room for is redrawn, and the sizes still match.
+
+    The pins are honoured by CAPACITY, not by membership, so a reference whose clusters have
+    shrunk, grown or vanished cannot make the control drift off the size multiset -- which is
+    the property the control had before the memory existed and must not have lost to it.
+    """
+    ids = tuple(f"cap{i}" for i in range(9))
+    memory = MatchedControlMemory()
+    random_matched_partition(part([0] * 3 + [1] * 3 + [2] * 3, ids=ids), seed=1, memory=memory)
+    for labels in ([0] * 8 + [1], [-1] * 9, [0, 1, 2, 3, 4, 5, 6, 7, 8], [0] * 4 + [1] * 5):
+        ref = part(labels, ids=ids)
+        ctrl = random_matched_partition(ref, seed=2, memory=memory)
+        assert ctrl.size_multiset() == ref.size_multiset()
+        assert ctrl.n_clusters == ref.n_clusters
+        assert ctrl.n_noise == ref.n_noise
+
+
+def test_a_reference_with_no_identities_is_drawn_afresh_every_time():
+    """No group ids means nothing to carry, and the memory is left empty rather than keyed
+    on batch position -- which is reshuffled every step, so a memory keyed on it would pin
+    each POSITION to an adapter and hand the group at that position another group's expert.
+    """
+    ref = Partition(labels=(0, 0, 1, 1, -1, -1), basis="no identities")
+    memory = MatchedControlMemory()
+    assert random_matched_partition(ref, seed=3, memory=memory).labels != \
+        random_matched_partition(ref, seed=4, memory=memory).labels
+    assert len(memory) == 0
+
+
+def test_the_default_memory_is_shared_and_resettable():
+    """The production call passes no memory, so the default is the one that must carry.
+
+    ``partition_from_config`` hands the partitioner's own memory, but
+    ``interference_analyze`` and every direct caller do not, and a default that did not
+    carry would leave those on the defective control.
+    """
+    ids = tuple(f"default{i}" for i in range(8))
+    ref = part([0, 0, 0, 0, 1, 1, 1, 1], ids=ids)
+    DEFAULT_CONTROL_MEMORY.reset()
+    first = random_matched_partition(ref, seed=0)
+    assert random_matched_partition(ref, seed=1).labels == first.labels
+    DEFAULT_CONTROL_MEMORY.reset()
+    assert len(DEFAULT_CONTROL_MEMORY) == 0
+
+
+def test_a_memory_that_remembers_nothing_is_refused():
+    """The defect, expressed as a configuration, is not accepted as one."""
+    with pytest.raises(ValueError, match="max_entries"):
+        MatchedControlMemory(max_entries=0)
+
+
+def test_the_memory_is_bounded_and_drops_the_oldest_first():
+    """A run must not grow a dict for every prompt it has ever seen without a ceiling."""
+    memory = MatchedControlMemory(max_entries=4)
+    for batch in range(3):
+        ids = tuple(f"b{batch}g{i}" for i in range(4))
+        random_matched_partition(part([0, 0, 1, 1], ids=ids), seed=batch, memory=memory)
+    assert len(memory) == 4
 
 
 def test_the_control_records_what_it_matched():

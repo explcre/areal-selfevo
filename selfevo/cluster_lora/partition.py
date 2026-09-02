@@ -32,15 +32,17 @@ fitted to one group.
 
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, OrderedDict
 from dataclasses import dataclass
 from typing import Mapping, Sequence
 
 import numpy as np
 
 __all__ = [
+    "DEFAULT_CONTROL_MEMORY",
     "SHARED_CLUSTER",
     "MEDSPartitioner",
+    "MatchedControlMemory",
     "Partition",
     "PartitionUnavailable",
     "balanced_assign",
@@ -198,8 +200,130 @@ def no_partition(n_groups: int, *, group_ids: Sequence[str] = ()) -> Partition:
     )
 
 
+class MatchedControlMemory:
+    """Which adapter the size-matched control has already given each group.
+
+    The control must differ from the method on ONE axis -- whether the labels saw the
+    behavioural features -- and on no other. Drawing a fresh permutation every batch adds a
+    second: MEASURED 2026-09-02 on a partition whose membership never changed at all, the
+    method churned 0.0 per step while a freshly-permuted control churned 0.875 and 0.667.
+
+    That second axis is not a nuisance parameter. ``FINDINGS_cluster_lora.md`` section 5.1
+    establishes churn as THE mechanism that makes per-cluster experts fail: at churn 1.0
+    every expert receives a different subpopulation each step and learns the average anyway,
+    which is the exact thing the method claims to avoid and the reason
+    :meth:`MEDSPartitioner._resync` exists. A control redrawn every batch is therefore not
+    "the method without clustering", it is "the method without clustering AND without stable
+    expert identity", and a gain over it cannot be attributed to the clustering.
+
+    This class is the control's half of ``_resync``. The method keeps a cluster's expert by
+    matching overlap after each refit; the control keeps a GROUP's expert by remembering the
+    label its first, feature-blind draw gave it. The draw is unchanged and stays blind: a
+    group is placed by a seeded permutation the first time the control sees it, and by
+    nothing about the group ever.
+
+    Args:
+        max_entries: Identities to remember; the oldest are dropped first. A run sees one
+            identity per prompt per epoch, so the default is far above any realised run and
+            exists only so that a long-lived process cannot grow without bound.
+
+    Raises:
+        ValueError: If ``max_entries`` is below 1. A memory that remembers nothing is the
+            defect this class exists to fix, wearing its name.
+    """
+
+    def __init__(self, max_entries: int = 1 << 18) -> None:
+        if max_entries < 1:
+            raise ValueError(
+                f"max_entries must be >= 1, got {max_entries}; a control memory that "
+                "remembers nothing re-permutes every batch, which is the defect"
+            )
+        self.max_entries = int(max_entries)
+        self._seen: OrderedDict[str, int] = OrderedDict()
+
+    def __len__(self) -> int:
+        """Group identities currently remembered."""
+        return len(self._seen)
+
+    def reset(self) -> None:
+        """Forget every identity.
+
+        For tests, and for a process that starts a second arm: a control carried over from
+        a previous arm would place this arm's groups by the previous arm's draw.
+        """
+        self._seen.clear()
+
+    def carry_forward(
+        self, group_ids: Sequence[str], drawn: Sequence[int]
+    ) -> tuple[tuple[int, ...], int]:
+        """Re-seat a freshly drawn control so a known group keeps the label it already had.
+
+        Args:
+            group_ids: Stable identity per group, in batch order. EMPTY means the caller
+                has no identities to key on: the draw is returned untouched and nothing is
+                remembered, because there is no carrying forward an assignment for a group
+                that cannot be recognised next batch.
+            drawn: The seeded permutation, already size-matched to the reference.
+
+        Returns:
+            ``(labels, n_carried)``. ``labels`` is a REARRANGEMENT of ``drawn`` -- the same
+            labels with the same multiplicities, so the size match is preserved by
+            construction rather than by a second permutation that could lose it -- in which
+            every group the control has placed before keeps that label, and the rest are
+            filled from what is left in the drawn order. ``n_carried`` is how many groups
+            kept a previous label, which is what the partition's basis records.
+        """
+        drawn = [int(v) for v in drawn]
+        if not group_ids:
+            return tuple(drawn), 0
+        capacity = Counter(drawn)
+        out: list[int | None] = [None] * len(drawn)
+        carried = 0
+        for i, gid in enumerate(group_ids):
+            remembered = self._seen.get(gid)
+            # Capacity, not mere membership. A remembered label this batch has no room for
+            # cannot be honoured without breaking the size match, and the size match is the
+            # other property the control exists to hold; such a group is redrawn below.
+            if remembered is not None and capacity[remembered] > 0:
+                out[i] = remembered
+                capacity[remembered] -= 1
+                carried += 1
+        # The leftovers taken in DRAWN order, so a group the control has not seen is placed
+        # by the seeded permutation and by nothing else.
+        remaining = Counter(capacity)
+        leftovers: list[int] = []
+        for value in drawn:
+            if remaining[value] > 0:
+                leftovers.append(value)
+                remaining[value] -= 1
+        spare = iter(leftovers)
+        for i, value in enumerate(out):
+            if value is None:
+                out[i] = next(spare)
+        for gid, label in zip(group_ids, out):
+            self._seen.pop(gid, None)
+            self._seen[gid] = int(label)
+        while len(self._seen) > self.max_entries:
+            self._seen.popitem(last=False)
+        return tuple(int(v) for v in out), carried
+
+
+#: The memory :func:`random_matched_partition` uses when the caller supplies none.
+#:
+#: Module-level rather than per-call because the property being fixed is a property ACROSS
+#: calls, and the function is called once per batch from a call site that holds no state of
+#: its own. A run that wants its own -- two arms in one process, or a test -- passes
+#: ``memory=``; :class:`MEDSPartitioner` holds one so that the control's memory has exactly
+#: the method's lifetime.
+DEFAULT_CONTROL_MEMORY = MatchedControlMemory()
+
+
 def random_matched_partition(
-    reference: Partition, *, seed: int, tag: str = "random_matched"
+    reference: Partition,
+    *,
+    seed: int,
+    tag: str = "random_matched",
+    memory: MatchedControlMemory | None = None,
 ) -> Partition:
     """The mandatory control: same N, same sizes, labels feature-blind.
 
@@ -216,14 +340,29 @@ def random_matched_partition(
     number of groups on the shared adapter. A control with fewer shared groups would have
     more per-cluster capacity than the method it controls for.
 
+    STABLE ACROSS BATCHES, which is the third property and was the missing one. The draw is
+    carried forward per GROUP IDENTITY through :class:`MatchedControlMemory`, so a group the
+    control has already placed keeps that adapter on every later batch instead of being
+    re-permuted under the next seed. Without it the control churned 0.875 and 0.667 per step
+    where the method churned 0.0, i.e. it differed from the arm in expert STABILITY as well
+    as in feature-blindness -- and section 5.1 of the findings makes stability the mechanism
+    the whole method rests on, so a gain over such a control is not attributable to the
+    clustering. A reference carrying NO group ids has no identity to key on and is drawn
+    afresh, exactly as before.
+
     Args:
-        reference: The partition whose N and sizes are to be reproduced.
-        seed: Permutation seed. A private generator, so this neither perturbs nor is
-            perturbed by sampling elsewhere in the process.
+        reference: The partition whose N and sizes are to be reproduced. Its ``group_ids``
+            are the identities the draw is carried forward on.
+        seed: Permutation seed, governing the draw for every group the control has not
+            placed before. A private generator, so this neither perturbs nor is perturbed by
+            sampling elsewhere in the process.
         tag: Prefix for the recorded basis.
+        memory: Where the per-identity draw is carried. Defaults to
+            :data:`DEFAULT_CONTROL_MEMORY`; :class:`MEDSPartitioner` holds one so that an
+            arm's control forgets exactly when its method does.
 
     Returns:
-        A size-matched, feature-blind :class:`Partition`.
+        A size-matched, feature-blind, identity-stable :class:`Partition`.
 
     Raises:
         ValueError: If the reference has no groups.
@@ -233,11 +372,17 @@ def random_matched_partition(
     rng = np.random.default_rng(seed)
     labels = np.array(reference.labels, dtype=np.int64)
     permuted = tuple(int(v) for v in rng.permutation(labels))
+    memory = DEFAULT_CONTROL_MEMORY if memory is None else memory
+    # A REARRANGEMENT of the draw, never a second draw, so the size match asserted below
+    # cannot be lost here.
+    permuted, carried = memory.carry_forward(reference.group_ids, permuted)
     out = Partition(
         labels=permuted,
         basis=(
             f"{tag}: labels of {reference.basis!r} permuted under seed {seed}; "
-            f"sizes {list(reference.size_multiset())} matched exactly"
+            f"sizes {list(reference.size_multiset())} matched exactly; "
+            f"{carried}/{reference.n_groups} groups kept the adapter the control had "
+            "already given them"
         ),
         group_ids=reference.group_ids,
     )
@@ -448,6 +593,10 @@ class MEDSPartitioner:
             clusterer = MEDSClusterer()
         self.clusterer = clusterer
         self.warmup_batches = int(warmup_batches)
+        # The control's half of the identity _resync keeps for the method, held here so the
+        # two have the SAME lifetime: a fresh partitioner is a fresh arm, and an arm whose
+        # control remembered the previous arm's draw would place this arm's groups by it.
+        self.control_memory = MatchedControlMemory()
         self.batches_seen = 0
         self._previous: Partition | None = None
         # Raw HDBSCAN label -> stable expert id, and the stable id of every buffered vector.
@@ -683,7 +832,9 @@ def partition_from_config(
             ``random_matched`` so labels stay stable across batches; passing ``None`` and
             getting a fresh one per batch is the silent no-op this argument exists to
             prevent.
-        seed: Seed for the control.
+        seed: Seed for the control, which draws only the groups it has not placed
+            before -- the rest are carried forward on the partitioner's own control memory,
+            so the control is as stable as the method it controls for.
         group_ids: Stable identifiers.
 
     Returns:
@@ -712,7 +863,9 @@ def partition_from_config(
     if mode == "meds":
         return meds
     if mode == "random_matched":
-        return random_matched_partition(meds, seed=seed)
+        return random_matched_partition(
+            meds, seed=seed, memory=partitioner.control_memory
+        )
     # No unconditional fallthrough. This used to end in `return random_matched_partition(...)`,
     # so a fourth name added to TRAINING_PARTITIONS without a branch here ran the CONTROL's
     # mechanism under the new arm's label -- and since the returned Partition is bit-identical

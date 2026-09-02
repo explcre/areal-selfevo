@@ -358,14 +358,6 @@ def test_defect_reconciling_after_the_advantage_computation_is_not_refused():
         reconcile_gold_logprobs(inverted)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-    "CONFIRMED DEFECT 6: random_matched churns 0.67-0.88 per step where the method churns "
-    "0.0, so the mandatory control differs on stability as well as feature-blindness. Fix: "
-    "draw the control once per group identity and carry it forward "
-    ),
-)
 def test_defect_the_size_matched_control_also_destroys_expert_identity():
     """The mandatory control differs from the method on TWO axes, and one of them is fatal.
 
@@ -383,11 +375,17 @@ def test_defect_the_size_matched_control_also_destroys_expert_identity():
     The existing tests assert the control sizes match exactly and that it is feature-blind
     over 50 seeds. Both pass. Neither looks at stability, so both pass for the wrong reason.
 
-    FAILS ON CURRENT CODE. The fix: draw the control assignment ONCE per group IDENTITY and
-    carry it forward the way ``_resync`` carries the method, re-balancing only for groups the
-    control has not seen. Size matching is preserved by permuting within the unseen groups
-    against the reference size multiset.
+    FIXED 2026-09-02, and the marker is gone with the fix. The control assignment is now
+    drawn ONCE per group IDENTITY and carried forward on
+    ``partition.MatchedControlMemory``, the way ``_resync`` carries the method, and the
+    groups the control has not seen are filled from the labels the seeded draw has left --
+    so the size match is preserved by REARRANGING the draw rather than by a second one.
     """
+    from selfevo.cluster_lora.partition import DEFAULT_CONTROL_MEMORY
+
+    # The default memory is process-global, so the measurement is taken against a known
+    # empty one rather than against whatever an earlier test in this session left in it.
+    DEFAULT_CONTROL_MEMORY.reset()
     ids = tuple(f"p{i}" for i in range(24))
     labels = tuple(i // 6 for i in range(24))
     reference = [

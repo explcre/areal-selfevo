@@ -325,6 +325,68 @@ def test_the_control_mode_goes_through_the_same_key_fn():
     assert ctrl.partition.labels != meds.partition.labels
 
 
+def test_the_control_mode_is_as_stable_across_batches_as_the_method():
+    """The control carries its assignment forward, and this is the seam that carries it.
+
+    ``begin_batch`` passes ``seed + self.batches``, so the control's seed MOVES every batch
+    by construction; before ``MatchedControlMemory`` existed that alone re-permuted every
+    group, and the control differed from the method in expert stability as well as in
+    feature-blindness -- the one axis findings 5.1 makes the method rest on.
+
+    ``partition_from_config`` hands the control the PARTITIONER's own memory, so a control
+    forgets exactly when the method it controls for does. Driven through the key fn rather
+    than through ``random_matched_partition`` because the per-batch seed advance lives here.
+    """
+    ids = [f"p{i}" for i in range(6)]
+    feats = np.array([[1.0], [1.0], [1.0], [-1.0], [-1.0], [-1.0]])
+    ctrl = keyfn("random_matched", warmup=0, seed=5)
+    first = None
+    for step in range(4):
+        ctrl.begin_batch([f"{step}:{i}" for i in range(6)], feats, group_ids=ids)
+        if first is None:
+            first = ctrl.partition.labels
+            continue
+        assert ctrl.report().churn == 0.0, f"the control re-permuted at batch {step}"
+        assert ctrl.partition.labels == first
+    assert len(ctrl.partitioner.control_memory) == len(ids)
+
+
+def test_the_control_arm_carries_on_the_partitioners_memory_not_the_global_one():
+    """A fresh partitioner is a fresh ARM, and two arms in one process must not share.
+
+    ``partition_from_config`` hands the partitioner's own memory rather than letting the
+    module-level default carry. Asserted by watching the DEFAULT memory stay empty while the
+    arm runs: with the argument dropped the arm still looks stable across its own batches --
+    the global carries just as well -- and the only visible difference is that a second arm
+    in the same process would inherit the first one's draw. That is a control decided by
+    which arm ran first, and it is not observable from inside one arm.
+    """
+    from selfevo.cluster_lora.partition import DEFAULT_CONTROL_MEMORY
+
+    ids = [f"p{i}" for i in range(6)]
+    feats = np.array([[1.0], [1.0], [1.0], [-1.0], [-1.0], [-1.0]])
+    DEFAULT_CONTROL_MEMORY.reset()
+    first = keyfn("random_matched", warmup=0, seed=5)
+    first.begin_batch([f"0:{i}" for i in range(6)], feats, group_ids=ids)
+    assert len(first.partitioner.control_memory) == len(ids)
+    assert len(DEFAULT_CONTROL_MEMORY) == 0, (
+        "the control arm carried its draw on the process-global memory, so a second arm in "
+        "this process would inherit this arm's control assignment"
+    )
+    # Over a sweep rather than one further seed: six groups over two clusters admit only
+    # twenty assignments, so a single second seed can collide with the first by chance and a
+    # test that happened to draw one would pass whatever the arms shared.
+    drawn = set()
+    for seed in range(6, 16):
+        other = keyfn("random_matched", warmup=0, seed=seed)
+        other.begin_batch([f"0:{i}" for i in range(6)], feats, group_ids=ids)
+        drawn.add(other.partition.labels)
+    assert len(drawn) > 1, (
+        f"ten arms under ten seeds produced one control ({drawn}); they carried each "
+        "other's draw, so which control an arm gets is decided by which arm ran first"
+    )
+
+
 def test_the_none_mode_needs_no_features_and_puts_everything_on_shared():
     kf = ClusterLoRAKeyFn(mode="none")
     kf.begin_batch(["0:0", "0:1"], np.zeros((2, 1)))
