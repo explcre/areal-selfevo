@@ -4245,3 +4245,53 @@ The general form is worth stating because it is not specific to this stack: **a 
 promptly and a launch that detaches are different properties, and only the second one keeps a job
 alive.** Checking that a process started is not checking that it will survive the thing that
 started it.
+
+### CORRECTION to the entry above: the SIGTERM was a deliberate reap of an already-wedged run
+
+The preceding section attributed A0's death to the ssh channel closing and called it "a clean
+shutdown of a healthy run". **Both halves are wrong**, and the entry immediately above this one --
+written by the agent that actually investigated the process state -- has the truth. Recorded here
+rather than by editing the mistake away, because the reasoning error is the useful part.
+
+**The run was not healthy. It had been deadlocked since 12:40:14**, parked in
+`_save_recover_checkpoint` with both actor ranks inside a `gather_object` collective and
+`/proc/<pid>/io` byte counters unchanged over a 10 s window. It logged `Step 24/12853` at 12:39:46
+and produced nothing for the next 42 minutes. **The SIGTERM at 13:22:35 was that agent's clean
+supervised reap of the wedge, not a side effect of my ssh session dying.**
+
+**And the wedge was caused by my own change.** I set `recover.mode=auto` with
+`recover.freq_steps=25` at 12:21 to stop relaunches discarding work. `recover_checkpoint` has
+`Birth: 2026-09-02 12:40:14` -- created for the first time ever, at step 24 of that run -- and is
+still empty. Recovery had never once fired on this stack, and the first time it did, it hung. So
+the change I made to stop losing work is what destroyed that hour, and it would have wedged the
+13:24 relaunch at step 24 as well.
+
+**What misled me.** I read `A0_EXIT=143` and an orderly `Destroying TrainController` sequence and
+concluded a healthy run had been terminated from outside. An orderly shutdown says the *shutdown*
+was orderly; it says nothing about whether the thing being shut down was working. The check that
+would have caught it costs one command -- GPU utilisation was **0% on all four cards while holding
+66-78 GiB**, and the last `Step` line was 42 minutes old. I had in fact seen 0% utilisation in my
+own earlier output at 12:35 and read it as a between-steps lull. **A number that is consistent with
+the story you already believe still has to be checked against the story you do not.**
+
+The launch-method point in the previous section stands on its own and is unaffected: a run should
+outlive the connection that started it, and A0 is now under `tmux`. It simply was not what killed
+this run.
+
+**Current state.** A0 relaunched 13:39:14 under tmux with `RECOVER_MODE=disabled` and periodic
+eval on, both asserted from the run's own artifacts rather than the launcher: `resolved_config.yaml`
+reads `mode: disabled`, and `process_env.json` carries all nine `SELFEVO_PERIODIC_EVAL_*` and
+`MATH_EVAL_DATA` keys. Disabling recovery costs nothing that was ever working -- it has produced no
+usable resume in three launches -- and removes the step-24 wedge. The open risk is unchanged and
+belongs to whoever reads the first eval point: `SELFEVO_PERIODIC_EVAL_BASE_URL` is pinned to
+`http://172.28.127.18:32735/v1`, and port 32735 has now been observed serving `a0_math-v*` ids
+across three separate launches, so it appears derived from the experiment identity rather than
+assigned freshly -- but that is an inference from three observations, not a guarantee.
+
+**One further gap, found the hard way.** Clearing the `proxy_rollout_server` orphans that
+`reap_a0.sh` does not match, I killed by process group using a pattern that **matched my own shell**
+and killed the ssh session issuing it. The GPUs and the orphans did come out clean, so nothing was
+lost, but this is the third time today a `pkill`-family pattern has matched the command running it.
+The bracket-class trick (`proxy_rollout_serve[r]`) does not help when the pattern appears inside a
+longer command string that also contains it; the fix is to exclude `bash -c` and the caller's own
+pid explicitly, which `reap_a0.sh` already does and my ad-hoc loop did not.
