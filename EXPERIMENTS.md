@@ -45,6 +45,75 @@ experiment has yet used either. The routed 30B arm is where they belong.
 a feature, grep its resolved config for the switch. `enabled:`, `router:` and `group_routing:`
 are three separate places a routing arm can be silently off.
 
+## 2026-09-02 — Cluster-routed adapters built; the label-stability finding that changes the method
+
+Commit `63a085d5`, `selfevo/cluster_lora/` + `selfevo/FINDINGS_cluster_lora.md`. All CPU. Three
+findings arrived BEFORE any GPU ran, and the first would have silently destroyed the method.
+
+**HDBSCAN renames its clusters on every refit, so a label is not an identity.** On four perfectly
+separated blobs whose membership did not change at all, three consecutive refits labelled the same
+six groups `2`, then `3`, then `0`. **Churn 1.0** — every group changes adapter every step while
+the clustering is structurally identical, so every expert receives somebody else's gradient: the
+method failing through exactly the mechanism meant to prevent interference. MEDS is not wrong; it
+uses the label only to look up a cluster SIZE for reward shaping, where a permutation costs
+nothing. Selecting an ADAPTER by that name is a different use. Fix (`MEDSPartitioner._resync`):
+match new raw labels to existing expert ids by OVERLAP on the buffered groups, greedily, largest
+first; unmatched raw labels get a fresh expert.
+
+| arm | churn per step |
+|---|---|
+| naive MEDS (kNN classify against raw labels) | **1.0** at every step |
+| with overlap matching | **0.0 - 0.083** |
+
+The naive figure is a LIVE counterfactual test, not a remembered number — without it the bound on
+the fixed version could be satisfied by a partitioner that never clustered anything. The residual
+0.083 is the buffer growing and a blob splitting off a fragment; bounded and reported.
+
+**MEDS' shipped `min_cluster_size=2` over-fragments**: 24 points in four separated blobs gave 6
+clusters + 2 noise; at 4 or 6 it gave 4 + 0. Every extra cluster is another expert trained on
+fewer groups. Exposed as `--min-cluster-size` and a run must SWEEP it (cheap, CPU-side); 5 is a
+sensible start for the 128-group MATH batch.
+
+**The clustering sees only DIRECTION** — the vendored path L2-normalises before euclidean HDBSCAN,
+so two features differing only in magnitude are the same point and the space is a sphere, on which
+nothing is far from everything. A 2-D outlier at 45 degrees was measured being absorbed into a
+neighbouring blob.
+
+**Features need an extra forward**: the layer-wise logits are NOT reachable at the
+`ClusterRouter.key_fn` seam without one. Its cost as a fraction of a training step is still
+outstanding and must be counted against A0 for a matched-budget claim.
+
+### The probe, and the floor it reports about itself
+
+Split as specified: `interference_dump.py` (GPU; torch/peft/transformers only) writes per-group
+sketches; `interference_analyze.py` (CPU; numpy/sklearn/hdbscan under `~/venv_probe`) forms all
+four partitions. A cluster's gradient is the exact SUM of its members', so any partition is free
+once the dump exists. **The dependency split is tested, not assumed** — one test runs both halves
+as two real processes in their two real venvs and asserts the analysis venv has no torch and the
+training venv no hdbscan.
+
+**Resolution floor: a CountSketch cosine has standard error ~1/sqrt(dim), so the floor is
+3/sqrt(8192) = 0.0331.** A dense Gaussian projection of 1e8 x 8192 would be 3 TB and cannot be
+formed. **So a cross-task cosine of ~1e-5 cannot be confirmed from sketches at any dimension this
+probe can afford**, and the analysis says so: every block carries `resolution_floor` and a
+`resolved` flag, and an unresolvable cosine is reported as below the floor rather than as a
+number. That is the honest answer to a reviewer citing 2608.03573; the stored full gradients for
+the first 8 groups are the only place a 1e-5 claim could be checked at all.
+
+Three statistical properties worth knowing before reading any result: the numerator of
+`cancellation` is partition-invariant (`sum_c g_c` is the batch gradient regardless), so it varies
+only through `sum_c ||g_c||` — measured 25.07 for the true partition against 9.6-13.2 across five
+control seeds. The bootstrap CI need NOT contain the point estimate (resampling duplicates biases
+a cluster sum toward its duplicated directions) and the tests do not require it to; the bootstrap
+SPREAD is the independent discriminator, std 0.0085 true vs 0.064-0.090 permuted. And **K=2 is not
+enough** — one pair only, control mean cosine swinging -0.12 to -0.22 across seeds; prefer K>=4.
+
+**CPU verification on a planted structure with a known answer**: four clusters along simplex
+directions, every pair cosine exactly -1/3. True partition -0.3025; `random_matched` -0.117 to
+-0.221 over five seeds. `elrea` is checked against its NULL (the fixture's prompt gradients carry
+no behavioural information, so it must land near the control), and `task` is checked to SKIP with
+a reason on a single-task batch rather than report a spurious zero.
+
 ## 2026-09-02 — LiveCodeBench generation path validated live; grading held, two generation bugs found
 
 35 problems (20 stdin/atcoder + an explicit 15-id leetcode slice, because `--limit N` never
