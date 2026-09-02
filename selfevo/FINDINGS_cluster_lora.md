@@ -476,3 +476,54 @@ because the tests that missed them looked entirely reasonable:
 
 Two of those five (1 and 4) are defects that would have produced a plausible, publishable
 number rather than an error.
+
+## 11. How to run it on the H100 box
+
+The dump needs only torch, peft and transformers, so it runs in the H100's own venv with no
+installs. Nothing here starts a training job.
+
+    # one dump per checkpoint; three checkpoints gives the early/mid/late comparison
+    for CKPT in initial_lora globalstep24 globalstep49; do
+      python -m selfevo.cluster_lora.interference_dump \
+        --model  <base model path> \
+        --adapter ~/runs/.../$CKPT \
+        --rollouts ~/runs/harnessT_trunc/rollouts_math64.jsonl \
+        --out    ~/runs/interference_$CKPT.npz \
+        --sketch-dim 8192 --full-grad-groups 8 --device cuda --dtype bfloat16
+    done
+
+`--adapter` is not optional in practice: without it `B = 0`, `dL/dA` is exactly zero and half
+of every gradient vanishes. The dump prints `zero_block_fraction` so a run made without it is
+identifiable after the fact rather than mistaken for a trained one; expect ~0.5 if it was
+omitted and well under that otherwise.
+
+The dump prints `seconds_gradients`, `seconds_features` and `seconds_total`. Those are the
+first real timings for the extra forward and belong in this file when they exist -- no
+estimate is recorded here, because CPU timings on the A100 box are contaminated by thread
+contention with the live job (section 6.4).
+
+If the rollout jsonl uses field names the loader does not know, it raises naming the file, the
+line, the names it looked for and the keys the record has. Pass `--group-key` / `--task-key` /
+`--reward-key` rather than converting the file.
+
+Then, on the A100 box, under the venv that has the clustering dependencies:
+
+    for CKPT in initial_lora globalstep24 globalstep49; do
+      for MCS in 2 5 8; do
+        PYTHONPATH=~/areal-selfevo ~/venv_probe/bin/python \
+          -m selfevo.cluster_lora.interference_analyze \
+          --dump ~/runs/interference_$CKPT.npz \
+          --out  ~/runs/interference_${CKPT}_mcs${MCS}.json \
+          --bootstrap 1000 --min-cluster-size $MCS
+      done
+    done
+
+Read `contrasts` first -- `meds_minus_random_matched`, `meds_minus_elrea`,
+`meds_minus_task` -- then check `resolved` and `resolution_floor` before believing any single
+`mean_cosine`, and read `sketch_validation` to see how far the sketched cosines sat from the
+exact ones on the pairs whose full gradients were kept. A `task` block reporting `skipped` is
+the correct output for a single-task batch, not a failure.
+
+The `min_cluster_size` sweep is the point of running three of them: it decides how many
+experts the method would allocate, MEDS' shipped 2 was measured over-fragmenting, and the
+sweep costs nothing because it is CPU-side on a dump that already exists.
