@@ -45,6 +45,56 @@ experiment has yet used either. The routed 30B arm is where they belong.
 a feature, grep its resolved config for the switch. `enabled:`, `router:` and `group_routing:`
 are three separate places a routing arm can be silently off.
 
+## 2026-09-02 — LiveCodeBench v6 wired with sandboxed grading; gold self-verifies 175/175
+
+Commit `11757e61`. `livecodebench/code_generation_lite` v6, whole release: **175 problems / 7000
+test cases** (463 public + 6537 private), stdin (atcoder, 112) and functional (leetcode, 63),
+contests 2025-01-04 to 2025-04-06. Upstream prompt reproduced so scores stay comparable.
+
+**Sandbox**: three tiers, strongest auto-selected and recorded next to every score — `bwrap`
+(user/net/pid/ipc/uts namespaces, read-only root, one writable scratch, die-with-parent) on this
+box; `unshare -rn`; plain subprocess. Every tier bounds RLIMIT_AS/CPU/FSIZE/NPROC/CORE, scrubs
+env, uses a fresh cwd, redirects stdio to FILES not pipes (a print loop cannot deadlock the
+grader), SIGKILLs the process group. Honestly: no seccomp, no hypervisor, no cgroup.
+
+**Gold through its own grader: 175/175 on all 7000 tests** (replay oracle keyed by SHA-256 of
+the delivered bytes — the release ships no reference solutions) **plus 10 hand-written computing
+solutions 10/10**; **31/31 known-wrong submissions fail**. **The first gold run scored 171/175
+and all four misses were one grader bug**: a 1 MiB read-back cap while 14 cases across 4
+problems expect up to 3.28 MiB, so truncated output compared unequal and correct code scored
+WRONG. Cap now set from the measured max, and a cut-off answer is an undecidable comparison
+reported as a HARNESS FAULT with non-zero exit — never quietly counted against the model.
+
+Two things that look like grader bugs and are not: the dataset repeats test inputs (372/7000
+across 70 problems), so a withheld test must be uniquely keyed to prove private tests run; and
+stray stdout is fatal for stdin problems but irrelevant for functional ones.
+
+**Accounting**: eight buckets (`pass, wrong_answer, runtime_error, timeout, output_limit,
+no_code, harness_error, gen_failed`), crash/hang/unparseable are FAILS in the denominator; only
+`gen_failed` (endpoint returned nothing) is excluded and the row reports `accuracy` and
+`accuracy_all` side by side. Per-problem JSONL artifact. Mutation: **28/28 applied killed, 3
+honest SKIPs** (one observationally equivalent, one would SIGKILL pytest itself, one hangs the
+harness). Tests 1505 -> 1611.
+
+**Not yet measured, needs a live model**: the prompt->completion round trip, `extract_code` on
+real output (the true `no_code` rate subtracts directly from the score), `max_tokens=16384` set
+by analogy not measurement, the 12 s per-test wall clock on the 80 hard problems, and any
+score at all — there is no 32B-tier number yet.
+
+## 2026-09-02 — The H100 arms ran on a RE-DERIVED selector because origin lacked the audited one
+
+The truncation treatment/control arms on 192.222.54.46 were briefed to fetch `da024c4d` (the
+audited selectors, 56/56 mutants). Origin was at `a67ef71f`; nothing after it had been pushed.
+The agent could not fetch, so it re-implemented `selectors.py` (`ecf97f84`, 539 lines vs 820).
+Diffed today: same thresholds and treatment rule, but its `RateMatchedControlSelector` takes a
+NOMINAL `move_rate` and an `up_share` destination parameter, whereas the audited control replays
+the treatment's REALISED move/stay multiset on a seeded deck (exact at every deck boundary) and
+draws destinations uniformly. A nominal-rate control is the failure `proportions.py` documents.
+Whether the running arms are rate-matched by construction is therefore NOT established; the
+agent has been instructed to finish, diff, reconcile to origin's harness package, and stop
+before any rerun. Origin now holds everything through `13879333`. Lesson recorded: push before
+any brief that says "fetch X", and forbid re-implementing a named file.
+
 ## 2026-09-01 — The harness axis has a consumer: the paper's second target is no longer a name
 
 The claim this paper is built on is that a trajectory can be routed between two targets, the
