@@ -3611,3 +3611,66 @@ its own model id and lists it at `/v1/models`. The step-149 server did exactly t
 to generate against an unlisted id — but it has not been exercised against the *training*
 server, only against a hand-launched one. This is the only part of the path that a CPU dry run
 cannot prove.
+
+## Gate 0 ANALYSIS: the confirmatory dump reads as a NULL, and the pre-registered gate closes (2026-09-02)
+
+The dump recorded above was analysed with `selfevo/cluster_lora/interference_analyze.py` at three
+settings of `min_cluster_size`. **The decision rule was fixed before any of these numbers existed**
+(`experiments/m25/PLAN.md`): proceed to the clustered arms only if the MEDS partition's mean
+pairwise gradient cosine sits BELOW the size-matched random partition's by more than the bootstrap
+interval; treat MEDS ~ random as evidence the clusters are noise and stop.
+
+**Mean pairwise cosine between per-cluster LoRA gradients, 140 informative groups,
+`globalstep199`:**
+
+| min_cluster_size | K | pairs | MEDS | random_matched | ELREA (prompt-grad) |
+|---|---|---|---|---|---|
+| 2 | 23 | 253 | -0.001221 | -0.001379 | +0.001335 |
+| 3 | 18 | 153 | -0.000002 | -0.000967 | +0.003569 |
+| 5 |  8 |  28 | +0.005785 | -0.003292 | +0.011546 |
+
+**Conflict rate (fraction of cluster pairs with negative cosine):** MEDS 0.502 / 0.477 / 0.500
+against random 0.534 / 0.484 / 0.500. One half is what a coin gives.
+**Cancellation** `||sum g_c|| / sum ||g_c||`: MEDS 0.242 / 0.274 / 0.407, random 0.244 / 0.272 /
+0.404 -- indistinguishable.
+
+**Verdict: NULL, and the sign is opposite to the hypothesis at ALL THREE settings.** MEDS is
+consistently ABOVE random, i.e. its clusters are if anything slightly LESS conflicting than
+feature-blind ones. The gate closes: **no per-cluster LoRA experts are built on this signal.**
+
+**Three readings that the earlier, weaker dump could not settle.**
+
+1. **The clustering is NOT degenerate.** The step149 probe found K=2 at every setting and it was
+   unclear whether the null was a clustering failure. Here MEDS finds 8 to 23 clusters depending
+   on the setting, with 55 groups assigned to noise at mcs=3. It separates the population fine.
+   What it does not separate is GRADIENTS.
+2. **Conflict exists, but it is isotropic.** Cancellation of 0.24 to 0.41 means the per-cluster
+   gradients do substantially cancel. They just cancel the same amount under a random labelling,
+   so the conflict is not aligned with anything we can compute. "There is almost no STRUCTURED
+   gradient there to partition" is the accurate statement, not "there is no conflict".
+3. **Rollouts buy nothing here.** ELREA-style prompt-gradient clusters, which need no rollouts at
+   all, have the HIGHEST mean cosine and the LOWEST conflict rate (0.490 / 0.438 / 0.321) at every
+   setting. The secondary argument -- that behavioural features are what make the partition work --
+   does not survive either.
+
+**The `task` partition is null at every setting**, as expected: the probe batch is single-corpus
+(DeepMath), so there is no cross-task calibration available on it. The cross-task scale bar still
+has to come from a mixed batch.
+
+**Environment note, and a guard that fired correctly.** `hdbscan` and `scikit-learn` are
+DELIBERATELY absent from the training venvs, because resolving them can pull a different numpy or
+scipy underneath a running job. The first analysis attempt therefore raised
+`PartitionUnavailable: MEDS clustering is unavailable` and **refused** rather than silently falling
+back to `random_matched` under the MEDS label -- which is the exact failure mode fixed earlier in
+`partition_from_config`. A separate CPU-only `~/venv_probe` was built for the analysis; the
+training env was not touched.
+
+**What survives.** This kills MEDS as a partition for separate adapters. It says nothing about
+MEDS as a TARGETING key for where a data supplier should act, which requires only that clusters
+identify consistent error patterns, not that they have separable gradients. That is a weaker and
+separately testable condition, and the cheap version of the test is whether MEDS clusters differ
+in SOLVE RATE by more than a size-matched random partition does -- runnable on rollouts we already
+have, on CPU.
+
+Written to `paper_src/results.tex` as Sec. "The interference probe returns a null".
+Artifacts: `~/runs/probe/analyze_step199_mcs{2,3,5}.json`, `~/runs/probe/analysis_outer.log`.
