@@ -228,6 +228,35 @@ The earlier collapse data is 1.5B on MATH; nobody has measured the threshold at 
 and `route/truncated_row_fraction` is the live instrument those runs lacked. Earlier, later or
 absent is a finding either way.
 
+**ADDED 2026-09-02 (PI): `r_covariate` — code-as-policy over covariates ONLY, ahead of the
+published baselines.** The feature audit found that of the seven observability features, **two are
+k-functions** (`solve_rate`, `reward_std`) and **five are covariates** (`mean_response_len`,
+`len_dispersion`, `mean_logprob`, `logprob_dispersion`, `truncated_fraction`) — and that the
+102/102 rule-collapse constrains NOTHING about covariates, since four of the five were held constant
+across those contexts. **Whether any covariate carries routing information beyond the pass count is
+therefore untested**, and under binary rewards k is all the outcome statistics contain, so this is
+the question the method rests on.
+
+`router=code_policy` is the direct test and the executor is already hardened (AST allowlist,
+subprocess cost-vetting, ~150 adversarial policies, 26/26 mutants, `PolicyRejected` at
+construction); `actor.py:610` already passes the seven features as `extra`. The arm's policy must
+read **only covariates and never a k-function** — that exclusion IS the experiment — with the source
+in a file under `experiments/`, fixed in advance, and archived with the run.
+
+Control and protocol identical to the others: `router=random` at `r_covariate`'s REALISED
+proportions, `solved_advantage=0.5`, evaluated at `min(149, first crossing)`, name-pinned.
+
+**Reading either outcome.** Beating its matched control means covariates carry signal beyond k and
+the method has a mechanism. Failing to means the pass-count collapse is the whole story at this
+scale — a strong negative that would explain every routing null in this repo. Both are more
+informative than reproducing DyME or Co-Harness, which is why this arm precedes them.
+
+**The LLM-generator idea sits behind this, not beside it.** The fuller design is an LLM writing that
+policy source from observability and MEDS signals. The safe executor exists; what is missing is the
+generator, and the MEDS cluster id is not in the feature set so a policy cannot currently read it.
+But a generator has nothing to find if no covariate carries signal, so `r_covariate` is its
+precondition rather than a detour.
+
 **Sequencing on one box**: A0 continues (it is the baseline for every arm), the confirmatory Gate 0
 dump takes ~25 minutes at `globalstep199`, then R-learned, then R-control configured from
 R-learned's measured proportions. R-rule last if time allows, since DyME and HPT are also cloned
