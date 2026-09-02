@@ -367,6 +367,81 @@ def test_an_arm_with_no_engine_says_so_rather_than_reporting_nothing(monkeypatch
     assert emitted["cluster_lora/plan_groups"] == float(B // G)
 
 
+def assert_stamps_track_the_plan(actor, batches):
+    """Drive ``batches`` real advantage computations and check the stamp against the plan.
+
+    Two properties, and both are needed. The stamp on a batch must equal the step the plan
+    armed for it records, since that equality is the whole of the engine's staleness check;
+    and the value must MOVE between batches, since a stamp that is always the same number
+    satisfies the first property and identifies nothing. One batch cannot tell those apart,
+    which is why this drives several.
+
+    The two arming seams start their counter at different points -- the routed one reads
+    ``_selfevo_batch`` after ``_route_groups`` has advanced it, the unrouted one before --
+    so the absolute value is deliberately not asserted. What is asserted is that the plan and
+    the batch agree and that consecutive batches differ, which is what the check downstream
+    actually rests on.
+
+    Args:
+        actor: An actor with a ``FakeEngine`` and a cluster arm configured.
+        batches: How many consecutive batches to drive.
+    """
+    seen = []
+    for _ in range(batches):
+        data = make_batch(MIXED)
+        actor._compute_advantages(data, meta())
+        tag = data[wiring.CLUSTER_BATCH_KEY]
+        assert tag.shape == data["loss_mask"].shape, (
+            "the identity is not shaped like the batch, so microbatch splitting will not "
+            "carry it the way it carries group_ids"
+        )
+        stamped = set(tag.reshape(-1).tolist())
+        plan_step = actor.engine._selfevo_cluster_plan.step
+        assert stamped == {plan_step}, (
+            f"the batch is stamped {sorted(stamped)} and its plan was armed for {plan_step}; "
+            "the engine compares exactly those two and would refuse this arm own batch"
+        )
+        seen.append(plan_step)
+    assert len(set(seen)) == batches, (
+        f"{batches} batches were stamped {seen}; an identity that does not move between "
+        "batches identifies nothing, and a stale plan passes the check"
+    )
+
+
+def test_the_armed_batch_carries_the_identity_its_plan_records(monkeypatch):
+    """The plan and the batch have to agree, and only this seam can make them.
+
+    The engine refuses a plan armed for a different batch by comparing the plan step against
+    the identity stamped on every row of the batch. That check is worth nothing if the stamp
+    is absent, or constant, or taken from a different counter than the plan -- and mutation
+    testing found exactly that gap: three defects in the WRITER survived a suite that tested
+    only the reader, because every engine test stamps its own batches by hand.
+
+    Asserted over consecutive batches, since one batch cannot tell a correct stamp from a
+    stamp that is always zero.
+    """
+    actor = routed_actor(monkeypatch, "none", engine=FakeEngine())
+    assert_stamps_track_the_plan(actor, 3)
+
+
+def test_the_unrouted_arm_stamps_the_batch_it_armed_as_well(monkeypatch):
+    """The second arming seam writes the same stamp, or the engine refuses its own plan."""
+    monkeypatch.setenv(wiring.CLUSTER_LORA_ENV, "none")
+    actor = make_actor(GroupRoutingConfig(enabled=False))
+    actor.engine = FakeEngine()
+    assert_stamps_track_the_plan(actor, 3)
+
+
+def test_an_unconfigured_run_stamps_nothing_on_the_batch(monkeypatch):
+    """The rollback: no cluster arm, no extra column on the trajectory dict."""
+    monkeypatch.delenv(wiring.CLUSTER_LORA_ENV, raising=False)
+    actor = make_actor(CLUSTER_ROUTED)
+    actor.engine = FakeEngine()
+    data = make_batch(MIXED)
+    actor._compute_advantages(data, meta())
+    assert wiring.CLUSTER_BATCH_KEY not in data
+
+
 def test_an_unconfigured_run_arms_nothing_outside_the_routing_branch_either(monkeypatch):
     """The rollback, on the branch that is now reachable with group routing switched off."""
     monkeypatch.delenv(wiring.CLUSTER_LORA_ENV, raising=False)
