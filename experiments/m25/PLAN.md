@@ -40,6 +40,34 @@ Per partition: pairwise cosine of per-cluster LoRA gradients, conflict rate, can
 `||Σg_c||/Σ||g_c||`, sizes, bootstrap CI on mean cosine. Three checkpoints (early/mid/late) if
 available, since interference plausibly grows as the policy specialises.
 
+**PRECONDITION on the probe batch, added 2026-09-02 after a measured false-negative risk.**
+A GRPO group whose rollouts all score alike (k=0 or k=G) has every advantage identically zero and
+therefore an EXACTLY zero gradient. Measured on the first real dump: **90 of 128 groups were
+unanimous, so 90 sketches were exactly zero** — the k-histogram (k=0: 28, k=8: 62) predicts the
+count exactly, so this is arithmetic, not a bug.
+
+Consequences, both of which invalidate the gate rather than merely weakening it:
+- **The measurement would rest on 38 groups, not 128**, and every partition's mean cosine would be
+  computed over a set where 90 members are zero vectors — pulling MEDS, random-matched and ELREA
+  toward the same value for a reason about advantage sparsity rather than about clustering. A
+  "MEDS approximately equals random" reading would satisfy the STOP rule below **while meaning
+  nothing about clusters.** That is a false negative that kills the method on an artifact.
+- **The damage is asymmetric.** The ELREA prompt-gradient sketch is unaffected (0 of 128 zero), so
+  the MEDS-vs-ELREA contrast would compare 38 usable groups against 128.
+
+**So Gate 0 may only be read on a batch where the NON-UNANIMOUS fraction is high.** Require at
+least 60% of groups with 0 < k < G, report the k-histogram alongside every probe result, and treat
+any dump whose zero-sketch fraction exceeds 40% as UNREADABLE rather than as evidence. This is the
+same regime error as the retracted M7 teacher demotion and GOAL.md 2c's training-corpus gap: on
+data the model has largely solved or wholly failed, the quantity of interest does not exist.
+
+**Related probe defect (author's call, not a plan item):** `--full-grad-groups N` stores the FIRST
+N groups in file order, which on a 70%-unanimous batch has ~0.5% chance of yielding the two
+non-zero gradients `_sketch_validation` needs — it stored 8 groups of which 7 were unanimous, so
+the sketch went unvalidated. Store the first N NON-UNANIMOUS groups instead. Separately, the store
+is only read at the end, so paging it to host memory frees ~2.1 GB of card and makes N a
+statistical choice rather than a memory one.
+
 **Decision rules, fixed now:**
 - Proceed to arms iff MEDS mean cosine is below the random partition's by more than the
   bootstrap CI **and** MEDS conflict rate is materially above the cross-task calibration.
