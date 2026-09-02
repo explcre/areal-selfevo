@@ -23,13 +23,23 @@ FIVE THINGS THIS MODULE REFUSES TO DO, each because the tree already records the
    second check is not derived from the first: it compares generations returned by the
    harness against indices read from ``olympiadbench_split.json`` on disk.
 
-3. **It does not report a liveness verdict from greedy text alone.** The step-149 probe did
-   exactly that and raised a FALSE ALARM: comparing logprobs on the same prompts showed the
-   adapter and base differing by max |dlogprob| 0.041, i.e. the adapter *was* live and a small
-   LoRA delta had moved the distribution without moving the argmax. ``greedy_differ_frac`` is
-   still emitted, because it is what a reader intuitively looks for, but the verdict series
-   ``liveness/is_live`` is decided on logprobs. A zero in ``greedy_differ_frac`` is a prompt
-   that is too easy, not a dead adapter.
+3. **It does not report a liveness verdict from greedy text alone, and it does not compare
+   two independent generations position by position.** The step-149 probe compared TEXT and
+   raised a FALSE ALARM: the adapter *was* live, differing by max |dlogprob| 0.041, and a
+   small LoRA delta had moved the distribution without moving the argmax. Its replacement
+   generated greedily from each side and zipped the two logprob streams -- and a NEGATIVE
+   CONTROL run on 2026-09-02 (A0 step ~100, base model probed against ITSELF) returned
+   ``is_live=1`` with max |dlogprob| 0.978, against 1.007 for a real adapter. The two do not
+   separate, so every verdict that metric ever produced was uninformative. The cause is that
+   greedy decoding on a batching server is NOT reproducible: the same weights produced
+   different text on 1 of 6 probes, and after the argmax paths diverge ``zip`` subtracts the
+   logprobs of DIFFERENT TOKENS, which is a number near 1.0 whatever the adapter is doing.
+   :func:`measure_liveness` therefore generates nothing. It scores a FIXED token sequence --
+   the probe prompt itself -- under each set of weights, so every compared position is the
+   same token in the same context, and it scores the BASE TWICE so the same-weights
+   difference is measured in band and the verdict is a comparison against it rather than
+   against a constant. On identical weights that control is the same number as the signal and
+   the verdict is inert, by construction rather than by hope.
 
 4. **It never reports a score for zero problems.** :func:`assert_scored_something` raises
    rather than let ``n_graded == 0`` reach W&B as a confident 0.0, and every failure path
@@ -89,7 +99,9 @@ COST. At the default cadence this is a measured 3.9% of training throughput; see
 and a small ``limit`` buys a wide Wilson interval: at 64 problems the interval is roughly
 +/-12 points, which cannot resolve a small gain. That is the intended trade. The accuracy
 curve is here to show gross trend and catch collapse; the liveness curve, which costs
-seconds, is the sensitive early warning.
+seconds, is the sensitive early warning. The liveness probe is three prefill-only requests
+per prompt and generates no tokens, so its cost does not grow as the run's completions
+lengthen.
 
 THE ENDPOINT is not configuration. AReaL's launcher allocates the sglang port and the server
 binds the host interface rather than localhost, so no constant written before the run can be
@@ -215,9 +227,11 @@ METRIC_KEYS = frozenset(
         "periodic_eval/cost/seconds",
         "periodic_eval/cost/throughput_frac",
         "periodic_eval/liveness/n_probes",
-        "periodic_eval/liveness/greedy_differ_frac",
+        "periodic_eval/liveness/prompts_live_frac",
         "periodic_eval/liveness/max_abs_dlogprob",
         "periodic_eval/liveness/mean_abs_dlogprob",
+        "periodic_eval/liveness/noise_max_abs_dlogprob",
+        "periodic_eval/liveness/noise_mean_abs_dlogprob",
         "periodic_eval/liveness/is_live",
         "periodic_eval/adapter/version",
         "periodic_eval/adapter/n_served",
@@ -286,7 +300,10 @@ _ROW_KEY = {"trend_score": "accuracy"}
 #: Probe prompts for the liveness measurement. Deliberately NOT the trivial arithmetic the
 #: step-149 probe used ("Compute 12*13"): those are prompts where base and adapter agree to
 #: the bit, which is what produced the false alarm. These are long-form and open-ended, the
-#: regime where a small LoRA delta actually shows up in the distribution.
+#: regime where a small LoRA delta actually shows up in the distribution. They are SCORED, not
+#: continued: the probe reads the per-position logprobs the model assigns to these exact
+#: tokens, so both sides are measured on one fixed sequence and nothing depends on what either
+#: of them would have generated.
 DEFAULT_PROBE_PROMPTS = (
     "Solve step by step: let x satisfy x^3 - 6x^2 + 11x - 6 = 0. Find every real root.",
     "Prove that the sum of the first n odd positive integers equals n^2.",
@@ -296,11 +313,21 @@ DEFAULT_PROBE_PROMPTS = (
     "Compute the area enclosed by y = x^2 and y = 2x, showing the integration.",
 )
 
-#: Below this maximum absolute per-token logprob difference the adapter is treated as inert.
-#: Chosen against the step-149 measurement: a genuinely live adapter 149 steps in produced
-#: max |dlogprob| of 0.041 and 0.012, so a threshold three orders of magnitude below the
-#: smaller of those separates "live but barely moved" from "bit-identical".
-DEFAULT_LIVE_EPS = 1e-4
+#: The margin by which the adapter-versus-base difference must EXCEED the same-weights
+#: difference measured in the same evaluation. It is a margin, not a threshold: the absolute
+#: scale of a logprob difference is a property of the server, not of the adapter. Scoring the
+#: base model twice against itself on A0's rollout server returned exactly 0.0 on 22 of 24
+#: attempts and 0.605 on the other two -- the server has two numerically distinct kernel paths
+#: for the same input, and 0.605 is larger than the 0.397 an adapter that had trained for 130
+#: versions produced. Any fixed threshold is therefore either blind to a real adapter or fooled
+#: by the server; only the in-band control separates them.
+#:
+#: The number is a FLOOR under that margin, not the verdict. It is set above the largest
+#: same-weights difference this project has measured -- 0.00952 pooled, from 39 negative
+#: controls against A0s own rollout server -- and below the weakest adapter signal measured
+#: on the same server, 0.0427, so a control that slips past the in-band comparison still has
+#: to clear a number no identical pair of weights has ever reached here.
+DEFAULT_LIVE_EPS = 0.01
 
 
 class ReportSplitTouched(RuntimeError):
@@ -1581,57 +1608,92 @@ async def run_one_benchmark(
 
 @dataclass(frozen=True)
 class LivenessReport:
-    """What the adapter-versus-base probe measured.
+    """What the adapter-versus-base probe measured, and what the same-weights control did.
+
+    Every difference field has a ``noise_`` twin measured in the SAME evaluation, against the
+    SAME token positions, by scoring each side TWICE and comparing it with itself. The twin is
+    the negative control, and it is a field rather than a thing someone remembers to run: a
+    metric with no control beside it cannot be read, and the metric this replaced was believed
+    for two evaluation points before anyone pointed the probe at the base model and found it
+    reported ``is_live=1`` there too.
 
     Attributes:
-        n_probes: Prompts compared.
-        greedy_differ_frac: Fraction whose greedy TEXT differs. Emitted because it is what a
-            reader looks for first, but NOT the verdict: at A0's step 149 this was 0.0 on a
-            demonstrably live adapter.
-        max_abs_dlogprob: Largest absolute per-token logprob difference over all probes. This
-            is the verdict signal, because a small LoRA delta moves the distribution long
-            before it moves the argmax.
-        mean_abs_dlogprob: Mean of the same quantity, for a smoother curve.
-        is_live: 1 when ``max_abs_dlogprob`` exceeds the configured epsilon, else 0.
-        n_tokens_compared: Token positions that could be compared, so a verdict resting on
-            almost no evidence is visible rather than implied.
+        n_probes: Prompts scored.
+        prompts_live_frac: Fraction of probe prompts whose own signal beat their own noise.
+            A per-prompt breakdown of the verdict, not a second verdict. It replaces
+            ``greedy_differ_frac``, which measured how often greedy TEXT differed and which
+            the negative control showed to be 0.167 when the base model was compared with
+            ITSELF -- it was reading the server's batching nondeterminism, not the adapter.
+        max_abs_dlogprob: Largest absolute per-position logprob difference between adapter and
+            base, over the pairing that produced ``mean_abs_dlogprob``. Reported, but NOT the
+            verdict: one position is exactly what the server's two kernel paths disagree on.
+        mean_abs_dlogprob: Mean of the same quantity over every compared position. This IS the
+            verdict signal, because a numerical outlier at one position out of hundreds moves
+            it by a factor of the token count while a real adapter moves every position.
+        noise_max_abs_dlogprob: ``max_abs_dlogprob`` of a model against ITSELF, worst side.
+        noise_mean_abs_dlogprob: ``mean_abs_dlogprob`` of a model against ITSELF, worst side.
+        is_live: 1 when ``mean_abs_dlogprob`` exceeds ``noise_mean_abs_dlogprob`` by more than
+            the configured epsilon, else 0. Identical weights make the two means equal and the
+            verdict 0 by construction.
+        n_tokens_compared: Positions compared, so a verdict resting on almost no evidence is
+            visible rather than implied.
     """
 
     n_probes: int
-    greedy_differ_frac: float
+    prompts_live_frac: float
     max_abs_dlogprob: float
     mean_abs_dlogprob: float
+    noise_max_abs_dlogprob: float
+    noise_mean_abs_dlogprob: float
     is_live: int
     n_tokens_compared: int
 
 
-async def _greedy_with_logprobs(session, url: str, model: str, prompt: str, cfg) -> tuple[str, list[float]]:
-    """One greedy completion together with its per-token logprobs.
+async def _score_prompt(session, cfg, model: str, prompt: str, caps, tio) -> list[float]:
+    """Per-position logprobs the given weights assign to one FIXED prompt. Generates nothing.
+
+    This is the whole reason the probe is trustworthy. Both sides are handed the same token
+    sequence and asked what they think of it, so position *i* is the same token in the same
+    context on both sides and the difference between them is a difference between the models.
+    The probe this replaced asked each side to GENERATE and then subtracted the two streams
+    position by position, which stops being a comparison the moment the argmax paths diverge.
 
     Args:
         session: An open ``aiohttp.ClientSession``.
-        url: The chat-completions URL.
-        model: The model id to route to.
+        cfg: The resolved configuration, for ``base_url``, ``base_model`` and ``timeout``.
+        model: The served id whose weights should score the prompt.
         prompt: The probe prompt.
-        cfg: The resolved configuration, for ``probe_max_tokens`` and ``timeout``.
+        caps: What the server said about itself.
+        tio: The local tokenizer, or None when the server holds one.
 
     Returns:
-        ``(text, logprobs)`` where ``logprobs`` holds one value per generated token.
+        One logprob per scored position. The first position of a sequence has no logprob --
+        nothing precedes it -- and is dropped by the server, not padded here.
 
     Raises:
-        LivenessUnavailable: If the endpoint fails, or answers without logprobs. Both are
-            refusals rather than a defaulted verdict: "assume live" and "assume inert" are
-            each an answer nobody measured.
+        LivenessUnavailable: If the endpoint fails, or answers without per-position logprobs.
+            A refusal, never a defaulted verdict: "assume live" and "assume inert" are each an
+            answer nobody measured.
     """
+    mb = _math_bench()
+    url = mb.root_url(cfg.base_url) + mb.GENERATE_PATH
     payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.0,
-        "top_p": 1.0,
-        "max_tokens": cfg.probe_max_tokens,
-        "logprobs": True,
-        "seed": cfg.seed,
+        "sampling_params": {"temperature": 0.0, "max_new_tokens": 0},
+        "stream": False,
+        "return_logprob": True,
+        "logprob_start_len": 0,
     }
+    if caps is not None and not caps.has_tokenizer:
+        payload["input_ids"] = list(tio.encode_chat(prompt))
+    else:
+        payload["text"] = prompt
+    # `/generate` has no model field: an adapter is reached by `lora_path` or not at all, and
+    # sending one for the base model fails every request. `adapter_route` decides this from
+    # what the SERVER called its base, which an endpoint that does not publish `/get_server_info`
+    # never said; the configured base id is known either way, so it is checked first.
+    lora = "" if model == cfg.base_model else mb.adapter_route(model, caps)
+    if lora:
+        payload["lora_path"] = lora
     try:
         async with session.post(url, json=payload, timeout=cfg.timeout) as r:
             if r.status != 200:
@@ -1642,102 +1704,62 @@ async def _greedy_with_logprobs(session, url: str, model: str, prompt: str, cfg)
     except Exception as exc:
         raise LivenessUnavailable(f"{url} could not be queried: {type(exc).__name__}: {exc}") from exc
 
-    ch = (d.get("choices") or [{}])[0]
-    text = (ch.get("message") or {}).get("content") or ""
-    content = ((ch.get("logprobs") or {}).get("content")) or []
-    lps = [t.get("logprob") for t in content if isinstance(t, dict) and t.get("logprob") is not None]
-    if not lps:
+    meta = d.get("meta_info") or {}
+    if (meta.get("finish_reason") or {}).get("type") == "abort":
         raise LivenessUnavailable(
-            f"{url} returned no per-token logprobs for model {model!r}. The liveness verdict "
+            f"{url} ABORTED the scoring request for model {model!r}. AReaL's weight sync drops "
+            f"requests in flight; an aborted probe measured nothing and has no verdict."
+        )
+    rows = meta.get("input_token_logprobs")
+    if not isinstance(rows, list) or not rows:
+        raise LivenessUnavailable(
+            f"{url} returned no per-position logprobs for model {model!r}. The liveness verdict "
             f"is decided on logprobs because greedy text alone raised a FALSE ALARM on a live "
             f"adapter at A0 step 149; without them there is no verdict to report."
         )
-    return text, [float(x) for x in lps]
+    return [float(t[0]) for t in rows if isinstance(t, (list, tuple)) and t and t[0] is not None]
 
 
-async def _greedy_with_logprobs_by_token_ids(session, cfg, model, prompt, caps, tio):
-    """The same greedy probe against a server that holds no tokenizer.
-
-    Identical measurement, different transport: the prompt is tokenised here, the reply comes
-    back as token ids and is decoded here. What :func:`measure_liveness` compares -- the text
-    and the per-token logprobs -- is the same in both cases, so the verdict does not depend on
-    which path produced it.
+def _paired_abs_diff(x: list[float], y: list[float], what: str) -> list[float]:
+    """Absolute differences of two logprob vectors that MUST describe the same positions.
 
     Args:
-        session: An open ``aiohttp.ClientSession``.
-        cfg: The resolved configuration.
-        model: The model id to route to.
-        prompt: The probe prompt.
-        caps: What the server said about itself.
-        tio: The local tokenizer.
+        x: One vector.
+        y: The other.
+        what: What is being compared, for the refusal message.
 
     Returns:
-        ``(text, logprobs)``.
+        One absolute difference per position.
 
     Raises:
-        LivenessUnavailable: If the endpoint would not answer, or answered without logprobs.
-            Same refusal as the text path and for the same reason: "assume live" and "assume
-            inert" are each an answer nobody measured.
+        LivenessUnavailable: If the two vectors are not the same length. They score the same
+            fixed token sequence, so a mismatch is a harness fault -- and truncating to the
+            shorter of the two is exactly the silent misalignment this probe was rewritten to
+            remove.
     """
-    mb = _math_bench()
-    params = {
-        "temperature": 0.0,
-        "top_p": 1.0,
-        "max_tokens": cfg.probe_max_tokens,
-        "seed": cfg.seed,
-        "timeout": cfg.timeout,
-    }
-    lora = mb.adapter_route(model, caps)
-    r = await mb.generate_ids(
-        session,
-        cfg.base_url,
-        tio.encode_chat(prompt),
-        params,
-        tio,
-        lora_path=lora,
-        return_logprob=True,
-    )
-    if r.get("status") != "ok":
+    if len(x) != len(y):
         raise LivenessUnavailable(
-            f"{mb.root_url(cfg.base_url)}{mb.GENERATE_PATH} returned no usable completion "
-            f"for model {model!r}"
+            f"{what}: scored {len(x)} positions against {len(y)}. Both sides were handed the "
+            f"same token sequence, so this is a harness fault and not a difference to report."
         )
-    lps = r.get("logprobs") or []
-    if not lps:
-        raise LivenessUnavailable(
-            f"{mb.root_url(cfg.base_url)}{mb.GENERATE_PATH} returned no per-token logprobs "
-            f"for model {model!r}. The liveness verdict is decided on logprobs because greedy "
-            f"text alone raised a FALSE ALARM on a live adapter at A0 step 149; without them "
-            f"there is no verdict to report."
-        )
-    return r.get("text") or "", [float(x) for x in lps]
-
-
-async def _greedy_probe(session, cfg, model, prompt, caps, tio):
-    """One greedy completion and its logprobs, on whichever path this server needs.
-
-    Args:
-        session: An open ``aiohttp.ClientSession``.
-        cfg: The resolved configuration.
-        model: The model id to route to.
-        prompt: The probe prompt.
-        caps: What the server said about itself; None means the text path, unconditionally.
-        tio: The local tokenizer, or None on the text path.
-
-    Returns:
-        ``(text, logprobs)``.
-    """
-    if caps is None or caps.has_tokenizer:
-        url = _math_bench().chat_url(cfg.base_url)
-        return await _greedy_with_logprobs(session, url, model, prompt, cfg)
-    return await _greedy_with_logprobs_by_token_ids(session, cfg, model, prompt, caps, tio)
+    return [abs(a - b) for a, b in zip(x, y)]
 
 
 async def measure_liveness(session, cfg: PeriodicEvalConfig, model: str) -> LivenessReport:
-    """Compare the adapter against the base model on a fixed probe set.
+    """Compare the adapter against the base model, controlled against each side's own spread.
 
-    Both ids are served by the same endpoint -- sglang routes a LoRA adapter by model id --
-    so this is two requests per prompt against one server and costs seconds, not minutes.
+    Each side is scored TWICE on every probe prompt. The signal is the SMALLEST of the four
+    adapter-versus-base pairings and the control is the LARGEST of the two same-weights
+    pairings, and the adapter is called live only when the smallest difference between the
+    models still exceeds the largest difference a model shows against itself.
+
+    THE MEASUREMENT THAT FORCED THIS SHAPE. A0's rollout server returns one of two
+    numerically distinct answers for the same input -- 22 of 24 identical scorings and 2
+    deviating by up to 0.605 nats at a single position. A single scoring per side is
+    therefore not a measurement of the weights: with one sample each, ten repetitions of the
+    base-versus-base control produced nine "inert" and one "live", because the deviant
+    scoring happened to land on the signal side. Two samples per side put that deviation into
+    the control, where it belongs, and the same ten repetitions separate cleanly.
 
     Args:
         session: An open ``aiohttp.ClientSession``.
@@ -1746,11 +1768,11 @@ async def measure_liveness(session, cfg: PeriodicEvalConfig, model: str) -> Live
             scored, or the liveness verdict belongs to a different point than the accuracy.
 
     Returns:
-        The measurement.
+        The measurement, signal and control together.
 
     Raises:
         LivenessUnavailable: If the endpoint would not answer, or answered without logprobs,
-            or no token position could be compared at all.
+            or no position could be compared at all.
     """
     mb = _math_bench()
     caps = await mb.server_capabilities(session, cfg.base_url)
@@ -1759,34 +1781,54 @@ async def measure_liveness(session, cfg: PeriodicEvalConfig, model: str) -> Live
         if caps.has_tokenizer
         else mb.TokenIO.from_model_path(cfg.model_path, caps.tokenizer_path)
     )
-    differ = 0
-    max_d = 0.0
-    sum_d = 0.0
+    cross_sum = [0.0] * 4  # (a1,b1) (a1,b2) (a2,b1) (a2,b2)
+    cross_max = [0.0] * 4
+    within_sum = [0.0] * 2  # (a1,a2) (b1,b2)
+    within_max = [0.0] * 2
+    live_prompts = 0
     n_tok = 0
     for prompt in cfg.probe_prompts:
-        a_text, a_lp = await _greedy_probe(session, cfg, model, prompt, caps, tio)
-        b_text, b_lp = await _greedy_probe(session, cfg, cfg.base_model, prompt, caps, tio)
-        if a_text != b_text:
-            differ += 1
-        # Compare only positions both sides produced. When the argmax paths diverge the
-        # shared prefix is still a valid comparison, and the divergence itself is already
-        # counted by `differ`.
-        for x, y in zip(a_lp, b_lp):
-            d = abs(x - y)
-            max_d = max(max_d, d)
-            sum_d += d
-            n_tok += 1
+        a = [await _score_prompt(session, cfg, model, prompt, caps, tio) for _ in range(2)]
+        b = [await _score_prompt(session, cfg, cfg.base_model, prompt, caps, tio) for _ in range(2)]
+        cross = [
+            _paired_abs_diff(a[x], b[y], f"adapter {model!r} against base")
+            for x in (0, 1)
+            for y in (0, 1)
+        ]
+        # THE NEGATIVE CONTROL, in band: each side against ANOTHER SCORING OF ITSELF.
+        within = [
+            _paired_abs_diff(a[0], a[1], f"adapter {model!r} against ITSELF"),
+            _paired_abs_diff(b[0], b[1], "base against ITSELF"),
+        ]
+        if not cross[0]:
+            continue
+        for k, d in enumerate(cross):
+            cross_sum[k] += sum(d)
+            cross_max[k] = max(cross_max[k], max(d))
+        for k, d in enumerate(within):
+            within_sum[k] += sum(d)
+            within_max[k] = max(within_max[k], max(d))
+        n = len(cross[0])
+        n_tok += n
+        if min(sum(d) for d in cross) / n > max(sum(d) for d in within) / n + cfg.live_eps:
+            live_prompts += 1
     if n_tok == 0:
         raise LivenessUnavailable(
-            "no token position could be compared between adapter and base; the probe "
-            "measured nothing and must not report a verdict."
+            "no position could be compared between adapter and base; the probe measured "
+            "nothing and must not report a verdict."
         )
+    k_signal = min(range(4), key=lambda k: cross_sum[k])
+    k_noise = max(range(2), key=lambda k: within_sum[k])
+    mean_d = cross_sum[k_signal] / n_tok
+    noise_mean = within_sum[k_noise] / n_tok
     return LivenessReport(
         n_probes=len(cfg.probe_prompts),
-        greedy_differ_frac=differ / len(cfg.probe_prompts),
-        max_abs_dlogprob=max_d,
-        mean_abs_dlogprob=sum_d / n_tok,
-        is_live=int(max_d > cfg.live_eps),
+        prompts_live_frac=live_prompts / len(cfg.probe_prompts),
+        max_abs_dlogprob=cross_max[k_signal],
+        mean_abs_dlogprob=mean_d,
+        noise_max_abs_dlogprob=within_max[k_noise],
+        noise_mean_abs_dlogprob=noise_mean,
+        is_live=int(mean_d > noise_mean + cfg.live_eps),
         n_tokens_compared=n_tok,
     )
 
@@ -2046,9 +2088,15 @@ def metrics_from(
         "periodic_eval/cost/seconds": float(seconds),
         "periodic_eval/cost/throughput_frac": float(throughput_frac),
         "periodic_eval/liveness/n_probes": float(liveness.n_probes) if liveness else nan,
-        "periodic_eval/liveness/greedy_differ_frac": float(liveness.greedy_differ_frac) if liveness else nan,
+        "periodic_eval/liveness/prompts_live_frac": float(liveness.prompts_live_frac) if liveness else nan,
         "periodic_eval/liveness/max_abs_dlogprob": float(liveness.max_abs_dlogprob) if liveness else nan,
         "periodic_eval/liveness/mean_abs_dlogprob": float(liveness.mean_abs_dlogprob) if liveness else nan,
+        "periodic_eval/liveness/noise_max_abs_dlogprob": (
+            float(liveness.noise_max_abs_dlogprob) if liveness else nan
+        ),
+        "periodic_eval/liveness/noise_mean_abs_dlogprob": (
+            float(liveness.noise_mean_abs_dlogprob) if liveness else nan
+        ),
         "periodic_eval/liveness/is_live": float(liveness.is_live) if liveness else nan,
         "periodic_eval/adapter/version": (
             float(adapter.version) if adapter is not None and adapter.version is not None else nan
@@ -2274,6 +2322,8 @@ def run_periodic_eval(
         f"endpoint={endpoint.base_url or 'UNDISCOVERED'} via {endpoint.source} "
         f"trend={accuracy:.4f}@{_budget_phrase(cfg, rows)} "
         f"live={getattr(liveness, 'is_live', 'na')} "
+        f"meandlogp={getattr(liveness, 'mean_abs_dlogprob', float('nan')):.6f} "
+        f"noise={getattr(liveness, 'noise_mean_abs_dlogprob', float('nan')):.6f} "
         f"maxdlogp={getattr(liveness, 'max_abs_dlogprob', float('nan')):.5f} "
         f"best={getattr(decision, 'best_score', float('nan'))}@{getattr(decision, 'best_step', -1)} "
         f"{seconds:.1f}s ({frac:.1%} of throughput)",

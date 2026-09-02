@@ -167,6 +167,9 @@ class _Policy:
         n_chat, n_generate, n_info, n_models: Requests served, per endpoint.
         generate_loras: The ``lora_path`` of every ``/generate`` request, in order.
         generate_caps: The ``max_new_tokens`` of every ``/generate`` request, in order.
+        generate_texts: The ``text`` of every ``/generate`` request, in order, or None when
+            the request spoke token ids. The liveness probe scores through ``/generate`` on
+            both kinds of server and picks the field the server can actually read.
         generate_inputs: The ``input_ids`` of every ``/generate`` request, in order, so a
             test can decode them and check WHAT was asked rather than only that something was.
     """
@@ -191,6 +194,7 @@ class _Policy:
         self.generate_loras = []
         self.generate_caps = []
         self.generate_inputs = []
+        self.generate_texts = []
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -292,6 +296,7 @@ class _Handler(BaseHTTPRequestHandler):
         p.generate_loras.append(req.get("lora_path", ""))
         p.generate_caps.append(cap)
         p.generate_inputs.append(list(ids))
+        p.generate_texts.append(req.get("text"))
         if p.context_limit and len(ids) + cap > p.context_limit:
             # Verbatim shape from A0's live server.
             self._send(
@@ -316,6 +321,12 @@ class _Handler(BaseHTTPRequestHandler):
             lps = p.logprobs_for(req.get("lora_path", ""))
             if lps is not None:
                 body["meta_info"]["output_token_logprobs"] = [[x, 1, None] for x in lps]
+                # The liveness probe SCORES a fixed sequence rather than generating one, so it
+                # reads `input_token_logprobs`. sglang omits the first position -- nothing
+                # precedes it -- and the stub omits it too, so the probe meets the real shape.
+                body["meta_info"]["input_token_logprobs"] = [[None, 1, None]] + [
+                    [x, 1, None] for x in lps
+                ]
         self._send(200, body)
 
 
@@ -1031,21 +1042,34 @@ def test_liveness_is_measured_through_token_ids_when_the_server_has_no_tokenizer
     cfg = _config(url, tokenizer_dir)
     rep = _run(_liveness(cfg))
     assert policy.n_chat == 0, "a text request was made to a server that cannot serve one"
+    assert all(t is None for t in policy.generate_texts), "text was sent to a server with no tokenizer"
     assert rep.n_tokens_compared == 4
     assert rep.is_live == 1
+    assert rep.noise_mean_abs_dlogprob == 0.0
     assert rep.max_abs_dlogprob == pytest.approx(0.8)
 
 
-def test_liveness_still_uses_the_chat_endpoint_when_the_server_has_one(endpoint, tokenizer_dir):
-    """Additive here too: the path that produced every previous liveness verdict is unchanged."""
+def test_liveness_scores_through_text_when_the_server_holds_a_tokenizer(endpoint, tokenizer_dir):
+    """One probe, two transports. The verdict must not depend on which one the server needs.
+
+    The probe scores a FIXED sequence rather than generating one, and ``/generate`` is the
+    endpoint that returns per-position logprobs on both kinds of server -- so the transport
+    difference is which field carries the prompt, not which arithmetic decides the verdict.
+    A tokenising server is sent ``text``; a tokeniser-less one is sent ``input_ids``.
+    """
     url, policy = endpoint
     policy.has_tokenizer = True
-    policy.logprobs_for = lambda model: ([-0.1, -0.2] if model == ADAPTER else [-0.9, -0.2])
+    policy.logprobs_for = lambda lora: ([-0.1, -0.2] if lora else [-0.9, -0.2])
     cfg = _config(url, tokenizer_dir)
     rep = _run(_liveness(cfg))
-    assert policy.n_generate == 0, "the token-id path engaged against a TOKENISING server"
-    assert policy.n_chat == 4
+    assert policy.n_chat == 0, "the liveness probe generated a completion"
+    assert policy.n_generate == 8, "each of two prompts must be scored twice on each side"
+    assert all(t is not None for t in policy.generate_texts), "a TOKENISING server was sent ids"
+    assert policy.generate_inputs == [[]] * 8, "ids were sent to a server that tokenises"
+    assert set(policy.generate_caps) == {0}, "the probe asked the server for new tokens"
     assert rep.is_live == 1
+    assert rep.max_abs_dlogprob == pytest.approx(0.8)
+    assert rep.noise_mean_abs_dlogprob == 0.0
 
 
 async def _liveness(cfg):

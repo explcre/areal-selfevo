@@ -89,6 +89,15 @@ class _Policy:
         text_for: ``(model, prompt) -> str``, the completion.
         logprobs_for: ``(model, prompt) -> list[float] | None``; None omits the logprobs
             block entirely, which is how a server that does not support them behaves.
+        score_for: ``(lora_path, prompt, nth_call) -> list[float] | None`` for ``/generate``,
+            the FORCED SCORING the liveness probe uses. ``nth_call`` is 1-based and exists so
+            a test can reproduce the behaviour that broke the old probe: A0's real server
+            answers the same input two numerically different ways depending on nothing the
+            caller controls, so a stub that always answers identically cannot exercise the
+            control that has to survive it.
+        n_generate, generate_loras, generate_caps: ``/generate`` requests served, the
+            ``lora_path`` of each and the ``max_new_tokens`` of each, so a test can prove the
+            probe routed to the weights it claims and generated nothing.
         finish_reason: Reported finish reason.
         n_chat: Completions served, so a test can prove the endpoint was really exercised.
     """
@@ -104,6 +113,10 @@ class _Policy:
         self.logprobs_for = lambda model, prompt: [-0.10, -0.20, -0.30]
         self.finish_reason = "stop"
         self.n_chat = 0
+        self.score_for = lambda lora, prompt, n: [-0.10, -0.20, -0.30]
+        self.n_generate = 0
+        self.generate_loras = []
+        self.generate_caps = []
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -141,10 +154,13 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(404, {"error": "not found"})
 
     def do_POST(self):
-        """Answer one chat completion according to the policy."""
+        """Answer one chat completion, or one forced scoring, according to the policy."""
         p = self.server.policy
         n = int(self.headers.get("Content-Length") or 0)
         req = json.loads(self.rfile.read(n) or b"{}")
+        if self.path.rstrip("/").endswith("/generate"):
+            self._generate(p, req)
+            return
         p.n_chat += 1
         if p.status != 200:
             self._send(p.status, {"error": "stub failure"})
@@ -160,6 +176,33 @@ class _Handler(BaseHTTPRequestHandler):
         if lps is not None:
             choice["logprobs"] = {"content": [{"token": "t", "logprob": x} for x in lps]}
         self._send(200, {"choices": [choice]})
+
+
+    def _generate(self, p, req):
+        """The native endpoint the liveness probe scores through.
+
+        ``/generate`` has no ``model`` field: an adapter is reached by ``lora_path`` or not at
+        all. sglang omits the first position's logprob -- nothing precedes it -- and the stub
+        omits it too, so the probe is exercised against the shape it really meets.
+
+        Args:
+            p: The policy.
+            req: The parsed request body.
+        """
+        p.n_generate += 1
+        lora = req.get("lora_path", "")
+        p.generate_loras.append(lora)
+        p.generate_caps.append(int((req.get("sampling_params") or {}).get("max_new_tokens") or 0))
+        if p.status != 200:
+            self._send(p.status, {"error": "stub failure"})
+            return
+        lps = p.score_for(lora, req.get("text", ""), p.n_generate)
+        body = {"text": "", "meta_info": {"finish_reason": {"type": "length"}}}
+        if lps is not None:
+            body["meta_info"]["input_token_logprobs"] = [[None, 7, None]] + [
+                [x, 7, None] for x in lps
+            ]
+        self._send(200, body)
 
 
 @pytest.fixture
@@ -422,52 +465,180 @@ def test_no_key_is_emitted_that_was_never_declared(endpoint, tmp_path):
 # ---------------------------------------------------------------- adapter liveness ----
 
 
+def _scores(base, adapter=None, deviant_call=None, deviant=None):
+    """A ``score_for`` that answers per weights, optionally deviating on ONE call.
+
+    Args:
+        base: Logprobs the base model returns.
+        adapter: Logprobs the adapter returns; defaults to ``base`` (identical weights).
+        deviant_call: 1-based ``/generate`` call that answers differently, or None.
+        deviant: What that one call answers.
+
+    Returns:
+        The hook.
+    """
+
+    def hook(lora, prompt, n):
+        """Answer one scoring request.
+
+        Args:
+            lora: The ``lora_path`` routed to; empty for the base model.
+            prompt: The scored prompt.
+            n: 1-based call index.
+
+        Returns:
+            The logprobs.
+        """
+        if deviant_call is not None and n == deviant_call:
+            return list(deviant)
+        return list(base if not lora else (adapter if adapter is not None else base))
+
+    return hook
+
+
+def test_liveness_calls_the_base_model_compared_with_itself_inert(endpoint):
+    """THE NEGATIVE CONTROL, as a test. Identical weights on both sides must be INERT.
+
+    Run against the real A0 endpoint on 2026-09-02 this is what the previous probe failed:
+    pointed at the base model with no adapter anywhere, it reported ``is_live=1`` with max
+    |dlogprob| 0.978, against 1.007 for a real adapter. Two evaluation points had already been
+    recorded and believed. A guard that answers "live" to its own negative control has never
+    been observed to fail and is not evidence of anything.
+    """
+    url, policy = endpoint
+    policy.score_for = _scores([-0.1, -0.2, -0.3])
+    rep = _liveness(_config(url, model=BASE))
+    assert rep.is_live == 0
+    assert rep.mean_abs_dlogprob == 0.0
+    assert rep.noise_mean_abs_dlogprob == 0.0
+    assert rep.prompts_live_frac == 0.0
+
+
+def test_a_server_that_answers_the_same_weights_two_ways_is_still_inert(endpoint):
+    """The negative control under the nondeterminism that actually exists.
+
+    A0's rollout server returns one of TWO numerically distinct answers for the same input:
+    22 of 24 identical, 2 deviating by up to 0.605 nats. With one scoring per side that
+    deviation lands on the signal side one time in ten and the base model is declared live.
+    The control has to be measured on the same weights in the same evaluation, and it has to
+    be the LARGER of the two sides, or it does not cover the case it exists for.
+    """
+    url, policy = endpoint
+    policy.score_for = _scores([-0.1, -0.2, -0.3], deviant_call=1, deviant=[-0.7, -0.2, -0.3])
+    rep = _liveness(_config(url, model=BASE, probe_prompts=("only",)))
+    assert rep.noise_mean_abs_dlogprob > 0.0, "premise: the deviation must reach the control"
+    assert rep.is_live == 0, "a deviant scoring of the SAME weights was called a live adapter"
+
+
+def test_two_deviant_scorings_pulling_opposite_ways_are_still_not_an_adapter(endpoint):
+    """The signal must be the SMALLEST pairing of the four, not the largest.
+
+    One deviant scoring on each side, deviating in opposite directions, makes the widest
+    adapter-versus-base pairing wider than either side's own spread -- so a probe that
+    reported its widest pairing would call identical weights live even with the control
+    measured correctly. The narrowest pairing is the honest one: two scorings of the same
+    weights agreed exactly, and that agreement is the evidence.
+
+    Found by mutation: reversing ``min`` to ``max`` on the cross pairings survived every
+    other test in this file.
+    """
+    url, policy = endpoint
+    modal = [-0.7, -0.2, -0.3]
+    # Calls 1 and 2 score the adapter, 3 and 4 the base.
+    deviations = {1: [-1.3, -0.2, -0.3], 3: [-0.1, -0.2, -0.3]}
+    policy.score_for = lambda lora, prompt, n: list(deviations.get(n, modal))
+    rep = _liveness(_config(url, model=BASE, probe_prompts=("only",)))
+    assert rep.mean_abs_dlogprob == 0.0, "two scorings of the same weights agreed exactly"
+    assert rep.noise_mean_abs_dlogprob == pytest.approx(0.2), "premise: the control saw a spread"
+    assert rep.is_live == 0, "the widest pairing of identical weights was called an adapter"
+
+
 def test_liveness_sees_an_adapter_that_moves_logprobs_but_not_the_argmax(endpoint):
-    """THE step-149 regression. Identical greedy text, different distribution: LIVE.
+    """THE step-149 regression. A distribution that moves without the argmax moving is LIVE.
 
-    The manual probe at A0 `globalstep149` compared greedy text on three trivial prompts,
+    The manual probe at A0 `globalstep149` compared greedy TEXT on three trivial prompts,
     found 0 of 3 differed and printed `adapter indistinguishable from base`. Comparing
-    logprobs showed max |dlogprob| 0.041 -- the adapter was live and the probe was too weak
-    to see it. If this test ever fails, the verdict has been moved back onto text.
+    logprobs showed max |dlogprob| 0.041 -- the adapter was live and the probe was too weak to
+    see it. If this test ever fails, the verdict has been moved back onto text.
     """
     url, policy = endpoint
-    policy.text_for = lambda model, prompt: "identical text either way"
-    policy.logprobs_for = lambda model, prompt: (
-        [-0.100, -0.200] if model == ADAPTER else [-0.141, -0.212]
-    )
+    policy.score_for = _scores([-0.141, -0.212], adapter=[-0.100, -0.200])
     rep = _liveness(_config(url))
-    assert rep.greedy_differ_frac == 0.0, "premise: the texts must be identical"
     assert rep.max_abs_dlogprob == pytest.approx(0.041, abs=1e-9)
-    assert rep.is_live == 1, "a live adapter was called inert on identical greedy text"
+    assert rep.noise_mean_abs_dlogprob == 0.0
+    assert rep.is_live == 1, "a live adapter was called inert"
+    assert rep.prompts_live_frac == 1.0
 
 
-def test_liveness_calls_a_bit_identical_adapter_inert(endpoint):
-    """The other direction: no distributional difference at all is genuinely inert."""
-    url, policy = endpoint
-    policy.logprobs_for = lambda model, prompt: [-0.1, -0.2, -0.3]
-    rep = _liveness(_config(url))
-    assert rep.max_abs_dlogprob == 0.0
-    assert rep.is_live == 0
+def test_the_verdict_is_a_margin_over_the_control_not_a_fixed_threshold(endpoint):
+    """A difference the SERVER also produces on identical weights is not a difference.
 
-
-def test_greedy_differ_frac_is_reported_but_does_not_decide(endpoint):
-    """Both series exist, and only one of them is the verdict.
-
-    Differing text with bit-identical logprobs is physically odd but is exactly the state a
-    text-only probe would call "live"; the verdict must still come from the distribution.
+    The old probe compared max |dlogprob| against a constant 1e-4. On this endpoint the base
+    model differs from itself by 0.605, which that constant calls live several thousand times
+    over. The scale of a logprob difference is a property of the server; only the in-band
+    control makes it a property of the adapter.
     """
     url, policy = endpoint
-    policy.text_for = lambda model, prompt: f"answer for {model}"
-    policy.logprobs_for = lambda model, prompt: [-0.5, -0.5]
-    rep = _liveness(_config(url))
-    assert rep.greedy_differ_frac == 1.0
-    assert rep.is_live == 0
+    # The adapter differs from the base by 0.5, and the base differs from ITSELF by 0.6.
+    # Calls 1 and 2 score the adapter, 3 and 4 the base, so call 4 is the base's second look.
+    policy.score_for = _scores(
+        [-0.1, -0.2, -0.3], adapter=[-0.6, -0.2, -0.3], deviant_call=4, deviant=[-0.7, -0.2, -0.3]
+    )
+    rep = _liveness(_config(url, probe_prompts=("only",)))
+    assert rep.noise_mean_abs_dlogprob == pytest.approx(0.2), "premise: the control saw the spread"
+    assert rep.mean_abs_dlogprob < rep.noise_mean_abs_dlogprob
+    assert rep.is_live == 0, "a difference the base model also shows against itself was a verdict"
+    assert rep.max_abs_dlogprob > pe.DEFAULT_LIVE_EPS, (
+        "premise: a guard that compared this difference with a fixed threshold, as the one "
+        "this replaced did, would have called it live"
+    )
+
+
+def test_liveness_refuses_to_compare_positions_that_are_not_the_same_positions(endpoint):
+    """THE BUG. Two vectors of different lengths are not a difference, they are a fault.
+
+    The probe this replaced generated from each side and zipped the two streams, so once the
+    greedy paths diverged it subtracted the logprobs of DIFFERENT TOKENS -- a number near 1.0
+    whatever the adapter was doing. Truncating to the shorter of two vectors is that same
+    silent misalignment, so it is refused rather than trimmed.
+    """
+    url, policy = endpoint
+    policy.score_for = lambda lora, prompt, n: ([-0.1, -0.2] if lora else [-0.1, -0.2, -0.3])
+    with pytest.raises(pe.LivenessUnavailable):
+        _liveness(_config(url))
+
+
+def test_liveness_generates_nothing(endpoint):
+    """The probe scores a fixed sequence. Nothing it does gets more expensive as the run runs.
+
+    Also the cost claim: an evaluation point cost 104.2s at step 50 and 139.5s at step 100
+    because GENERATION lengthens as the policy learns. A probe that decodes no tokens cannot
+    contribute to that climb.
+    """
+    url, policy = endpoint
+    policy.score_for = _scores([-0.1, -0.2, -0.3])
+    _liveness(_config(url))
+    assert policy.n_chat == 0, "the liveness probe generated a completion"
+    assert policy.generate_caps, "premise: the probe reached /generate"
+    assert set(policy.generate_caps) == {0}, "the probe asked the server for new tokens"
+
+
+def test_liveness_routes_the_base_model_without_a_lora_path(endpoint):
+    """`/generate` has no model field: sending a `lora_path` for the base fails every request,
+    and omitting one for the adapter SILENTLY SCORES THE BASE -- which is the failure the
+    whole guard exists to detect, reproduced inside the guard itself."""
+    url, policy = endpoint
+    policy.score_for = _scores([-0.1, -0.2, -0.3])
+    _liveness(_config(url, probe_prompts=("only",)))
+    assert policy.generate_loras == [ADAPTER, ADAPTER, "", ""], (
+        "each side must be scored twice, the adapter under its own id and the base under none"
+    )
 
 
 def test_liveness_refuses_when_the_endpoint_returns_no_logprobs(endpoint):
     """Neither "assume live" nor "assume inert": both are answers nobody measured."""
     url, policy = endpoint
-    policy.logprobs_for = lambda model, prompt: None
+    policy.score_for = lambda lora, prompt, n: None
     with pytest.raises(pe.LivenessUnavailable):
         _liveness(_config(url))
 
@@ -475,7 +646,7 @@ def test_liveness_refuses_when_the_endpoint_returns_no_logprobs(endpoint):
 def test_liveness_counts_the_tokens_it_actually_compared(endpoint):
     """A verdict resting on almost no evidence must be visible as such."""
     url, policy = endpoint
-    policy.logprobs_for = lambda model, prompt: [-0.1, -0.2, -0.3, -0.4]
+    policy.score_for = _scores([-0.1, -0.2, -0.3, -0.4])
     rep = _liveness(_config(url, probe_prompts=("a", "b", "c")))
     assert rep.n_probes == 3
     assert rep.n_tokens_compared == 12
@@ -595,7 +766,7 @@ def _rep(is_live: int) -> pe.LivenessReport:
     Returns:
         The report.
     """
-    return pe.LivenessReport(2, 0.0, 0.04 if is_live else 0.0, 0.01, is_live, 8)
+    return pe.LivenessReport(2, 0.0, 0.04 if is_live else 0.0, 0.01, 0.0, 0.0, is_live, 8)
 
 
 def test_diagnosis_separates_not_learning_from_learning_but_not_helping():
@@ -920,8 +1091,12 @@ def test_generation_uses_the_resolved_id_and_never_the_configured_one(endpoint, 
     m = pe.run_periodic_eval(cfg, 5, pe.BestValTracker(cfg.patience, cfg.state_path))
     assert m["periodic_eval/status_code"] == pe.STATUS["ok"]
     assert policy.chat_models, "no completion reached the endpoint, so nothing was checked"
-    assert set(policy.chat_models) == {f"{ADAPTER}-v13", BASE}
+    assert set(policy.chat_models) == {f"{ADAPTER}-v13"}
     assert f"{ADAPTER}-v3" not in policy.chat_models
+    # The liveness probe generates nothing, so the base model appears on `/generate` -- where
+    # it must be routed with NO lora_path -- and never as a completion.
+    assert set(policy.generate_loras) == {f"{ADAPTER}-v13", ""}
+    assert f"{ADAPTER}-v3" not in policy.generate_loras
 
 
 @needs_data
