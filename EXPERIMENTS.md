@@ -45,6 +45,52 @@ experiment has yet used either. The routed 30B arm is where they belong.
 a feature, grep its resolved config for the switch. `enabled:`, `router:` and `group_routing:`
 are three separate places a routing arm can be silently off.
 
+## 2026-09-02 — LiveCodeBench generation path validated live; grading held, two generation bugs found
+
+35 problems (20 stdin/atcoder + an explicit 15-id leetcode slice, because `--limit N` never
+reaches the functional family) against the step-49 adapter served at TP=2, harness at `bf23c9b4`,
+nothing tuned.
+
+**What held.** Sandbox tier auto-selected **`bwrap`** (bubblewrap 0.6.1), confirmed twice.
+Eight-bucket accounting intact: stdin 6 pass / 10 wrong / 3 timeout / 1 no_code,
+accuracy 0.3000 (Wilson [0.145, 0.519]); functional 4 / 9 / 2 / 0, accuracy 0.2667
+([0.109, 0.520]). `accuracy == accuracy_all` in both, `gen_failed = 0`. **`max_tokens=16384` does
+not bind**: `cap_limited` 0, `finish_reason` `stop` for all 35, completions 201-2149 chars
+(median 880). Neither the `FAILED_RATE_ABORT` nor the `cap_limited` guard fired. Replaying the
+saved generations through `--from-generations` reproduced the numbers exactly and exited 0, so the
+grader is deterministic on this slice.
+
+**The 12 s per-test budget is not too tight.** Passing stdin problems ran 1.40-1.51 s for 42-44
+tests (~33 ms/test). All 5 timeouts sat at 12.11-12.63 s and each was a SINGLE test over budget;
+**two of the five failed on public/sample tests**, so those programs are genuinely too slow rather
+than clipped. Wrong answers return in 0.03-0.29 s (fail-fast), which is why the "hard" mean looks
+low — 7 of 9 hard problems failed immediately, not quickly-and-correctly.
+
+**`no_code` was 1/35 = 2.9%, and the cause was not the expected one.** All 35 completions used
+``` fences; **0/35 emitted `[PYTHON]` tags and 0/35 were unfenced**, so those extraction paths
+remain unexercised against real output.
+
+**BUG 1 — a valid submission is discarded.** Verified independently from the saved artifact:
+`abc390_e`'s completion is 1130 chars with two fenced blocks of lengths **[1102, 0]** — a real
+1102-character program followed by a trailing EMPTY python fence. `extract_code` takes the LAST
+python-tagged block, finds it empty, and returns `None` without backing up to the earlier
+non-empty block. The empty-block guard is right to refuse to execute; discarding the submission is
+wrong. Worth 5 points on a 20-problem slice, and it understates every model's score.
+
+**BUG 2 — a wrong model can be scored and nothing records it.** The request payload has no
+`lora_path`; evaluating an adapter works only because sglang registers `--lora-paths name=...` as
+a MODEL ID in `/v1/models`. **An unregistered model name returns HTTP 200 and silently serves the
+BASE model** — and the harness default was `--model evalmodel`, exactly such a name, while the
+results `params` block records `max_tokens`, `sandbox_tier` and `dataset_md5` but **not `model`**.
+A run left at the default would have scored the base model with nothing in the artifact saying so.
+Only positive evidence the adapter was live: 1 of 3 greedy probes diverged from the base.
+
+Also: the dataset fallback path is hardcoded to `~/.cache/huggingface/...` while `HF_HOME` on the
+eval box is `~/hf_cache`, so `LCB_DATA` had to be set by hand. `test6.jsonl` verified at 175 rows,
+md5 `7e54179572530b58002d14178c19886b`, matching the module docstring.
+
+Both bugs are being fixed; neither is in the grading path, which stands as verified.
+
 ## 2026-09-02 — The harness axis is NOT vacuous on single-turn math, once it drives generation budget
 
 The risk flagged before launch was that `HarnessVariant.step_limit` documents itself as "maximum
