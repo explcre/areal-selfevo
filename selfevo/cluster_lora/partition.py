@@ -49,6 +49,7 @@ __all__ = [
     "cluster_key",
     "feature_partition",
     "label_churn",
+    "max_experts_for_roster",
     "meds_partition",
     "no_partition",
     "partition_from_config",
@@ -579,20 +580,44 @@ class MEDSPartitioner:
         warmup_batches: Batches to buffer before the first fit. HDBSCAN on a handful of
             points returns almost all noise, and a first batch that is 100% noise would put
             every group on the shared adapter and look like the method doing nothing.
+        max_experts: How many ``cluster_<i>`` adapters exist to be assigned, from
+            :func:`max_experts_for_roster`, or ``None`` for the unbounded allocation every
+            run before this bound had. The ids are otherwise sparse and unbounded while the
+            roster is fixed at process start, so an unbounded partitioner is expected to
+            name an adapter the run does not have and die partway through; see
+            :func:`max_experts_for_roster` for the measurement and for why the allocation is
+            bounded rather than compressed onto the roster.
 
     Raises:
-        ValueError: If ``warmup_batches`` is negative.
+        ValueError: If ``warmup_batches`` is negative, or if ``max_experts`` is below one --
+            refused at CONSTRUCTION, because a roster that cannot seat a single cluster
+            cannot run this method at all and the honest place to say so is before the
+            accelerators are allocated.
     """
 
-    def __init__(self, clusterer=None, *, warmup_batches: int = 1) -> None:
+    def __init__(
+        self, clusterer=None, *, warmup_batches: int = 1, max_experts: int | None = None
+    ) -> None:
         if warmup_batches < 0:
             raise ValueError(f"warmup_batches must be >= 0, got {warmup_batches}")
+        if max_experts is not None and int(max_experts) < 1:
+            raise ValueError(
+                f"max_experts must be >= 1 or None, got {max_experts}; a roster with no "
+                "cluster_<i> expert cannot carry a partition, and discovering that at step "
+                "300 costs the run"
+            )
         if clusterer is None:
             from selfevo.clustering.meds import MEDSClusterer
 
             clusterer = MEDSClusterer()
         self.clusterer = clusterer
         self.warmup_batches = int(warmup_batches)
+        self.max_experts = None if max_experts is None else int(max_experts)
+        # Raw labels the roster has no expert left for. A SET of raw labels rather than a
+        # count of groups, so it says how many CLUSTERS were turned away however many groups
+        # they held, and rebuilt by _resync so it describes the live fit rather than the
+        # run's history.
+        self._overflow: set[int] = set()
         # The control's half of the identity _resync keeps for the method, held here so the
         # two have the SAME lifetime: a fresh partitioner is a fresh arm, and an arm whose
         # control remembered the previous arm's draw would place this arm's groups by it.
@@ -621,16 +646,40 @@ class MEDSPartitioner:
             del self._history[: len(self._history) - buffered]
 
     def _stable_id(self, raw: int) -> int:
-        """Map a raw HDBSCAN label to the expert that owns it, allocating one if new."""
+        """Map a raw HDBSCAN label to the expert that owns it, allocating one if new.
+
+        Allocation is BOUNDED by ``max_experts`` when one was given. ``_next_stable`` is
+        monotone by design -- reusing a freed id would give an expert somebody else's
+        subpopulation, which is the thing ``_resync`` exists to prevent -- so it climbs past
+        the number of live clusters as HDBSCAN fragments and renames across refits, and the
+        names emitted stop fitting the roster the run was started with. Once the bound is
+        reached a genuinely new cluster is sent to the SHARED adapter and recorded in
+        ``overflow_clusters``, which is the treatment this module already gives a group it
+        has no behavioural claim about, rather than being given a name the run cannot honour.
+        """
         raw = int(raw)
         if raw == -1:
             return -1
         got = self._raw_to_stable.get(raw)
         if got is None:
+            if self.max_experts is not None and self._next_stable >= self.max_experts:
+                self._overflow.add(raw)
+                return -1
             got = self._next_stable
             self._next_stable += 1
             self._raw_to_stable[raw] = got
         return got
+
+    @property
+    def overflow_clusters(self) -> tuple[int, ...]:
+        """Raw labels the roster has no expert for, sorted; empty when it has room.
+
+        Reported rather than merely handled: a run whose clusters are being folded into the
+        shared adapter is training fewer experts than its config names, and the difference
+        between that and a run whose clustering found fewer clusters is invisible in
+        ``n_clusters`` alone.
+        """
+        return tuple(sorted(self._overflow))
 
     def _resync(self) -> None:
         """Re-anchor expert identity after a refit. **Without this the method is a no-op.**
@@ -675,6 +724,9 @@ class MEDSPartitioner:
         before = dict(self._raw_to_stable)
         self._raw_to_stable = mapping
         self._next_stable = max([*used, self._next_stable - 1, -1]) + 1
+        # Recomputed for the fit that has just happened, so it describes the clusters the
+        # roster cannot seat NOW rather than every one it ever turned away.
+        self._overflow.clear()
         for raw in {int(r) for r in raw_labels if int(r) != -1}:
             self._stable_id(raw)
         if before and any(before.get(k) != v for k, v in self._raw_to_stable.items()):
@@ -754,6 +806,14 @@ class MEDSPartitioner:
                 "does not carry hdbscan/scikit-learn, so a run configured for "
                 "partition=meds must refuse rather than fall back to one adapter"
             ) from exc
+        if self._overflow:
+            # Present tense, and measured after this batch's refit rather than tallied over
+            # the run: _resync rebuilds the mapping every batch, so the honest statement is
+            # how many clusters the roster cannot seat NOW.
+            basis += (
+                f"; {len(self._overflow)} cluster(s) have no expert in the "
+                f"{self.max_experts}-adapter roster and are on {SHARED_CLUSTER}"
+            )
         out = Partition(labels=labels, basis=basis, group_ids=tuple(group_ids))
         self._previous = out
         return out
@@ -876,6 +936,72 @@ def partition_from_config(
         "rather than letting it fall through to the size-matched control, which would report "
         "this arm's label for the control's mechanism."
     )
+
+
+def max_experts_for_roster(roster: Sequence[str]) -> int | None:
+    """How many experts a fixed adapter roster can carry, refusing one that can carry none.
+
+    ``adapter_roster()`` is read once, before FSDP shards the model and before the optimizer
+    exists, so the adapters a run has are fixed at process start. :class:`MEDSPartitioner`'s
+    expert ids are not: :meth:`MEDSPartitioner._stable_id` allocates a fresh one for every
+    raw HDBSCAN label that overlap matching does not claim, and ``_next_stable`` is monotone
+    non-decreasing, so the names emitted are both SPARSE and UNBOUNDED. Twelve batches over
+    two live clusters were measured emitting ``cluster_1`` and ``cluster_3`` with
+    ``_next_stable`` at 4 -- names a ``cluster_0,cluster_1,shared`` roster refuses, although
+    the partition has exactly the two clusters that roster was sized for. On the accelerator
+    that refusal arrives at whichever step HDBSCAN first splits off a fragment, i.e. it kills
+    a long run mid-flight.
+
+    BOUNDING the allocation is chosen over compressing the ids onto the roster. Compression
+    would seat two behaviourally distinct clusters on ONE expert while ``n_clusters`` went on
+    reporting two, which is the silent mislabelling this module refuses at every other seam.
+    A bound is visible instead: the roster IS the capacity, a cluster it cannot seat goes to
+    the shared adapter -- the treatment this module already gives a group it has no
+    behavioural claim about -- and the partition's basis records how many did.
+
+    Args:
+        roster: Adapter names in order, as ``adapter_roster()`` returns them. Empty means no
+            roster was configured, and the partitioner is left unbounded exactly as before.
+
+    Returns:
+        The number of ``cluster_<i>`` experts, or ``None`` for an empty roster.
+
+    Raises:
+        ValueError: If the roster names no ``cluster_<i>`` expert, if its numbers are not
+            exactly ``0..N-1``, or if it has no shared adapter. All three are refused HERE,
+            at construction, rather than at the step that first needs the missing name: a
+            bounded partitioner allocates densely from zero, so a gap leaves an expert no
+            cluster can ever be given, and a roster with no shared adapter has nowhere to put
+            either HDBSCAN noise or a cluster the bound turns away.
+    """
+    names = tuple(roster)
+    if not names:
+        return None
+    prefix = "cluster_"
+    numbers = sorted(
+        int(n[len(prefix):])
+        for n in names
+        if n.startswith(prefix) and n[len(prefix):].isdigit()
+    )
+    if not numbers:
+        raise ValueError(
+            f"the adapter roster {list(names)} names no {prefix}<i> expert, so a partition "
+            "would have nothing but the shared adapter to route to and the arm would be the "
+            "baseline under the method's name"
+        )
+    if numbers != list(range(len(numbers))):
+        raise ValueError(
+            f"the adapter roster {list(names)} numbers its experts {numbers}; a bounded "
+            f"partitioner allocates ids densely from 0, so a gap leaves an expert that no "
+            f"cluster can ever be given. Name them {prefix}0..{prefix}{len(numbers) - 1}"
+        )
+    if SHARED_CLUSTER not in names:
+        raise ValueError(
+            f"the adapter roster {list(names)} has no {SHARED_CLUSTER!r} adapter. HDBSCAN "
+            f"noise goes there, and so does any cluster beyond the roster's {len(numbers)} "
+            "experts; without it a run dies at whichever step first produces either"
+        )
+    return len(numbers)
 
 
 def label_churn(

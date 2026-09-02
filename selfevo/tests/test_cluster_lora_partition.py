@@ -20,11 +20,13 @@ from selfevo.cluster_lora.partition import (
     DEFAULT_CONTROL_MEMORY,
     SHARED_CLUSTER,
     MatchedControlMemory,
+    MEDSPartitioner,
     Partition,
     PartitionUnavailable,
     balanced_assign,
     cluster_key,
     label_churn,
+    max_experts_for_roster,
     no_partition,
     partition_from_config,
     random_matched_partition,
@@ -485,6 +487,194 @@ def test_the_control_refuses_if_its_own_permutation_stopped_matching(monkeypatch
     monkeypatch.setattr(np.random, "default_rng", lambda *_a, **_k: Bad())
     with pytest.raises(PartitionUnavailable, match="not size-matched"):
         random_matched_partition(part([0, 0, 1, 1]), seed=0)
+
+
+# ------------------------------------------- the roster the emitted names have to fit ---
+#
+# The expert ids are allocated one per unseen raw HDBSCAN label and _next_stable is monotone,
+# while adapter_roster() is fixed at process start. So the names emitted are sparse and
+# unbounded, and an unbounded run is expected to name an adapter it does not have partway
+# through. Driven here through a scripted clusterer rather than hdbscan: the allocation is
+# ours, the labels are the library's, and only the allocation is under test.
+
+
+class ScriptedClusterer:
+    """Emits the raw labels it is handed, so ID ALLOCATION can be driven without hdbscan.
+
+    Carries no ``_state``, so ``_resync`` takes its documented identity fallback -- which is
+    exactly the state in which every unseen raw label costs one fresh expert id, the
+    allocation these tests are about. The real clusterer is exercised in
+    ``test_cluster_lora_clustering.py`` under the probe venv.
+    """
+
+    knn_k, knn_metric, min_cluster_size, metric, backend = 3, "cosine", 2, "euclidean", "stub"
+    n_clusters = 2
+
+    def __init__(self, labels):
+        self.queue = list(labels)
+        self.fitted = False
+
+    def add(self, v):
+        """Accept a vector, as the real clusterer does; the labels are scripted."""
+
+    def fit(self):
+        """Mark fitted, as the real clusterer does."""
+        self.fitted = True
+        return self.n_clusters
+
+    def assign(self, v):
+        """The next scripted raw label."""
+        return self.queue.pop(0)
+
+
+def drive(partitioner, batches, width=4):
+    """Run ``batches`` batches of ``width`` groups through a partitioner."""
+    ids = tuple(f"g{i}" for i in range(width))
+    return [
+        partitioner.partition(np.zeros((width, 1)), group_ids=ids) for _ in range(batches)
+    ]
+
+
+def test_an_unbounded_partitioner_names_experts_a_fixed_roster_does_not_have():
+    """The hazard, reproduced: two clusters per batch, and by batch two the names have moved.
+
+    This is what kills a long run. ``begin_cluster_batch`` refuses a partition naming an
+    adapter outside ``SELFEVO_CLUSTER_LORA_ADAPTERS``, and the roster cannot grow because
+    every expert is created before FSDP shards the model and before the optimizer exists.
+    """
+    p = MEDSPartitioner(ScriptedClusterer([5, 5, 7, 7, 9, 9, 11, 11]), warmup_batches=0)
+    second = drive(p, 2)[1]
+    assert second.n_clusters == 2
+    assert set(second.keys) == {"cluster_2", "cluster_3"}, (
+        "the fixture no longer reproduces the drift these tests are about"
+    )
+    assert not set(second.keys) <= {"cluster_0", "cluster_1", SHARED_CLUSTER}
+
+
+def test_a_bounded_partitioner_never_names_an_expert_outside_the_roster():
+    """The fix: the roster IS the capacity, and a cluster it cannot seat goes to shared."""
+    roster = ("cluster_0", "cluster_1", SHARED_CLUSTER)
+    p = MEDSPartitioner(
+        ScriptedClusterer(range(5, 200)),
+        warmup_batches=0,
+        max_experts=max_experts_for_roster(roster),
+    )
+    for part in drive(p, 12):
+        assert set(part.keys) <= set(roster), f"emitted {sorted(set(part.keys))}"
+
+
+def test_the_clusters_the_roster_turned_away_are_counted_and_recorded():
+    """Folding a cluster into shared is a real loss of capacity, so it is not silent.
+
+    A run whose clusters are being folded into the shared adapter trains fewer experts than
+    its config names, and ``n_clusters`` alone cannot tell that from a clustering that found
+    fewer clusters.
+    """
+    p = MEDSPartitioner(
+        ScriptedClusterer(range(5, 200)), warmup_batches=0, max_experts=2
+    )
+    last = drive(p, 6)[-1]
+    assert p.overflow_clusters, "the roster was exhausted and nothing recorded it"
+    assert f"have no expert in the 2-adapter roster and are on {SHARED_CLUSTER}" in last.basis
+
+
+def test_an_unbounded_partitioner_turns_nothing_away():
+    """Default off: with no bound the allocation is bit-identical to what it always was."""
+    p = MEDSPartitioner(ScriptedClusterer(range(5, 200)), warmup_batches=0)
+    drive(p, 6)
+    assert p.max_experts is None
+    assert p.overflow_clusters == ()
+
+
+class ResyncingClusterer(ScriptedClusterer):
+    """A scripted clusterer that also exposes the label state ``_resync`` reads.
+
+    With ``_state`` present the partitioner takes its overlap-matching path, which rebuilds
+    the raw-label-to-expert mapping after every refit. The roster bound has to be recomputed
+    with it, or a cluster the roster turned away once stays counted long after HDBSCAN
+    stopped producing it, and the basis reports capacity the run is not actually losing.
+    """
+
+    def __init__(self, labels, buffer=4):
+        super().__init__(labels)
+        self.buffer = int(buffer)
+        self._state = {"vectors": [], "labels": []}
+        self.given = []
+
+    def add(self, v):
+        """Buffer the vector, trimming from the FRONT as the real clusterer does."""
+        self._state["vectors"].append(np.asarray(v, dtype=float))
+        del self._state["vectors"][: max(0, len(self._state["vectors"]) - self.buffer)]
+
+    def assign(self, v):
+        """The next scripted label, kept so ``fit`` can publish the same ones."""
+        got = super().assign(v)
+        self.given.append(got)
+        return got
+
+    def fit(self):
+        """Publish the labels of everything still buffered, as a real refit does."""
+        self._state["labels"] = list(self.given)[-len(self._state["vectors"]):]
+        return super().fit()
+
+
+def test_a_cluster_the_roster_turned_away_stops_being_counted_once_it_is_gone():
+    """The overflow set describes the LIVE fit, not the run's history.
+
+    Batch two produces a third cluster the two-expert roster cannot seat. By batch three it
+    has aged out of the clusterer's buffer, which is trimmed from the front exactly as MEDS'
+    is, so the refit no longer knows about it. A count that survived that refit would report
+    capacity the run is no longer losing, and would go on reporting it for the rest of the
+    run.
+    """
+    script = [10, 10, 11, 11] + [10, 10, 11, 99] + [10, 10, 11, 11]
+    p = MEDSPartitioner(ResyncingClusterer(script), warmup_batches=0, max_experts=2)
+    batches = drive(p, 3)
+    assert batches[1].keys == ("cluster_0", "cluster_0", "cluster_1", SHARED_CLUSTER)
+    assert "have no expert in the 2-adapter roster" in batches[1].basis
+    assert batches[2].keys == ("cluster_0", "cluster_0", "cluster_1", "cluster_1")
+    assert p.overflow_clusters == (), "a cluster HDBSCAN no longer produces is still counted"
+    assert "have no expert" not in batches[2].basis
+
+
+def test_a_roster_that_cannot_seat_one_cluster_is_refused_at_construction():
+    """Before the accelerators are allocated, not at the step that first needs the name."""
+    with pytest.raises(ValueError, match="max_experts"):
+        MEDSPartitioner(ScriptedClusterer([]), max_experts=0)
+
+
+@pytest.mark.parametrize(
+    "roster, expected",
+    [
+        ((), None),
+        (("cluster_0", "cluster_1", SHARED_CLUSTER), 2),
+        ((SHARED_CLUSTER, "cluster_0"), 1),
+        (tuple(f"cluster_{i}" for i in range(8)) + (SHARED_CLUSTER,), 8),
+    ],
+)
+def test_the_roster_bound_counts_the_experts_it_actually_has(roster, expected):
+    assert max_experts_for_roster(roster) == expected
+
+
+@pytest.mark.parametrize(
+    "roster, match",
+    [
+        ((SHARED_CLUSTER,), "names no cluster_<i> expert"),
+        (("cluster_0", "cluster_2", SHARED_CLUSTER), "numbers its experts"),
+        (("cluster_0", "cluster_1"), f"no {SHARED_CLUSTER!r} adapter"),
+    ],
+    ids=["no-expert", "sparse-roster", "no-shared"],
+)
+def test_a_roster_that_cannot_carry_the_partition_is_refused_by_name(roster, match):
+    """Each refusal names the fix, because each has a different one.
+
+    A gap in the numbering leaves an expert no cluster can ever be given, since a bounded
+    partitioner allocates densely from zero; a roster with no shared adapter has nowhere to
+    put HDBSCAN noise OR a cluster the bound turns away, and would die at whichever comes
+    first.
+    """
+    with pytest.raises(ValueError, match=match):
+        max_experts_for_roster(roster)
 
 
 def test_every_mutation_anchor_still_occurs_exactly_once():
