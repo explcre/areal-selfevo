@@ -26,8 +26,9 @@ existing local spelling should move here only when the call is behaviourally ide
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager
-from typing import TYPE_CHECKING, Callable, Iterator
+from typing import TYPE_CHECKING
 
 import pytest
 

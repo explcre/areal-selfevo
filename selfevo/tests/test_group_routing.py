@@ -24,20 +24,20 @@ import logging
 import pytest
 import torch
 
-from areal.api.cli_args import GroupRoutingConfig
-
 from selfevo.tests.conftest import (  # noqa: F401  (re-exported for older importers)
-    B,
-    G,
     MIXED,
     PROMPT,
     SOLVED_AND_UNSOLVED,
+    B,
+    G,
     T,
     advantages,
     make_actor,
     make_batch,
     meta,
 )
+
+from areal.api.cli_args import GroupRoutingConfig
 
 logging.disable(logging.INFO)
 
