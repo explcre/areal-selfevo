@@ -93,9 +93,10 @@ seconds, is the sensitive early warning.
 
 THE ENDPOINT is not configuration. AReaL's launcher allocates the sglang port and the server
 binds the host interface rather than localhost, so no constant written before the run can be
-right. :func:`base_url_from_rollout` reads it off the inference engine the trainer is itself
-generating against; ``SELFEVO_PERIODIC_EVAL_BASE_URL`` remains only as an explicit override
-for use outside a trainer, and when it is set the engine is not consulted at all.
+right. :func:`resolve_endpoint` finds it; ``SELFEVO_PERIODIC_EVAL_BASE_URL`` remains an explicit override, and when it is set no
+other source is consulted at all -- but it is no longer REQUIRED, which is the point:
+``resolve_endpoint`` walks four sources, records which one answered next to the score, and
+refuses with its own status code rather than guessing when none of them does.
 
 CONFIGURATION is by environment variable, following ``SELFEVO_CLUSTER_LORA`` (``actor.py``)
 and ``SELFEVO_CLUSTER_LORA_ADAPTERS`` (``fsdp_engine.py``), the established shape in this tree
@@ -124,6 +125,9 @@ __all__ = [
     "AdapterEvicted",
     "AdapterUnresolved",
     "BestValDecision",
+    "ENDPOINT_SOURCE",
+    "EndpointUndiscoverable",
+    "ResolvedEndpoint",
     "BestValTracker",
     "BudgetUnrecorded",
     "EmptyEvaluation",
@@ -138,10 +142,17 @@ __all__ = [
     "assert_scored_something",
     "assert_search_only",
     "assert_still_served",
-    "base_url_from_rollout",
     "bench_namespace",
     "budget_record",
     "diagnose",
+    "endpoint_from_engine",
+    "endpoint_from_name_resolve",
+    "endpoint_from_process_table",
+    "endpoint_from_server_infos",
+    "endpoint_port",
+    "read_process_table",
+    "resolve_endpoint",
+    "trial_identity",
     "metrics_from",
     "require_committed_split",
     "resolve_adapter",
@@ -189,6 +200,7 @@ STATUS = {
     "adapter_unresolved": 7,  # /v1/models lists no version of the configured adapter
     "adapter_evicted": 8,  # the pinned version disappeared while this evaluation ran
     "budget_unrecorded": 9,  # a score arrived without the token budget that produced it
+    "endpoint_undiscovered": 10,  # no source could say where the inference server is
 }
 
 #: Every key this module can emit. Declared, and asserted against the real emission in
@@ -209,6 +221,8 @@ METRIC_KEYS = frozenset(
         "periodic_eval/liveness/is_live",
         "periodic_eval/adapter/version",
         "periodic_eval/adapter/n_served",
+        "periodic_eval/endpoint/source",
+        "periodic_eval/endpoint/port",
         "periodic_eval/best_val/score",
         "periodic_eval/best_val/step",
         "periodic_eval/best_val/steps_since_best",
@@ -331,6 +345,17 @@ class AdapterUnresolved(RuntimeError):
     which the server *does* serve, and scoring the base under the arm's name is the failure
     this project has already recorded once. The caller emits ``adapter_unresolved`` and NaN,
     which is distinguishable in the series from an accuracy of zero.
+    """
+
+
+class EndpointUndiscoverable(RuntimeError):
+    """No source could say where this run's inference server is listening.
+
+    Its own status code, distinct from ``endpoint_error``, because "the address is
+    unknown" and "the address is known and the server did not answer" are different
+    faults with different fixes and a shared code would hide the first behind the
+    second. Never downgraded to a localhost guess: A0's server binds the host
+    interface, and a guess that connects has scored some other run's weights.
     """
 
 
@@ -511,43 +536,400 @@ async def assert_still_served(session, cfg, pinned: ResolvedAdapter) -> None:
         )
 
 
-def base_url_from_rollout(rollout) -> str:
-    """The ``/v1`` endpoint of the inference server the TRAINER is generating against.
+#: Where the ``/v1`` endpoint came from, recorded beside every score as
+#: ``periodic_eval/endpoint/source``. A point whose address is not recorded cannot be
+#: audited after the fact, and this project has already spent a day on exactly that: an
+#: address was pinned, later called wrong, and could only be shown to have been RIGHT
+#: because the serving process' command line still existed to be read. Ordered by how much
+#: the source can be trusted, which is also the order :func:`resolve_endpoint` tries them in.
+ENDPOINT_SOURCE = {
+    "unresolved": 0,  # nothing produced an address; the point refuses
+    "configured": 1,  # handed in explicitly, e.g. SELFEVO_PERIODIC_EVAL_BASE_URL
+    "engine": 2,  # an inference engine re-exported `addresses`
+    "server_infos": 3,  # the rollout controller's own record of the servers it launched
+    "name_resolve": 4,  # this trial's `gen_servers` record on disk
+    "process_cmdline": 5,  # the serving process' command line, filtered to this trial
+}
 
-    The address cannot be configured ahead of the run: AReaL's launcher allocates the sglang
-    port, and on A0 the server binds the host interface (``172.28.127.18:32735``) rather than
-    localhost, so a probe of localhost finds nothing and a constant is a guess. The trainer
-    already holds the engine that knows, so this reads it there instead of adding a second
-    place the address is written down.
+#: Where AReaL's NFS name-resolution repository lives when nothing overrides it. The same
+#: default ``areal.infra.rpc.guard.app`` falls back to, and the root every worker on this
+#: stack is launched with.
+DEFAULT_NAME_RESOLVE_ROOT = "/tmp/areal/name_resolve"
 
-    ``RemoteSGLangEngine`` composes ``RemoteInfEngine`` and does not re-export its
-    ``addresses``, so the composed engine is read as a fallback. Narrow and deliberate: the
-    alternative is an environment variable that nobody can fill in correctly.
+
+def _v1(addr: str) -> str:
+    """Normalise a ``host:port`` or a url into the ``/v1`` endpoint form.
 
     Args:
-        rollout: The trainer's inference engine.
+        addr: An address in any of the forms the sources below produce.
 
     Returns:
-        ``http://<host>:<port>/v1`` for the first server the engine is using.
-
-    Raises:
-        RuntimeError: If the engine holds no address. There is deliberately no default: an
-            evaluation against a guessed endpoint is an evaluation of unknown weights.
+        ``http://<host>:<port>/v1``.
     """
-    addrs = getattr(rollout, "addresses", None) or getattr(
-        getattr(rollout, "_engine", None), "addresses", None
-    )
-    if not addrs:
-        raise RuntimeError(
-            f"{type(rollout).__name__} exposes no inference server address, so there is no "
-            f"endpoint to evaluate against. Set {ENV_PREFIX}BASE_URL explicitly if this "
-            f"deployment keeps the address somewhere else."
-        )
-    addr = str(addrs[0]).strip()
+    addr = str(addr).strip()
     if "://" not in addr:
         addr = "http://" + addr
     addr = addr.rstrip("/")
     return addr if addr.endswith("/v1") else addr + "/v1"
+
+
+def endpoint_port(base_url: str) -> int | None:
+    """The TCP port of an endpoint, for the series that records what was queried.
+
+    Args:
+        base_url: A ``/v1`` endpoint, or an empty string.
+
+    Returns:
+        The port, or None when the url carries none.
+    """
+    m = re.search(r":(\d+)(?:/|$)", base_url or "")
+    return int(m.group(1)) if m else None
+
+
+def endpoint_from_engine(rollout) -> str:
+    """The address an inference ENGINE re-exports, or ``""``.
+
+    ``RemoteSGLangEngine`` composes ``RemoteInfEngine`` and does not re-export its
+    ``addresses``, so the composed engine is read as well.
+
+    Args:
+        rollout: The trainer's rollout object, or None.
+
+    Returns:
+        ``host:port``, or ``""`` when this object holds no address.
+    """
+    if rollout is None:
+        return ""
+    addrs = getattr(rollout, "addresses", None) or getattr(
+        getattr(rollout, "_engine", None), "addresses", None
+    )
+    return str(addrs[0]).strip() if addrs else ""
+
+
+def endpoint_from_server_infos(rollout) -> str:
+    """The address the rollout CONTROLLER launched, or ``""``.
+
+    THE DEFECT THIS FUNCTION IS. A0's trainer holds a ``RolloutController``, not an engine,
+    and a controller has no ``addresses`` -- so the engine lookup above returned nothing at
+    every evaluation this feature has ever run, and the automatic path had never once
+    produced an address on this stack. What the controller does hold is ``server_infos``:
+    the ``LocalInfServerInfo(host, port, process)`` list that its own launch returned. That
+    is the most authoritative source there is, because it is this run's launcher telling us
+    what this run started, in this process, with no file and no scan in between.
+
+    Args:
+        rollout: The trainer's rollout object, or None.
+
+    Returns:
+        ``host:port`` of the first server, or ``""``.
+    """
+    infos = getattr(rollout, "server_infos", None)
+    if not infos:
+        return ""
+    host = str(getattr(infos[0], "host", "") or "").strip()
+    port = getattr(infos[0], "port", None)
+    return f"{host}:{int(port)}" if host and port else ""
+
+
+def trial_identity(rollout, env=None) -> tuple[str, str]:
+    """The experiment and trial this process belongs to, or ``("", "")``.
+
+    Both on-disk sources below are scoped to ONE trial, because this box runs several at
+    once and has held as many as five sglang servers in a day. Without an identity there is
+    no scope, and a scan of the whole box is a guess -- so when this returns ``("", "")``
+    those sources are skipped entirely rather than allowed to name another run's server.
+
+    Args:
+        rollout: The trainer's rollout object, or None.
+        env: Environment mapping; defaults to ``os.environ``.
+
+    Returns:
+        ``(experiment_name, trial_name)``, or ``("", "")`` when neither is knowable.
+    """
+    env = os.environ if env is None else env
+    exp = (env.get(ENV_PREFIX + "EXPERIMENT", "") or "").strip()
+    trial = (env.get(ENV_PREFIX + "TRIAL", "") or "").strip()
+    if exp and trial:
+        return exp, trial
+    sched = getattr(rollout, "scheduler", None)
+    exp = str(getattr(sched, "experiment_name", "") or "").strip()
+    trial = str(getattr(sched, "trial_name", "") or "").strip()
+    return (exp, trial) if exp and trial else ("", "")
+
+
+def _gen_servers_key(experiment: str, trial: str) -> str:
+    """The name-resolve key AReaL records inference server addresses under.
+
+    Derived from ``areal.utils.names.gen_servers`` rather than re-spelled here, so a change
+    to the key layout there fails this lookup loudly instead of making it silently blind.
+
+    Args:
+        experiment: Experiment name.
+        trial: Trial name.
+
+    Returns:
+        The key, relative to the name-resolve root.
+    """
+    from areal.utils import names
+
+    return names.gen_servers(experiment, trial)
+
+
+def endpoint_from_name_resolve(root, experiment: str, trial: str) -> str:
+    """The inference address this trial recorded under ``gen_servers``, or ``""``.
+
+    ONLY ``gen_servers`` is read, and that restriction is the whole point of the function.
+    The sibling ``workers/`` subtree holds the RPC ports of the worker PROCESSES -- 16866
+    for A0's rollout worker, 17672 and 17909 for its actors -- and on 2026-09-02 those ports
+    were read out of this directory and quoted as proof that a correct pinned sglang address
+    (:32735) was wrong. They are different things: one is a Python RPC server, the other is
+    the OpenAI-compatible HTTP server. Reading ``workers/`` here would build that mistake
+    into the code, so this function cannot see it.
+
+    Not every deployment writes this key: on the v2 inference service the controller launches
+    the server itself and records it only in ``server_infos``, so on A0 this returns ``""``
+    and the next source answers. That is a miss, not a failure -- a source that is silent
+    when it has nothing is exactly what a fallback chain needs.
+
+    Args:
+        root: The name-resolve record root.
+        experiment: Experiment name.
+        trial: Trial name.
+
+    Returns:
+        The recorded address, or ``""`` when this trial recorded none.
+    """
+    d = Path(root) / _gen_servers_key(experiment, trial)
+    if not d.is_dir():
+        return ""
+    for p in sorted(d.rglob("ENTRY")):
+        try:
+            v = p.read_text().strip()
+        except OSError:  # pragma: no cover - a record deleted between listing and reading
+            continue
+        if v:
+            return v.splitlines()[0].strip()
+    return ""
+
+
+def _flag(argv, flag: str) -> str:
+    """The value of ``--flag`` in a command line, in either spelling.
+
+    Args:
+        argv: The command line, already split into arguments.
+        flag: The flag, including its leading dashes.
+
+    Returns:
+        The value, or ``""``.
+    """
+    for i, a in enumerate(argv):
+        if a == flag and i + 1 < len(argv):
+            return argv[i + 1]
+        if a.startswith(flag + "="):
+            return a.split("=", 1)[1]
+    return ""
+
+
+def _descends_from(pid: int, owners, by_pid) -> bool:
+    """Whether a process descends from (or is) one of ``owners``.
+
+    Args:
+        pid: The process to walk up from.
+        owners: Pids that mark ownership.
+        by_pid: ``{pid: (ppid, argv)}``.
+
+    Returns:
+        True when an owner is on the ancestry chain.
+    """
+    seen: set[int] = set()
+    while pid in by_pid and pid not in seen:
+        if pid in owners:
+            return True
+        seen.add(pid)
+        pid = by_pid[pid][0]
+    return pid in owners
+
+
+def endpoint_from_process_table(procs, experiment: str, trial: str) -> str:
+    """The address of THIS trial's serving process, read off its own command line.
+
+    The serving process was launched with ``--host`` and ``--port`` and still carries them,
+    which makes its command line the one place on the box that cannot be stale: a port that
+    a process is running with now is the port it is listening on now. The reason a pinned
+    environment variable was not the answer is that it records the port of the launch that
+    wrote it, and A0 has been launched on 17727, 21698, 17762, 18284 and 32735 in one day.
+
+    OWNERSHIP, not a box-wide grep. The serving process descends from the rollout worker,
+    whose own command line carries ``--experiment-name`` and ``--trial-name``, so a server
+    is attributed to this trial only when an owning process is on its ancestry chain. A
+    concurrent run's server is therefore invisible here rather than a coin toss.
+
+    Args:
+        procs: The process table as ``(pid, ppid, argv)`` triples.
+        experiment: Experiment name.
+        trial: Trial name.
+
+    Returns:
+        ``host:port``, or ``""`` when this trial owns no serving process.
+
+    Raises:
+        EndpointUndiscoverable: If this trial owns serving processes at two different
+            addresses. Ambiguity is a discovery failure; picking one would be the guess this
+            whole module exists to refuse.
+    """
+    by_pid = {int(pid): (int(ppid), list(argv)) for pid, ppid, argv in procs}
+    owners = {
+        pid
+        for pid, (_, argv) in by_pid.items()
+        if _flag(argv, "--experiment-name") == experiment
+        and _flag(argv, "--trial-name") == trial
+    }
+    if not owners:
+        return ""
+    found = set()
+    for pid, (_, argv) in by_pid.items():
+        if not any(a.endswith("launch_server") for a in argv):
+            continue
+        host, port = _flag(argv, "--host"), _flag(argv, "--port")
+        if not host or not port or not _descends_from(pid, owners, by_pid):
+            continue
+        found.add(f"{host}:{port}")
+    if len(found) > 1:
+        raise EndpointUndiscoverable(
+            f"{len(found)} serving processes belong to {experiment}/{trial} at different "
+            f"addresses ({sorted(found)}), so which one this evaluation should score is not "
+            f"decidable from the process table. Refusing to pick one: a curve point scored "
+            f"against the wrong server is worse than a gap. Set {ENV_PREFIX}BASE_URL to say "
+            f"which."
+        )
+    return found.pop() if found else ""
+
+
+def read_process_table():
+    """Every process on this box as ``(pid, ppid, argv)``.
+
+    ``/proc`` is read directly rather than shelling out to ``ps``: ``ps`` truncates the
+    command line at a width that varies by platform, and the sglang launch line is about
+    1200 characters with ``--host`` and ``--port`` at the very end of it.
+
+    Returns:
+        The process table. Processes that vanish mid-read are skipped rather than raised on.
+    """
+    out = []
+    for d in Path("/proc").iterdir():
+        if not d.name.isdigit():
+            continue
+        try:
+            argv = [
+                a
+                for a in (d / "cmdline").read_bytes().decode("utf-8", "replace").split("\0")
+                if a
+            ]
+            stat = (d / "stat").read_text()
+        except OSError:  # the process exited while we were reading it
+            continue
+        if not argv:
+            continue
+        # `comm` may itself contain spaces and parentheses, so ppid is counted from the LAST
+        # closing parenthesis rather than by splitting the whole line.
+        try:
+            ppid = int(stat[stat.rindex(")") + 1 :].split()[1])
+        except (ValueError, IndexError):  # pragma: no cover - malformed /proc entry
+            continue
+        out.append((int(d.name), ppid, argv))
+    return out
+
+
+@dataclass(frozen=True)
+class ResolvedEndpoint:
+    """Which server one evaluation queried, and how that was found out.
+
+    Attributes:
+        base_url: The ``/v1`` endpoint.
+        source: A key of :data:`ENDPOINT_SOURCE`. Recorded with the score so a reader can
+            always tell what was queried and on whose authority, rather than inferring it
+            from a configuration file written before the run started.
+    """
+
+    base_url: str
+    source: str
+
+
+def resolve_endpoint(
+    rollout=None, env=None, procs=None, name_resolve_root=None
+) -> ResolvedEndpoint:
+    """Find the inference server this run is generating against, or refuse.
+
+    PRECEDENCE, in one place because two places to look for an address is how a run scores
+    the wrong server. An explicitly configured endpoint wins outright and nothing else is
+    consulted. Otherwise the in-process sources come first (they cannot name another run's
+    server and cannot be stale), then this trial's own on-disk record, and only then a scan
+    of the process table -- which is the only source that can see a foreign server at all,
+    and is therefore fenced by trial ownership.
+
+    There is deliberately NO localhost default and no last-resort guess. A0's server binds
+    the host interface on a launcher-allocated port, so a guess does not merely fail to
+    connect: it can connect to some other run's server and score its weights under this
+    arm's name.
+
+    Args:
+        rollout: The trainer's rollout controller or engine, or None outside a trainer.
+        env: Environment mapping; defaults to ``os.environ``.
+        procs: Process table as ``(pid, ppid, argv)``; defaults to reading ``/proc``.
+        name_resolve_root: Name-resolve record root; defaults to
+            :data:`DEFAULT_NAME_RESOLVE_ROOT`.
+
+    Returns:
+        The endpoint and the name of the source that produced it.
+
+    Raises:
+        EndpointUndiscoverable: If no source produced an address, naming every source tried.
+    """
+    env = os.environ if env is None else env
+    tried = []
+
+    configured = (env.get(ENV_PREFIX + "BASE_URL", "") or "").strip()
+    if configured:
+        return ResolvedEndpoint(_v1(configured), "configured")
+    tried.append(f"{ENV_PREFIX}BASE_URL (unset)")
+
+    addr = endpoint_from_engine(rollout)
+    if addr:
+        return ResolvedEndpoint(_v1(addr), "engine")
+    tried.append(f"{type(rollout).__name__}.addresses (absent)")
+
+    addr = endpoint_from_server_infos(rollout)
+    if addr:
+        return ResolvedEndpoint(_v1(addr), "server_infos")
+    tried.append(f"{type(rollout).__name__}.server_infos (absent)")
+
+    experiment, trial = trial_identity(rollout, env)
+    if not experiment or not trial:
+        tried.append(
+            "the name-resolve record and the process table (SKIPPED: this process cannot "
+            "say which experiment and trial it belongs to, and an unscoped search of the "
+            "box can name another run's server)"
+        )
+    else:
+        root = name_resolve_root or DEFAULT_NAME_RESOLVE_ROOT
+        addr = endpoint_from_name_resolve(root, experiment, trial)
+        if addr:
+            return ResolvedEndpoint(_v1(addr), "name_resolve")
+        tried.append(f"{root}/{_gen_servers_key(experiment, trial)} (no record)")
+
+        addr = endpoint_from_process_table(
+            read_process_table() if procs is None else procs, experiment, trial
+        )
+        if addr:
+            return ResolvedEndpoint(_v1(addr), "process_cmdline")
+        tried.append(f"the command line of {experiment}/{trial}'s serving process (none)")
+
+    raise EndpointUndiscoverable(
+        "no inference server address could be discovered, so there is nothing to evaluate "
+        "against and this point is refused rather than guessed. Tried, in order: "
+        + "; ".join(tried)
+        + f". Set {ENV_PREFIX}BASE_URL explicitly to override."
+    )
 
 
 def split_path(bench: str) -> Path:
@@ -875,8 +1257,10 @@ class PeriodicEvalConfig:
         max_tokens, temperature, top_p, n, concurrency, timeout, seed: Generation
             parameters, passed to the harness exactly as the CLI would.
         base_url: OpenAI-compatible ``/v1`` endpoint. Empty under a trainer, where
-            :func:`base_url_from_rollout` supplies it from the engine the run is already
-            generating against; set explicitly only outside one.
+            :func:`resolve_endpoint` discovers it; set explicitly only outside one.
+        base_url_source: A key of :data:`ENDPOINT_SOURCE` naming which source produced
+            ``base_url``. Recorded with the score, so a point can always be traced to
+            the address it queried and to the authority that named it.
         model: The configured adapter, which names a FAMILY rather than a version. The
             served id is ``<model>-v<N>`` and only a rolling window of ``N`` exists at any
             moment, so :func:`resolve_adapter` picks the newest at each evaluation. A version
@@ -907,6 +1291,7 @@ class PeriodicEvalConfig:
     timeout: int = 1800
     seed: int = 0
     base_url: str = ""
+    base_url_source: str = ""
     model: str = ""
     base_model: str = ""
     model_path: str = ""
@@ -917,6 +1302,16 @@ class PeriodicEvalConfig:
     state_path: str = ""
     out_dir: str = ""
     explicit_gen_keys: frozenset[str] = frozenset()
+
+    def __post_init__(self):
+        """Name the source of an endpoint that was handed in rather than discovered.
+
+        A configuration built directly -- a test, or a script run outside a trainer --
+        still has to record WHERE its address came from, because the recorded source is
+        what a reader checks a suspicious point against.
+        """
+        if self.base_url and not self.base_url_source:
+            object.__setattr__(self, "base_url_source", "configured")
 
     @classmethod
     def from_env(cls, env=None, require_base_url: bool = True) -> "PeriodicEvalConfig":
@@ -933,7 +1328,7 @@ class PeriodicEvalConfig:
             require_base_url: Whether an endpoint must be named here. False when the caller
                 holds the trainer's inference engine, which knows the address that no
                 constant can: AReaL allocates the port and the server binds the host
-                interface. Never a licence to guess -- :func:`base_url_from_rollout` refuses
+                interface. Never a licence to guess -- :func:`resolve_endpoint` refuses
                 rather than defaulting, and :func:`_evaluate_async` refuses an empty one.
 
         Returns:
@@ -1612,6 +2007,7 @@ def metrics_from(
     status_code: int,
     diagnosis: int,
     adapter: "ResolvedAdapter | None" = None,
+    endpoint: "ResolvedEndpoint | None" = None,
 ) -> dict[str, float]:
     """Flatten one evaluation into the metric dict the trainer's own logger commits.
 
@@ -1631,6 +2027,9 @@ def metrics_from(
         adapter: The pinned adapter, or None when resolution never succeeded. Its version is
             emitted as its own series so every point on the accuracy curve carries the
             version of the weights that produced it.
+        endpoint: Which server this point queried and how that address was found. Emitted
+            for the same reason as the adapter version: a score is attributable only if
+            the reader can see what answered it.
 
     Returns:
         A flat mapping of metric key to float.
@@ -1639,6 +2038,7 @@ def metrics_from(
         BudgetUnrecorded: If a benchmark produced a score with no token budget beside it.
     """
     nan = float("nan")
+    port = None if endpoint is None else endpoint_port(endpoint.base_url)
     out: dict[str, float] = {
         "periodic_eval/step": float(global_step),
         "periodic_eval/status_code": float(status_code),
@@ -1654,6 +2054,13 @@ def metrics_from(
             float(adapter.version) if adapter is not None and adapter.version is not None else nan
         ),
         "periodic_eval/adapter/n_served": float(adapter.n_served) if adapter is not None else nan,
+        "periodic_eval/endpoint/source": float(
+            ENDPOINT_SOURCE.get(
+                "unresolved" if endpoint is None else endpoint.source,
+                ENDPOINT_SOURCE["unresolved"],
+            )
+        ),
+        "periodic_eval/endpoint/port": nan if port is None else float(port),
         "periodic_eval/best_val/score": float(decision.best_score) if decision else nan,
         "periodic_eval/best_val/step": float(decision.best_step) if decision else nan,
         "periodic_eval/best_val/steps_since_best": float(decision.steps_since_best) if decision else nan,
@@ -1701,7 +2108,7 @@ async def _evaluate_async(
         ``(rows, records, liveness, grader_calls, pinned)``.
 
     Raises:
-        ValueError: If no endpoint was resolved at all.
+        EndpointUndiscoverable: If no endpoint was resolved at all.
         AdapterUnresolved: If the endpoint serves no version of the configured adapter.
         AdapterEvicted: If the pinned version was evicted before the evaluation finished.
         LivenessUnavailable: Propagated from the probe.
@@ -1710,9 +2117,9 @@ async def _evaluate_async(
     import aiohttp
 
     if not cfg.base_url:
-        raise ValueError(
-            "no /v1 endpoint: neither the trainer's rollout engine nor "
-            f"{ENV_PREFIX}BASE_URL supplied one, and there is no default to guess."
+        raise EndpointUndiscoverable(
+            "no /v1 endpoint: discovery produced nothing and "
+            f"{ENV_PREFIX}BASE_URL supplied nothing, and there is no default to guess."
         )
     rows: dict[str, dict] = {}
     records: dict[str, list] = {}
@@ -1767,8 +2174,16 @@ def run_periodic_eval(
     records: dict[str, list] = {}
     grader_calls = 0
     pin: dict = {}
+    endpoint = ResolvedEndpoint(cfg.base_url, cfg.base_url_source or "unresolved")
     try:
         rows, records, liveness, grader_calls, resolved = asyncio.run(_evaluate_async(cfg, pin))
+    except EndpointUndiscoverable as exc:
+        status = STATUS["endpoint_undiscovered"]
+        _log(
+            logger,
+            "error",
+            f"periodic eval has no endpoint to evaluate against at step {global_step}: {exc}",
+        )
     except AdapterUnresolved as exc:
         status = STATUS["adapter_unresolved"]
         _log(logger, "error", f"periodic eval could not resolve an adapter at step {global_step}: {exc}")
@@ -1829,7 +2244,8 @@ def run_periodic_eval(
     frac = throughput_fraction(seconds, cfg.freq_steps, step_seconds)
     try:
         metrics = metrics_from(
-            global_step, rows, liveness, decision, seconds, frac, status, diagnosis, resolved
+            global_step, rows, liveness, decision, seconds, frac, status, diagnosis,
+            resolved, endpoint,
         )
     except BudgetUnrecorded as exc:
         # The post-condition fired. The score is DROPPED rather than emitted without its
@@ -1838,7 +2254,8 @@ def run_periodic_eval(
         status = STATUS["budget_unrecorded"]
         decision = None
         metrics = metrics_from(
-            global_step, {}, liveness, None, seconds, frac, status, DIAGNOSIS["unknown"], resolved
+            global_step, {}, liveness, None, seconds, frac, status, DIAGNOSIS["unknown"],
+            resolved, endpoint,
         )
     metrics[EVAL_GRADER_KEY] = float(grader_calls)
     # Every key the configuration declares is emitted every time, NaN included. A key that
@@ -1846,12 +2263,15 @@ def run_periodic_eval(
     for key in cfg.metric_keys():
         metrics.setdefault(key, float("nan"))
     if cfg.out_dir:
-        _persist(cfg, global_step, rows, records, liveness, decision, metrics, resolved)
+        _persist(
+            cfg, global_step, rows, records, liveness, decision, metrics, resolved, endpoint
+        )
     _log(
         logger,
         "info",
         f"periodic eval step={global_step} status={status} diagnosis={diagnosis} "
         f"model={'UNRESOLVED' if resolved is None else resolved.model} "
+        f"endpoint={endpoint.base_url or 'UNDISCOVERED'} via {endpoint.source} "
         f"trend={accuracy:.4f}@{_budget_phrase(cfg, rows)} "
         f"live={getattr(liveness, 'is_live', 'na')} "
         f"maxdlogp={getattr(liveness, 'max_abs_dlogprob', float('nan')):.5f} "
@@ -1887,7 +2307,9 @@ def _budget_phrase(cfg: PeriodicEvalConfig, rows: dict) -> str:
     )
 
 
-def _persist(cfg, global_step, rows, records, liveness, decision, metrics, resolved=None) -> None:
+def _persist(
+    cfg, global_step, rows, records, liveness, decision, metrics, resolved=None, endpoint=None
+) -> None:
     """Write the full artifact for one evaluation point.
 
     Every number this project reports must be re-auditable without regenerating it, so the
@@ -1904,6 +2326,8 @@ def _persist(cfg, global_step, rows, records, liveness, decision, metrics, resol
         resolved: The pinned adapter, or None when resolution failed. Written whole, so the
             artifact says which served id produced these generations rather than which id
             was configured months earlier.
+        endpoint: The endpoint queried and the source that named it, for the same reason:
+            the artifact is what gets re-read when nobody remembers which server ran.
     """
     d = Path(cfg.out_dir) / f"step{global_step}"
     d.mkdir(parents=True, exist_ok=True)
@@ -1914,6 +2338,7 @@ def _persist(cfg, global_step, rows, records, liveness, decision, metrics, resol
                 "split": EVAL_SPLIT,
                 "configured_model": cfg.model,
                 "resolved_adapter": None if resolved is None else resolved.__dict__,
+                "endpoint": None if endpoint is None else endpoint.__dict__,
                 # The budget sits NEXT TO the score in the artifact as well as in the metrics,
                 # because the artifact is what gets re-read months later when nobody remembers
                 # which server produced it.
@@ -1984,6 +2409,7 @@ class PeriodicEvalHook:
         """
         self.logger = logger
         self._rollout = rollout
+        self._env = os.environ if env is None else env
         self.config = PeriodicEvalConfig.from_env(env, require_base_url=rollout is None)
         self.tracker = (
             BestValTracker(self.config.patience, self.config.state_path)
@@ -2006,23 +2432,21 @@ class PeriodicEvalHook:
     def _eval_config(self) -> PeriodicEvalConfig:
         """The configuration for one evaluation, with the endpoint filled in.
 
-        PRECEDENCE, written down once because two places to look for an address is how a run
-        scores the wrong server: an explicitly set ``SELFEVO_PERIODIC_EVAL_BASE_URL`` is used
-        verbatim and the engine is NOT consulted; otherwise the address comes from the
-        rollout engine the trainer is itself generating against. There is no third case and
-        no localhost default -- A0's server binds the host interface on a launcher-allocated
-        port, so a guess is simply wrong, and a wrong endpoint either fails to connect or,
-        worse, scores some other run's weights.
+        The precedence lives in :func:`resolve_endpoint` and is not repeated here, because
+        two places to look for an address is how a run scores the wrong server.
 
         Returns:
             The configuration to evaluate with.
 
         Raises:
-            RuntimeError: From :func:`base_url_from_rollout`, if the engine holds no address.
+            EndpointUndiscoverable: From :func:`resolve_endpoint`, if no source has an
+                address. Deliberately not caught here: the caller turns it into a status
+                code, and swallowing it here would leave an empty url to be guessed at.
         """
-        if self.config.base_url or self._rollout is None:
-            return self.config
-        return replace(self.config, base_url=base_url_from_rollout(self._rollout))
+        found = resolve_endpoint(self._rollout, self._env)
+        return replace(
+            self.config, base_url=found.base_url, base_url_source=found.source
+        )
 
     def step_seconds(self) -> float:
         """Median recent training step duration, measured from this hook's own clock.
@@ -2129,7 +2553,7 @@ class PeriodicEvalHook:
                     f"{type(exc).__name__}: {exc}"
                 ),
             )
-            cfg = self.config
+            cfg = replace(self.config, base_url="", base_url_source="")
         metrics.update(
             run_periodic_eval(
                 cfg,

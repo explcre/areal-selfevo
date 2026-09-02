@@ -30,6 +30,7 @@ GPU, no network beyond loopback, no second scorer anywhere in the file.
 
 from __future__ import annotations
 
+import getpass
 import json
 import math
 import os
@@ -1084,61 +1085,500 @@ def test_a_refusal_and_a_genuine_zero_are_different_points_in_the_series(endpoin
 
 
 # ------------------------------------------------------------ where to evaluate ----
+#
+# THE DEFECT THESE TESTS EXIST FOR. `base_url_from_rollout` read `.addresses`, which lives on
+# `RemoteInfEngine`. A0's trainer holds a `RolloutController`, which has no such attribute, so
+# the automatic path had NEVER produced an address on this stack -- every evaluation it ever
+# ran either used a pinned environment variable or refused. The pin worked, but a pin records
+# the port of the launch that wrote it and A0 has been launched on five different ports in a
+# day, so the fix is discovery, not a better constant.
+#
+# The fixtures below are the four shapes discovery meets: an object that exposes an address,
+# one that does not, a name-resolution directory that is present and one that is missing, and
+# a command line that carries a port and one that does not.
 
 
-def test_the_endpoint_comes_from_the_engine_the_trainer_generates_against():
-    """The port is allocated by the launcher and the host is not localhost, so it is read.
+class _FakeScheduler:
+    """The scheduler a `RolloutController` holds, which is where the trial identity lives."""
 
-    Both engine shapes: the composed one the real `RemoteSGLangEngine` is, and a direct
-    `addresses` attribute, because a future passthrough on the wrapper must not break this.
+    def __init__(self, experiment: str, trial: str):
+        """Name one trial.
+
+        Args:
+            experiment: Experiment name.
+            trial: Trial name.
+        """
+        self.experiment_name = experiment
+        self.trial_name = trial
+
+
+class _FakeServerInfo:
+    """One `LocalInfServerInfo`: what the controller's own launch handed back."""
+
+    def __init__(self, host: str, port: int):
+        """Hold one address.
+
+        Args:
+            host: The interface the server bound.
+            port: The port the launcher allocated.
+        """
+        self.host = host
+        self.port = port
+        self.process = None
+
+
+class _FakeController:
+    """The shape A0's trainer ACTUALLY holds: `server_infos`, and no `addresses` at all.
+
+    Modelled on `areal.infra.controller.rollout_controller.RolloutController`, which sets
+    `self.server_infos` from its own `launch_server` call and never defines `addresses`. A
+    fixture that exposed both would pass whatever the code read and prove nothing.
     """
-    assert pe.base_url_from_rollout(_FakeEngine(["172.28.127.18:32735"])) == (
-        "http://172.28.127.18:32735/v1"
+
+    def __init__(self, infos=(), experiment: str = "", trial: str = ""):
+        """Build a controller-shaped object.
+
+        Args:
+            infos: ``(host, port)`` pairs the launcher returned.
+            experiment: Experiment name, or "" for a controller with no scheduler.
+            trial: Trial name.
+        """
+        self.server_infos = [_FakeServerInfo(h, p) for h, p in infos]
+        if experiment or trial:
+            self.scheduler = _FakeScheduler(experiment, trial)
+
+
+def _procs(*rows):
+    """A process table from ``(pid, ppid, argv)`` rows.
+
+    Args:
+        *rows: The rows.
+
+    Returns:
+        The table in the shape :func:`read_process_table` produces.
+    """
+    return list(rows)
+
+
+def _serving_argv(host: str, port: str | int, launcher: str = "areal.v2.inference_service.sglang.launch_server"):
+    """The command line of a serving process, as `/proc` reports it.
+
+    Args:
+        host: ``--host`` value.
+        port: ``--port`` value, or "" to omit the flag entirely.
+        launcher: The module the server was started as.
+
+    Returns:
+        An argv list.
+    """
+    argv = ["python3", "-m", launcher, "--model-path", "/models/x", "--tp-size", "2"]
+    if host:
+        argv += ["--host", host]
+    if port != "":
+        argv += ["--port", str(port)]
+    return argv
+
+
+def _worker_argv(experiment: str, trial: str, role: str = "rollout", port: str = "16866"):
+    """The command line of an AReaL rpc worker, which is what carries the trial identity.
+
+    Args:
+        experiment: ``--experiment-name`` value.
+        trial: ``--trial-name`` value.
+        role: ``--role`` value.
+        port: The worker's own RPC port -- deliberately NOT the serving port.
+
+    Returns:
+        An argv list.
+    """
+    return [
+        "python", "-m", "areal.infra.rpc.rpc_server",
+        "--port", port,
+        "--experiment-name", experiment,
+        "--trial-name", trial,
+        "--role", role,
+        "--worker-index", "0",
+    ]
+
+
+def _live_tree(root, experiment: str, trial: str, address: str) -> None:
+    """Write a `gen_servers` record the way AReaL's NFS repository writes one.
+
+    Args:
+        root: The name-resolve record root.
+        experiment: Experiment name.
+        trial: Trial name.
+        address: The address to record.
+    """
+    d = Path(root) / pe._gen_servers_key(experiment, trial)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "ENTRY").write_text(address)
+
+
+# ------------------------------------------------------------------- the sources ----
+
+
+def test_the_engine_that_re_exports_an_address_is_still_read():
+    """Both engine shapes, because a future passthrough on the wrapper must not break this."""
+    assert pe.resolve_endpoint(_FakeEngine(["172.28.127.18:32735"]), env={}) == (
+        pe.ResolvedEndpoint("http://172.28.127.18:32735/v1", "engine")
     )
-    assert pe.base_url_from_rollout(_FakeEngineDirect(["10.0.0.2:9000"])) == (
-        "http://10.0.0.2:9000/v1"
+    assert pe.resolve_endpoint(_FakeEngineDirect(["10.0.0.2:9000"]), env={}) == (
+        pe.ResolvedEndpoint("http://10.0.0.2:9000/v1", "engine")
     )
 
 
-def test_an_engine_with_no_address_is_a_refusal_not_a_localhost_guess():
-    """A0's server binds the host interface: a probe of localhost finds nothing at all."""
-    with pytest.raises(RuntimeError) as exc:
-        pe.base_url_from_rollout(_FakeEngine([]))
-    assert "127.0.0.1" not in str(exc.value)
+def test_the_controller_the_trainer_actually_holds_yields_an_address():
+    """THE DEFECT, in one line: a `RolloutController` has `server_infos`, not `addresses`.
+
+    Every periodic evaluation A0 has ever run reached this object and asked it for
+    `.addresses`. There is no such attribute, so discovery had never once succeeded on this
+    stack and the feature depended entirely on a pinned environment variable.
+    """
+    rollout = _FakeController([("172.28.127.18", 32735)])
+    assert not hasattr(rollout, "addresses"), "premise: the controller exposes no `addresses`"
+    assert pe.resolve_endpoint(rollout, env={}) == (
+        pe.ResolvedEndpoint("http://172.28.127.18:32735/v1", "server_infos")
+    )
 
 
-def test_the_hook_takes_the_address_from_the_engine_when_none_is_configured():
-    """With no BASE_URL in the environment the hook still knows where to evaluate."""
-    env = _env()
+def test_the_name_resolution_record_supplies_the_address_when_the_run_wrote_one(tmp_path):
+    """The on-disk source, read at the key AReaL's own `names.gen_servers` spells."""
+    _live_tree(tmp_path, "expA", "t1", "10.1.2.3:31000")
+    found = pe.resolve_endpoint(
+        _FakeController([], "expA", "t1"), env={}, procs=[], name_resolve_root=tmp_path
+    )
+    assert found == pe.ResolvedEndpoint("http://10.1.2.3:31000/v1", "name_resolve")
+
+
+def test_a_missing_name_resolution_record_falls_through_rather_than_failing(tmp_path):
+    """A0's stack never writes `gen_servers`, so a miss here must not end discovery.
+
+    The v2 inference service launches the server from the controller and records it only in
+    `server_infos`. A source that raised on absence would make the last source unreachable
+    on the one deployment this is being fixed for.
+    """
+    procs = _procs(
+        (100, 1, _worker_argv("expA", "t1")),
+        (101, 100, _serving_argv("172.28.127.18", 32735)),
+    )
+    assert not (tmp_path / pe._gen_servers_key("expA", "t1")).exists()
+    found = pe.resolve_endpoint(
+        _FakeController([], "expA", "t1"), env={}, procs=procs, name_resolve_root=tmp_path
+    )
+    assert found == pe.ResolvedEndpoint("http://172.28.127.18:32735/v1", "process_cmdline")
+
+
+def test_the_worker_rpc_ports_in_the_name_resolution_directory_are_never_read(tmp_path):
+    """The misdiagnosis of 2026-09-02, encoded so it cannot be made again.
+
+    `workers/rollout/0/ENTRY` holds 16866 -- the port of the rollout WORKER's Python RPC
+    server. The sglang HTTP server is on 32735. Those ports were compared as though they
+    were the same thing and the (correct) pinned address was declared wrong on that basis.
+    A resolver that scanned the whole name-resolve subtree would return 16866 here, which
+    answers no OpenAI request at all.
+    """
+    w = tmp_path / f"{getpass.getuser()}/expA/t1/workers/rollout/0"
+    w.mkdir(parents=True)
+    (w / "ENTRY").write_text("172.28.127.18:16866")
+    procs = _procs(
+        (100, 1, _worker_argv("expA", "t1", port="16866")),
+        (101, 100, _serving_argv("172.28.127.18", 32735)),
+    )
+    found = pe.resolve_endpoint(
+        _FakeController([], "expA", "t1"), env={}, procs=procs, name_resolve_root=tmp_path
+    )
+    assert found.base_url == "http://172.28.127.18:32735/v1"
+    assert "16866" not in found.base_url
+
+
+def test_the_serving_process_command_line_supplies_the_port_it_was_launched_with(tmp_path):
+    """The source that actually answers on this stack, and the only one that cannot be stale."""
+    procs = _procs(
+        (1, 0, ["init"]),
+        (100, 1, _worker_argv("expA", "t1")),
+        (101, 100, _serving_argv("172.28.127.18", 32735)),
+    )
+    assert pe.endpoint_from_process_table(procs, "expA", "t1") == "172.28.127.18:32735"
+
+
+def test_a_serving_process_with_no_port_on_its_command_line_yields_nothing(tmp_path):
+    """Half an address is not an address; a partial match must not become a default port."""
+    procs = _procs(
+        (100, 1, _worker_argv("expA", "t1")),
+        (101, 100, _serving_argv("172.28.127.18", "")),
+    )
+    assert pe.endpoint_from_process_table(procs, "expA", "t1") == ""
+    with pytest.raises(pe.EndpointUndiscoverable):
+        pe.resolve_endpoint(
+            _FakeController([], "expA", "t1"),
+            env={},
+            procs=procs,
+            name_resolve_root=tmp_path,
+        )
+
+
+def test_another_trials_serving_process_is_invisible(tmp_path):
+    """This box runs several trials at once; a box-wide grep would score the wrong weights."""
+    procs = _procs(
+        (100, 1, _worker_argv("otherexp", "t9")),
+        (101, 100, _serving_argv("172.28.127.18", 39999)),
+    )
+    assert pe.endpoint_from_process_table(procs, "expA", "t1") == ""
+
+
+def test_a_trial_that_owns_no_server_does_not_inherit_another_trials(tmp_path):
+    """The discriminating case for the ownership filter, which the obvious test cannot reach.
+
+    `test_another_trials_serving_process_is_invisible` looks like it covers this and does
+    not: with no worker of our own the function returns early on an empty owner set, so a
+    build with the ancestry filter DELETED still passes it. Here this trial does own a
+    worker -- the early return cannot fire -- and the only thing between this evaluation and
+    another run's weights is the filter itself. Measured: removing the filter leaves that
+    test green and turns this one red.
+    """
+    procs = _procs(
+        (100, 1, _worker_argv("expA", "t1")),
+        (200, 1, _worker_argv("otherexp", "t9")),
+        (201, 200, _serving_argv("172.28.127.18", 39999)),
+    )
+    assert pe.endpoint_from_process_table(procs, "expA", "t1") == ""
+    with pytest.raises(pe.EndpointUndiscoverable):
+        pe.resolve_endpoint(
+            _FakeController([], "expA", "t1"),
+            env={},
+            procs=procs,
+            name_resolve_root=tmp_path,
+        )
+
+
+def test_a_serving_process_is_attributed_through_its_ancestry_not_its_own_flags(tmp_path):
+    """The serving process carries no trial name; the worker that forked it does.
+
+    The real chain on A0 is launch_server -> rpc_server(rollout) -> bash -> trainer, so the
+    owner is two levels up. A matcher that only looked at the parent would find nothing.
+    """
+    procs = _procs(
+        (100, 1, _worker_argv("expA", "t1")),
+        (101, 100, ["bash", "-c", "..."]),
+        (102, 101, _serving_argv("172.28.127.18", 32735)),
+    )
+    assert pe.endpoint_from_process_table(procs, "expA", "t1") == "172.28.127.18:32735"
+
+
+def test_two_serving_processes_for_one_trial_are_a_refusal_not_a_coin_toss(tmp_path):
+    """Ambiguity is a discovery failure. Picking one is the guess this module refuses to make."""
+    procs = _procs(
+        (100, 1, _worker_argv("expA", "t1", role="rollout")),
+        (101, 100, _serving_argv("172.28.127.18", 32735)),
+        (200, 1, _worker_argv("expA", "t1", role="eval-rollout")),
+        (201, 200, _serving_argv("172.28.127.18", 41000)),
+    )
+    with pytest.raises(pe.EndpointUndiscoverable) as exc:
+        pe.endpoint_from_process_table(procs, "expA", "t1")
+    assert "32735" in str(exc.value) and "41000" in str(exc.value)
+
+
+def test_the_process_table_reader_sees_this_very_process():
+    """The default reader is exercised, not only the injected fixture.
+
+    A pure function over an injected table proves the FILTER; it does not prove that the
+    thing feeding it can read `/proc` at all. This test is the other half.
+    """
+    table = pe.read_process_table()
+    mine = {pid: argv for pid, _, argv in table}
+    assert os.getpid() in mine
+    assert any("python" in a for a in mine[os.getpid()])
+
+
+# ------------------------------------------------------------------- precedence ----
+
+
+def test_an_explicit_environment_variable_still_wins_over_every_discovered_source():
+    """The pin remains available as an override; it is simply no longer REQUIRED.
+
+    Asserted on the engine never being touched: `_ExplodingEngine` raises on every attribute,
+    so reaching it at all fails the test rather than merely returning the wrong answer.
+    """
+    env = {pe.ENV_PREFIX + "BASE_URL": "http://10.9.9.9:1234/v1"}
+    found = pe.resolve_endpoint(_ExplodingEngine(), env=env)
+    assert found == pe.ResolvedEndpoint("http://10.9.9.9:1234/v1", "configured")
+
+
+def test_the_in_process_sources_outrank_the_ones_that_scan_the_box(tmp_path):
+    """When the controller knows, nothing on disk or in the process table is consulted.
+
+    The controller's own launch return value cannot name another run's server and cannot be
+    stale; the two scanning sources can be both. So the order is not arbitrary, and a
+    fixture where every source answers DIFFERENTLY is the only way to observe it.
+    """
+    _live_tree(tmp_path, "expA", "t1", "10.1.2.3:31000")
+    procs = _procs(
+        (100, 1, _worker_argv("expA", "t1")),
+        (101, 100, _serving_argv("172.28.127.18", 39999)),
+    )
+    found = pe.resolve_endpoint(
+        _FakeController([("172.28.127.18", 32735)], "expA", "t1"),
+        env={},
+        procs=procs,
+        name_resolve_root=tmp_path,
+    )
+    assert found == pe.ResolvedEndpoint("http://172.28.127.18:32735/v1", "server_infos")
+
+
+def test_the_disk_record_outranks_the_process_table(tmp_path):
+    """This trial's own record beats a scan of every process on the box."""
+    _live_tree(tmp_path, "expA", "t1", "10.1.2.3:31000")
+    procs = _procs(
+        (100, 1, _worker_argv("expA", "t1")),
+        (101, 100, _serving_argv("172.28.127.18", 39999)),
+    )
+    found = pe.resolve_endpoint(
+        _FakeController([], "expA", "t1"), env={}, procs=procs, name_resolve_root=tmp_path
+    )
+    assert found.source == "name_resolve"
+
+
+# ------------------------------------------------------- refusing, never guessing ----
+
+
+def test_nothing_anywhere_is_a_named_refusal_and_never_a_localhost_guess(tmp_path):
+    """A0's server binds the host interface: a probe of localhost finds nothing at all.
+
+    Worse than nothing, in fact -- on a box that runs several trials a localhost guess can
+    CONNECT, to some other run's server, and score its weights under this arm's name. So the
+    refusal names every source it tried and offers no address.
+    """
+    with pytest.raises(pe.EndpointUndiscoverable) as exc:
+        pe.resolve_endpoint(
+            _FakeController([], "expA", "t1"), env={}, procs=[], name_resolve_root=tmp_path
+        )
+    msg = str(exc.value)
+    assert "127.0.0.1" not in msg and "localhost" not in msg
+    assert "server_infos" in msg and "gen_servers" in msg and "command line" in msg
+
+
+def test_a_process_that_cannot_name_its_trial_does_not_scan_the_box(tmp_path):
+    """Without an identity there is no scope, and an unscoped scan is a guess.
+
+    The discriminating pair with the test above it: same empty result, different reason, and
+    the reason is in the message because that is the only thing a reader of a gap has.
+    """
+    with pytest.raises(pe.EndpointUndiscoverable) as exc:
+        pe.resolve_endpoint(_FakeController([]), env={}, name_resolve_root=tmp_path)
+    assert "SKIPPED" in str(exc.value)
+
+
+def test_an_undiscoverable_endpoint_is_its_own_status_code(tmp_path):
+    """A gap with a reason attached, and a reason distinct from `the server did not answer`."""
+    env = _env(FREQ_STEPS=1)
     del env[pe.ENV_PREFIX + "BASE_URL"]
-    hook = pe.PeriodicEvalHook(env=env, rollout=_FakeEngine(["172.28.127.18:32735"]))
-    assert hook.config.base_url == ""
-    assert hook._eval_config().base_url == "http://172.28.127.18:32735/v1"
+    hook = pe.PeriodicEvalHook(env=env, rollout=_FakeController([]))
+    m = hook.maybe_run(global_step=1)
+    assert m["periodic_eval/status_code"] == pe.STATUS["endpoint_undiscovered"]
+    assert m["periodic_eval/status_code"] != pe.STATUS["endpoint_error"]
+    assert math.isnan(m["periodic_eval/olympiadbench/trend_score"])
+    assert m["periodic_eval/endpoint/source"] == pe.ENDPOINT_SOURCE["unresolved"]
+    assert math.isnan(m["periodic_eval/endpoint/port"])
 
 
-def test_an_explicit_base_url_wins_and_the_engine_is_not_consulted():
-    """The documented precedence, asserted on the engine never being touched.
+def test_an_unknown_address_and_a_dead_one_are_different_points_in_the_series():
+    """The discriminating pair. Both produce no score and they must not read alike.
 
-    Two places to look for an address is how a run scores the wrong server, so the rule is
-    one or the other and never a merge.
+    "I do not know where the server is" is a configuration fault; "I know where it is and it
+    did not answer" is an operational one. A shared status code would hide the first behind
+    the second, which is precisely how the first went unnoticed.
     """
-    hook = pe.PeriodicEvalHook(env=_env(), rollout=_ExplodingEngine())
-    assert hook._eval_config().base_url == "http://127.0.0.1:1/v1"
+    dead = _env(FREQ_STEPS=1, BASE_URL="http://127.0.0.1:9/v1")
+    known = pe.PeriodicEvalHook(env=dead, rollout=None).maybe_run(global_step=1)
+    unknown_env = _env(FREQ_STEPS=1)
+    del unknown_env[pe.ENV_PREFIX + "BASE_URL"]
+    unknown = pe.PeriodicEvalHook(env=unknown_env, rollout=_FakeController([])).maybe_run(1)
+
+    assert known["periodic_eval/status_code"] == pe.STATUS["endpoint_error"]
+    assert known["periodic_eval/endpoint/port"] == 9.0
+    assert unknown["periodic_eval/status_code"] == pe.STATUS["endpoint_undiscovered"]
+    assert math.isnan(unknown["periodic_eval/endpoint/port"])
 
 
 def test_a_missing_endpoint_is_a_status_code_not_a_crash():
-    """An engine that cannot say where it serves must not take the training run down."""
+    """An object that cannot say where it serves must not take the training run down."""
     env = _env(FREQ_STEPS=1)
     del env[pe.ENV_PREFIX + "BASE_URL"]
     hook = pe.PeriodicEvalHook(env=env, rollout=_FakeEngine([]))
     m = hook.maybe_run(global_step=1)
-    assert m["periodic_eval/status_code"] == pe.STATUS["endpoint_error"]
-    assert math.isnan(m["periodic_eval/olympiadbench/trend_score"])
+    assert m["periodic_eval/status_code"] == pe.STATUS["endpoint_undiscovered"]
+    assert not (hook.config.metric_keys() - set(m)), "a refused point must still fill every series"
 
 
 def test_the_base_url_is_still_required_outside_a_trainer():
-    """Without an engine there is nothing to read the address off, so it must be configured."""
+    """Without a rollout object there is nothing to discover from, so it must be configured."""
     env = _env()
     del env[pe.ENV_PREFIX + "BASE_URL"]
     with pytest.raises(ValueError):
         pe.PeriodicEvalConfig.from_env(env)
+
+
+# --------------------------------------------------- the address is RECORDED ----
+
+
+def test_the_hook_takes_the_address_from_the_controller_when_none_is_configured():
+    """With no BASE_URL in the environment the hook still knows where to evaluate."""
+    env = _env()
+    del env[pe.ENV_PREFIX + "BASE_URL"]
+    hook = pe.PeriodicEvalHook(env=env, rollout=_FakeController([("172.28.127.18", 32735)]))
+    assert hook.config.base_url == ""
+    cfg = hook._eval_config()
+    assert cfg.base_url == "http://172.28.127.18:32735/v1"
+    assert cfg.base_url_source == "server_infos"
+
+
+@needs_data
+def test_a_point_records_the_address_it_RESOLVED_not_the_one_configured(endpoint, tmp_path):
+    """The recorded address must come from discovery, not from the configuration.
+
+    The discriminating construction: nothing is configured at all, the stub's port is known
+    only to the fixture, and the point is asserted to carry that port. An implementation that
+    echoed `cfg.base_url` as written at launch would record an empty address here -- and one
+    that echoed a constant would record the wrong port.
+    """
+    url, policy = endpoint
+    policy.models = _window(13)
+    host, port = url.split("//", 1)[1].split("/", 1)[0].split(":")
+    env = _env(
+        FREQ_STEPS=5,
+        LIMIT=4,
+        MAX_TOKENS=64,
+        CONCURRENCY=4,
+        TIMEOUT=30,
+        STATE=str(tmp_path / "best.json"),
+        OUT_DIR=str(tmp_path / "out"),
+    )
+    del env[pe.ENV_PREFIX + "BASE_URL"]
+    hook = pe.PeriodicEvalHook(env=env, rollout=_FakeController([(host, int(port))]))
+    m = hook.maybe_run(global_step=5)
+
+    assert m["periodic_eval/status_code"] == pe.STATUS["ok"], "premise: the point must score"
+    assert policy.n_chat > 0, "premise: the stub must actually have been queried"
+    assert m["periodic_eval/endpoint/port"] == float(port)
+    assert m["periodic_eval/endpoint/source"] == pe.ENDPOINT_SOURCE["server_infos"]
+    saved = json.loads((tmp_path / "out" / "step5" / "results.json").read_text())
+    assert saved["endpoint"] == {"base_url": url, "source": "server_infos"}
+
+
+@needs_data
+def test_a_configured_address_is_recorded_as_configured_not_as_discovered(endpoint, tmp_path):
+    """The other half: the source series must distinguish a pin from a discovery.
+
+    Same score, same endpoint, different provenance -- and provenance is the whole reason the
+    series exists, because a pinned address is the one that can be silently wrong.
+    """
+    url, policy = endpoint
+    policy.models = _window(13)
+    cfg = _config(url, out_dir=str(tmp_path / "out"), state_path=str(tmp_path / "b.json"))
+    m = pe.run_periodic_eval(cfg, 5, pe.BestValTracker(cfg.patience, cfg.state_path))
+    assert m["periodic_eval/status_code"] == pe.STATUS["ok"]
+    assert m["periodic_eval/endpoint/source"] == pe.ENDPOINT_SOURCE["configured"]
+    assert m["periodic_eval/endpoint/source"] != pe.ENDPOINT_SOURCE["server_infos"]
+    saved = json.loads((tmp_path / "out" / "step5" / "results.json").read_text())
+    assert saved["endpoint"]["base_url"] == url

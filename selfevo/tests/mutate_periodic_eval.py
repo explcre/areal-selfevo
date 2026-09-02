@@ -95,10 +95,32 @@ MUTATIONS = [
         repl="        is_live=int(differ > 0),",
     ),
     Mutation(
-        label="a missing logprobs block is treated as `no difference` instead of refused",
+        label="a missing logprobs block is `no difference` instead of refused (chat path)",
         rel="selfevo/periodic_eval.py",
-        find="    if not lps:\n        raise LivenessUnavailable(",
-        repl="    if not lps:\n        return text, [0.0]\n    if False:\n        raise LivenessUnavailable(",
+        find=(
+            "    lps = [t.get(\"logprob\") for t in content if isinstance(t, dict) and t.get(\"logprob\") is not None]\n"
+            "    if not lps:\n"
+        ),
+        repl=(
+            "    lps = [t.get(\"logprob\") for t in content if isinstance(t, dict) and t.get(\"logprob\") is not None]\n"
+            "    if not lps:\n"
+            "        return text, [0.0]\n"
+            "    if False:\n"
+        ),
+    ),
+    Mutation(
+        label="a missing logprobs block is `no difference` instead of refused (token-id path)",
+        rel="selfevo/periodic_eval.py",
+        find=(
+            "    lps = r.get(\"logprobs\") or []\n"
+            "    if not lps:\n"
+        ),
+        repl=(
+            "    lps = r.get(\"logprobs\") or []\n"
+            "    if not lps:\n"
+            "        return r.get(\"text\", \"\"), [0.0]\n"
+            "    if False:\n"
+        ),
     ),
     Mutation(
         label="THE BRIEF'S FOURTH MUTATION: best-val keeps the LATEST checkpoint",
@@ -238,10 +260,92 @@ MUTATIONS = [
         repl='    addrs = ["127.0.0.1:30000"]',
     ),
     Mutation(
-        label="an explicitly configured endpoint is overridden by the engine's address",
+        label="THE BRIEF'S MUTATION: an explicitly configured endpoint is overridden by discovery",
         rel="selfevo/periodic_eval.py",
-        find="        if self.config.base_url or self._rollout is None:",
-        repl="        if self._rollout is None:",
+        find='    if configured:\n        return ResolvedEndpoint(_v1(configured), "configured")',
+        repl='    if False:\n        return ResolvedEndpoint(_v1(configured), "configured")',
+    ),
+    Mutation(
+        label="THE BRIEF'S MUTATION: discovery falls back to a localhost guess",
+        rel="selfevo/periodic_eval.py",
+        find="    raise EndpointUndiscoverable(\n        \"no inference server address could be discovered, so there is nothing to evaluate \"",
+        repl=(
+            '    return ResolvedEndpoint("http://127.0.0.1:30000/v1", "process_cmdline")\n'
+            "    raise EndpointUndiscoverable(\n"
+            "        \"no inference server address could be discovered, so there is nothing to evaluate \""
+        ),
+    ),
+    Mutation(
+        label="THE BRIEF'S MUTATION: a discovery failure returns an address nothing checked",
+        rel="selfevo/periodic_eval.py",
+        find='    infos = getattr(rollout, "server_infos", None)\n    if not infos:\n        return ""',
+        repl='    infos = getattr(rollout, "server_infos", None)\n    if not infos:\n        return "172.28.127.18:32735"',
+    ),
+    Mutation(
+        label="THE BRIEF'S MUTATION: the recorded source is always the CONFIGURED one",
+        rel="selfevo/periodic_eval.py",
+        find='    endpoint = ResolvedEndpoint(cfg.base_url, cfg.base_url_source or "unresolved")',
+        repl='    endpoint = ResolvedEndpoint(cfg.base_url, "configured")',
+    ),
+    Mutation(
+        label="the recorded port is a constant rather than the port that was queried",
+        rel="selfevo/periodic_eval.py",
+        find="    port = None if endpoint is None else endpoint_port(endpoint.base_url)",
+        repl="    port = 30000",
+    ),
+    Mutation(
+        label="THE ORIGINAL DEFECT: the controller's own server_infos is not read",
+        rel="selfevo/periodic_eval.py",
+        find='    infos = getattr(rollout, "server_infos", None)\n',
+        repl="    infos = None\n",
+    ),
+    Mutation(
+        label="THE 2026-09-02 MISDIAGNOSIS: worker RPC ports are read as serving addresses",
+        rel="selfevo/periodic_eval.py",
+        find="    return names.gen_servers(experiment, trial)",
+        repl='    return names.worker_discovery(experiment, trial, "rollout", 0)',
+    ),
+    Mutation(
+        label="the process scan ignores trial ownership and can find another run's server",
+        rel="selfevo/periodic_eval.py",
+        find='        if not host or not port or not _descends_from(pid, owners, by_pid):',
+        repl="        if not host or not port:",
+    ),
+    Mutation(
+        label="a command line with no port acquires a default one",
+        rel="selfevo/periodic_eval.py",
+        find='        host, port = _flag(argv, "--host"), _flag(argv, "--port")',
+        repl='        host, port = _flag(argv, "--host"), _flag(argv, "--port") or "30000"',
+    ),
+    Mutation(
+        label="ownership is decided on the serving process alone, not on its ancestry",
+        rel="selfevo/periodic_eval.py",
+        find="        seen.add(pid)\n        pid = by_pid[pid][0]",
+        repl="        seen.add(pid)\n        return pid in owners",
+    ),
+    Mutation(
+        label="two servers for one trial: one is picked instead of refusing",
+        rel="selfevo/periodic_eval.py",
+        find="    if len(found) > 1:",
+        repl="    if False:",
+    ),
+    Mutation(
+        label="the trial-identity gate is removed, so an unscoped scan of the box happens",
+        rel="selfevo/periodic_eval.py",
+        find="    if not experiment or not trial:",
+        repl="    if False:",
+    ),
+    Mutation(
+        label="an undiscoverable endpoint reuses the generic `the server did not answer` code",
+        rel="selfevo/periodic_eval.py",
+        find='        status = STATUS["endpoint_undiscovered"]',
+        repl='        status = STATUS["endpoint_error"]',
+    ),
+    Mutation(
+        label="the discovered address is not normalised to a /v1 endpoint",
+        rel="selfevo/periodic_eval.py",
+        find='    return addr if addr.endswith("/v1") else addr + "/v1"',
+        repl="    return addr",
     ),
     Mutation(
         label="a failed evaluation forgets the adapter it was pinned to (the step-50 wart)",

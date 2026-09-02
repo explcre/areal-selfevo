@@ -52,6 +52,22 @@ class StatsLogger:
         if suffix == "timestamp":
             suffix = time.strftime("%Y_%m_%d_%H_%M_%S")
 
+        # selfevo: one launch, one tracker identifier. The vendor default builds the id
+        # from experiment, trial and a CONSTANT suffix, so every relaunch of a trial
+        # resumes the previous run under `resume="allow"` -- and W&B then ignores every
+        # write below the step that run had reached. A0 lost four hours of curve to this
+        # on 2026-09-02 while looking healthy from every other angle. `resolve_run_id`
+        # appends a launch-unique token unless SELFEVO_WANDB_RUN_ID names an id to
+        # resume, and the two assertions below fire when that has not worked.
+        from selfevo.run_identity import (
+            assert_id_is_fresh,
+            resolve_run_id,
+        )
+
+        run_id, self._intended_resume = resolve_run_id(
+            self.config.experiment_name, self.config.trial_name, suffix or ""
+        )
+
         exp_config_dict = asdict(self.exp_config)
         exp_config_dict["version_info"] = {
             "commit_id": version_info.commit,
@@ -73,9 +89,13 @@ class StatsLogger:
             config=exp_config_dict,  # save all experiment config to wandb
             dir=self.get_log_path(self.config),
             force=True,
-            id=f"{self.config.experiment_name}_{self.config.trial_name}_{suffix}",
+            id=run_id,
             resume="allow",
         )
+        _step = getattr(wandb.run, "step", 0)
+        self._resumed_step = _step if isinstance(_step, int) else 0
+        self._checked_first_commit = False
+        assert_id_is_fresh(run_id, self._resumed_step, self._intended_resume)
 
         swanlab_config = self.config.swanlab
         if swanlab_config.mode != "disabled":
@@ -143,6 +163,18 @@ class StatsLogger:
         if isinstance(data, dict):
             data = [data]
         log_step = max(global_step, self._last_commit_step + 1)
+        # selfevo: the first write is the first moment at which both the step this run
+        # will log and the step the tracker sits at are known. A write that does not
+        # advance the tracker is DISCARDED by it, silently, so it is refused here --
+        # including for an intended resume that rewound, which the startup check by
+        # construction cannot see.
+        if not getattr(self, "_checked_first_commit", True):
+            from selfevo.run_identity import assert_step_advances
+
+            self._checked_first_commit = True
+            assert_step_advances(
+                getattr(wandb.run, "id", ""), getattr(self, "_resumed_step", 0), log_step
+            )
         for i, item in enumerate(data):
             # Filter out counter keys for scalar variables
             item = {k: v for k, v in item.items() if not k.endswith("__count")}
