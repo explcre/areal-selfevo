@@ -213,6 +213,7 @@ STATUS = {
     "adapter_evicted": 8,  # the pinned version disappeared while this evaluation ran
     "budget_unrecorded": 9,  # a score arrived without the token budget that produced it
     "endpoint_undiscovered": 10,  # no source could say where the inference server is
+    "cost_capped": 11,  # projected cost exceeded the ceiling; the point was SKIPPED, not run
 }
 
 #: Every key this module can emit. Declared, and asserted against the real emission in
@@ -226,6 +227,8 @@ METRIC_KEYS = frozenset(
         "periodic_eval/diagnosis",
         "periodic_eval/cost/seconds",
         "periodic_eval/cost/throughput_frac",
+        "periodic_eval/cost/projected_throughput_frac",
+        "periodic_eval/cost/cap",
         "periodic_eval/liveness/n_probes",
         "periodic_eval/liveness/prompts_live_frac",
         "periodic_eval/liveness/max_abs_dlogprob",
@@ -328,6 +331,15 @@ DEFAULT_PROBE_PROMPTS = (
 #: on the same server, 0.0427, so a control that slips past the in-band comparison still has
 #: to clear a number no identical pair of weights has ever reached here.
 DEFAULT_LIVE_EPS = 0.01
+
+#: Default ceiling for :func:`cost_cap_decision`, as a fraction of training throughput.
+#: 0.15 is the first value tried, chosen against A0's own measured series: the benchmark
+#: phase there sat at 7.8% of throughput at step 50, peaked at 13.0% at step 150, and
+#: settled back to 9.8-10.5% over steps 200-400. A ceiling of 0.15 is above every point
+#: that run has produced, so it does not silence a curve that is behaving, and it stops a
+#: curve that is not. It is NOT a claim about where the cost belongs; it is the level at
+#: which the evaluation stops being worth its wall time on this run.
+DEFAULT_MAX_THROUGHPUT_FRAC = 0.15
 
 
 class ReportSplitTouched(RuntimeError):
@@ -1298,6 +1310,10 @@ class PeriodicEvalConfig:
             measurement, not a capability measurement.
         live_eps: Maximum absolute per-token logprob difference below which the adapter is
             called inert.
+        max_throughput_frac: Ceiling on the projected cost of one evaluation, as a
+            fraction of training throughput. A point whose projection exceeds it is
+            SKIPPED and recorded with ``STATUS['cost_capped']``. Zero or less disables
+            the cap. See :func:`cost_cap_decision`.
         patience: Evaluations without a new best before ``should_stop`` is raised.
         state_path: Where best-validation state is persisted, so a resumed run does not
             forget which checkpoint was best.
@@ -1325,6 +1341,7 @@ class PeriodicEvalConfig:
     probe_prompts: tuple[str, ...] = DEFAULT_PROBE_PROMPTS
     probe_max_tokens: int = 32
     live_eps: float = DEFAULT_LIVE_EPS
+    max_throughput_frac: float = DEFAULT_MAX_THROUGHPUT_FRAC
     patience: int = 10
     state_path: str = ""
     out_dir: str = ""
@@ -1440,6 +1457,9 @@ class PeriodicEvalConfig:
             model_path=_resolve_model_path(env, base_model),
             probe_max_tokens=_env_int(env, "PROBE_MAX_TOKENS", 32),
             live_eps=_env_float(env, "LIVE_EPS", DEFAULT_LIVE_EPS),
+            max_throughput_frac=_env_float(
+                env, "MAX_THROUGHPUT_FRAC", DEFAULT_MAX_THROUGHPUT_FRAC
+            ),
             patience=_env_int(env, "PATIENCE", 10),
             state_path=env.get(ENV_PREFIX + "STATE", "").strip(),
             out_dir=env.get(ENV_PREFIX + "OUT_DIR", "").strip(),
@@ -2039,6 +2059,83 @@ def throughput_fraction(eval_seconds: float, freq_steps: int, step_seconds: floa
     return eval_seconds / (freq_steps * step_seconds)
 
 
+@dataclass(frozen=True)
+class CostCapDecision:
+    """Whether the next evaluation point is worth its projected wall time.
+
+    Attributes:
+        skip: True when the point must NOT run.
+        projected_frac: The projection the decision was made on, as a fraction of
+            training throughput. NaN when no projection could be made.
+        ceiling: The ceiling it was compared against.
+    """
+
+    skip: bool
+    projected_frac: float
+    ceiling: float
+
+
+def cost_cap_decision(
+    last_eval_seconds: float | None,
+    freq_steps: int,
+    step_seconds: float,
+    ceiling: float,
+) -> CostCapDecision:
+    """Decide whether to run the next evaluation, from what the last one cost.
+
+    WHY THIS EXISTS. Nothing else in this module bounds the evaluation's cost. Measured
+    on A0 across steps 50 to 150 the benchmark phase grew 88.7 -> 123.9 -> 155.4 seconds,
+    and three points cannot separate linear growth from a transient: extrapolated, that
+    slope reached 100% of training throughput near step 1900. Five further points (steps
+    200-400: 122.9, 117.4, 124.0, 126.7, 121.5 s) showed it was a transient: the
+    post-transient slope is +0.013 s/step, smaller than the 3.1 s scatter it is fitted
+    through. So this is a SAFETY NET rather than a correction for a growth that is happening,
+    and it is written to be one: it costs nothing while the cost behaves, and it never
+    silently drops a point.
+
+    THE PROJECTION IS THE PREVIOUS POINT'S COST, not a fitted trend. A trend fitted to a
+    handful of noisy points is exactly what produced the step-1900 projection this module
+    is not repeating. The last measured cost, re-divided by the CURRENT step time, is a
+    statement about what the next point would cost if it behaved like the last one, and
+    that is the only claim being made.
+
+    TWO CASES DELIBERATELY DO NOT SKIP, because a cap that fires on an unknown blinds the
+    curve for a reason that has nothing to do with cost:
+
+    * no previous point (``last_eval_seconds`` is None) -- the first evaluation of a run
+      always runs, because there is nothing to project from;
+    * the step time is not yet known, so :func:`throughput_fraction` returns NaN. Every
+      comparison against NaN is False in Python, and that is the wanted behaviour rather
+      than an accident, so it is stated here and tested.
+
+    A ceiling of zero or less switches the cap off entirely.
+
+    ONE PROPERTY WORTH STATING PLAINLY: while the cap is firing, ``last_eval_seconds``
+    stops being refreshed -- a skipped point measures nothing. So once tripped the cap
+    latches until the step time rises enough to bring the same projection back under the
+    ceiling. That is intended (a cost that reached the ceiling should stay off, not
+    oscillate), and it is safe to read because every skipped point is emitted with
+    ``STATUS['cost_capped']``: a latched cap is a visible run of status-11 points on the
+    curve, not a silent absence.
+
+    Args:
+        last_eval_seconds: Wall seconds the previous evaluation took, or None if there
+            has not been one in this process.
+        freq_steps: Steps between evaluations.
+        step_seconds: Measured seconds per training step.
+        ceiling: Maximum tolerated fraction of training throughput.
+
+    Returns:
+        The decision, carrying the projection it was made on so the number that caused a
+        skip is recorded rather than recomputed by a reader.
+    """
+    if ceiling is None or ceiling <= 0 or last_eval_seconds is None:
+        return CostCapDecision(False, float("nan"), float(ceiling or 0.0))
+    projected = throughput_fraction(last_eval_seconds, freq_steps, step_seconds)
+    # NaN > ceiling is False: an unprojectable point runs. See the docstring.
+    return CostCapDecision(bool(projected > ceiling), projected, float(ceiling))
+
+
 def metrics_from(
     global_step: int,
     rows: dict[str, dict],
@@ -2050,6 +2147,7 @@ def metrics_from(
     diagnosis: int,
     adapter: "ResolvedAdapter | None" = None,
     endpoint: "ResolvedEndpoint | None" = None,
+    cap: "CostCapDecision | None" = None,
 ) -> dict[str, float]:
     """Flatten one evaluation into the metric dict the trainer's own logger commits.
 
@@ -2072,6 +2170,10 @@ def metrics_from(
         endpoint: Which server this point queried and how that address was found. Emitted
             for the same reason as the adapter version: a score is attributable only if
             the reader can see what answered it.
+        cap: The cost-cap decision made before this point, or None where no cap was
+            consulted. Its projection and ceiling are emitted as their own series so a
+            skipped point can be read against the number that skipped it, on the same
+            axis as the costs that were actually paid.
 
     Returns:
         A flat mapping of metric key to float.
@@ -2087,6 +2189,10 @@ def metrics_from(
         "periodic_eval/diagnosis": float(diagnosis),
         "periodic_eval/cost/seconds": float(seconds),
         "periodic_eval/cost/throughput_frac": float(throughput_frac),
+        "periodic_eval/cost/projected_throughput_frac": (
+            nan if cap is None else float(cap.projected_frac)
+        ),
+        "periodic_eval/cost/cap": nan if cap is None else float(cap.ceiling),
         "periodic_eval/liveness/n_probes": float(liveness.n_probes) if liveness else nan,
         "periodic_eval/liveness/prompts_live_frac": float(liveness.prompts_live_frac) if liveness else nan,
         "periodic_eval/liveness/max_abs_dlogprob": float(liveness.max_abs_dlogprob) if liveness else nan,
@@ -2193,6 +2299,7 @@ def run_periodic_eval(
     checkpoint: str = "",
     step_seconds: float = 0.0,
     logger=None,
+    cap: "CostCapDecision | None" = None,
 ) -> dict[str, float]:
     """Evaluate the current weights and return the metrics for the trainer to commit.
 
@@ -2209,6 +2316,8 @@ def run_periodic_eval(
             score so the selected checkpoint can be found afterwards.
         step_seconds: Measured seconds per training step, for the throughput cost.
         logger: Optional logger for the human-readable line.
+        cap: The cost-cap decision that allowed this point to run, recorded with it so
+            the projection sits on the curve beside the cost that was actually paid.
 
     Returns:
         The metric mapping, always containing every key in ``cfg.metric_keys()``.
@@ -2293,7 +2402,7 @@ def run_periodic_eval(
     try:
         metrics = metrics_from(
             global_step, rows, liveness, decision, seconds, frac, status, diagnosis,
-            resolved, endpoint,
+            resolved, endpoint, cap,
         )
     except BudgetUnrecorded as exc:
         # The post-condition fired. The score is DROPPED rather than emitted without its
@@ -2303,7 +2412,7 @@ def run_periodic_eval(
         decision = None
         metrics = metrics_from(
             global_step, {}, liveness, None, seconds, frac, status, DIAGNOSIS["unknown"],
-            resolved, endpoint,
+            resolved, endpoint, cap,
         )
     metrics[EVAL_GRADER_KEY] = float(grader_calls)
     # Every key the configuration declares is emitted every time, NaN included. A key that
@@ -2327,6 +2436,65 @@ def run_periodic_eval(
         f"maxdlogp={getattr(liveness, 'max_abs_dlogprob', float('nan')):.5f} "
         f"best={getattr(decision, 'best_score', float('nan'))}@{getattr(decision, 'best_step', -1)} "
         f"{seconds:.1f}s ({frac:.1%} of throughput)",
+    )
+    return metrics
+
+
+def record_capped_point(
+    cfg: PeriodicEvalConfig,
+    global_step: int,
+    cap: CostCapDecision,
+    logger=None,
+) -> dict[str, float]:
+    """Emit and persist a point that was SKIPPED to stay under the cost ceiling.
+
+    A skipped point is a POINT, not an absence. It goes through the same
+    :func:`metrics_from` as a scored one and, when an ``out_dir`` is configured, through
+    the same :func:`_persist`, so the gap on the curve carries a status code, the
+    projection that caused it and the ceiling it was measured against -- rather than
+    being a hole a reader has to explain. The whole point of the cap is to make the
+    decision visible; a silent skip would trade an hour of wall time for a mystery.
+
+    Every measurement is NaN, following this module's rule that a number it did not make
+    is never a zero. ``cost/seconds`` is the exception and is a true 0.0: the evaluation
+    genuinely cost no wall time, and that is measured, not missing.
+
+    Args:
+        cfg: The resolved configuration.
+        global_step: The step that was not evaluated.
+        cap: The decision, carrying the projection and the ceiling.
+        logger: Optional logger for the human-readable line.
+
+    Returns:
+        The metric mapping, containing every key in ``cfg.metric_keys()``.
+    """
+    metrics = metrics_from(
+        global_step,
+        {},
+        None,
+        None,
+        0.0,
+        float("nan"),
+        STATUS["cost_capped"],
+        DIAGNOSIS["unknown"],
+        None,
+        None,
+        cap,
+    )
+    metrics[EVAL_GRADER_KEY] = 0.0
+    for key in cfg.metric_keys():
+        metrics.setdefault(key, float("nan"))
+    if cfg.out_dir:
+        _persist(cfg, global_step, {}, {}, None, None, metrics, None, None)
+    _log(
+        logger,
+        "info",
+        f"periodic eval SKIPPED step={global_step} status={STATUS['cost_capped']} "
+        f"(cost cap): the last evaluation would cost {cap.projected_frac:.1%} of "
+        f"training throughput at the current step time, over the {cap.ceiling:.1%} "
+        f"ceiling. No generation ran. Raise "
+        f"{ENV_PREFIX}MAX_THROUGHPUT_FRAC to spend more, or lower "
+        f"{ENV_PREFIX}LIMIT to make each point cheaper.",
     )
     return metrics
 
@@ -2440,6 +2608,10 @@ class PeriodicEvalHook:
     is under a minute; a much larger ``LIMIT`` would need the barrier timeout checked first.
     """
 
+    #: The cost cap is consulted here rather than inside ``run_periodic_eval`` for one
+    #: reason: this is the only place that can decline to call it at all, and a cap that
+    #: fires after the evaluation has started has not saved anything.
+    #:
     #: How many recent step durations to keep for the median used as the throughput
     #: denominator. A median, not a mean: checkpoint steps are much slower than plain ones
     #: and would drag a mean upward, making the evaluation look cheaper than it is.
@@ -2469,6 +2641,10 @@ class PeriodicEvalHook:
         self._step_times: list[float] = []
         self._last_step_t: float | None = None
         self._last_counts = None
+        # The cost of the last evaluation that actually ran, which is what the next
+        # point's cost is projected from. None until one has run: the first evaluation
+        # of a process has nothing to project from and is never capped.
+        self._last_eval_seconds: float | None = None
 
     @property
     def enabled(self) -> bool:
@@ -2588,6 +2764,17 @@ class PeriodicEvalHook:
         metrics = self.budget_metrics()
         if not self.config.should_run(global_step):
             return metrics
+        # The cap is consulted BEFORE the endpoint is resolved and before a token is
+        # generated, because its entire purpose is not to pay for this point.
+        cap = cost_cap_decision(
+            self._last_eval_seconds,
+            self.config.freq_steps,
+            self.step_seconds(),
+            self.config.max_throughput_frac,
+        )
+        if cap.skip:
+            metrics.update(record_capped_point(self.config, global_step, cap, self.logger))
+            return metrics
         try:
             cfg = self._eval_config()
         except Exception as exc:
@@ -2612,8 +2799,15 @@ class PeriodicEvalHook:
                 checkpoint=checkpoint,
                 step_seconds=self.step_seconds(),
                 logger=self.logger,
+                cap=cap,
             )
         )
+        # What the next point's cost is projected from. Taken from the emitted metric
+        # rather than re-timed here, so the projection is made on the same number the
+        # curve reports -- two clocks for one cost is how they drift apart.
+        measured = metrics.get("periodic_eval/cost/seconds")
+        if measured is not None and not math.isnan(measured):
+            self._last_eval_seconds = float(measured)
         # Exclude the evaluation's own wall time from the training step-time window.
         self._last_step_t = time.time()
         return metrics

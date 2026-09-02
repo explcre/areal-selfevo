@@ -2000,3 +2000,152 @@ live=na best=nan@-1 0.0s (0.0\% of throughput)
 
 Four consecutive refusals, none of them scoring, at no measurable cost to throughput. The
 substance of mode (viii) is unchanged and its evidence is four times larger than reported.
+
+\subsection{The evaluation's cost growth was a transient, and is capped anyway}
+\label{sec:evalcost}
+
+The paragraph ``The cost of the check, and what does not explain it'' in the fifth-failure-mode
+subsection above reads three cost points as an unbounded rise and projects that the periodic
+evaluation consumes the whole of training throughput near step $1900$. Five further points now
+exist. \textbf{They refute the projection}: the rise was a transient that peaked at step $150$,
+and the series is flat thereafter. The reading is retracted; the remedy recommended there is
+implemented regardless, as a safety net rather than as a correction to a growth that is
+happening.
+
+\begin{table}[t]
+\centering\small
+\caption{Cost of one A0 periodic evaluation point, all eight points, read from
+\texttt{runs/a0\_periodic/step\{50,\dots,400\}/results.json}. \emph{Benchmark} is the generation
+and grading phase alone; \emph{total} adds the liveness probe and adapter resolution.
+\emph{Throughput} is the total divided by the $50$ training steps it is amortised over.
+Step time is implied from the two, as $\mathrm{total}/(50\times\mathrm{throughput})$.}
+\label{tab:evalcost}
+\begin{tabular}{rccccc}
+\toprule
+step & benchmark (s) & total (s) & throughput & mean chars & truncated \\
+\midrule
+$50$  & $88.7$  & $104.2$ & $7.85\%$  & $2289$ & $3$ \\
+$100$ & $123.9$ & $139.5$ & $10.30\%$ & $2336$ & $3$ \\
+$150$ & $155.4$ & $177.4$ & $12.95\%$ & $2287$ & $3$ \\
+\midrule
+$200$ & $122.9$ & $138.6$ & $10.10\%$ & $2323$ & $2$ \\
+$250$ & $117.4$ & $133.1$ & $9.82\%$  & $2397$ & $4$ \\
+$300$ & $124.0$ & $139.8$ & $10.45\%$ & $2287$ & $2$ \\
+$350$ & $126.7$ & $142.5$ & $10.52\%$ & $2382$ & $4$ \\
+$400$ & $121.5$ & $137.2$ & $9.78\%$  & $2312$ & $3$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{The slope collapses once the transient is out of the window.} Fitted to the first
+three points the benchmark phase rises at $+0.667$ seconds per training step, which is the
+slope that produced the step-$1900$ projection. Fitted to the five points from step $200$
+onward it is $+0.013$ seconds per step, and that residual is not resolvable: across its own
+$200$-step window it implies a rise of $2.6$ seconds against a point-to-point scatter of $3.1$
+seconds about the mean of $122.5$. In throughput terms those five points are $10.10\%$,
+$9.82\%$, $10.45\%$, $10.52\%$ and $9.78\%$ --- mean $10.13\%$, standard deviation $0.31$
+percentage points. The series is flat, and step $150$ is the maximum of all eight rather than a
+point on a trend. The two negative findings the earlier paragraph established hold across all
+eight points and are strengthened by them: mean generated length stays in $[2287, 2397]$
+characters with no trend, truncations stay at $2$ to $4$ of $64$, all $64$ problems grade at
+every point, and the implied training step time moves only between $26.6$ and $28.1$ seconds.
+What changed is the conclusion drawn from three points, not the measurements.
+
+\paragraph{We do not replace one extrapolation with another.} Fitted to all eight points the
+slope is $+0.034$ seconds per step, and extrapolating \emph{that} would cross the ceiling
+below near step $2200$ --- inside this run. The post-transient fit extrapolates to step
+$5400$. Neither number is offered as a prediction: the all-eight fit pools a transient with a
+plateau and estimates neither, and the post-transient slope is smaller than the scatter it is
+fitted through, so its crossing point is an artefact of a slope that is not distinguishable
+from zero. The honest statement is the one the earlier paragraph made and this one keeps: a
+handful of points cannot separate these shapes, and nothing measured so far bounds the cost.
+What has changed is that the specific alarming projection is refuted, and that the bound is
+now enforced rather than predicted.
+
+\paragraph{The cap, and what it is a cap on.} Before each point the projected cost is computed
+as the \emph{previous} point's wall seconds divided by the cadence times the current measured
+step time; if that fraction exceeds a ceiling the point is skipped, and the skip is emitted and
+persisted as a point with \texttt{status\_code 11} (\texttt{cost\_capped}) and NaN for every
+measurement. The projection is deliberately the last measured cost rather than a fitted trend:
+a trend fitted to a handful of noisy points is exactly what produced the step-$1900$ figure
+this subsection retracts. The ceiling is $0.15$, set by
+\texttt{SELFEVO\_PERIODIC\_\allowbreak EVAL\_MAX\_\allowbreak THROUGHPUT\_FRAC}, chosen to sit above every point in
+Table~\ref{tab:evalcost} --- including the step-$150$ peak --- so that it does not silence a
+curve that is behaving. Two new series,
+\texttt{periodic\_eval/\allowbreak cost/\allowbreak projected\_throughput\_frac} and
+\texttt{periodic\_eval/cost/cap}, are emitted on every point, scored and skipped alike, so a
+gap on the curve can be read against the number that caused it and the ceiling it was measured
+against. The cadence ($50$ steps) and the problem limit ($64$) are unchanged: they set what the
+curve measures, and the cap is about what it costs.
+
+\paragraph{Three cases deliberately do not skip, and one property is worth stating.} The first
+evaluation of a process is never capped, because there is no previous point to project from; a
+step time that is not yet measured yields a NaN projection, and every comparison against NaN is
+false, so the point runs rather than being blinded for a reason that has nothing to do with
+cost; and a ceiling of zero or less disables the cap outright. The property: while the cap is
+firing, the previous cost is not refreshed --- a skipped point measures nothing --- so once
+tripped the cap latches until the step time rises enough to bring the same projection back
+under the ceiling. That is intended, and it is safe to read precisely because a skipped point
+is a recorded point: a latched cap appears as a run of \texttt{status\_code 11} on the curve,
+not as an absence.
+
+\paragraph{The cap does not protect the run that motivated it.} The A0 arm now training imported
+this module at launch, before the change, so it continues under the uncapped code and the cap
+takes effect at the next launch. This is stated rather than glossed because the two facts are
+easy to combine into a false one: the running arm is not protected by the cap, and on the
+evidence of Table~\ref{tab:evalcost} it does not need to be.
+
+\paragraph{The controls the cap is held in place by.} Twelve mutations of the cap, applied one
+at a time to a copy of the tree, MUT\_SUMMARY Among them: a projection hard-wired to zero
+so nothing is ever capped; the ceiling comparison reversed; a skipped point reporting the
+success status instead of its own; the decision computed and then ignored; the hook never
+recording what a point cost, so the cap can never fire; an unmeasurable step time skipping
+rather than running; the ceiling read from the wrong configuration field; the cadence dropped
+from the projection; the default ceiling silently changed; the projection not recorded on the
+skipped point; the skipped point never written to the artifact directory; and a skipped point
+emitting zeroes where it should emit NaN. The last of these is the mutation that matters most
+for how the curve reads, since a zero \texttt{trend\_score} is indistinguishable from a model
+that got every problem wrong --- the failure mode Sec.~\ref{sec:evalfailures} is about.
+
+\paragraph{A stale run's checkpoints were separated from the live run's, and the separation
+raced the saver.} The saver directory for the A0 arm mixed two runs. The trial name
+\texttt{a0\_math/t1} has been reused across seven launches, so all seven wrote checkpoints into
+\texttt{areal-runs/\allowbreak checkpoints/\allowbreak ubuntu/\allowbreak a0\_math/\allowbreak t1/\allowbreak default/} keyed only by step --- exactly the
+overwrite-in-place shape Sec.~\ref{sec:perevalfix} records for the evaluation artifacts, and
+with the same consequence: any retrospective scoring of ``A0's checkpoints by step'' would have
+mixed two runs silently, and the highest-numbered checkpoints would have come from a run that
+no longer exists. The live run was near step $350$; the same directory also held steps $374$,
+$399$, $424$, $449$, $474$ and $499$, whose directories all carried modification times from
+16:39 to 17:38 UTC, inside the window of the launch that was killed at step $509$. Those six
+were moved --- renamed within the same filesystem, never deleted --- to
+\texttt{areal-runs/\allowbreak stale\_checkpoints/\allowbreak a0\_math\_t1\_\allowbreak run\_killed\_at\_\allowbreak step509\_20260902T1738Z/},
+and every file matched its pre-move size and MD5 at the destination.
+
+\paragraph{One of the six was not stale, and the check that caught it is not the check that
+verified the move.} Between the survey that classified the six at 22:51:20 and the checksum
+pass some tens of seconds later, the live run reached step $374$ and its saver overwrote that
+path in place at 22:52:00. The move therefore carried the \emph{live} run's fresh step-$374$
+checkpoint out with the five genuinely stale ones. The before/after checksums agree --- they
+were both taken after the overwrite, so they verified the move faithfully and could not
+possibly have caught the mislabelling. What caught it was the \emph{file} modification time:
+22:52:00 for step $374$ against 16:51 to 17:38 for the other five. A directory's modification
+time is not evidence about the files inside it, and a survey taken a minute before a move is not
+evidence about the state at the moment of the move; against a live writer, provenance has to be
+re-established at the instant of the operation, not inherited from a listing. Step $374$ has
+been moved out of the stale directory to
+\texttt{areal-runs/\allowbreak misplaced\_live\_\allowbreak checkpoint\_step374/}, which records the account and the
+single command that returns it to the saver directory; until that is run the live run's saves
+have a hole at step $374$ and nothing else is affected.
+
+\paragraph{What was already lost, and what is not ambiguous.} No surviving checkpoint is
+ambiguous: every one left in the live directory has a file modification time after the live
+launch began at 19:43. The losses had already happened and are not recoverable. The killed
+run's checkpoints for steps $24$ through $349$ were overwritten in place by the two launches
+that followed it, before any of this; its step $374$ was overwritten by the live run at
+22:52:00 during the separation. Steps $399$, $424$, $449$, $474$ and $499$ are the only
+surviving weights from that run, and the margin was minutes rather than hours: the move
+completed at 22:52, and the live run wrote its own step $399$ into the freed slot at 23:03:35
+and its step $424$ at 23:17:26. Both of those stale checkpoints would already have been
+destroyed had they been left in place, and the remaining three were inside the following hour.
+That is what makes the separation a rescue rather than a tidy-up --- and it is also why the
+race in the preceding paragraph happened at all.

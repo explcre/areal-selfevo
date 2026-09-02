@@ -1757,3 +1757,297 @@ def test_a_configured_address_is_recorded_as_configured_not_as_discovered(endpoi
     assert m["periodic_eval/endpoint/source"] != pe.ENDPOINT_SOURCE["server_infos"]
     saved = json.loads((tmp_path / "out" / "step5" / "results.json").read_text())
     assert saved["endpoint"]["base_url"] == url
+
+
+# --------------------------------------------------------------- the cost ceiling ----
+#
+# The evaluation's cost is not bounded by anything else in this module. Measured on A0 the
+# benchmark phase went 88.7 -> 123.9 -> 155.4 seconds over steps 50 to 150, and extrapolating
+# those three points reached 100% of training throughput near step 1900. Four later points
+# (122.9, 117.4, 124.0, 126.7 at steps 200-350) showed the rise was a transient, so the cap
+# below is a safety net rather than a correction. These tests are written against the net.
+
+
+class _FakeEval:
+    """Stands in for ``run_periodic_eval``, recording every call and returning a fixed cost.
+
+    A fake rather than the stub endpoint because these tests are about the DECISION to
+    evaluate, and the cheapest way to prove a point was not evaluated is a callable that
+    records that it was never called.
+
+    Attributes:
+        seconds: The wall cost each fake evaluation reports.
+        calls: Global steps this was called at, in order.
+        caps: The cap decision handed to each call. Recorded rather than fabricated in the
+            return value: a fake that invented the projection series would prove only that
+            the fake can spell it.
+    """
+
+    def __init__(self, seconds: float):
+        self.seconds = seconds
+        self.calls: list[int] = []
+        self.caps: list = []
+
+    def __call__(self, cfg, global_step, tracker, **kw):
+        """Record the call and return an ok-shaped metric mapping.
+
+        Args:
+            cfg: Ignored.
+            global_step: Recorded.
+            tracker: Ignored.
+            **kw: The cap decision is recorded from here.
+
+        Returns:
+            A metric mapping carrying the cost the hook projects the next point from.
+        """
+        self.calls.append(global_step)
+        self.caps.append(kw.get("cap"))
+        return {
+            "periodic_eval/step": float(global_step),
+            "periodic_eval/status_code": float(pe.STATUS["ok"]),
+            "periodic_eval/cost/seconds": float(self.seconds),
+        }
+
+
+def _capped_hook(monkeypatch, fake, *, ceiling, step_seconds, freq=50, out_dir=""):
+    """A hook wired to a fake evaluation and a fixed step time.
+
+    ``step_seconds`` is pinned rather than accumulated: the cap is a function of the step
+    time, so a test that let the real clock supply it would be asserting on the speed of the
+    machine running the suite.
+
+    Args:
+        monkeypatch: pytest's patcher.
+        fake: The :class:`_FakeEval` to install.
+        ceiling: ``MAX_THROUGHPUT_FRAC``.
+        step_seconds: What ``hook.step_seconds()`` will report.
+        freq: Evaluation cadence.
+        out_dir: Optional artifact directory.
+
+    Returns:
+        The hook.
+    """
+    env = _env(FREQ_STEPS=freq, MAX_THROUGHPUT_FRAC=ceiling)
+    if out_dir:
+        env[pe.ENV_PREFIX + "OUT_DIR"] = str(out_dir)
+    hook = pe.PeriodicEvalHook(env=env)
+    monkeypatch.setattr(pe, "run_periodic_eval", fake)
+    monkeypatch.setattr(hook, "step_seconds", lambda: float(step_seconds))
+    return hook
+
+
+def test_the_cap_projects_the_previous_cost_over_the_cadence():
+    """The projection is last cost / (cadence * step time), and nothing cleverer.
+
+    A fitted trend over a handful of points is what produced the step-1900 projection this
+    cap exists because of; the previous point's cost is a claim that can be checked by hand.
+    """
+    d = pe.cost_cap_decision(140.0, 50, 28.0, 0.15)
+    assert d.projected_frac == pytest.approx(140.0 / (50 * 28.0))
+    assert d.projected_frac == pytest.approx(0.1)
+    assert not d.skip, "0.10 is under the 0.15 ceiling"
+    assert d.ceiling == 0.15
+
+
+def test_a_point_projected_under_the_ceiling_runs(monkeypatch):
+    """The whole run must not be capped by a cap that fires when the cost is fine."""
+    fake = _FakeEval(seconds=140.0)
+    hook = _capped_hook(monkeypatch, fake, ceiling=0.15, step_seconds=28.0)
+    hook._last_eval_seconds = 140.0  # 0.100 of throughput
+
+    m = hook.maybe_run(global_step=50)
+
+    assert fake.calls == [50], "a point under the ceiling must actually be evaluated"
+    assert m["periodic_eval/status_code"] == pe.STATUS["ok"]
+    assert not fake.caps[0].skip
+    assert fake.caps[0].projected_frac == pytest.approx(0.1), (
+        "the decision must be handed to the evaluation, which records it on the point"
+    )
+
+
+def test_a_point_projected_over_the_ceiling_is_skipped(monkeypatch):
+    """Over the ceiling the point does not run AT ALL -- and says so with its own code."""
+    fake = _FakeEval(seconds=300.0)
+    hook = _capped_hook(monkeypatch, fake, ceiling=0.15, step_seconds=28.0)
+    hook._last_eval_seconds = 300.0  # 0.214 of throughput
+
+    m = hook.maybe_run(global_step=50)
+
+    assert fake.calls == [], "a capped point must not generate a single token"
+    assert m["periodic_eval/status_code"] == pe.STATUS["cost_capped"]
+    assert m["periodic_eval/cost/projected_throughput_frac"] == pytest.approx(300.0 / 1400.0)
+    assert m["periodic_eval/cost/cap"] == 0.15
+
+
+def test_the_skip_status_is_not_the_success_status():
+    """A skipped point that reported `ok` would be a gap nobody could see.
+
+    Asserted on the table rather than on one emission, so a future status cannot be given
+    the same number as another one.
+    """
+    assert pe.STATUS["cost_capped"] != pe.STATUS["ok"]
+    assert len(set(pe.STATUS.values())) == len(pe.STATUS), "status codes must be distinct"
+
+
+def test_the_ceiling_is_compared_in_the_right_direction(monkeypatch):
+    """Just under runs, just over skips. The two cases straddle one ceiling.
+
+    Written as a pair because either comparison alone passes with the inequality reversed.
+    """
+    under, over = [], []
+    for seconds, sink in ((139.0, under), (141.0, over)):
+        fake = _FakeEval(seconds=seconds)
+        hook = _capped_hook(monkeypatch, fake, ceiling=0.10, step_seconds=28.0)
+        hook._last_eval_seconds = seconds
+        sink.append(hook.maybe_run(global_step=50)["periodic_eval/status_code"])
+        sink.append(fake.calls)
+    assert under == [pe.STATUS["ok"], [50]], "139s is 0.0993 of throughput: under 0.10, runs"
+    assert over == [pe.STATUS["cost_capped"], []], "141s is 0.1007: over 0.10, skipped"
+
+
+def test_the_first_evaluation_of_a_process_is_never_capped(monkeypatch):
+    """There is nothing to project from, and refusing on an unknown blinds the curve."""
+    fake = _FakeEval(seconds=140.0)
+    hook = _capped_hook(monkeypatch, fake, ceiling=0.000001, step_seconds=28.0)
+    assert hook._last_eval_seconds is None, "premise: no previous point"
+
+    m = hook.maybe_run(global_step=50)
+
+    assert fake.calls == [50], "the first point runs even under an absurd ceiling"
+    assert m["periodic_eval/status_code"] == pe.STATUS["ok"]
+    assert math.isnan(fake.caps[0].projected_frac), "nothing to project from"
+
+
+def test_an_unmeasurable_step_time_does_not_skip(monkeypatch):
+    """NaN > ceiling is False, and that is the wanted behaviour rather than an accident.
+
+    A cap that fires because the step time is not known yet would blind the curve for a
+    reason that has nothing to do with cost.
+    """
+    fake = _FakeEval(seconds=9999.0)
+    hook = _capped_hook(monkeypatch, fake, ceiling=0.15, step_seconds=0.0)
+    hook._last_eval_seconds = 9999.0
+
+    m = hook.maybe_run(global_step=50)
+
+    assert fake.calls == [50]
+    assert m["periodic_eval/status_code"] == pe.STATUS["ok"]
+    assert math.isnan(pe.cost_cap_decision(9999.0, 50, 0.0, 0.15).projected_frac)
+
+
+def test_a_ceiling_of_zero_switches_the_cap_off(monkeypatch):
+    """An operator must be able to turn this off without editing the module."""
+    fake = _FakeEval(seconds=9999.0)
+    hook = _capped_hook(monkeypatch, fake, ceiling=0, step_seconds=28.0)
+    hook._last_eval_seconds = 9999.0
+
+    assert hook.maybe_run(global_step=50)["periodic_eval/status_code"] == pe.STATUS["ok"]
+    assert fake.calls == [50]
+
+
+def test_the_hook_projects_from_a_cost_it_measured_itself(monkeypatch, tmp_path):
+    """Two real calls: the first point's cost must be what caps the second.
+
+    The wiring is the part that can silently rot -- a cap whose `last cost` is never
+    refreshed can never fire -- so this drives the hook rather than setting the field.
+    """
+    fake = _FakeEval(seconds=300.0)  # 0.214 of throughput at 28 s/step
+    hook = _capped_hook(monkeypatch, fake, ceiling=0.15, step_seconds=28.0,
+                        out_dir=tmp_path / "out")
+
+    first = hook.maybe_run(global_step=50)
+    assert first["periodic_eval/status_code"] == pe.STATUS["ok"]
+    assert hook._last_eval_seconds == 300.0, "the hook must remember what the point cost"
+
+    second = hook.maybe_run(global_step=100)
+    assert second["periodic_eval/status_code"] == pe.STATUS["cost_capped"]
+    assert fake.calls == [50], "the second point must not have run"
+
+    # And it latches: a skipped point measures nothing, so the projection does not move.
+    third = hook.maybe_run(global_step=150)
+    assert third["periodic_eval/status_code"] == pe.STATUS["cost_capped"]
+    assert fake.calls == [50]
+
+
+def test_the_skip_is_visible_in_the_recorded_artifact(monkeypatch, tmp_path):
+    """The gap on the curve must be re-auditable from disk, not only from W&B."""
+    fake = _FakeEval(seconds=300.0)
+    hook = _capped_hook(monkeypatch, fake, ceiling=0.15, step_seconds=28.0,
+                        out_dir=tmp_path / "out")
+    hook._last_eval_seconds = 300.0
+
+    hook.maybe_run(global_step=100)
+
+    saved = json.loads((tmp_path / "out" / "step100" / "results.json").read_text())
+    assert saved["global_step"] == 100
+    assert saved["metrics"]["periodic_eval/status_code"] == pe.STATUS["cost_capped"]
+    assert saved["metrics"]["periodic_eval/cost/cap"] == 0.15
+    assert saved["metrics"]["periodic_eval/cost/projected_throughput_frac"] == pytest.approx(
+        300.0 / 1400.0
+    )
+    assert saved["rows"] == {}, "a skipped point scored nothing"
+
+
+def test_a_skipped_point_carries_no_score_not_a_zero(monkeypatch):
+    """A zero trend_score reads as a model that got everything wrong."""
+    fake = _FakeEval(seconds=300.0)
+    hook = _capped_hook(monkeypatch, fake, ceiling=0.15, step_seconds=28.0)
+    hook._last_eval_seconds = 300.0
+
+    m = hook.maybe_run(global_step=50)
+
+    assert math.isnan(m["periodic_eval/olympiadbench/trend_score"])
+    assert m["periodic_eval/diagnosis"] == pe.DIAGNOSIS["unknown"]
+    assert m["periodic_eval/cost/seconds"] == 0.0, "a skipped point really did cost nothing"
+
+
+def test_a_skipped_point_still_emits_every_declared_key(monkeypatch):
+    """A key that appears only on the steps it succeeded on leaves invisible gaps in W&B."""
+    fake = _FakeEval(seconds=300.0)
+    hook = _capped_hook(monkeypatch, fake, ceiling=0.15, step_seconds=28.0)
+    hook._last_eval_seconds = 300.0
+
+    m = hook.maybe_run(global_step=50)
+
+    missing = hook.config.metric_keys() - set(m)
+    assert not missing, f"a skipped point dropped {sorted(missing)}"
+
+
+def test_the_two_cost_series_are_declared():
+    """Declared keys are asserted against the real emission elsewhere; declare these too."""
+    assert "periodic_eval/cost/projected_throughput_frac" in pe.METRIC_KEYS
+    assert "periodic_eval/cost/cap" in pe.METRIC_KEYS
+
+
+def test_the_default_ceiling_is_the_configured_one():
+    """0.15 is the first value tried; a silent change of it changes what a run spends."""
+    assert pe.DEFAULT_MAX_THROUGHPUT_FRAC == 0.15
+    assert pe.PeriodicEvalConfig.from_env(_env()).max_throughput_frac == 0.15
+    assert pe.PeriodicEvalConfig.from_env(
+        _env(MAX_THROUGHPUT_FRAC=0.25)
+    ).max_throughput_frac == 0.25
+
+
+@needs_data
+def test_a_scored_point_records_the_projection_it_was_allowed_by(endpoint, tmp_path):
+    """The other half of the pair: on the REAL path both cost series reach the metrics.
+
+    Driven through `run_periodic_eval` against the stub rather than through the fake, so
+    this fails if `metrics_from` stops carrying the decision -- which is the seam the fake
+    cannot see.
+    """
+    url, policy = endpoint
+    policy.models = _window(13)
+    cfg = _config(url, out_dir=str(tmp_path / "out"), state_path=str(tmp_path / "c.json"))
+    cap = pe.cost_cap_decision(140.0, 50, 28.0, 0.15)
+    assert not cap.skip, "premise: this point is allowed to run"
+
+    m = pe.run_periodic_eval(
+        cfg, 5, pe.BestValTracker(cfg.patience, cfg.state_path), cap=cap
+    )
+
+    assert m["periodic_eval/status_code"] == pe.STATUS["ok"]
+    assert m["periodic_eval/cost/projected_throughput_frac"] == pytest.approx(0.1)
+    assert m["periodic_eval/cost/cap"] == 0.15
+    saved = json.loads((tmp_path / "out" / "step5" / "results.json").read_text())
+    assert saved["metrics"]["periodic_eval/cost/cap"] == 0.15

@@ -354,10 +354,104 @@ MUTATIONS = [
         repl="    if False:\n        resolved = pin.get(\"adapter\")",
     ),
     Mutation(
+        # The anchor carries its preceding line because `record_capped_point` fills the
+        # declared keys in the same way, so the bare loop appears twice and an unqualified
+        # anchor would SKIP rather than test.
         label="declared keys are not filled in, leaving invisible gaps in the W&B series",
         rel="selfevo/periodic_eval.py",
-        find="    for key in cfg.metric_keys():\n        metrics.setdefault(key, float(\"nan\"))",
-        repl="    for key in []:\n        metrics.setdefault(key, float(\"nan\"))",
+        find=(
+            "    metrics[EVAL_GRADER_KEY] = float(grader_calls)\n"
+            "    # Every key the configuration declares is emitted every time, NaN included. A key that\n"
+            "    # appears only on the steps where it succeeded produces a W&B series with invisible gaps.\n"
+            "    for key in cfg.metric_keys():\n"
+            '        metrics.setdefault(key, float("nan"))'
+        ),
+        repl=(
+            "    metrics[EVAL_GRADER_KEY] = float(grader_calls)\n"
+            "    for key in []:\n"
+            '        metrics.setdefault(key, float("nan"))'
+        ),
+    ),
+    # ------------------------------------------------------------- the cost ceiling ----
+    Mutation(
+        label="THE COST CAP'S FIRST MUTATION: the projection is always zero, so nothing is ever capped",
+        rel="selfevo/periodic_eval.py",
+        find="    projected = throughput_fraction(last_eval_seconds, freq_steps, step_seconds)",
+        repl="    projected = 0.0",
+    ),
+    Mutation(
+        label="THE COST CAP'S SECOND MUTATION: the ceiling comparison runs the wrong way round",
+        rel="selfevo/periodic_eval.py",
+        find="    return CostCapDecision(bool(projected > ceiling), projected, float(ceiling))",
+        repl="    return CostCapDecision(bool(projected < ceiling), projected, float(ceiling))",
+    ),
+    Mutation(
+        label="THE COST CAP'S THIRD MUTATION: a skipped point reports the success status",
+        rel="selfevo/periodic_eval.py",
+        find='        STATUS["cost_capped"],\n        DIAGNOSIS["unknown"],',
+        repl='        STATUS["ok"],\n        DIAGNOSIS["unknown"],',
+    ),
+    Mutation(
+        label="the cap is computed and then ignored, so every point runs anyway",
+        rel="selfevo/periodic_eval.py",
+        find="        if cap.skip:\n",
+        repl="        if False:\n",
+    ),
+    Mutation(
+        label="the hook never remembers what a point cost, so the cap can never fire",
+        rel="selfevo/periodic_eval.py",
+        find="            self._last_eval_seconds = float(measured)",
+        repl="            pass",
+    ),
+    Mutation(
+        label="an unmeasurable step time SKIPS, blinding the curve for a non-cost reason",
+        rel="selfevo/periodic_eval.py",
+        find="    return CostCapDecision(bool(projected > ceiling), projected, float(ceiling))",
+        repl="    return CostCapDecision(not (projected <= ceiling), projected, float(ceiling))",
+    ),
+    Mutation(
+        label="the ceiling is read from the wrong config field (the liveness epsilon)",
+        rel="selfevo/periodic_eval.py",
+        find="            self.config.max_throughput_frac,",
+        repl="            self.config.live_eps,",
+    ),
+    Mutation(
+        label="the projection ignores the cadence, so one point is charged as a whole step",
+        rel="selfevo/periodic_eval.py",
+        find="    projected = throughput_fraction(last_eval_seconds, freq_steps, step_seconds)",
+        repl="    projected = throughput_fraction(last_eval_seconds, 1, step_seconds)",
+    ),
+    Mutation(
+        label="the default ceiling is silently something other than the 0.15 that was chosen",
+        rel="selfevo/periodic_eval.py",
+        find="DEFAULT_MAX_THROUGHPUT_FRAC = 0.15",
+        repl="DEFAULT_MAX_THROUGHPUT_FRAC = 0.95",
+    ),
+    Mutation(
+        label="a skipped point does not record the projection that skipped it",
+        rel="selfevo/periodic_eval.py",
+        find="            nan if cap is None else float(cap.projected_frac)",
+        repl="            nan",
+    ),
+    Mutation(
+        label="a skipped point is never written to the artifact directory",
+        rel="selfevo/periodic_eval.py",
+        find="        _persist(cfg, global_step, {}, {}, None, None, metrics, None, None)",
+        repl="        pass",
+    ),
+    Mutation(
+        label="a skipped point emits zeroes rather than NaN, reading as a model that failed",
+        rel="selfevo/periodic_eval.py",
+        find=(
+            "    metrics[EVAL_GRADER_KEY] = 0.0\n"
+            "    for key in cfg.metric_keys():\n"
+            '        metrics.setdefault(key, float("nan"))'
+        ),
+        repl=(
+            "    metrics[EVAL_GRADER_KEY] = 0.0\n"
+            "    for key in cfg.metric_keys():\n"
+            "        metrics.setdefault(key, 0.0)"
+        ),
     ),
 ]
 
