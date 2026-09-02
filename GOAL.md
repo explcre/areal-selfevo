@@ -1127,6 +1127,156 @@ to raise a reward is to make it easier to satisfy.
 
 ---
 
+## 2f. BigBang-v1 and Ornith-1.5, read from primary sources 2026-09-02 -- THE POSITIONING DECISION
+
+Both were read from the primary documents (BigBang PDF md5 `e1dba99762a81c49d089d8c4d9f017fb`,
+20 pages; the Ornith 1.5 AND 1.0 blogs -- 1.0 is REQUIRED because the anti-hacking design exists
+only there). Two working assumptions this project held are now falsified, and one wedge opened.
+
+### FALSIFIED 1: BigBang has no reward agent, and no reward at all
+
+The string `reward` occurs **zero times** in the 20-page paper. So do `GRPO`, `reinforcement`,
+`trust region`, `stopping` and `hack`. The circle is **generator <-> critic**, and the outer loop
+is closed by a component our earlier description omitted: a **meta-critic** that compares the
+critic's assessment against the realised training outcome and uses the DISCREPANCY to refine both
+the evaluation criteria and the generation strategy. Utility never touches the critic directly.
+
+It is **two nested loops at different clock rates**, and the critic exists precisely because the
+outer one is too slow: *"repeated training and evaluation are costly... We therefore use the
+critic as a fast proxy for the training value of synthetic data."*
+
+The object the generator rewrites is the **data-synthesis program**, not a reward function:
+*"the generator operates as a code agent that can directly modify, execute, and debug the data
+synthesis code... a continuous search over programs."* So BigBang is already code-as-policy, at
+the data level. It is SFT-only (read off a FIGURE LABEL, not prose -- UNVERIFIED), no RL.
+
+**If we cite BigBang as prior art for evolving reward code we will be factually wrong.**
+
+### FALSIFIED 2: "reward as a fifth evolution target" is NOT novel -- Ornith-1.5 already does it
+
+Literally and by construction. The generated harness **is** the reward function
+(`R_rollout(tau) = h(q, tau)`), `h` is generated per task by the model, and `h` is optimised by
+GRPO against its own score `R_harness = C x F x H` (task alignment x reward fidelity x hack
+resistance). Leading with a fifth-target claim would be a re-derivation of a shipped system.
+**Do not lead with it.**
+
+### THE WEDGE: an evolving reward ANCHORED on a fixed external utility. Neither built it.
+
+* **BigBang HAS the anchor and no moving reward.** Verbatim: *"BigBang anchors this evolution in
+  a set of verifiable frontier tasks"*, and *"real frontier tasks provide the direction of
+  evolution, verifiability supplies trustworthy feedback."* Nothing to anchor.
+* **Ornith-1.5 HAS the moving reward and no anchor in its loop.** Ornith-1.0 held the boundary
+  static: *"the environment, the tool surface, and test isolation are immutable and outside the
+  model's reach"*, plus a deterministic monitor assigning violations **zero reward AND exclusion
+  from the advantage computation**, plus a **frozen LLM judge as a veto on top of the verifier
+  rather than the primary reward**. In 1.5 the model now GENERATES the harness that evaluates it
+  -- exactly the object 1.0 held immutable -- and **1.5 never restates how the boundary
+  survives**. `trust`, `boundary`, `immutable`, `monitor`, `veto`, `frozen` return ZERO hits in
+  the 1.5 blog. Its `H(h)` hack-resistance term is a NAME with no formula, no estimator, and no
+  named scorer.
+
+So the principle "the reward may move only because a fixed external utility does not" is
+confirmed by the system with no reward and absent from the system with the reward. **That
+combination is the spine of the paper.** It is narrower and far more defensible than a fifth axis.
+
+### NEITHER SYSTEM HAS A ROUTER. Our granularity claim survives; the target claim does not.
+
+* BigBang's critic is a **filter** with a binary codomain (accept / revise / reject per sample).
+  A router has a CATEGORICAL codomain over {unit, target, loss, source}. BigBang never chooses a
+  loss or a source: one loss (SFT), one source (generator-synthesised data).
+* Ornith operates at **whole-task** granularity and that is the FINEST thing it does. What varies
+  per task is artifact CONTENT (scaffold text, harness code), never the learning mechanism: GRPO
+  for every task, own-rollouts for every task. It explicitly DISCLAIMS routing -- per-category
+  strategy *"emerges automatically"*, with no decision variable anywhere.
+* `cluster` returns ZERO hits in all three documents. Behavioural clustering features and
+  trajectory observability as ROUTER INPUTS are unoccupied by both.
+
+### Two attacks our existing findings already arm us for
+
+1. **The absorption control neither ran.** Ornith never tests whether its emergent per-task
+   behaviour beats a FROZEN or RANDOM scaffold. Our own `finding_routing_absorption` says learned
+   routing repeatedly equals frozen-random unless the control is run. If their emergence is
+   absorption, that is a headline result and we are the ones positioned to measure it.
+2. **`p* = 0.2` with an unstated group size.** Their difficulty term
+   `D = exp(-(p - p*)^2 / 2 sigma^2)` targets a 20% success rate. Under BINARY rewards at small
+   N, a fixed low-p target produces many UNANIMOUS groups, which contribute EXACTLY ZERO gradient
+   (our binary-reward-collapse result). They report neither N nor the k-histogram. This is a
+   concrete, quantitative flaw and the right subject for an ablation figure.
+3. Neither paper has a loop ablation. BigBang ADMITS it: *"the individual contributions of the
+   generator, critic, and outcome-calibration stages require separate ablations."* Ornith's only
+   loop-adjacent comparison (1.5 vs 1.0) is confounded by a base-training change.
+
+### RE-ORDER THE AXES BY MEASURED HEADROOM, not by preference (decision, 2026-09-02)
+
+The three nulls on record are ALL on the UNIT axis: token routing has no measurable effect
+(1.7% reach, McNemar 0.53-0.92), and the learned router does not beat its matched control at
+group level. Routing among fixed alternatives at matched budget has repeatedly changed nothing,
+and there is a mechanism for that -- under binary rewards every group-relative estimator
+collapses to the same form.
+
+**So RELAX unit granularity and spend the budget on the SOURCE axis, which has the largest
+untouched headroom**: ~61% of the routed channel is unsolved groups that currently learn NOTHING,
+and a supplier there changes something real rather than re-allocating a signal that is already
+degenerate. Ornith wins by GENERATING artifacts (a much larger action space) rather than
+SELECTING among them, and that asymmetry is the honest explanation for our nulls.
+
+### Concretely reimplementable, in descending order of specificity
+
+* **Ornith-1.5 `R_task = V x D x N`**, complete: `V` a hard validity gate (scaffold runs,
+  high-confidence solutions pass, clearly wrong ones fail) so `V=0 => R=0`;
+  `D = exp(-(p-p*)^2 / 2 sigma^2)` with `p* = 0.2` over N rollouts; `N(q) = 1 - max_j sim(q,q_j)`
+  over a buffer of prior tasks. Only `sigma`, `sim` and `|B|` are missing and are ours to choose.
+  Steal the self-scaling property: as the model improves, `D` falls automatically, so the
+  curriculum advances with NO schedule.
+* **Ornith-1.0's three-layer hack defence**, reimplementable as written, and the right baseline to
+  cite. Note the detail that matters to US specifically: violations get zero reward **AND are
+  excluded from the advantage computation**. Zeroing WITHOUT excluding changes the group baseline
+  and silently reweights the surviving rows -- exactly the failure our own `kl_ctl=0` finding
+  describes.
+* **BigBang's two-level critic split**: a cheap DETERMINISTIC gate (parseability by the actual
+  training and execution system, format completeness, tool-use presence, information sufficiency)
+  BEFORE any expensive LLM judgement. Cheap and directly transferable.
+* **BigBang's generator experiment journal** -- motivation for each change, results, failure
+  causes, conclusions, carried across rounds. A concrete memory format for LLM-written-code
+  routing.
+* **BigBang's "critic held fixed" control** is the right control design even though they report
+  no number for it.
+
+### Is Ornith-1.5 a good starting point? As a METHOD, yes. As a MODEL, no.
+
+Its 35B-A3B weights are architecturally untrainable here (nested config, ~1 layer in 4 carries
+q/k/v/o, so our adapter would cover a quarter of the depth). But we do not need their model, we
+need their recipe, and the recipe is GRPO-based, which is what our stack already runs. Reimplement
+the method on Qwen2.5-32B-Instruct; that reimplementation IS the baseline to beat.
+
+### Ornith trains across its whole task distribution. We currently do NOT.
+
+All three of its stages are optimised jointly with GRPO over its task distribution. **A0 trains on
+DeepMath ONLY -- math, decontaminated.** There is no code and no SQL in our training data at all,
+so LiveCodeBench (0.3086) and BIRD are pure OUT-OF-DOMAIN transfer numbers, and math training will
+not move them. Two honest options, and they are not exclusive: frame code and SQL as TRANSFER
+evidence (a stronger claim if the gain does transfer), and/or add matching corpora so the numbers
+are EARNED. BIRD ships a train split (~9.4K pairs, 8.9 GB) and the DeepSWE work released
+`R2E-Gym/R2E-Gym-Subset` (4.5K) publicly. Re-measure the solved/unsolved split PER DOMAIN; the
+0.875 figure is a property of GSM8K at a high solve rate, not a constant.
+
+### Unverified in both, do not cite as fact
+
+BigBang's post-training algorithm (SFT is read off a figure label); the meta-critic's mechanism
+and whether any accept/reject arbiter exists; the identity and provenance of BigBang's "held-out
+real research tasks" (a contamination risk that CANNOT be excluded from the document alone, since
+those tasks steer the generator's domain distribution and the paper never says what they are);
+BigBang's loop-round counts and filter rates; Ornith's `sigma`, `sim`, `|B|`, group size N, and
+whether its `s` and `h` are one artifact or two; and whether Ornith-1.0's three-layer defence is
+still in force in 1.5, which 1.5 is silent about and we will NOT assume.
+
+**Released code:** BigBang's repo ships an EVALUATION harness only (`evaluation/agent.py`,
+`context_policy.py`, `tools/`, `scripts/run_eval.py`); `data/` holds only a README. No generator,
+no critic, no meta-critic, no synthesis pipeline. The eval harness is real and reusable; the
+method is not released.
+
+---
+
 ## 3. Measured constraints — do not rediscover
 
 - **GSM8K train reward MIS-ORDERS checkpoints** vs held-out MATH-500. Never select on it.
