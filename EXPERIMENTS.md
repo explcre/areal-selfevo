@@ -2874,3 +2874,34 @@ The result was 16-member "groups" and a k histogram running to k=16 when `n_samp
 group is one generation of `n_samples` under one policy version, so the identity is now
 `(version, task_id, generation)`. **Any batch file exported before this fix must be treated as
 invalid rather than as comparable data** — it contains groups that never existed.
+
+## Two independent quantities say the same thing about the GRPO gradient
+
+Gate 0 compared partitions by the COSINE between per-cluster gradients. The NORMS, measured on
+the same dump and costing nothing extra, say the same thing from the other direction, and the
+two together are what make "there is almost no gradient there to partition" a measurement
+rather than a reading of a null.
+
+From `dump_hard_step49.npz` (153 groups, all non-unanimous, `globalstep49` of the harness pilot):
+
+    EXACT, 8 stored groups        min 7.7271e-05  median 1.0877e-04  p90 1.1090e-04  max 1.1674e-04
+      max/min spread (non-zero)   1.51x
+    SKETCHED, all 153 groups      min 5.8110e-05  median 9.9008e-05  p90 1.2215e-04  max 1.8131e-04
+    PROMPT-NLL sketched, all 153  min 3.4359e-03  median 5.4796e-03  p90 6.8272e-03  max 1.4183e-02
+
+**The GRPO gradients are uniform in magnitude.** 1.51x across the exact eight and 3.1x across
+all 153 sketched. There is no subset of groups carrying a disproportionate update for a
+partition to isolate, so even a perfect clustering would be dividing a nearly homogeneous set.
+
+**The prompt-NLL gradient is ~50x larger** (median 5.5e-3 against 1.1e-4). The ELREA feature is
+both larger in norm and better oriented, with cosines around 0.42 against GRPO around 0.0005,
+so the asymmetry between the two sides of the MEDS-versus-ELREA ablation is not a property of
+the clustering at all: one side has signal and the other does not.
+
+**Why the N=8 non-spanning outcome was unremarkable.** The full-gradient store took the first 8
+informative groups in file order. Under the observed K=2 partition with a 102-of-128 majority,
+P(all 8 in one cluster) = 0.80^8 = 17%, so landing non-spanning was ordinary rather than
+evidence of a correlation between file order and cluster membership. At 32 stored it is
+0.80^32 = 0.08%, which is why the confirmatory run raises the store rather than reordering the
+batch. If a 32-group store still lands non-spanning, THAT would be evidence of such a
+correlation and is worth knowing.
