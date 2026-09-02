@@ -2786,3 +2786,91 @@ their tests; only the config surface above is re-applied on top. Origin's own mu
 for the harness package passes 56 killed / 0 survived after the re-application. The
 re-derived `selfevo/tests/test_harness_selectors.py` written here is retired to
 `~/areal-selfevo-superseded/`.
+
+## A preflight that asserts a proxy is not a preflight
+
+The A0 preflight PASSED a configuration measured to OOM, and the note explaining why it was
+safe was itself the false claim:
+
+    max_tokens_per_mb=2048 bounds peak activation memory
+
+`max_tokens_per_mb` packs sequences into a microbatch. It cannot SPLIT one. A single sequence
+longer than the cap therefore forms its own oversized microbatch, and peak activation memory is
+set by that sequence rather than by the cap. The bound stops bounding anything the moment
+
+    train_dataset.max_length + gconfig.max_new_tokens > actor.mb_spec.max_tokens_per_mb
+
+At the shipped cap that is `1024 + 1024 = 2048`, exactly the cap, so it never binds — which is
+precisely why the proxy survived: it held for every configuration anyone had run. At a 2048
+generation cap it is `1024 + 2048 = 3072`, one microbatch at 1.5x the token count.
+
+MEASURED on this box at cap 1024 (A0, DeepMath, `fsdp:d2p1t1`):
+
+    memory allocated  61.60 GB   sharded fp32 weights + optimizer, fixed
+    memory reserved   71.55 GB   -> transient activation pool 9.95 GB
+    device used       75.81 GB of 79.18  -> margin 3.37 GB
+    non-PyTorch        4.26 GB   CUDA context, NCCL
+
+and microbatches already saturate the cap (`padded to: [2048, 2048, ...]`). Scaling the
+transient pool linearly with microbatch tokens puts a 3072-token microbatch at ~14.9 GB, i.e.
+~80.8 GB total against a 79.18 GB card — an OOM, from a config the preflight called safe.
+
+The guard now computes the worst-case single sequence and refuses, naming both numbers and all
+three config keys so a reader can act. The superseded note was removed in the same change
+rather than left standing beside a check that contradicts it.
+
+**The guard is tested to FIRE**, not merely to be present: `test_preflight_seqlen.py` drives
+the real launcher at both caps and asserts refusal at 2048 (`rc=6`, `[FAIL]`) and pass at 1024
+(`rc=0`, `[ok]`), plus that the message names 3072, 2048 and the config keys. Two mutants --
+inverting the comparison, and dropping `max_length` from the worst case -- are both killed by
+it. A guard whose only evidence is that it did not fire is not evidence.
+
+**The rule this generalises to: a preflight must assert the property, not a proxy for it.** A
+proxy that holds across every configuration yet run is indistinguishable from the property
+until the first configuration where it does not, and that is the configuration nobody checks.
+
+## The cap stays at 1024, and the k histogram measures mathematics rather than the cap
+
+A0 on DeepMath truncates 11.5% of responses at `gconfig.max_new_tokens=1024` (118 of 1024),
+which raises the question of whether the cap is manufacturing the `k=0` groups. Measured over
+the 128 groups of A0's first DeepMath checkpoint batch:
+
+| k | groups | truncated responses | groups fully truncated |
+|---|---|---|---|
+| 0 | 22 | 55 | **3** |
+| 1 | 10 | 25 | 1 |
+| 2 | 5 | 2 | 0 |
+| 3 | 5 | 5 | 0 |
+| 4 | 9 | 11 | 0 |
+| 5 | 9 | 3 | 0 |
+| 6 | 12 | 13 | 1 |
+| 7 | 19 | 3 | 0 |
+| 8 | 37 | 1 | 0 |
+
+Only **3 of the 22 `k=0` groups have every response truncated** — 13.6% of `k=0`, 2.3% of all
+groups. Those are the only ones the cap can fully explain; the other 19 contain at least one
+response that terminated and was still wrong. So the ceiling on the confound is tight: if all
+three became informative under an unlimited cap, the informative fraction would rise from
+**0.5391 to at most 0.5625**. The 55 truncated responses inside `k=0` groups sit in groups that
+were failing anyway.
+
+A +2.4-point ceiling does not justify a 2048 cap that the arithmetic above puts at a negative
+margin, so the cap stays at 1024 and the histogram is read as a statement about the
+mathematics.
+
+## Every rollout batch exported before the version-key fix is invalid
+
+`export_rollout_batch.py` keyed a group by `task_id` alone. Three defects compounded:
+
+1. a task's dump file is APPENDED to, so a prompt rolled out twice leaves 16 records in one
+   file (`sample_idx` 0-7 twice, sixteen distinct completions) — 105 of 274 files on A0's first
+   checkpoint;
+2. 36 tasks appear under TWO version directories, having been regenerated after a weight
+   update, and keying on task alone merged rollouts produced by two different policies that
+   were never normalised against each other;
+3. two integer parses of the now-suffixed key.
+
+The result was 16-member "groups" and a k histogram running to k=16 when `n_samples=8`. A GRPO
+group is one generation of `n_samples` under one policy version, so the identity is now
+`(version, task_id, generation)`. **Any batch file exported before this fix must be treated as
+invalid rather than as comparable data** — it contains groups that never existed.
