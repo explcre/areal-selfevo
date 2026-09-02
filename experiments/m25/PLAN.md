@@ -8,6 +8,28 @@ improvises a control. Decision rules are written down BEFORE any number exists.
 `selfevo/cluster_lora/interference_probe.py` on a 32B checkpoint + one saved rollout batch,
 FOUR partitions on the same batch: (1) MEDS behavioural clusters, (2) size-matched random,
 (3) ELREA-style prompt-gradient clusters, (4) task-label calibration if the batch spans tasks.
+
+**Amended 2026-09-02 from `FINDINGS_cluster_lora.md`, before any GPU ran:**
+- **The task-label calibration cannot reach 1e-5.** A CountSketch cosine has s.e. ~1/sqrt(dim),
+  so the floor is `3/sqrt(8192) = 0.0331`; a dense projection at the needed size would be 3 TB.
+  Every block carries `resolution_floor` and a `resolved` flag, and an unresolvable cosine is
+  reported as BELOW THE FLOOR, never as a number. Against a reviewer citing 2608.03573 the claim
+  is "below our floor", plus the stored full gradients for the first 8 groups, which are the only
+  place a 1e-5 figure could be checked at all.
+- **Require K >= 4 clusters.** At K=2 there is one pair and the control's mean cosine was measured
+  swinging -0.12 to -0.22 across seeds; no discrimination is possible.
+- **Sweep `--min-cluster-size`, do not inherit it.** MEDS ships 2, which over-fragments (6
+  clusters + 2 noise where 4 + 0 was right); every extra cluster is an expert trained on fewer
+  groups. Start at 5 for the 128-group MATH batch; the sweep is CPU-side and cheap.
+- **Read the bootstrap SPREAD, not containment.** The CI need not contain the point estimate
+  (resampling duplicates bias a cluster sum toward its duplicated directions). The discriminator
+  is the spread: std 0.0085 for a true partition vs 0.064-0.090 permuted.
+- **`cancellation` varies only through `sum_c ||g_c||`**, since `sum_c g_c` is the batch gradient
+  for every partition. Read it as internal coherence, not as a conflict measure.
+- **Adapter identity must be overlap-matched, not label-matched** — HDBSCAN renames clusters on
+  every refit (churn 1.0 naive, 0.0-0.083 fixed). Any arm must report `churn` per step.
+- **The MEDS features need an extra forward pass**; its cost as a fraction of a step must be
+  counted against A0 for the matched-budget claim.
 Per partition: pairwise cosine of per-cluster LoRA gradients, conflict rate, cancellation
 `||Σg_c||/Σ||g_c||`, sizes, bootstrap CI on mean cosine. Three checkpoints (early/mid/late) if
 available, since interference plausibly grows as the policy specialises.
