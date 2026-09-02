@@ -386,6 +386,46 @@ def test_a_router_that_cannot_carry_a_partition_is_refused(monkeypatch):
         advantages(actor, MIXED)
 
 
+def test_the_partitioner_is_bounded_by_the_roster_the_run_configured(monkeypatch):
+    """The roster the engine will create is the number of experts the clustering may name.
+
+    Without the bound the ids MEDS emits are sparse and monotone, so a run whose clustering
+    fragments once names an adapter the engine was never told to create and dies at that
+    step. The bound turns that into a cluster on the shared adapter, counted.
+    """
+    actor = routed_actor(
+        monkeypatch, "meds", engine=FakeEngine(tiny_lm()), FEATURES="1",
+        ADAPTERS="cluster_0,cluster_1,cluster_2,shared",
+    )
+    try:
+        advantages(actor, MIXED)
+    except PartitionUnavailable:
+        pass  # no hdbscan in this venv; the partitioner is still the one that was built
+    assert actor._selfevo_cluster_keyfn.partitioner.max_experts == 3
+
+
+def test_a_roster_that_cannot_carry_the_clustering_is_refused_at_the_wiring(monkeypatch):
+    """Refused where the arm is configured, not at whichever step first overflows."""
+    actor = routed_actor(
+        monkeypatch, "meds", engine=FakeEngine(), FEATURES="0",
+        ADAPTERS="cluster_0,cluster_2,shared",
+    )
+    with pytest.raises(ClusterWiringError, match="cannot carry a 'meds' partition"):
+        advantages(actor, MIXED)
+
+
+def test_the_none_arm_is_left_unbounded_because_it_allocates_no_expert_ids(monkeypatch):
+    """``none`` puts every group on ``shared`` and never asks the partitioner for an id, so
+    a bound would refuse rosters that arm perfectly well -- and the roster it DOES need is
+    checked by the refusal below.
+    """
+    actor = routed_actor(
+        monkeypatch, "none", engine=FakeEngine(), ADAPTERS="cluster_0,cluster_2,shared"
+    )
+    advantages(actor, MIXED)
+    assert actor._selfevo_cluster_keyfn.partitioner.max_experts is None
+
+
 def test_a_partition_naming_an_adapter_outside_the_roster_is_refused(monkeypatch):
     """Every expert is created before the optimizer, so one discovered later has none.
 

@@ -651,7 +651,11 @@ def begin_cluster_batch(actor, router, data, contexts, group_sizes) -> dict[str,
     from selfevo.routing.cluster import ClusterRouter
 
     from .features import ClusterLoRAKeyFn
-    from .partition import MEDSPartitioner, PartitionUnavailable
+    from .partition import (
+        MEDSPartitioner,
+        PartitionUnavailable,
+        max_experts_for_roster,
+    )
 
     cfg = ClusterLoRAConfig.from_env()
     if cfg is None:  # pragma: no cover - the call site gates on the same variable
@@ -667,10 +671,28 @@ def begin_cluster_batch(actor, router, data, contexts, group_sizes) -> dict[str,
     if keyfn is None:
         from selfevo.clustering.meds import MEDSClusterer
 
+        # The roster is the partitioner's CAPACITY, and it is fixed here for the life of the
+        # run: every expert is created before FSDP shards the model and before the optimizer
+        # exists. Unbounded, the expert ids are sparse and monotone -- twelve batches over
+        # two live clusters were measured emitting cluster_1 and cluster_3 -- so a long meds
+        # run is expected to name an adapter it does not have and die partway through. The
+        # 'none' arm allocates no ids at all, and its roster is checked by the refusal below,
+        # so it is left unbounded rather than made to satisfy a bound it never uses.
+        try:
+            bound = (
+                None
+                if cfg.partition == "none"
+                else max_experts_for_roster(adapter_roster())
+            )
+        except ValueError as exc:
+            raise ClusterWiringError(
+                f"{ROSTER_ENV} cannot carry a {cfg.partition!r} partition: {exc}"
+            ) from exc
         keyfn = ClusterLoRAKeyFn(
             MEDSPartitioner(
                 MEDSClusterer(min_cluster_size=cfg.min_cluster_size),
                 warmup_batches=cfg.warmup_batches,
+                max_experts=bound,
             ),
             mode=cfg.partition,
             seed=cfg.seed,
