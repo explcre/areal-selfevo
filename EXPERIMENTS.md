@@ -3181,3 +3181,202 @@ agentic rows -- SWE-bench Pro 61.7, Terminal Bench 2.1 73.0, NL2Repo-Bench 42.3,
 -- are produced with the Claude Code harness at temperature 1.0 and a 256K context window, a
 scaffold we do not have. Those are not numbers our stack can approach or be compared against.
 LiveCodeBench v6 is the only row on that card we can meet on equal terms.
+
+## BIRD text-to-SQL is wired as a third domain, and the grader is proved before any score exists (2026-09-02)
+
+`experiments/bench/sql_bench.py` joins `math_bench.py` and `code_bench.py`, with
+`sql_selfcheck.py`, `test_sql_bench.py` and `mutate_sql_bench.py` beside it. **No model has
+been run against it.** GPUs 0-1 were serving the A0 training arm throughout and nothing here
+touched CUDA or an endpoint; building and proving the grader was the whole task, and the
+score comes later. B13 in `GOAL.md` said "both on disk, never run" — half of it is now built.
+
+**Why BIRD and not Spider 2.0.** Qwen2.5-32B-Instruct, our exact base model, scores **43.8%**
+execution accuracy on BIRD Mini-Dev (arXiv 2511.04153), Qwen2.5-Coder-32B **49.4**, and the
+leaderboard top is about **82**. That is a wide separable band at our scale. On Spider 2.0 the
+same model class scores 5-11 and grading needs cloud-warehouse credentials.
+
+### The data, counted rather than assumed
+
+`dev.zip` from `bird-bench.oss-cn-beijing.aliyuncs.com`, linked from bird-bench.github.io,
+downloaded ungated over plain HTTP 200 at **346,207,293 bytes**, sha256
+`cdd6d19faeb45a23970b98d3ef6c40a87987c95459c2cf12076897a60cf5a630`. A downloader exiting 0
+is not data, so every number below was read back off disk:
+
+| | `bird_dev` | `bird_mini_dev` |
+|---|---|---|
+| questions | **1534** | **500** |
+| databases | **11** | **11** (the same ones) |
+| difficulty | 925 simple / 464 moderate / 145 challenging | 148 / 250 / 102 |
+| source file | `dev_20240627/dev.json` | `minidev_json/mini_dev_sqlite.json` |
+
+`dev_databases/` unpacks to **11** `.sqlite` files totalling **1,493,538,934 bytes** (1.4 GiB),
+232 KiB (superhero) to 570 MiB (european_football_2). Total under `~/evaldata/bird`, including
+both archives, 2.1 GiB.
+
+**Mini-dev is not a filter of dev.json, and building it as one would have been wrong.** All 500
+mini-dev `question_id`s occur in `dev.json`, which is what makes the mistake attractive — the
+committed-id-split shape `math500_split.json` uses would have loaded cleanly. But 4 of its
+questions and **14 of its gold SQL strings differ**: mini-dev ships revised golds. An id split
+would have scored 14 questions against superseded answers while printing the mini-dev name.
+It is loaded from its own file. Mini-dev needed its own 800 MB download (`minidev.zip`), of
+which only the 278 KB question file is kept; the rest is a duplicate copy of the same
+databases plus 1.9 GiB of MySQL/PostgreSQL dumps.
+
+### The grading rule, and where it deliberately differs from BIRD's own
+
+Execution accuracy: run predicted and gold SQL against the same database, compare result sets.
+
+* **Row order ignored unless the gold orders its output**; rows otherwise compare as
+  **multisets**, so duplicate rows count.
+* **Column order and column naming ignored.** Names are never read; column order is quantified
+  over, pruned by an exact necessary condition (gold column *i* can only map to a predicted
+  column with an equal value multiset) rather than by Spider's `random.choice` sampling, which
+  is not reproducible.
+* **Error, timeout or wrong rows is WRONG**, bucketed, in the denominator, never an abort.
+* **Timeout 30.0 s per execution**, which is BIRD's own `evaluation_ex.py` `meta_time_out`
+  default. Slowest gold measured here is **3.99 s** (dev qid 596), so 7.5x headroom over the
+  slowest query the dataset itself needs. Enforced by killing a child process: sqlite releases
+  the GIL inside `execute()`, so an in-interpreter limit would bound nothing.
+* **Row cap 1,000,000**, set from the measured maximum gold result of **278,230** rows, not
+  from a round number. A gold over the cap is reported `row_limit` (undecidable), never
+  truncated and compared anyway.
+* **Every database opened read-only** (`mode=ro` plus an authorizer denying ATTACH/DETACH).
+
+BIRD's own grader is `set(pred) == set(gold)` — looser on duplicates and on order, stricter on
+column order. Rather than pick a side silently, **both verdicts are computed from the same
+executions and both are in every results row**: `accuracy` under our rules, `accuracy_official`
+under `calculate_ex` reproduced exactly, and `n_verdict_differs`. Compare our arms with the
+first; compare against a published BIRD number with the second.
+
+How much the divergence can bite, measured on the golds:
+
+| | dev | mini-dev |
+|---|---|---|
+| golds whose result contains duplicate rows (set ≠ multiset) | 132 / 1534 | 33 / 500 |
+| golds with a **top-level** ORDER BY (our rule) | 276 / 1534 | 88 / 500 |
+| golds matching Spider's `"order by" in sql.lower()` | 305 | 106 |
+| rules disagree (ORDER BY that does not order the result) | **29** | **18** |
+| order-sensitive golds returning >1 row, where the rule actually bites | **55 / 276** | **18 / 88** |
+
+### Proof the grader is not vacuous
+
+`sql_selfcheck.py`, exit non-zero on any deviation. Run on the committed `sql_bench.py`
+(sha256 `6b1afb6c…`), 31 s for mini-dev and 54 s for dev, CPU only.
+
+**1. GOLD SELF-CHECK — 1534/1534 dev, 500/500 mini-dev. Zero broken rows.** Zero golds fail to
+execute, zero time out, and **zero return an empty result**. The last is worth stating: an
+empty gold self-verifies while being ungradeable, because any prediction returning nothing —
+including `WHERE 1=0` — scores correct against it. Published work documents pervasive
+annotation errors in BIRD; on the execution axis, on these two releases, there are none.
+
+**2. EQUIVALENCE — 433/433 dev, 139/139 mini-dev.** Gold-against-gold is nearly vacuous on its
+own: the same bytes on both sides pass under any reflexive comparator, including one that
+ignores row values. So every order-insensitive multi-row gold is also graded against a rewrite
+returning the same rows in a different order. The row sequence really changed on **383** of 433
+(dev) and **120** of 139 (mini-dev); a rewrite that returned the same order would have proved
+nothing, so that count is reported rather than the total.
+
+**3. KNOWN-WRONG — 2050/2050 dev, 1925/1925 mini-dev**, over nine families, capped at 250
+questions per family:
+
+| family | dev | mini-dev | BIRD's set rule would pass |
+|---|---|---|---|
+| wrong_constant | 250/250 | 250/250 | 0 |
+| different_columns | 250/250 | 250/250 | 0 |
+| inverted_where | 250/250 | 250/250 | 0 |
+| **duplicated_rows** | 250/250 | 250/250 | **all of them** |
+| dropped_row | 250/250 | 158/158 | 45 dev / 19 mini |
+| **reversed_order** | 50/50 | 17/17 | **all of them** |
+| syntax_error | 250/250 | 250/250 | 0 |
+| empty_string | 250/250 | 250/250 | 0 |
+| prose | 250/250 | 250/250 | 0 |
+
+The two bold families exist because they separate this grader from BIRD's: every one of them
+is graded wrong here and correct by `calculate_ex`. If either stops failing, the multiset rule
+or the ordering rule has stopped existing.
+
+**4. READ-ONLY.** INSERT, DELETE, CREATE TABLE, DROP TABLE (on a table that really exists in
+that database, looked up from `sqlite_master`), ATTACH and a chained `PRAGMA writable_schema;
+DELETE` are each refused, and the smallest database is sha256'd before and after the whole
+battery: unchanged.
+
+**5. TIMEOUT.** An unbounded recursive CTE is graded `timeout` in bounded wall-clock time.
+
+**6. MUTATION — `mutate_sql_bench.py`: 27 killed, 0 survived, 0 skipped, and 27 of 27 killed by
+the guard aimed at them.** The harness copies `experiments/bench/` to a temp directory itself
+and refuses a path inside the live checkout, which is one step stronger than
+`mutate_harness_selectors.py` and exists because six agents write to this tree while a trainer
+imports it. Mutants cover the four the task named — comparison ignores row values, execution
+error counts correct, timeout returns correct, multiset becomes set — plus the ordering rule in
+both directions, subquery-nesting, no-SQL and broken-gold scored correct, the denominator, the
+read-only URI, the authorizer, and the loader's fatal checks.
+
+### Four defects this process found, three of them in my own checks
+
+The self-check and the mutation harness caught more in the checks than in the grader, which is
+the expected ratio and the reason both exist.
+
+1. **A test that passed for the wrong reason.** `test_duplicate_rows_count…` compared gold
+   against a de-duplicated and a doubled result — both of which differ from gold in ROW COUNT,
+   so `results_equal` rejected them at the length guard and never reached the multiset
+   comparison the test names. The set-vs-multiset mutant left that test GREEN and was killed
+   only incidentally by an unrelated test. Found only because the harness checks *which* test
+   fired, not merely that the suite went red; `-x` had been attributing the kill to whichever
+   test ran first. A same-length pair with a different multiset was added and the mutant is
+   now killed by its own guard.
+2. **A read-only probe that fired on the wrong thing.** `DROP TABLE IF EXISTS superhero` was
+   run against whichever database question 0 used. The table was not in it, `IF EXISTS` made
+   the statement a legal no-op, SQLite returned success without attempting a write, and the
+   probe reported a read-only BREACH that had not happened.
+3. **A known-wrong family that was not wrong.** `reversed_order` wraps the gold and re-sorts by
+   column 1 descending; on 5 dev golds that reproduced the gold's own sequence, so the
+   "wrong" prediction was correct and passing it was right. Reported as 5 grader escapes until
+   the family was made to verify that it had actually reversed something.
+4. **A real grader bug, caught by a new test.** `main()` scrubbed non-finite floats only at the
+   top level of a results row, and the per-difficulty table carries a NaN accuracy two levels
+   down for any difficulty with nothing graded, which `json.dumps(allow_nan=False)` refuses.
+   The scrub is now recursive; `allow_nan=False` is deliberately kept so a miss is a crash and
+   not a `NaN` token that is not valid JSON.
+
+### A property of BIRD's golds that will cost us points and is not our bug
+
+**3 dev golds (qids 580, 751, 812) and 1 mini-dev gold (751) are PLAN-DEPENDENT.** They carry a
+`LIMIT` with no total order, so *which* rows they return is the query planner's arbitrary
+choice. Each is deterministic when re-run, so they self-verify; but wrapping them in a subquery
+— which is what any semantically equivalent rephrasing does to the plan — returns a different
+set of rows. A model that answers these correctly can be graded wrong. Detected by comparing
+the multiset of the gold against the multiset of a re-planned rewrite, over all 491 dev and 158
+mini-dev multi-row golds. It is an upper bound of 3/1534 and 1/500 on this effect and is
+excluded from the equivalence requirement rather than papered over.
+
+### Test counts, quoted from the runs
+
+* `pytest experiments/bench/test_sql_bench.py -q` → **72 passed** in 6.89 s.
+* `pytest experiments/bench -q` → **259 passed, 22 failed, 3 skipped** in 29.81 s. All 22
+  failures are `test_math_bench.py` raising `FileNotFoundError`: `MATH_EVAL_DATA` points at
+  `~/baselines/Absolute-Zero-Reasoner/evaluation/math_eval/eval/data`, which does not exist on
+  this box. Pre-existing and unrelated; **0** failures name sql or bird.
+* `pytest selfevo/tests -m "not slow" -q` → **1803 passed, 54 failed, 7 skipped**, 5 deselected,
+  4 xfailed, in 304 s. The 54 are in `test_cluster_lora_export.py` (20),
+  `test_cluster_lora_engine.py` (14), `test_harness_route_trainer.py` (11),
+  `test_gold_batch_path.py` (3), `test_audit_2026_09_02.py` (3), `test_code_policy.py` (2) and
+  `test_cluster_lora_wired.py` (1) — another agent's in-flight work, all of it in the 79 files
+  staged in the shared index. **0** name sql or bird, and nothing under `selfevo/` imports
+  anything added here. The count is above CI's 1,500-executed floor.
+
+### LICENCE — this must survive into the paper
+
+**BIRD's `mini_dev` carries NO LICENSE FILE.** Verified 2026-09-02: the repository root holds
+only `.gitignore`, `README.md`, `requirements.txt` and directories; GitHub's licence API answers
+**404** and the repository's `license` field is **null**. It is therefore usable on a
+**run-and-cite basis only and must not become a redistributed dependency**. No BIRD data is
+committed to this repository; `$BIRD_DATA` is fetched per box, and the Mini-Dev question file
+and the reference evaluation semantics are cited, never vendored.
+
+### What is still unexercised
+
+Generation. The prompt is BIRD's own, transcribed from `llm/src/prompt.py` and
+`table_schema.py`, and the endpoint client, model-identity refusal and retry policy are
+`math_bench`'s, already exercised by the other two domains — but no token has been generated
+against this benchmark and no BIRD score exists. `bird_mini_dev` is the default `SUITE` entry:
+500 questions, and the release our 43.8% anchor is comparable to.
