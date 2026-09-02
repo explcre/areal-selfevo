@@ -42,16 +42,19 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 __all__ = [
+    "CLUSTER_BATCH_KEY",
     "CLUSTER_LORA_ENV",
     "ClusterLoRAConfig",
     "ClusterPlan",
     "EngineOptimizer",
     "adapter_roster",
+    "assert_plan_describes_batch",
     "begin_cluster_batch",
     "behaviour_features",
     "every_expert",
     "rows_by_adapter",
     "select_rows",
+    "tag_cluster_batch",
 ]
 
 #: Master switch AND partition selector: ``meds | random_matched | none``. Unset or empty is
@@ -61,6 +64,14 @@ CLUSTER_LORA_ENV = "SELFEVO_CLUSTER_LORA"
 
 #: Adapter names the engine creates up front, comma separated. Required by the engine seam.
 ROSTER_ENV = "SELFEVO_CLUSTER_LORA_ADAPTERS"
+
+#: Per-row column carrying the identity of the batch a plan was armed for.
+#:
+#: Shaped like ``group_ids`` -- one value per TOKEN -- for the identical reason: the batch
+#: is split into PPO minibatches and then into microbatches, both of which re-slice and
+#: reorder rows, and only a per-row column survives that intact. The value is the actor's
+#: batch counter, which is exactly what ``ClusterPlan.step`` already records.
+CLUSTER_BATCH_KEY = "cluster_batch_id"
 
 
 class ClusterWiringError(RuntimeError):
@@ -262,6 +273,70 @@ def rows_by_adapter(
             )
         out.setdefault(key, []).append(row)
     return out
+
+
+def tag_cluster_batch(data: dict, batch_id: int) -> None:
+    """Stamp every row of a batch with the identity of the plan armed for it.
+
+    Written where the plan is armed, read where it is used. One value per token, mirroring
+    ``group_ids``, because everything between the two seams re-slices rows.
+
+    Args:
+        data: The batch dict, mutated in place. Must carry ``loss_mask``, which fixes the
+            shape and is the tensor every other per-row column here is shaped against.
+        batch_id: The actor's batch counter, the same number the plan records as its
+            ``step``.
+    """
+    import torch
+
+    data[CLUSTER_BATCH_KEY] = torch.full_like(
+        data["loss_mask"], int(batch_id), dtype=torch.long
+    )
+
+
+def assert_plan_describes_batch(plan: "ClusterPlan", batch: Mapping[str, Any]) -> None:
+    """Refuse a plan armed for a batch other than the one about to be trained.
+
+    ``ClusterPlan.step`` says in its own docstring that it exists "so a stale plan is
+    identifiable", and nothing identified it. The engine read ``_selfevo_cluster_plan``,
+    never cleared it and never compared its step to anything, so a step on which the actor
+    did not re-arm trained the NEW batch under the PREVIOUS batch's group-to-expert
+    assignment. :func:`rows_by_adapter` cannot catch that: group ids are ``0..G-1`` in every
+    batch, so a stale plan names every group of the new batch and looks complete. The one
+    observable was ``cluster_lora/plan_step``, which was emitted and compared to nothing.
+
+    CONSUMING the plan instead -- popping it -- would be wrong. ``PPOActor._ppo_update``
+    calls ``train_batch`` once per PPO MINIBATCH, so one arming is legitimately used several
+    times. A plan describes a batch, not a call, and this is the check that says which batch.
+
+    Args:
+        plan: The armed plan.
+        batch: The batch about to be trained, carrying :data:`CLUSTER_BATCH_KEY`.
+
+    Raises:
+        ClusterWiringError: If the batch carries no identity at all, or carries one the plan
+            was not armed for. Both are refused rather than warned about, for the reason
+            every other refusal here gives: the alternative trains, logs and reports as the
+            method while routing groups by an assignment that was not made for them.
+    """
+    tag = batch.get(CLUSTER_BATCH_KEY)
+    if tag is None:
+        raise ClusterWiringError(
+            f"a cluster plan armed for batch {plan.step} is on this engine but the batch "
+            f"carries no {CLUSTER_BATCH_KEY!r}, so there is nothing to identify it by. "
+            "Every armed batch is stamped by begin_cluster_batch, so an unstamped one "
+            "reached the engine without passing that seam and routing it would apply some "
+            "other batch's partition"
+        )
+    seen = sorted({int(v) for v in tag.reshape(int(tag.shape[0]), -1)[:, 0].tolist()})
+    if seen != [int(plan.step)]:
+        raise ClusterWiringError(
+            f"the armed plan was armed for batch {plan.step} and this batch is {seen}. A "
+            "plan describes one batch and is used by every PPO minibatch of it; a step on "
+            "which the actor did not re-arm would otherwise train the new batch under the "
+            "previous batch's partition, which rows_by_adapter cannot see because the group "
+            "ids are 0..G-1 in every batch"
+        )
 
 
 def select_rows(batch: Mapping[str, Any], rows: Sequence[int]) -> dict[str, Any]:
@@ -668,11 +743,15 @@ def begin_cluster_batch(actor, router, data, contexts, group_sizes) -> dict[str,
                 "exists, so one discovered mid-run has no parameters to train; raise the "
                 "roster or raise SELFEVO_CLUSTER_LORA_MIN_CLUSTER_SIZE"
             )
+    step = int(getattr(actor, "_selfevo_batch", 0))
+    # The identity of the batch this plan describes, stamped on the batch itself so the
+    # engine can tell it from the next one. See assert_plan_describes_batch.
+    tag_cluster_batch(data, step)
     engine = getattr(actor, "engine", None)
     if engine is not None:
         engine._selfevo_cluster_plan = ClusterPlan(
             key_of_group=dict(enumerate(partition.keys)),
-            step=int(getattr(actor, "_selfevo_batch", 0)),
+            step=step,
             basis=partition.basis,
         )
 

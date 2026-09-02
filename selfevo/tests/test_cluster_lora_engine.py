@@ -43,7 +43,11 @@ from areal.engine.fsdp_engine import FSDPEngine  # noqa: E402
 from areal.engine.fsdp_utils.parallel import ParallelHelper  # noqa: E402
 from areal.utils import logging as areal_logging  # noqa: E402
 from selfevo.cluster_lora.adapters import ClusterAdapterSet  # noqa: E402
-from selfevo.cluster_lora.wiring import ClusterPlan, ClusterWiringError  # noqa: E402
+from selfevo.cluster_lora.wiring import (  # noqa: E402
+    ClusterPlan,
+    ClusterWiringError,
+    tag_cluster_batch,
+)
 
 REPO = "/home/ubuntu/areal-selfevo"
 NAMES = ("cluster_0", "cluster_1", "shared")
@@ -275,9 +279,17 @@ def weight_fn(x):
 
 
 def run(engine, data, plan=None, loss_fn=linear_loss):
-    """One real ``train_batch``, optionally with a cluster plan armed."""
+    """One real ``train_batch``, optionally with a cluster plan armed.
+
+    Arming a plan also stamps the batch with the plan's step, which is what
+    ``begin_cluster_batch`` does for a real run: the engine refuses a plan that was armed for
+    a different batch, so a helper that armed without stamping would make every caller here
+    exercise that refusal instead of the thing it is about. Tests about the stamp itself
+    arm and stamp by hand.
+    """
     if plan is not None:
         engine._selfevo_cluster_plan = plan
+        tag_cluster_batch(data, plan.step)
     return engine.train_batch(data, loss_fn=loss_fn, loss_weight_fn=weight_fn)
 
 
@@ -504,6 +516,61 @@ def test_an_unarmed_engine_never_looks_for_a_plan(world, tmp_path):
     before = adapters.snapshot("shared")
     run(engine, data)
     assert not adapters.unchanged("shared", before)
+
+
+def test_a_plan_is_used_by_every_minibatch_of_its_batch_and_refused_by_the_next(
+    world, tmp_path
+):
+    """A plan describes one BATCH, and the engine is called once per PPO MINIBATCH of it.
+
+    So the plan is not consumed. ``PPOActor._ppo_update`` splits the batch into
+    ``ppo_n_minibatches`` and calls ``train_batch`` on each, and popping the plan on the
+    first call would leave the rest of the batch unrouted -- which, since the refusal above
+    exists, would now be a crash rather than a silent baseline, but is still not the arm that
+    was configured. What the engine checks instead is WHICH batch: the identity the actor
+    stamped on every row against the one the plan was armed for.
+
+    Nothing checked it before. ``rows_by_adapter`` cannot: group ids are ``0..G-1`` in every
+    batch, so a plan left over from the previous batch names every group of the new one and
+    looks complete.
+    """
+    engine, _adapters = make_engine(tmp_path)
+    engine._selfevo_cluster_plan = plan_of(SPLIT, step=4)
+    for _ in range(2):
+        mb = make_batch(seed=0)
+        tag_cluster_batch(mb, 4)
+        stats = engine.train_batch(mb, loss_fn=linear_loss, loss_weight_fn=weight_fn)
+        assert stats["cluster_lora/plan_step"] == 4.0
+    stale = make_batch(seed=1)
+    tag_cluster_batch(stale, 5)
+    with pytest.raises(ClusterWiringError, match="armed for batch 4 and this batch is"):
+        engine.train_batch(stale, loss_fn=linear_loss, loss_weight_fn=weight_fn)
+
+
+def test_a_batch_that_never_passed_the_arming_seam_is_refused(world, tmp_path):
+    """No stamp means the batch did not come through ``begin_cluster_batch``.
+
+    Refused rather than waved through, for the reason every refusal in this module gives: the
+    alternative routes the batch by an assignment that was not made for it, and reports the
+    partition as though it had been.
+    """
+    engine, _adapters = make_engine(tmp_path)
+    engine._selfevo_cluster_plan = plan_of(SPLIT, step=0)
+    with pytest.raises(ClusterWiringError, match="carries no 'cluster_batch_id'"):
+        engine.train_batch(
+            make_batch(seed=0), loss_fn=linear_loss, loss_weight_fn=weight_fn
+        )
+
+
+def test_a_batch_carrying_two_identities_is_refused(world, tmp_path):
+    """One batch, one identity. Rows from two batches in one call is not a batch."""
+    engine, _adapters = make_engine(tmp_path)
+    engine._selfevo_cluster_plan = plan_of(SPLIT, step=0)
+    data = make_batch(seed=0)
+    tag_cluster_batch(data, 0)
+    data["cluster_batch_id"][2:] = 1
+    with pytest.raises(ClusterWiringError, match=r"this batch is \[0, 1\]"):
+        engine.train_batch(data, loss_fn=linear_loss, loss_weight_fn=weight_fn)
 
 
 def test_a_roster_of_experts_with_no_plan_armed_is_refused(world, tmp_path):

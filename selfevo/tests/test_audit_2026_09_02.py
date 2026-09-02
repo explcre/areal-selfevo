@@ -48,6 +48,10 @@ from selfevo.gold.substitute import (  # noqa: E402
     substitute_gold_rows,
     substitute_in_place,
 )
+from selfevo.cluster_lora.wiring import (  # noqa: E402
+    ClusterWiringError,
+    tag_cluster_batch,
+)
 from selfevo.tests.test_cluster_lora_engine import (  # noqa: E402
     NAMES,
     SPLIT,
@@ -214,14 +218,6 @@ def test_defect_the_actor_arms_nothing_when_group_routing_is_off(monkeypatch):
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-    "CONFIRMED DEFECT 2: _selfevo_cluster_plan is never consumed and ClusterPlan.step is "
-    "never compared to anything. Fix: carry the batch identity on the plan and refuse a "
-    "mismatch "
-    ),
-)
 def test_defect_a_plan_armed_for_one_batch_is_silently_reused_by_the_next(world, tmp_path):
     """``ClusterPlan.step`` exists so a stale plan is identifiable. Nothing identifies it.
 
@@ -232,19 +228,33 @@ def test_defect_a_plan_armed_for_one_batch_is_silently_reused_by_the_next(world,
     the new batch and looks complete. The only observable is ``cluster_lora/plan_step``,
     which is emitted and read by nobody.
 
-    FAILS ON CURRENT CODE. The fix is to CONSUME the plan: pop it in
-    ``_train_batch_by_cluster`` (an armed plan describes one batch) or carry the batch
-    identity on it and refuse a mismatch. Popping also closes the twin defect above, where
-    an unarmed step runs unrouted, because a popped plan and an absent one are then the same
-    state and one refusal covers both.
+    FIXED 2026-09-02, and the marker is gone with the fix. The batch identity is carried,
+    not the plan consumed: ``begin_cluster_batch`` stamps every row of the batch it armed
+    for with the same number the plan records as its ``step``, and
+    ``assert_plan_describes_batch`` refuses a mismatch, which finally gives ``plan_step`` the
+    consumer its docstring promised.
+
+    POPPING WOULD HAVE BEEN WRONG, which is why the assertion below is no longer that the
+    plan is ``None``. ``PPOActor._ppo_update`` calls ``train_batch`` once per PPO MINIBATCH,
+    so one arming is legitimately used ``ppo_n_minibatches`` times; a pop would leave every
+    minibatch after the first unrouted. Both halves are asserted here -- the same plan serves
+    a second minibatch of ITS batch, and refuses the next batch -- because a fix that only
+    refused would break the live update loop and a fix that only accepted would be the
+    defect.
     """
     engine, _adapters = make_engine(tmp_path)
     engine._selfevo_cluster_plan = plan_of(SPLIT, step=0)
-    engine.train_batch(make_batch(seed=0), loss_fn=linear_loss, loss_weight_fn=weight_fn)
-    assert getattr(engine, "_selfevo_cluster_plan", None) is None, (
-        "the plan survived the step it was armed for, so the NEXT batch is routed by the "
-        "previous batch partition unless the actor happens to overwrite it first"
+    for _ in range(2):
+        armed = make_batch(seed=0)
+        tag_cluster_batch(armed, 0)
+        engine.train_batch(armed, loss_fn=linear_loss, loss_weight_fn=weight_fn)
+    assert getattr(engine, "_selfevo_cluster_plan", None) is not None, (
+        "the plan was consumed, so every PPO minibatch after the first is unrouted"
     )
+    nxt = make_batch(seed=1)
+    tag_cluster_batch(nxt, 1)
+    with pytest.raises(ClusterWiringError, match="armed for batch 0"):
+        engine.train_batch(nxt, loss_fn=linear_loss, loss_weight_fn=weight_fn)
 
 
 @pytest.mark.xfail(
@@ -439,9 +449,9 @@ def test_defect_a_forward_outside_the_step_sees_exactly_one_expert(world, tmp_pa
     engine, _adapters = make_engine(tmp_path)
     for step in range(3):
         engine._selfevo_cluster_plan = plan_of(SPLIT, step=step)
-        engine.train_batch(
-            make_batch(seed=step), loss_fn=linear_loss, loss_weight_fn=weight_fn
-        )
+        data = make_batch(seed=step)
+        tag_cluster_batch(data, step)
+        engine.train_batch(data, loss_fn=linear_loss, loss_weight_fn=weight_fn)
     active = list(engine.model.active_adapters)
     assert set(active) == set(NAMES), (
         f"after a routed step the active adapters are {active}; every forward outside "
@@ -527,9 +537,9 @@ def test_refuted_the_cluster_denominator_is_not_rescaled_by_cluster_size(world, 
         lopsided._selfevo_cluster_plan = plan_of(
             {0: "cluster_0", 1: "cluster_0", 2: "cluster_0", 3: "cluster_1"}
         )
-        lopsided.train_batch(
-            make_batch(seed=4), loss_fn=linear_loss, loss_weight_fn=weight_fn
-        )
+        routed = make_batch(seed=4)
+        tag_cluster_batch(routed, 0)
+        lopsided.train_batch(routed, loss_fn=linear_loss, loss_weight_fn=weight_fn)
     finally:
         fe.compute_total_loss_weight = original
     assert len(seen) == 2, f"the denominator was taken {len(seen)} times, not once per step"
@@ -549,10 +559,10 @@ def test_refuted_a_stale_plan_that_names_too_few_groups_still_refuses(world, tmp
 
     engine, _ = make_engine(tmp_path)
     engine._selfevo_cluster_plan = plan_of({0: "cluster_0", 1: "cluster_0"})
+    short = make_batch(seed=6)
+    tag_cluster_batch(short, 0)
     with pytest.raises(ClusterWiringError, match="does not name"):
-        engine.train_batch(
-            make_batch(seed=6), loss_fn=linear_loss, loss_weight_fn=weight_fn
-        )
+        engine.train_batch(short, loss_fn=linear_loss, loss_weight_fn=weight_fn)
 
 
 def test_refuted_peft_set_adapter_takes_one_name(world, tmp_path):

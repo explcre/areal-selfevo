@@ -928,6 +928,7 @@ class FSDPEngine(TrainEngine):
         from selfevo.cluster_lora.wiring import (
             ClusterWiringError,
             EngineOptimizer,
+            assert_plan_describes_batch,
             rows_by_adapter,
             select_rows,
         )
@@ -945,6 +946,13 @@ class FSDPEngine(TrainEngine):
                 "keyed on group identity because microbatch splitting reorders rows, and "
                 "routing on positions would hand each row another row's expert"
             )
+        # SEAM 2c: the plan describes ONE batch, and this engine is called once per PPO
+        # minibatch of it -- so the plan is not consumed, it is checked. Without this a step
+        # on which the actor did not re-arm routed the new batch by the previous batch's
+        # partition and reported the previous batch's plan_step, and nothing compared the
+        # two. Ordered after the group_ids guard so that a batch with no grouping at all is
+        # still reported as that rather than as an identity mismatch.
+        assert_plan_describes_batch(cluster_plan, input_batched)
         rows = rows_by_adapter(
             input_batched["group_ids"][:, 0].tolist(), cluster_plan.key_of_group
         )

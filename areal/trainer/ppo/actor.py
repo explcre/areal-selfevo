@@ -392,7 +392,7 @@ class PPOActor:
     def compute_advantages(self, data: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return batched_call(self._compute_advantages, data, pass_meta=True)
 
-    def _arm_unrouted_cluster_batch(self, gr, n_groups: int) -> dict[str, float]:
+    def _arm_unrouted_cluster_batch(self, gr, data, n_groups: int) -> dict[str, float]:
         """Arm -- or refuse -- a cluster-LoRA batch on a run whose routing cannot carry one.
 
         A cluster-LoRA arm is switched on by TWO variables read at two seams that never
@@ -424,6 +424,8 @@ class PPOActor:
         Args:
             gr: The ``GroupRoutingConfig``, or ``None``. Read only to say in the refusal
                 which half of the routing configuration is missing.
+            data: The batch dict, stamped with this batch's identity so the engine can tell
+                the plan armed for it from a plan left over from the previous batch.
             n_groups: Groups in this batch, which is what the degenerate partition is over.
 
         Returns:
@@ -442,6 +444,7 @@ class PPOActor:
             ClusterPlan,
             ClusterWiringError,
             adapter_roster,
+            tag_cluster_batch,
         )
 
         cfg = ClusterLoRAConfig.from_env()
@@ -468,6 +471,7 @@ class PPOActor:
         partition = no_partition(n_groups)
         step = int(getattr(self, "_selfevo_batch", 0))
         self._selfevo_batch = step + 1
+        tag_cluster_batch(data, step)
         engine = getattr(self, "engine", None)
         if engine is not None:
             engine._selfevo_cluster_plan = ClusterPlan(
@@ -1041,7 +1045,7 @@ class PPOActor:
                 cluster_arm = os.environ.get("SELFEVO_CLUSTER_LORA", "").strip()
                 if cluster_arm and not (routing_on and getattr(gr, "router", None)):
                     stats_tracker.scalar(
-                        **self._arm_unrouted_cluster_batch(gr, len(sizes))
+                        **self._arm_unrouted_cluster_batch(gr, data, len(sizes))
                     )
                 sft_rows = None
                 sft_excluded = 0
