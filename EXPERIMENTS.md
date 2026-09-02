@@ -2513,3 +2513,138 @@ the feature-driven rule GOAL.md predicts (`truncated_fraction == 1` selecting a 
 variant); `selector` is the seam for that and is exercised by tests, but a feature rule is a
 larger claim needing its own matched-proportion control. And the three registered variants
 differ only in `step_limit`, which is a real axis but a thin one.
+
+## 2026-09-01 — The harness rule follows a feature, and the control that makes that a measurement
+
+`selector` has been the seam for a feature-driven dispatch rule since the axis got a consumer
+the same day, and the slot held `round_robin`: deterministic, always moves, visits every
+member, and **blind**. The prediction the paper makes is not "the harness changes" but "the
+harness follows `truncated_fraction`", and round-robin cannot test it — it proposes the same
+successor whether every rollout ran out of steps or none did.
+
+**The rule.** `selfevo/harness/selectors.py::TruncationStepLimitSelector` reduces a batch to
+`t`, the mean of `truncated_fraction` over its groups, and
+
+```
+t >= raise_above (0.5)   -> the NEAREST variant with a LARGER  step_limit
+t <= lower_below (0.05)  -> the NEAREST variant with a SMALLER step_limit
+otherwise                -> refuse, recorded as `no_move_wanted`
+```
+
+with a refusal recorded as `no_variant` when the set holds no member in the direction asked
+for. Four choices in that, each with its reason:
+
+**1. Direction, not destination.** Nothing in `truncated_fraction` measures how many MORE steps
+a truncated rollout needed. A rule that jumped to the largest budget would claim a magnitude the
+evidence does not carry, and would make the arm's trajectory a function of the configured set's
+DIAMETER rather than of the feature: the same run over `[plain, long]` and over
+`[plain, long, enormous]` would land in different places from identical evidence. One rung per
+decision crosses exactly one variant boundary per decision.
+
+**2. Symmetric, and that clause is what makes the axis about ADAPTATION.** Without the downward
+move, "the harness follows the feature" is confounded with "the harness gets more compute": an
+arm that only ever grows its step budget also spends more, and a gain over a fixed-budget
+control could be bought entirely with the extra steps.
+
+**3. The thresholds are asymmetric on purpose and are NOT pinned by a measurement, and the
+docstring says so instead of inventing a citation.** Raising the budget wrongly costs compute;
+lowering it wrongly destroys solves that were within reach. 0.5 says raise once the budget binds
+for the MEDIAN rollout rather than for a tail, since the extra steps are paid for by every
+rollout in the batch while only the truncated ones can benefit; 0.05 says cut only when it bound
+for at most about one rollout in twenty. What IS measured is the branch's PREMISE, and it is
+already recorded in `rule_policy.py`: doubling the OlympiadBench cap moved truncation 79 -> 78,
+and `n_truncated == n_no_box` in every MATH/AMC/AIME row, so a truncated sample never terminated
+usefully rather than being a few tokens short. Same standing as
+`RulePolicyRouter.truncated_threshold`, and reported the same way.
+
+**4. Refusals are TYPED, not silent.** `HarnessSelectionRefused` separates a DATA condition —
+dead band, ceiling, floor — from a PROGRAMMER condition — features never arrived, the caller and
+the dispatcher disagree about the set. `apply` catches the first BY TYPE and returns a
+`DispatchRecord(changed=False, refused=True)` carrying the rule's own words; the second still
+stops the run. This is the only behavioural change to `dispatch.py`, and it exists because the
+guard that refuses a selector returning the already-active variant demands a TOTAL rule, while
+the rule worth testing has three answers and the third is the ORDINARY case. On the sequence
+below the rule declines on 36 of 48 decisions. Under round-robin that state does not exist,
+which is another way of saying round-robin is not the same experiment.
+
+**The control, which is the half that makes this science.** This project has reached the same
+finding from three directions — `proportions.py` exists for it, the `rule_policy` retraction is
+it, and the routing-targeting audit measured it — that a "smart" rule can be indistinguishable
+from a random one applied at the same RATE. A harness arm inherits that hazard in a sharper
+form: changing the step limit perturbs the rollout distribution whatever the reason for the
+change, so "switches sometimes" is a treatment by itself.
+`RateMatchedControlSelector.from_treatment(t, seed=...)` reads the treatment's REALISED `moves`
+and `decisions` — measured, never nominal, for the reason `proportions.py` documents at length —
+builds a deck of that many MOVE tokens among that many decisions, shuffles it with a private
+`random.Random`, and serves one token per decision, reshuffling on exhaustion. On a MOVE it
+draws uniformly among the members that are not active.
+
+**Over the run, not per step, and the choice is the whole design.** Matching per step — moving
+exactly where the treatment moved — would match the rate perfectly and would be the WRONG
+control: the intervention times would then be a deterministic function of the feature, so the
+control would inherit the treatment's targeting in the time dimension and could only test the
+choice of destination. Matching over the run keeps the marginal rate identical and makes the
+times independent of the feature, which is the null this arm has to represent.
+
+**Residual mismatch, stated exactly.** After `n = q*decisions + r` calls the control has made
+`q*moves + s` moves with `0 <= s <= min(r, moves)`. At every multiple of `decisions` the rate is
+EXACTLY the treatment's — matched by construction, not in expectation, which a Bernoulli draw at
+the same `p` could not offer (count s.d. `sqrt(n p (1-p))`). In between it differs by at most
+`r/n`. The two arms are separate RUNS whose proposing-batch counts need not agree, which is why
+the deck recycles rather than being consumed once: `MatchedPermutationControl` records realising
+8.5% against a 32% target when it assumed otherwise.
+
+**What is NOT matched, said out loud.** The DESTINATION mixture. The control's destinations are
+uniform while the treatment's are whatever its rule chose, so this arm isolates "switching at
+rate p" from "switching where the feature says" and does NOT separate "the feature says where"
+from "longer budgets are simply better". The follow-up that separates those is a second control
+replaying the treatment's realised destination multiset on this same feature-independent
+schedule. Named here rather than discovered in review.
+
+**A denominator finding, and it is not book-keeping.** `consume()` calls a selector a
+data-dependent number of times per batch: it stops at the first proposal that MOVES, so a batch
+whose rule moves calls it once while a batch whose rule declines calls it once per proposing
+group. Counting raw calls would make the rate's denominator a function of the OUTCOME —
+declining batches contributing more denominator than moving ones — and the treatment and control
+rates would not be comparable even when both behaved identically. The unit of decision is
+therefore the OBSERVATION: `observe()` opens an epoch, the first call after it decides, later
+calls in the same epoch are refused and counted separately as repeats. Both selectors inherit
+that from one place, so the two arms cannot drift apart on the definition of the quantity being
+matched. It also makes the failure mode of an observe-then-decide seam visible: a caller that
+forgets `observe()` freezes the harness, and `route/harness_sel_repeat_calls` climbs while
+`route/harness_sel_decisions` does not.
+
+**Measured, on CPU, on a 48-batch stream** whose truncation runs 0.9 -> 0.3 -> 0.02 twice: the
+treatment takes 48 decisions and 12 moves (rate 0.25) — up three rungs, 14 refusals at the
+ceiling, down three rungs, twice — with 22 dead-band refusals. The control at seed 0 takes 48
+decisions and exactly 12 moves, having read nothing, and lands on four different destinations.
+
+**A hole the dispatcher's own guard leaves open.** `HarnessDispatcher` deliberately ACCEPTS
+variants that differ only in `settings` -- that is a real axis for an adapter, and its
+construction guard says so. This rule moves along the step budget, so over such a set it can
+never move: every proposal would be refused and the arm would report a feature-driven harness
+while training exactly like the control it is meant to be compared against. That is the failure
+the axis exists to prevent, arriving through a door the axis left open, so the rule raises on a
+multi-member set whose `step_limit`s are all equal rather than letting it become the most common
+refusal in the log.
+
+**Mutation results: 56/56 killed, 0 survived, 0 skipped**, against a copy asserted sha256
+identical to the live checkout before the first mutation and after the last, with byte-diff and
+compile checks so that an unapplied mutation is reported as SKIP and never as SURVIVED. One
+mutation is deliberately ABSENT with its proof recorded in the harness: dropping
+`math.isfinite` from `not math.isfinite(v) or not 0.0 <= v <= 1.0` is EQUIVALENT, because every
+non-finite value already fails the range test — `nan` fails every comparison, `+-inf` lies
+outside [0, 1] — so it would alter bytes, compile, run and survive while proving nothing. The
+reachable defect in the same place, dropping the RANGE test, is in the table and dies.
+`mutate_harness_dispatch.py` was re-run unchanged against the patched `dispatch.py`: 58/58
+killed, 0 skipped, so the refusal seam staled none of its anchors. Full suite 1397 -> 1462.
+
+**What is NOT claimed.** No arm has trained with either selector; the whole result is CPU
+behaviour. No config field selects a selector, so both are reachable only through
+`HarnessDispatcher(..., selector=...)` and `observe()` has no production call site —
+`_route_groups` would need three lines and `cli_args.py` a field, and this repo's AGENTS.md says
+to ask before changing config structures. So the rate this control would be matched to has never
+been measured on a real run, only on the synthetic stream above; the thresholds remain prices for
+an asymmetric error rather than estimates; and whether a longer step budget actually reduces
+truncation on an agentic harness is the assumption the whole rule rests on and is untested here,
+because no adapter runs on this box.
