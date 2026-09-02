@@ -730,6 +730,38 @@ class FSDPEngine(TrainEngine):
         assert self.lr_scheduler is not None
         self.lr_scheduler.step()
 
+    def _read_only_forward_adapters(self, forward_only: bool):
+        """The adapter activation a READ-ONLY forward must run under.
+
+        A cluster-routed run deploys the SUM of its experts, but ``ClusterAdapterSet.only()``
+        restores ``names[0]`` on the way out, so between training steps the model is one
+        arbitrary expert. Every read-only forward therefore ran on that expert:
+        ``compute_logp`` (via ``forward_batch``), which is the importance-ratio denominator
+        for EVERY group in the batch and not only the routed one, and ``eval_batch``, which
+        is where reported numbers come from. Neither has any other observable -- the ratio is
+        simply wrong and the evaluation simply describes a model no arm produced.
+
+        A training forward is deliberately NOT covered: routing each cluster's gradient into
+        its own expert is the method, and activating every expert there would make the run
+        the shared-adapter baseline wearing the method's name.
+
+        Args:
+            forward_only: Whether this pass takes a backward.
+
+        Returns:
+            ``nullcontext()`` for a training pass or an unarmed engine -- the default, under
+            which nothing changes and selfevo is not imported -- and otherwise a context that
+            activates every expert for the duration.
+        """
+        if not forward_only:
+            return nullcontext()
+        adapters = getattr(self, "_selfevo_adapters", None)
+        if adapters is None:
+            return nullcontext()
+        from selfevo.cluster_lora.wiring import every_expert
+
+        return every_expert(self.model, adapters.names)
+
     def forward_backward_batch(
         self,
         mb_list: MicroBatchList,
@@ -738,38 +770,39 @@ class FSDPEngine(TrainEngine):
         ],
         forward_only: bool = False,
     ) -> None:
-        for mb_item in mb_list:
-            inputs, ctx = self._prepare_mb_inputs(mb_item)
+        with self._read_only_forward_adapters(forward_only):
+            for mb_item in mb_list:
+                inputs, ctx = self._prepare_mb_inputs(mb_item)
 
-            # Lazily create tree attention metadata just before forward.
-            # The returned dict keys are prefixed with "tree_" to avoid collisions
-            # with HuggingFace's own kwargs. The patched _tree_attn_fwd_func in
-            # module_fsdp.py reads these keys from the **kwargs that transformers
-            # forwards through.
-            tree_attn_keys: list[str] = []
-            if self.enable_tree_training and ctx.trie_node is not None:
-                padded_size = mb_item.padded_to_length
-                assert padded_size is not None
-                tree_kwargs = build_tree_attn_kwargs(
-                    ctx.trie_node, padded_size, self.device
-                )
-                inputs.update(tree_kwargs)
-                tree_attn_keys = list(tree_kwargs.keys())
+                # Lazily create tree attention metadata just before forward.
+                # The returned dict keys are prefixed with "tree_" to avoid collisions
+                # with HuggingFace's own kwargs. The patched _tree_attn_fwd_func in
+                # module_fsdp.py reads these keys from the **kwargs that transformers
+                # forwards through.
+                tree_attn_keys: list[str] = []
+                if self.enable_tree_training and ctx.trie_node is not None:
+                    padded_size = mb_item.padded_to_length
+                    assert padded_size is not None
+                    tree_kwargs = build_tree_attn_kwargs(
+                        ctx.trie_node, padded_size, self.device
+                    )
+                    inputs.update(tree_kwargs)
+                    tree_attn_keys = list(tree_kwargs.keys())
 
-            with trace_scope("fsdp_engine.forward"):
-                outputs = self.model(**inputs)
-            logits = outputs.logits.squeeze(0)
+                with trace_scope("fsdp_engine.forward"):
+                    outputs = self.model(**inputs)
+                logits = outputs.logits.squeeze(0)
 
-            # Release tree attention metadata after forward pass
-            for key in tree_attn_keys:
-                del inputs[key]
+                # Release tree attention metadata after forward pass
+                for key in tree_attn_keys:
+                    del inputs[key]
 
-            ctx_dict = ctx.to_dict()
-            loss = process_output_fn(logits, ctx_dict)
+                ctx_dict = ctx.to_dict()
+                loss = process_output_fn(logits, ctx_dict)
 
-            if not forward_only and loss is not None:
-                with trace_scope("fsdp_engine.backward"):
-                    loss.backward()
+                if not forward_only and loss is not None:
+                    with trace_scope("fsdp_engine.backward"):
+                        loss.backward()
 
     def train_batch(
         self,
@@ -1053,6 +1086,24 @@ class FSDPEngine(TrainEngine):
 
         if not self.config.use_lora or self.model is None:
             return {}
+        experts = self._lora_export_experts()
+        if experts:
+            # EXIT POINT: these shapes size the rollout engine's LoRA slots, and a merged
+            # adapter is rank sum_c r_c. Derived arithmetically rather than by gathering:
+            # DTensor.shape is already the global shape, and a controller calls this on
+            # rank 0 alone, where starting an all-gather would deadlock.
+            from selfevo.cluster_lora.merge import merged_lora_shapes
+
+            shapes = {
+                name: tuple(param.shape)
+                for name, param in self.model.named_parameters()
+                if "lora_" in name
+            }
+            return {
+                re.sub(r"^base_model\.model\.", "", key): value
+                for key, value in merged_lora_shapes(shapes, experts).items()
+            }
+        self._refuse_single_adapter_export("get_lora_adapter_info")
         result = {}
         for name, param in self.model.named_parameters():
             if param.requires_grad and "lora_" in name:
@@ -1513,6 +1564,133 @@ class FSDPEngine(TrainEngine):
                 tensor = tensor.to(current_platform.device_type)
             return tensor
 
+    # ---------------------------------------------------------------------------------
+    # Exporting LoRA: which adapters leave this engine, and as what.
+    #
+    # A cluster-routed run trains one expert per behavioural cluster and DEPLOYS THEIR SUM
+    # (selfevo/cluster_lora/merge.py documents why the sum and not a mean). Every exit point
+    # below used to select LoRA tensors by ``requires_grad``, which is true of exactly the
+    # one adapter ``ClusterAdapterSet.only()`` last activated -- so a checkpoint or a weight
+    # sync carried ONE arbitrary expert, loaded cleanly, and evaluated to a number describing
+    # a model no arm produced. Default off: with no ClusterAdapterSet armed,
+    # ``_lora_export_experts`` returns ``()`` and every branch below is the shipped code.
+
+    def _lora_export_experts(self) -> tuple[str, ...]:
+        """The experts an export of this engine must carry, or ``()`` when none are routed.
+
+        Returns:
+            The cluster roster in its fixed order, or ``()`` for an ordinary single-adapter
+            run. The order is part of the artifact: the merge concatenates ``A`` and ``B``
+            blocks in it, and two exports that disagreed on it would pair each expert's ``B``
+            with another expert's ``A``.
+        """
+        adapters = getattr(self, "_selfevo_adapters", None)
+        return () if adapters is None else tuple(adapters.names)
+
+    def _refuse_single_adapter_export(self, where: str) -> None:
+        """Refuse a ``requires_grad``-selected export from a multi-adapter model.
+
+        The guard sits on the DEFAULT path deliberately. A future caller that carries several
+        adapters without arming a ``ClusterAdapterSet`` would otherwise export whichever one
+        happened to be active, and nothing downstream can tell that artifact from a correct
+        one. This is the only place that difference is observable, so it is where it refuses.
+
+        Args:
+            where: The exit point, named in the message.
+
+        Raises:
+            MergeSelectionError: If the model carries more than one PEFT adapter.
+        """
+        configs = getattr(getattr(self, "model", None), "peft_config", None) or {}
+        if len(configs) > 1:
+            from selfevo.cluster_lora.merge import MergeSelectionError
+
+            raise MergeSelectionError(
+                f"{where} selects LoRA tensors by requires_grad, but this model carries "
+                f"adapters {sorted(configs)}. After a per-cluster step exactly one of them "
+                "is trainable, so this export would carry that one expert and silently drop "
+                "the rest. Arm a ClusterAdapterSet (SELFEVO_CLUSTER_LORA_ADAPTERS) so the "
+                "experts are summed, or export a model with one adapter"
+            )
+
+    def _merged_lora_named_tensors(
+        self,
+        experts: tuple[str, ...],
+        named_params,
+        *,
+        for_checkpoint: bool,
+    ) -> list[tuple[str, torch.Tensor]]:
+        """``(key, tensor)`` for the SUM of the cluster experts, ready to write or broadcast.
+
+        Every rank walks the same parameters and takes the same all-gathers -- ``full_tensor``
+        is a collective and a rank that skipped one would hang the rest -- and only rank 0
+        keeps the results and merges them. That mirrors what the callers already do for the
+        single-adapter case.
+
+        Peak extra memory on rank 0 is the gathered adapter state plus the merged copy, which
+        is the same order as one weight-sync bucket; the gathered dict is dropped before
+        returning.
+
+        Args:
+            experts: The roster, in concatenation order.
+            named_params: ``(name, parameter)`` pairs to select from, as the caller iterates
+                them -- the sync path renames some of them for the rollout engine, so the
+                iterator is passed in rather than taken from ``self.model``.
+            for_checkpoint: Which of the two shipped gathers to use. True reproduces
+                ``_save_lora_to_hf``'s -- unshard in place and move to the host, never onto
+                the accelerator. False reproduces the weight sync's ``_get_full_tensor``,
+                which does move a host tensor to the device because that is where it is
+                broadcast from. Sharing one gather here would change one exit point's device
+                behaviour to suit the other's.
+
+        Returns:
+            Sorted ``(key, tensor)`` pairs on rank 0, and ``[]`` on every other rank. Keys
+            carry no adapter segment, which is the format ``PeftModel.save_pretrained``
+            writes and the rollout engines parse.
+
+        Raises:
+            MergeSelectionError: If a trainable parameter is not a LoRA tensor -- it would be
+                dropped by the selection below -- or from the merge itself, on a ragged or
+                unexpected adapter set.
+        """
+        from torch.distributed.tensor import DTensor
+
+        from selfevo.cluster_lora.merge import (
+            MergeSelectionError,
+            expert_scalings,
+            merge_expert_tensors,
+        )
+
+        main_rank = dist.get_rank() == 0
+        gathered: dict[str, torch.Tensor] = {}
+        for name, param in named_params:
+            if "lora_" not in name:
+                # Checked on every rank, before any collective, so a model whose trainable
+                # set is not exactly its LoRA tensors refuses everywhere at once instead of
+                # dropping those tensors from the artifact.
+                if param.requires_grad:
+                    raise MergeSelectionError(
+                        f"{name!r} is trainable but is not a LoRA tensor, so the merged "
+                        "export would drop it; a cluster-routed run must train LoRA "
+                        "parameters only"
+                    )
+                continue
+            if for_checkpoint:
+                data = param.data
+                full = data.full_tensor() if isinstance(data, DTensor) else data
+            else:
+                full = self._get_full_tensor(param)
+            if not main_rank:
+                continue
+            gathered[name] = full.cpu() if for_checkpoint else full
+        if not main_rank:
+            return []
+        merged = merge_expert_tensors(
+            gathered, experts, expert_scalings(self.model, experts)
+        )
+        gathered.clear()
+        return sorted(merged.items())
+
     def _update_bucket_weights_from_distributed_async(
         self,
         meta: WeightUpdateMeta,
@@ -1540,9 +1718,16 @@ class FSDPEngine(TrainEngine):
             else:
                 target_modules = self.config.target_modules
 
+            # EXIT POINT: vLLM/SGLang apply alpha/r themselves, so a merged adapter
+            # advertised at one expert's rank would be deployed at 1/K of its trained
+            # magnitude -- invisible in every training metric.
+            experts = self._lora_export_experts()
+            merged = self._lora_export_peft_config(experts) if experts else None
             meta.peft_config = {
-                "r": self.config.lora_rank,
-                "lora_alpha": self.config.lora_alpha,
+                "r": merged.r if merged is not None else self.config.lora_rank,
+                "lora_alpha": (
+                    merged.lora_alpha if merged is not None else self.config.lora_alpha
+                ),
                 "target_modules": target_modules,
                 "bias": "none",
             }
@@ -1786,12 +1971,28 @@ class FSDPEngine(TrainEngine):
         pending_bucket: _PendingWeightUpdateBucket | None = None
 
         if self.config.use_lora:
-            # For LoRA, only iterate over trainable LoRA parameters
-            param_iterator = (
-                (name, param)
-                for name, param in self._get_model_name_parameters(meta)
-                if param.requires_grad
-            )
+            experts = self._lora_export_experts()
+            if experts:
+                # EXIT POINT, and the least visible one: a sync that shipped one expert
+                # would leave training correct and every rollout drawn from a model no arm
+                # produced. The gathers happen here, eagerly, on every rank -- the loop
+                # below then walks already-full tensors, which _get_full_tensor passes
+                # through unchanged.
+                param_iterator = iter(
+                    self._merged_lora_named_tensors(
+                        experts,
+                        self._get_model_name_parameters(meta),
+                        for_checkpoint=False,
+                    )
+                )
+            else:
+                self._refuse_single_adapter_export("the xccl weight sync")
+                # For LoRA, only iterate over trainable LoRA parameters
+                param_iterator = (
+                    (name, param)
+                    for name, param in self._get_model_name_parameters(meta)
+                    if param.requires_grad
+                )
         else:
             # For full model, iterate over all parameters
             param_iterator = self._get_model_name_parameters(meta)
@@ -1908,41 +2109,74 @@ class FSDPEngine(TrainEngine):
         import re
 
         from safetensors.torch import save_file
-        from torch.distributed.tensor import DTensor
 
         if dist.get_rank() == 0:
             os.makedirs(path, exist_ok=True)
 
+        experts = self._lora_export_experts()
         adapter_state = {}
-        for name, param in self.model.named_parameters():
-            if not param.requires_grad or "lora_" not in name:
-                continue
-
-            if isinstance(param.data, DTensor):
-                full_param = param.data.full_tensor()
-            else:
-                full_param = param.data
-
-            if dist.get_rank() == 0:
-                # Emit PEFT-serving-standard keys. Drop the active-adapter
-                # segment (".default") so names match what
-                # PeftModel.save_pretrained produces
-                # (e.g. "...down_proj.lora_A.weight"). Keeping ".default"
-                # makes vLLM's parse_fine_tuned_lora_name reject the adapter
-                # with "unsupported LoRA weight" on disk-mode load.
-                clean_name = re.sub(r"\.default\.(weight|bias)$", r".\1", name)
+        if experts:
+            # EXIT POINT: the checkpoint an eval reads, and the artifact the disk-mode
+            # weight sync ships. It must be the SUM of the experts, at the summed rank.
+            for clean_name, tensor in self._merged_lora_named_tensors(
+                experts, self.model.named_parameters(), for_checkpoint=True
+            ):
                 adapter_state[clean_name] = (
-                    self._cast_to_compute_dtype(full_param.cpu())
-                    if full_param.is_floating_point()
-                    else full_param.cpu()
+                    self._cast_to_compute_dtype(tensor)
+                    if tensor.is_floating_point()
+                    else tensor
                 )
+        else:
+            from torch.distributed.tensor import DTensor
+
+            self._refuse_single_adapter_export("_save_lora_to_hf")
+            for name, param in self.model.named_parameters():
+                if not param.requires_grad or "lora_" not in name:
+                    continue
+
+                if isinstance(param.data, DTensor):
+                    full_param = param.data.full_tensor()
+                else:
+                    full_param = param.data
+
+                if dist.get_rank() == 0:
+                    # Emit PEFT-serving-standard keys. Drop the active-adapter
+                    # segment (".default") so names match what
+                    # PeftModel.save_pretrained produces
+                    # (e.g. "...down_proj.lora_A.weight"). Keeping ".default"
+                    # makes vLLM's parse_fine_tuned_lora_name reject the adapter
+                    # with "unsupported LoRA weight" on disk-mode load.
+                    clean_name = re.sub(r"\.default\.(weight|bias)$", r".\1", name)
+                    adapter_state[clean_name] = (
+                        self._cast_to_compute_dtype(full_param.cpu())
+                        if full_param.is_floating_point()
+                        else full_param.cpu()
+                    )
 
         if dist.get_rank() == 0:
             save_file(adapter_state, os.path.join(path, "adapter_model.safetensors"))
-            # Save adapter config
-            self.model.peft_config["default"].save_pretrained(path)
+            # Save adapter config. For a merged export this must be the MERGED config: a
+            # server applies alpha/r itself, so writing one expert's r here would rescale
+            # the whole deployed delta with nothing reporting it.
+            self._lora_export_peft_config(experts).save_pretrained(path)
 
         dist.barrier(group=self.cpu_group)
+
+    def _lora_export_peft_config(self, experts: tuple[str, ...]):
+        """The ``LoraConfig`` that describes what this export actually contains.
+
+        Args:
+            experts: The roster, or ``()`` for an ordinary single-adapter run.
+
+        Returns:
+            The merged config (rank and alpha both ``sum_c r_c``) when experts are routed,
+            and the shipped ``peft_config["default"]`` otherwise.
+        """
+        if not experts:
+            return self.model.peft_config["default"]
+        from selfevo.cluster_lora.merge import merged_lora_config
+
+        return merged_lora_config(self.model.peft_config, experts)
 
     def _save_full_model_to_hf(
         self,

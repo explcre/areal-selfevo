@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import os
 import time
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
@@ -48,6 +49,7 @@ __all__ = [
     "adapter_roster",
     "begin_cluster_batch",
     "behaviour_features",
+    "every_expert",
     "rows_by_adapter",
     "select_rows",
 ]
@@ -337,6 +339,82 @@ class EngineOptimizer:
         self.stats = self.engine.optimizer_step()
 
 
+@contextmanager
+def every_expert(model, names: Sequence[str]):
+    """Run a READ-ONLY forward with every cluster expert active: the deployed model.
+
+    ``ClusterAdapterSet.only()`` restores ``names[0]`` on the way out, so between training
+    steps the model IS one arbitrary expert. Every forward taken outside ``step`` therefore
+    ran on that one expert -- including ``compute_logp``, which is the importance-ratio
+    denominator for every group in the batch and not only the routed one, and including the
+    behavioural forward whose output decides the NEXT partition. Both failures are silent:
+    the ratio is merely wrong, and the clustering merely describes one adapter.
+
+    Activating all of them is not an approximation of the merge, it IS the merge.
+    ``LoraLayer.forward`` iterates ``self.active_adapters`` and adds each one's
+    ``scaling * B A`` to the result, so the output equals the summed adapter's exactly. That
+    equality is asserted in ``test_cluster_lora_export.py``, because it is the one place the
+    in-process model and the exported artifact are guaranteed to be the same model.
+
+    READ-ONLY BY CONSTRUCTION. ``set_adapter`` marks every ACTIVE adapter trainable, so a
+    backward inside this block would accumulate into all of them at once and destroy the
+    isolation the whole method rests on. Rather than document that, the block runs under
+    ``torch.no_grad()``: every call site is already no-grad, so it costs nothing and makes
+    the leak impossible instead of merely forbidden.
+
+    Args:
+        model: A ``PeftModel`` carrying every name.
+        names: The experts to activate, i.e. the roster.
+
+    Yields:
+        The model, with every expert active.
+
+    Raises:
+        ClusterWiringError: If ``names`` is empty, if a name is not on the model, if the
+            model carries no tuner able to activate several adapters, or if the activation
+            did not take. The last is checked rather than assumed: ``PeftModel.set_adapter``
+            raises ``TypeError: unhashable type: 'list'`` on a list (verified on peft
+            0.18.1), so this must go through ``base_model`` -- and an API that quietly
+            accepted a list and activated nothing would leave every forward on one expert
+            with this context manager apparently in place.
+    """
+    import torch
+
+    names = tuple(names)
+    if not names:
+        raise ClusterWiringError(
+            "every_expert needs at least one expert; activating none would leave the "
+            "forward on whichever adapter happened to be active"
+        )
+    present = getattr(model, "peft_config", {}) or {}
+    missing = [n for n in names if n not in present]
+    if missing:
+        raise ClusterWiringError(
+            f"adapters {missing} are not on this model (it has {sorted(present)}), so this "
+            "forward would see a subset of the deployed model"
+        )
+    tuner = getattr(model, "base_model", None)
+    if tuner is None or not hasattr(tuner, "set_adapter"):
+        raise ClusterWiringError(
+            "this model has no tuner that can activate several adapters at once, so the "
+            "sum of the experts cannot be reached in process"
+        )
+    previous = list(getattr(model, "active_adapters", []) or [])
+    tuner.set_adapter(list(names))
+    try:
+        active = set(getattr(model, "active_adapters", []) or [])
+        if active != set(names):
+            raise ClusterWiringError(
+                f"activating {list(names)} left {sorted(active)} active; this forward would "
+                "run on a subset of the experts while appearing to run on all of them"
+            )
+        with torch.no_grad():
+            yield model
+    finally:
+        if previous:
+            tuner.set_adapter(previous[0] if len(previous) == 1 else list(previous))
+
+
 def behaviour_features(
     model,
     batch: Mapping[str, Any],
@@ -344,6 +422,7 @@ def behaviour_features(
     cfg: ClusterLoRAConfig,
     *,
     boxed_ids: Sequence[int] | None = None,
+    experts: Sequence[str] = (),
 ) -> tuple[np.ndarray, int]:
     """MEDS behavioural vectors, one per GROUP, from one extra no-grad forward per sample.
 
@@ -364,6 +443,11 @@ def behaviour_features(
         cfg: The arm's configuration.
         boxed_ids: Token ids of ``"\\boxed{"`` under this run's tokenizer, for
             ``answer_strategy='boxed'``.
+        experts: The cluster roster. When given, the trace runs with EVERY expert active --
+            the deployed model -- instead of on whichever one ``only()`` last restored. A
+            feature computed under one expert makes the partition a function of that
+            adapter's behaviour rather than the model's, and the next batch is routed by it.
+            ``()`` is the single-adapter case and is unchanged.
 
     Returns:
         ``((n_groups, d) float64, n_fallbacks)`` where a fallback is a sequence whose answer
@@ -411,31 +495,37 @@ def behaviour_features(
     model.eval()
     fallbacks = 0
     per_row: list[np.ndarray] = []
+    # The trace must see the DEPLOYED model. Between steps ``only()`` leaves one arbitrary
+    # expert active, and a feature read from it makes the next partition a function of that
+    # adapter rather than of the model that produced the rollouts.
+    activation = every_expert(model, experts) if experts else nullcontext()
     try:
-        for row in range(n_rows):
-            seq = ids_all[row, : int(lens[row])].tolist()
-            try:
-                pos = answer_token_index(
-                    seq,
-                    boxed_ids=boxed_ids,
-                    strategy=cfg.answer_strategy,
-                    response_start=int(prompt_lens[row]),
+        with activation:
+            for row in range(n_rows):
+                seq = ids_all[row, : int(lens[row])].tolist()
+                try:
+                    pos = answer_token_index(
+                        seq,
+                        boxed_ids=boxed_ids,
+                        strategy=cfg.answer_strategy,
+                        response_start=int(prompt_lens[row]),
+                    )
+                except Exception:
+                    # Recorded, not hidden: the same fallback interference_dump.py takes,
+                    # and for the same reason -- a feature read at a different position is
+                    # not comparable with its peers, and the count is what says how many
+                    # there were.
+                    pos = len(seq) - 2
+                    fallbacks += 1
+                ids = torch.tensor(seq, dtype=torch.long, device=device).unsqueeze(0)
+                trace = extractor.trace(model, ids, pos, int(seq[pos + 1]))
+                per_row.append(
+                    meds_feature(
+                        trace,
+                        use_layer_diff=cfg.use_layer_diff,
+                        last_n_layers=cfg.last_n_layers,
+                    )
                 )
-            except Exception:
-                # Recorded, not hidden: the same fallback interference_dump.py takes, and
-                # for the same reason -- a feature read at a different position is not
-                # comparable with its peers, and the count is what says how many there were.
-                pos = len(seq) - 2
-                fallbacks += 1
-            ids = torch.tensor(seq, dtype=torch.long, device=device).unsqueeze(0)
-            trace = extractor.trace(model, ids, pos, int(seq[pos + 1]))
-            per_row.append(
-                meds_feature(
-                    trace,
-                    use_layer_diff=cfg.use_layer_diff,
-                    last_n_layers=cfg.last_n_layers,
-                )
-            )
     finally:
         if was_training:
             model.train()
@@ -529,8 +619,16 @@ def begin_cluster_batch(actor, router, data, contexts, group_sizes) -> dict[str,
                 "actor has no engine model to run it on"
             )
         started = time.perf_counter()
+        # The roster is taken from the MODEL, not from the environment: these are exactly
+        # the adapters this forward would otherwise see one of.
+        adapters = getattr(engine, "_selfevo_adapters", None)
         features, fallbacks = behaviour_features(
-            model, data, sizes, cfg, boxed_ids=_boxed_ids(engine)
+            model,
+            data,
+            sizes,
+            cfg,
+            boxed_ids=_boxed_ids(engine),
+            experts=() if adapters is None else tuple(adapters.names),
         )
         seconds = time.perf_counter() - started
     elif cfg.partition != "none":
