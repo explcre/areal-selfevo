@@ -1656,3 +1656,308 @@ The code run truncated on no problems at all and was not budget-bound, so its $0
 property of the policy rather than of the cap --- the contrast with the frontier model above is
 the clearest illustration in this paper of why a generation budget must be reported alongside
 any code score.
+
+% ---------------------------------------------------------------------------
+% Backfill from the experiment log, 2026-09-02. Every number in the five subsections below
+% was re-derived on the training box from the artifact named beside it -- a results JSON, a
+% rollout dump, a training log or a generations file -- and not copied from any prose
+% summary. Appended, never edited into the subsections above; the one figure that turned out
+% to be wrong is corrected as a correction, per paper_src/README.md.
+% ---------------------------------------------------------------------------
+
+\subsection{Correction to Sec.~\ref{sec:harnessvalid}: the canonical code check ran at 2000
+tokens, not 16384}
+\label{sec:harnessvalidfix}
+
+Sec.~\ref{sec:harnessvalid} reports the third grader check --- a frontier 27B model scored
+through our own code grader --- and states that the low score was taken ``at $16{,}384$
+tokens'', and that ``a difference of four times in that budget'' carried the same model from
+$0.251$ to $0.749$. Both figures are wrong. Re-derived from the run's own artifacts, the
+canonical cap was $2000$ and the budget ratio is about $31\times$. The correction makes the
+subsection's argument stronger, not weaker, which is the reason to state it precisely.
+
+Every one of the ten canonical seeds
+(\texttt{canonical\_livecodebench\_v6\_seed0..9.json} under \texttt{runs/validate\_v3/}) records
+\texttt{params.max\_tokens: 2000}, and the launcher that produced them
+(\texttt{harness4/run\_v3.sh}) carries \texttt{MAXTOK} defaulted to $2000$, which is the
+benchmark's own upstream default rather than a value this project chose. No run of that model
+at $16{,}384$ exists. Table~\ref{tab:capfix} restates the ladder from the JSON.
+
+\begin{table}[t]
+\centering\small
+\caption{The third grader check, re-derived from the results JSON of each run. The canonical
+row is ten seeds at the benchmark's own default cap; the two raised caps are one seed each.
+\texttt{trunc} is the fraction of the $175$ generations that hit the cap, read from
+\texttt{truncation\_rate} in the same file. Runs \texttt{canonical}, \texttt{noncap} and
+\texttt{noncap2} under \texttt{runs/validate\_v3/}. The canonical row's accuracy and interval
+columns are ranges across its ten seeds --- the lowest and highest point estimate, and the
+lowest lower bound and highest upper bound --- not one interval.}
+\label{tab:capfix}
+\begin{tabular}{rlccc}
+\toprule
+cap & seeds & accuracy & Wilson 95\% & trunc \\
+\midrule
+$2000$   & $10$ & $0.2514$--$0.2800$ & $[0.193, 0.351]$ & $74.9$--$77.7\%$ \\
+$24576$  & $1$  & $0.6457$           & $[0.572, 0.713]$ & $42.9\%$ \\
+$61440$  & $1$  & $0.7486$           & $[0.679, 0.807]$ & $23.4\%$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Three numbers move and one does not.} The across-seed range is $0.2514$ to
+$0.2800$, not the $0.251$ to $0.269$ recorded: the top of the range is seed $8$ at $0.2800$,
+and quoting the range short of its maximum understates the seed spread by a fifth. The budget
+ratio between the two ends of the ladder is $61440/2000 = 30.7\times$, not four. The
+truncation figure at the canonical cap is $131$ to $136$ of $175$, which is what
+Sec.~\ref{sec:harnessvalid} already says and which is unaffected. So is the whole
+conditional-on-completion argument, which we re-derived per generation from
+\texttt{finish\_reason} in the records files rather than from the summary counters: at the
+canonical cap $39$ generations terminated normally and \emph{all $39$} passed, so the grader
+rejected nothing that finished; at $61440$, $134$ terminated normally and $124$ passed,
+$0.9254$, which is the $92.5\%$ already reported.
+
+\paragraph{Why the corrected version is the stronger one.} At $16{,}384$ the reading would
+have been that a frontier model needs four times a generous budget to be scored fairly. At
+$2000$ it is that the benchmark's \emph{own published default cap} truncates three quarters of
+a frontier model's generations and costs it half a point of accuracy, and that a card
+reporting a score under that default is reporting a property of the default. That is the
+general claim Sec.~\ref{sec:harnessvalid} makes, and the corrected cap is the evidence for it.
+The lesson for our own reporting is the one this paper keeps relearning in a new place: the
+cap was read out of a summary rather than out of \texttt{params.max\_tokens} in the row, and
+the row had carried the right number the whole time.
+
+\subsection{Corpus saturation: the baseline's first corpus left $72\%$ of its groups silent}
+\label{sec:corpussat}
+
+The A0 baseline arm (Qwen2.5-32B-Instruct, LoRA rank $32$, GRPO, $8$ prompts $\times\ 8$
+samples per step, \texttt{group\_routing: null}) was first launched on a MATH corpus and then
+relaunched on decontaminated DeepMath with every other setting held fixed. That accident is a
+controlled measurement of how much of the silent channel is a property of the \emph{corpus}
+rather than of the method, and it is the reason the arm was moved. Table~\ref{tab:corpussat}
+reads the four \texttt{*\_group\_fraction} series the actor logs unconditionally on every
+step, out of the training logs themselves.
+
+\begin{table}[t]
+\centering\small
+\caption{The silent channel under a corpus change at fixed model and configuration. Each row
+is one launch; \texttt{n} is its logged steps. The MATH row is
+\texttt{runs/a0\_math\_MATHCORPUS\_superseded/train.log.1788330321} and
+\texttt{.1788333052}; the DeepMath rows are \texttt{runs/a0\_math/train.log.1788336152}
+$+$ \texttt{.1788344500}, \texttt{.1788371484} and \texttt{.1788377789}. The parser matches
+each key with the cell delimiter in front of it, because \texttt{solved\_group\_fraction} is
+a substring of \texttt{unsolved\_group\_fraction} and a bare match for the first also matches
+every row of the second --- the aliasing that forced the retraction recorded on 2026-08-31.}
+\label{tab:corpussat}
+\begin{tabular}{llrcccc}
+\toprule
+corpus & launch & $n$ & silent & solved & unsolved & informative \\
+\midrule
+MATH     & \texttt{.1788330321+.1788333052} & $88$  & $0.7188$ & $0.6321$ & $0.0866$ & $28.1\%$ \\
+\midrule
+DeepMath & \texttt{.1788336152+.1788344500} & $234$ & $0.5043$ & $0.3365$ & $0.1677$ & $49.6\%$ \\
+DeepMath & \texttt{.1788371484}             & $509$ & $0.5206$ & $0.3480$ & $0.1726$ & $47.9\%$ \\
+DeepMath & \texttt{.1788377789}             & $212$ & $0.5047$ & $0.3314$ & $0.1733$ & $49.5\%$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{The rollout dumps say the same thing without going through a logged metric.}
+Counting a group as unanimous when every reward in it is equal, directly over the exported
+rollouts: on the MATH corpus $193$ of $261$ groups across two probes are unanimous,
+$0.7395$, with the step-$24$ probe alone at $102$ of $133$, $0.767$; on DeepMath $533$ of
+$1025$ groups across eight probes are unanimous, $0.5200$, with no single probe exceeding
+$0.570$. Two independent instruments --- a per-step metric the trainer emits and a per-group
+recount of the dumped rollouts --- agree to within the sampling difference between them.
+
+\paragraph{What saturation does to the update, stated in the quantity that matters.} On MATH
+the median gradient norm over the $88$ steps is $1.82\times10^{-4}$ and \textbf{$11$ of the
+$88$ steps have a gradient norm of exactly zero}: on one step in eight the entire batch was
+unanimous and the update was a no-op. On DeepMath the median gradient norm is
+$5.18\times10^{-4}$, $2.8\times$ larger, and \emph{no} step in $234$ has a zero gradient. Mean
+train reward moves the opposite way, $0.7923$ on MATH against $0.6034$ on DeepMath, which is
+the point: the corpus that produced the higher training reward is the one that was teaching
+the model almost nothing.
+
+\paragraph{Why this belongs in a results section and not in an operations note.} A run on a
+saturated corpus does not fail. It exits zero, its loss is finite, its reward is high and
+rising, and its logs contain no error --- and three quarters of every batch contributes
+exactly nothing to the update. This is the same failure shape as Sec.~\ref{sec:trainreward},
+one level further back: there, train reward mis-ordered checkpoints; here, train reward is
+high \emph{because} the corpus is already solved, and the higher number is the worse arm. The
+practical rule we adopt from it is that a corpus is qualified for an arm by its unanimity rate
+measured on that arm's own model, before the arm is launched, and not by its reputation for
+difficulty.
+
+\paragraph{Scope.} One model, one pair of corpora, one configuration; the MATH row is $88$
+steps against $234$--$509$ for DeepMath, and the two corpora were run at different points of
+the same day on the same box. The claim is a corpus difference at this model scale, not a
+property of either dataset in general.
+
+\subsection{The unsolved branch is a third of the silent channel on the arm actually trained}
+\label{sec:supplyshare}
+
+Table~\ref{tab:flip} reports that the composition of the silent channel inverts with task
+difficulty, reaching $60.9\%$ unsolved on MATH, and the plan for a data supplier is sized on
+that figure. Both columns of that table are Qwen2.5-1.5B-Instruct, and the MATH column is
+$n=11$ batches. Re-measured on the arm this paper actually trains --- Qwen2.5-32B-Instruct on
+decontaminated DeepMath --- the unsolved share is about half of it.
+
+\begin{table}[t]
+\centering\small
+\caption{The unsolved share of the silent channel, at the operating point the earlier table
+measured and at the one now being trained. The first two rows are Table~\ref{tab:flip}
+restated; the last three are the three A0 launches of Table~\ref{tab:corpussat}, whose
+\texttt{unclassified} series is exactly $0.0000$ on every one of their steps, so
+$\text{unsolved}/\text{silent}$ and $\text{unsolved}/(\text{solved}+\text{unsolved})$ are the
+same number here and the share is well posed.}
+\label{tab:supplyshare}
+\begin{tabular}{llrcc}
+\toprule
+task & model & $n$ & unsolved, all groups & unsolved share of channel \\
+\midrule
+GSM8K    & 1.5B & $98$  & $0.045$  & $12.5\%$ \\
+MATH     & 1.5B & $11$  & $0.255$  & $\mathbf{60.9\%}$ \\
+\midrule
+DeepMath & 32B  & $234$ & $0.1677$ & $\mathbf{33.3\%}$ \\
+DeepMath & 32B  & $509$ & $0.1726$ & $33.2\%$ \\
+DeepMath & 32B  & $212$ & $0.1733$ & $34.4\%$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Three independent launches agree, so this is not a window effect.} The three
+DeepMath rows are three separate launches of the same configuration on three different logs,
+totalling $955$ logged steps, and their unsolved shares are $33.3$, $33.2$ and $34.4$ percent.
+Within the longest of them the share is stable rather than drifting: over the second half of
+the $234$-step series it is $34.0\%$ against $33.3\%$ over the whole.
+
+\paragraph{The confound is stated rather than buried, because it is not separable here.}
+Table~\ref{tab:flip} holds the model fixed and varies the task. These rows vary both, $1.5$B
+to $32$B and MATH to decontaminated DeepMath. A larger model solves more, so a smaller share
+of its silent channel is unsolved by construction, and nothing in this measurement separates
+``DeepMath is easier for this model'' from ``scale shrinks the unsolved branch''. It is
+reported as one number and not as an attribution.
+
+\paragraph{What it changes for the supplier axis, which is the reason to report it.} The
+supplier is the only consumer that can act on the unsolved branch, so the size of that branch
+is the size of the lever. At $64$ groups per batch, $0.167$ is about $10.7$ groups per batch
+with no target of any kind, against the $16$ that a $60.9\%$ reading implies. The lever
+survives --- a sixth of every batch still reaches the update with nothing to learn from --- and
+it is worth about half what the quoted figure claims on the arm being trained. No statement
+sized on $60.9\%$ may be carried onto a DeepMath result.
+
+\subsection{The first periodic evaluation points of the A0 baseline}
+\label{sec:pereval}
+
+The baseline arm now scores a held-out slice during training. Table~\ref{tab:pereval} gives
+the points it has produced, read from \texttt{runs/a0\_periodic/step\{50,100,150\}/results.json}
+as of 21:00 UTC on 2026-09-02, while the run continues.
+
+\begin{table}[t]
+\centering\small
+\caption{A0 periodic evaluation, OlympiadBench search half, $64$ problems, greedy, one sample.
+\texttt{adapter} is the LoRA version the rollout server actually resolved and served for that
+point, recorded in the row rather than configured. Every point graded $64$ of $64$ with no
+request failures and $3$ truncations. \textbf{These are not accuracies} and must not be placed
+beside any other number in this paper: see the budget columns.}
+\label{tab:pereval}
+\begin{tabular}{rlcccc}
+\toprule
+step & adapter & trend score & Wilson 95\% & budget & headline budget \\
+\midrule
+$50$  & \texttt{a0\_math-v51}  & $0.1094$ & $[0.054, 0.209]$ & $2048$ & $16384$ \\
+$100$ & \texttt{a0\_math-v101} & $0.1250$ & $[0.065, 0.228]$ & $2048$ & $16384$ \\
+$150$ & \texttt{a0\_math-v151} & $0.1406$ & $[0.076, 0.246]$ & $2048$ & $16384$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{The budget is not the headline budget, and the series is named so that it cannot be
+mistaken for one.} These points are generated by the \emph{training} rollout server, which
+publishes \texttt{context\_length: 4096} in its own server info, so the evaluation runs at
+$2048$ new tokens against the $16{,}384$ every headline number in this paper was taken at.
+Each row therefore carries \texttt{budget\_matches\_headline: 0} and
+\texttt{not\_comparable\_with\_headline: true}, and the quantity is published as
+\texttt{trend\_score} rather than \texttt{accuracy} --- there is no accuracy series in that
+namespace at all, so there is nothing a reader can line up against a headline accuracy by
+name. Sec.~\ref{sec:harnessvalidfix} is what that convention is defending against: on this
+project's own measurements a budget change alone moved one model on one problem set through
+one grader from $0.2514$ to $0.7486$.
+
+\paragraph{What the three points do and do not support.} They rise monotonically, $0.1094$ to
+$0.1406$. At $n=64$ the three Wilson intervals overlap almost entirely, so \textbf{no trend is
+claimed}: the interval at step $150$ contains the point estimate at step $50$. What the series
+does establish is the thing it was built for. The adapter version advances exactly one per
+training step ($51$ at step $50$, $101$ at $100$, $151$ at $150$), and it is read from the
+server's response rather than from the configuration, so the weights being scored are provably
+the weights being trained --- the failure this project measured at
+\texttt{globalstep149}, where an evaluation could not distinguish an arm's adapter from its
+base model, cannot silently recur here. Truncation is constant at $3$ of $64$ across all
+three points, so the scores are not budget-bound relative to each other even though they are
+not comparable with the headline.
+
+\subsection{Four further ways the evaluation reported a number that was not a measurement}
+\label{sec:evalfailures}
+
+Secs.~\ref{sec:harness} and~\ref{sec:reporting} record four ways this project's benchmark
+harness produced a number that was not a measurement, and Sec.~\ref{sec:liveness} a fifth in
+which a check could not fail. Standing the periodic evaluation up on a live training run
+produced four more within one day, on a different part of the pipeline. They are recorded
+together because the distribution across them is the finding: three of the four
+\emph{refused}, and only the one whose failure was inside the scoring path produced a number.
+
+\paragraph{(vi) An aborted generation graded as a wrong answer.} An eight-problem run returned
+a plausible $0.125$. Opening the generations shows why: of the eight,
+\textbf{six carry \texttt{finish\_reason: "abort"}}, one was cut off after $75$ characters,
+and every one of the six was graded \texttt{correct: false}
+(\texttt{work\_pe/dryrun\_out/step50/olympiadbench\_generations.jsonl}, eight rows, six
+\texttt{abort} and two \texttt{stop}, one correct). The cause is that the trainer sends
+\texttt{pause\_generation} around every weight update, which drops the requests in flight; a
+curve built from that reads ``the model gets everything wrong'' when what happened is that the
+run interrupted its own evaluation. An abort is now a failed request, excluded from the
+denominator and counted, and the same eight problems then return an empty-evaluation status
+and NaN instead of $0.125$. This is the only one of the four that produced a number, and the
+number was in the plausible range for a genuinely weak arm.
+
+\paragraph{(vii) A cap above the \emph{server's} context, which the model's own config cannot
+reveal.} Modes (ii) and (iv) are a cap larger than the model's context, which a guard reading
+the model's \texttt{config.json} can catch. This one is not that. A0's Qwen2.5-32B declares
+\texttt{max\_position\_embeddings: 32768}, so the guard passes, while its rollout server was
+launched with \texttt{--context-length 4096} and rejected every request. Ten consecutive
+periodic-eval points, steps $50$ through $500$, refused: every one is
+\texttt{status\_code 3} (empty evaluation) with \texttt{resolved\_adapter: null}, no problems
+graded and a cost of $0.0088$--$0.0094$ of training throughput
+(ten \texttt{step*/results.json} under \texttt{runs/a0\_periodic.pinnedurl\_run.20260902T175124Z/}). A
+server flag is not visible in a model's config, so the clamp has to be against the limit the
+server publishes about itself.
+
+\paragraph{(viii) An endpoint that could not be discovered at all.} A later point refused with
+\texttt{status\_code 6}, \texttt{resolved\_adapter: null}, empty
+\texttt{token\_budget} and \texttt{rows}, at a cost of $6.2\times10^{-7}$ of throughput
+(\texttt{runs/a0\_periodic/step200/results.json}, written before the launch that produced
+Table~\ref{tab:pereval}). The discovery path read an attribute that exists on the engine class
+the deployment does not use, so it had never worked; what had been keeping the evaluation
+alive was a hardcoded address, and removing the hardcoded address is what exposed it. Recorded
+because the diagnosis that preceded it was wrong in an instructive way: the pin was blamed,
+and the pin was correct.
+
+\paragraph{(ix) A reused tracker run id discarding an entire run's metrics.} A relaunch
+reused the experiment's tracker run id, so the tracker resumed the \emph{previous} run at its
+last step and answered every commit from the new one with \texttt{Tried to log to step $N$
+that is less than the current step 509 \ldots this data will be ignored}. That line appears
+$212$ times in the relaunch's own tracker output
+(\texttt{.../a0\_math/t1/wandb/run-20260902\_175715-a0\_math\_t1\_train}),
+one per logged step: \textbf{every metric of that run, training statistics and evaluation
+points alike, was discarded at the tracker while the run itself was healthy}. The on-disk
+results were unaffected, which is the only reason the loss is recoverable. Run ids are now
+minted fresh per launch.
+
+\paragraph{What these four add to the rule of Sec.~\ref{sec:harness}.} That subsection requires
+a token budget, a truncation fraction and a failure count beside every score. These four say
+the same requirement applies one level up, to the \emph{evaluation's own} status: a point that
+did not run and a point that scored zero must not be the same value on a curve. Three of these
+four failures were survivable precisely because the module emits a status code and a NaN
+rather than a zero, so a broken evaluation and a genuinely inert adapter stayed
+distinguishable; mode (vi) was not survivable that way, because it scored. The convention we
+adopt is therefore that every evaluation point carries a status alongside its score, and that
+a plotted curve shows refusals as gaps rather than omitting them.
