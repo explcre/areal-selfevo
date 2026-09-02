@@ -520,6 +520,62 @@ The ordering cannot be observed on a CPU box by DEVICE, but it can by DTYPE: und
 order `.cpu()` is called on a bfloat16 tensor, under the wrong one it only ever sees float32.
 That is the test.
 
+#### The guard was reading the allocator's history, not free memory
+
+Fourth failure of the projection check, third distinct cause, and this one was in the guard's
+PREMISE rather than its arithmetic.
+
+`mem_get_info` reports what the DRIVER has free. **PyTorch's caching allocator keeps freed
+blocks RESERVED rather than returning them**, so driver-free shrinks monotonically as a run
+proceeds even though nothing leaks. The guard was comparing an honest estimate against a
+number that describes how long the run had been going.
+
+MEASURED on a clear card, sampled every 2 s: usage sits at 73-76 GB and oscillates after the
+weights load, then spikes to 79,607 MiB at the refusal.
+
+| budget | chunk | refused at group | free at refusal |
+|---|---|---|---|
+| 4.0 GiB | large | **5** of 153 | 2.7 GiB |
+| 1.5 GiB | 882 tok | **25** of 153 | 1.4 GiB |
+
+**A smaller chunk does not fix this.** It buys more groups before the pool closes the window;
+extrapolating, no fixed budget finishes 153 groups. That is why going below 1.5 was not
+attempted, and it was the right call.
+
+Why 1.5 GiB completed the earlier 128-group batch and not this one: the hard batch is
+systematically longer -- median padded tokens 8,768 against 7,000 (+25%), mean 8,405 against
+6,980 (+20%), because Level 5 answers run longer and hit the cap more often (11.8% vs 8.7%).
+Same budget, more tokens per group, pool grows faster, window closes sooner. The earlier batch
+finished with nothing to spare.
+
+The fix is to make the guard's INPUT honest rather than to change what it means:
+`_free_bytes` calls `empty_cache()` immediately before `mem_get_info`, so the reading is
+genuinely available memory. The guard's logic, its thresholds and everything calibrated
+against them are untouched. Sizing against `reserved` instead would be more principled but
+would redefine the number every existing threshold was set against, which is a change worth
+making deliberately and not while unblocking a run.
+
+**Every existing test checked WHEN the guard fired; none checked what it was fed.** That is
+the same shape as the inverted-advice bug -- the guard was right and its surroundings were
+not. `FakePool` now models a caching allocator in a dozen lines: `mem_get_info` returns total
+minus reserved and grows the pool on each read, `empty_cache` returns it. Forty reads with the
+release show one constant value; forty without it walk an 80 GiB card down past any fixed
+budget, which is the failure exactly. The run also records `free_bytes_first/last/min/max`, so
+drift is visible in a finished dump rather than inferred from where it stopped.
+
+#### The derived-budget branch never engaged, and the patch that was meant to fix it said nothing
+
+With `--logits-budget-gb` omitted the script logged `explicit --logits-budget-gb 4.0`. The
+dataclass default was correctly `None`; **argparse still carried `default=4.0`**, so the flag
+was never absent and the derivation was unreachable from the command line.
+
+The cause is worth recording because it is this project's own favourite failure, committed
+while fixing it: the patch that was supposed to change that default used a string replacement
+**with no assertion on its own match count**, the anchor did not match, and it did nothing and
+reported success. Every other replacement in that patch asserted `count == 1`. One did not, and
+that is the one that mattered. A test now drives `main()` with the flag omitted and requires
+the config to carry `None`, and with it present requires the value to arrive intact.
+
 **Not done, deliberately.** All eight sequences in a group share an identical prompt prefix, so
 at id=11 the same 1,330 tokens are forwarded eight times; sharing that prefix would cut the
 worst group by most of its cost but needs KV-cache reuse across the eight continuations, and it
@@ -679,20 +735,22 @@ See section 8 for the harness. Results are appended below when both arms have ru
 
 Run against `/home/ubuntu/mutcopy` and `/home/ubuntu/mutcopy2`, each verified sha256-identical
 to the originals for every `cluster_lora` module before starting and verified restored clean
-afterwards. **90 distinct mutations, two arms, every one killed and no SKIPs.**
+afterwards. **93 distinct mutations, two arms, every one killed and no SKIPs.**
 
 | arm | interpreter | applicable | killed | survivors |
 |---|---|---|---|---|
-| `torch` | `~/venv312b` | 78 | **78** | none |
+| `torch` | `~/venv312b` | 81 | **81** | none |
 | `cluster` | `~/venv_probe` | 29 | **29** | none |
 
-17 mutations run on both arms, so the union is 90: every mutation is exercised somewhere. By
-area: the dump 44, the partition and control 15, adapter isolation 11, the analysis 9, the
-sketch 6, the merge 5. Seventeen of them were added only after the probe was RUN on the real
-box -- covering the memory guard's advice, the derived budget, the full-gradient store's
-selection and its paging -- and four of those restore a clause the code actually shipped with.
+17 mutations run on both arms, so the union is 93: every mutation is exercised somewhere. By
+area: the dump 47, the partition and control 15, adapter isolation 11, the analysis 9, the
+sketch 6, the merge 5. **Twenty of them were added only after the probe was RUN on real
+hardware** -- the memory guard's advice, the derived budget, the store's selection and its
+paging, and the allocator behind the guard's input -- and seven restore a clause the code
+actually shipped with. That ratio is the finding: a fifth of the coverage on this module
+exists because something ran, not because someone reasoned about it.
 
-**Ten defects survived a first pass and each produced a new test.** They are recorded
+**Twelve defects survived a first pass and each produced a new test.** They are recorded
 because the tests that missed them all looked entirely reasonable, and because five of the
 seven would have produced a plausible number rather than an error:
 
@@ -739,7 +797,16 @@ seven would have produced a plausible number rather than an error:
    rather than by device: under the correct order the host transfer sees bfloat16, under the
    wrong one only float32.
 
-Lessons 6, 7, 8 and 9 are the general ones. An optimisation whose whole purpose is to use less
+11. *The guard was fed the caching allocator's history instead of free memory.* Every test
+   asserted it fired on the right CONDITION; none asserted anything about its INPUT, so a
+   premise that decayed over a run was invisible. A twelve-line fake allocator now reproduces
+   the decay and the tests require the reading to be constant across forty groups -- and,
+   separately, require it to decay without the fix, so the check is not vacuous.
+12. *The patch that was meant to fix the CLI default did nothing and reported success.* Every
+   replacement in that script asserted `count == 1` except one, and that was the one whose
+   anchor had drifted. A silent no-op in the tooling that hunts silent no-ops.
+
+Lessons 6, 7, 8, 9 and 11 are the general ones. An optimisation whose whole purpose is to use less
 memory cannot be validated by asserting the answer is unchanged, because the answer is
 unchanged when the optimisation does not happen -- the mechanism has to be observed, not the
 result. And a mutation harness silently decays as the code it points at is rewritten. The third:
@@ -747,7 +814,9 @@ a guard is not finished when it refuses correctly -- what it says next is part o
 asserting only that it raised leaves the half a human actually reads untested. The fourth:
 a fixture built from healthy data cannot test a selection rule, because every selection looks
 right on a batch where every choice is a good one -- the fixture has to contain the pathology
-the rule exists to handle.
+the rule exists to handle. The fifth: a guard has an INPUT as well as a condition, and a
+premise that is true at the first call and false at the hundredth will pass every test that
+only ever makes one call.
 
 ### 10.1 A process failure worth recording
 
@@ -779,13 +848,14 @@ installs. Nothing here starts a training job.
         --rollouts ~/runs/harnessT_trunc/rollouts_math64_probe.jsonl \
         --out    ~/runs/interference_$CKPT.npz \
         --sketch-dim 8192 --full-grad-groups 8 --device cuda --dtype bfloat16 \
-        --logits-budget-gb 2.5 --activation-budget-gb 6.0
+        --activation-budget-gb 6.0
     done
 
-`--logits-budget-gb` may be omitted entirely: it then derives from measured free memory,
-which on a card holding 61 GB of weights picks about 2.8 GiB. It is given explicitly above
-because the probe is sharing the card with the A0 baseline, and an explicit value is honoured
-exactly rather than re-derived under whatever happens to be free at that instant.
+**`--logits-budget-gb` is deliberately omitted above.** Omitting it is now what engages the
+derivation from measured free memory, and that reading is taken after the allocator's cache is
+released, so it is re-derived honestly for every group rather than fixed once against a card
+state that will not last. An explicit value is still honoured exactly, and is the right choice
+only when the probe must share the card with a run whose footprint it cannot see.
 
 The chunked unembedding, the sequence sub-batching and gradient checkpointing are on by
 default and are what make this fit at 32B; `--no-checkpoint` and `--no-gradient-checkpointing` exist only to reproduce the

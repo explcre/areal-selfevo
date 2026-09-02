@@ -1094,17 +1094,42 @@ def _assert_deterministic_forward(model) -> None:
         )
 
 
-def _free_bytes(device) -> int | None:
-    """Free memory on ``device``, or ``None`` where it cannot be asked.
+def _free_bytes(device, *, release_cache: bool = True) -> int | None:
+    """Genuinely available memory on ``device``, or ``None`` where it cannot be asked.
 
-    Returned rather than raised on a CPU or a backend without the query, so the budget check
-    still runs and only the device check is skipped -- a guard that silently disabled itself
-    on an unfamiliar backend would be worse than one that never existed.
+    **The cache is released FIRST, and that is the whole point of this function.**
+    ``mem_get_info`` reports what the DRIVER has free, and PyTorch's caching allocator keeps
+    freed blocks RESERVED rather than returning them. So driver-free shrinks monotonically as
+    a run proceeds even though nothing leaks, and a guard fed that number is comparing its
+    estimate against a figure that describes the allocator's history rather than what is
+    actually available.
+
+    MEASURED 2026-09-02, and it is the reason the fourth projection attempt failed. On a
+    clear card the pool grows steadily; at a 4.0 GiB budget the guard refused at group 5 of
+    153 with 2.7 GiB reported free, and at 1.5 GiB it refused at group 25 with 1.4 GiB.
+    **A smaller chunk does not fix this** -- it only buys more groups before the window
+    closes, so no fixed budget finishes the batch. The defect was in what the guard was fed,
+    not in when it fired, which is the same shape as the inverted-advice bug: the guard was
+    right and its surroundings were not.
+
+    Releasing the cache costs re-allocation on the next group, which against a run of many
+    minutes is noise. ``release_cache=False`` reproduces the old, drifting reading and exists
+    so a test can show the drift is real rather than assumed.
+
+    Args:
+        device: The device to ask about.
+        release_cache: Return cached blocks to the driver before reading.
+
+    Returns:
+        Free bytes, or ``None`` on a CPU or a backend without the query -- returned rather
+        than raised so the budget check still runs and only the device check is skipped.
     """
     import torch
 
     try:
         if torch.device(device).type == "cuda" and torch.cuda.is_available():
+            if release_cache:
+                torch.cuda.empty_cache()
             return int(torch.cuda.mem_get_info(torch.device(device))[0])
     except Exception:  # pragma: no cover - backend-specific
         return None
@@ -1258,10 +1283,23 @@ def run_dump(cfg: DumpConfig) -> dict[str, Any]:
         activation_budget_bytes=int(cfg.activation_budget_gb * 1024**3),
         **loss_kw,
     )
+    # Every free-memory reading the guard is given, so DRIFT is visible in a finished run
+    # rather than inferred from where it stopped. A healthy run's readings oscillate around a
+    # level; readings that fall monotonically to the refusal are the signature of a guard
+    # being fed the allocator's history, which is what the fourth projection attempt hit.
+    free_seen: list[int] = []
+
+    def guard_free() -> int | None:
+        """Read genuinely-available memory, releasing the cache first, and record it."""
+        v = _free_bytes(cfg.device)
+        if v is not None:
+            free_seen.append(int(v))
+        return v
+
     budget_record = assert_logits_fit(
         group_id=widest.group_id, n_tokens=widest_tokens, vocab=vocab,
         chunk_tokens=plan_chunk, budget_bytes=budget_bytes,
-        free_bytes=_free_bytes(cfg.device), peak_bytes=cfg.logit_peak_bytes,
+        free_bytes=guard_free(), peak_bytes=cfg.logit_peak_bytes,
     )
 
     sketches, prompt_sketches, feats = [], [], []
@@ -1276,7 +1314,7 @@ def run_dump(cfg: DumpConfig) -> dict[str, Any]:
         group_backward(
             model, g, which="grpo", device=cfg.device,
             token_denominator=resp_tokens, prompt_denominator=prompt_tokens,
-            **backward_kw, free_bytes=_free_bytes(cfg.device),
+            **backward_kw, free_bytes=guard_free(),
         )
         grads = [(n, p.grad if p.grad is not None else torch.zeros_like(p)) for n, p in blocks]
         zero_frac.append(
@@ -1304,7 +1342,7 @@ def run_dump(cfg: DumpConfig) -> dict[str, Any]:
         group_backward(
             model, g, which="nll", device=cfg.device,
             token_denominator=resp_tokens, prompt_denominator=prompt_tokens,
-            **backward_kw, free_bytes=_free_bytes(cfg.device),
+            **backward_kw, free_bytes=guard_free(),
         )
         pgrads = [(n, p.grad if p.grad is not None else torch.zeros_like(p)) for n, p in blocks]
         prompt_sketches.append(sketch_torch(pgrads, plan))
@@ -1403,6 +1441,13 @@ def run_dump(cfg: DumpConfig) -> dict[str, Any]:
         # The worst group priced before the run, so a completed dump can be read against the
         # plan it ran under rather than against the defaults someone assumes it used.
         "logits_budget": budget_record,
+        # The guard's INPUT over the run. first and last far apart with min == last is a pool
+        # that was never released; oscillation around a level is health.
+        "free_bytes_readings": len(free_seen),
+        "free_bytes_first": free_seen[0] if free_seen else None,
+        "free_bytes_last": free_seen[-1] if free_seen else None,
+        "free_bytes_min": min(free_seen) if free_seen else None,
+        "free_bytes_max": max(free_seen) if free_seen else None,
     }
     np.savez_compressed(
         cfg.out,
@@ -1448,8 +1493,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                    help="sequences per trunk forward; default derives from the budget")
     p.add_argument("--activation-budget-gb", type=float, default=6.0,
                    help="ceiling on the trunk's retained activations per forward")
-    p.add_argument("--logits-budget-gb", type=float, default=4.0,
-                   help="ceiling on the chunked head's transient memory")
+    p.add_argument("--logits-budget-gb", type=float, default=None,
+                   help="chunked head budget in GiB; OMIT IT to derive from measured free "
+                        "memory, capped at 4 GiB. A value here is honoured exactly")
     p.add_argument("--logit-peak-bytes", type=int, default=LOGIT_PEAK_BYTES_PER_ELEMENT,
                    help="bytes per (token, vocab-entry) used by the estimate")
     p.add_argument("--no-checkpoint", action="store_true",

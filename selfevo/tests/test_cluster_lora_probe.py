@@ -1432,3 +1432,143 @@ def test_the_store_is_moved_to_the_host_BEFORE_it_is_upcast(ckpt, rollouts, tmp_
     assert torch.bfloat16 in seen, (
         "every host transfer saw float32, so the gradient was upcast before it was moved"
     )
+
+
+# =========================================================================================
+# The guard's INPUT. The fourth projection attempt failed with the guard firing on exactly
+# the condition it was built for -- but the number it was fed was wrong. PyTorch's caching
+# allocator keeps freed blocks RESERVED, so `mem_get_info` reports driver-free, which shrinks
+# monotonically as a run proceeds even though nothing leaks. At a 4.0 GiB budget it refused
+# at group 5 of 153, at 1.5 GiB at group 25: a smaller chunk only buys more groups before the
+# window closes. Every existing test checked WHEN the guard fired, none checked what it read.
+# =========================================================================================
+
+
+class FakePool:
+    """A caching allocator that reserves what it frees, like the real one.
+
+    ``mem_get_info`` returns driver-free, which is total minus what the pool holds. Each read
+    models a group's activations entering the pool. ``empty_cache`` returns them. This is the
+    smallest thing that reproduces the failure, and it makes the fix checkable on a box with
+    no accelerator at all.
+    """
+
+    def __init__(self, total=80 * 1024**3, per_group=2 * 1024**3):
+        self.total = total
+        self.per_group = per_group
+        self.reserved = 0
+        self.releases = 0
+        self.calls: list[str] = []
+
+    def mem_get_info(self, _device=None):
+        """Report driver-free, then grow the pool as the next group would."""
+        self.calls.append("read")
+        free = self.total - self.reserved
+        self.reserved += self.per_group
+        return (free, self.total)
+
+    def empty_cache(self):
+        """Return every reserved block to the driver."""
+        self.calls.append("release")
+        self.releases += 1
+        self.reserved = 0
+
+
+@pytest.fixture
+def fake_cuda(monkeypatch):
+    """Present a CUDA device backed by :class:`FakePool`."""
+    pool = FakePool()
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", pool.mem_get_info)
+    monkeypatch.setattr(torch.cuda, "empty_cache", pool.empty_cache)
+    return pool
+
+
+def test_the_free_memory_probe_releases_the_cache_BEFORE_it_reads(fake_cuda):
+    """Order is the fix. Reading first would report the pool's history, not availability."""
+    from selfevo.cluster_lora.interference_dump import _free_bytes
+
+    _free_bytes("cuda")
+    assert fake_cuda.calls == ["release", "read"], fake_cuda.calls
+
+
+def test_the_guards_input_does_not_drift_across_groups(fake_cuda):
+    """The failure, reproduced and then removed.
+
+    Twenty reads standing in for twenty groups. With the cache released each time the reading
+    is the same every time; the guard is comparing its estimate against what is actually
+    available rather than against how long the run has been going.
+    """
+    from selfevo.cluster_lora.interference_dump import _free_bytes
+
+    seen = [_free_bytes("cuda") for _ in range(20)]
+    assert len(set(seen)) == 1, seen
+    assert seen[0] == 80 * 1024**3
+
+
+def test_and_without_the_release_it_really_does_drift(fake_cuda):
+    """Non-vacuity. If the pool did not shrink the reading, the test above proves nothing.
+
+    This is the old behaviour: monotonically falling, and it crosses any fixed budget
+    eventually -- which is why no chunk size finishes the batch.
+    """
+    from selfevo.cluster_lora.interference_dump import _free_bytes
+
+    # Forty reads: enough for a 2 GiB-per-group pool to walk an 80 GiB card down past any
+    # fixed budget, which is the point -- no chunk size finishes, each value just fails later.
+    seen = [_free_bytes("cuda", release_cache=False) for _ in range(40)]
+    assert seen == sorted(seen, reverse=True) and seen[0] > seen[-1]
+    assert min(seen) < 4 * 1024**3, seen[-3:]
+    # The reading falls with the number of groups processed, not with anything real.
+    assert seen[0] - seen[1] == fake_cuda.per_group
+
+
+def test_a_cpu_device_still_reports_unknown_rather_than_guessing():
+    """The budget check must still run where the device check cannot."""
+    from selfevo.cluster_lora.interference_dump import _free_bytes
+
+    assert _free_bytes("cpu") is None
+
+
+def test_the_dump_re_measures_free_memory_for_every_group(ckpt, rollouts, tmp_path,
+                                                          patched_tokenizer):
+    """A value read once and reused would be stale by the group it mattered for.
+
+    Recorded per reading so a finished run shows the guard's input rather than only its
+    verdict: first and last far apart with min == last is a pool that was never released.
+    """
+    meta = run_dump(cfg_for(ckpt, rollouts, tmp_path / "d.npz"))
+    # CPU reports None, so nothing is recorded -- the keys must still exist and say so.
+    assert meta["free_bytes_readings"] == 0
+    assert meta["free_bytes_first"] is None and meta["free_bytes_min"] is None
+
+
+# ---------------------------------------------------- the derived branch must engage ------
+
+
+def test_omitting_the_budget_flag_reaches_the_DERIVED_branch(monkeypatch, tmp_path):
+    """The flag defaulted to 4.0 in argparse while the dataclass defaulted to None.
+
+    So omitting it logged `explicit --logits-budget-gb 4.0` and the derivation never ran. The
+    dataclass default was right and the CLI silently overrode it -- and the patch that was
+    supposed to fix the CLI had no assertion on its own replacement, so it did nothing and
+    said nothing. That is the failure mode this project distrusts, committed while fixing it.
+    """
+    import selfevo.cluster_lora.interference_dump as dump
+
+    seen = []
+
+    def capture(cfg):
+        """Record the config the CLI built and return metadata main() can serialise."""
+        seen.append(cfg)
+        return {"ok": True}
+
+    monkeypatch.setattr(dump, "run_dump", capture)
+    base = ["--model", "m", "--rollouts", "r", "--out", str(tmp_path / "o.npz")]
+    dump.main(base)
+    assert seen[-1].logits_budget_gb is None, (
+        "omitting the flag must leave it None so resolve_logits_budget derives it"
+    )
+    # And an explicit value still arrives intact, so the fix did not simply ignore the flag.
+    dump.main(base + ["--logits-budget-gb", "2.5"])
+    assert seen[-1].logits_budget_gb == 2.5
