@@ -303,3 +303,46 @@ def test_the_control_refuses_if_its_own_permutation_stopped_matching(monkeypatch
     monkeypatch.setattr(np.random, "default_rng", lambda *_a, **_k: Bad())
     with pytest.raises(PartitionUnavailable, match="not size-matched"):
         random_matched_partition(part([0, 0, 1, 1]), seed=0)
+
+
+def test_every_mutation_anchor_still_occurs_exactly_once():
+    """A refactor that invalidates an anchor turns a mutation into a silent SKIP.
+
+    This happened: rewriting the dump's loss for the 32B OOM left one anchor matching zero
+    lines, and the harness reported ``anchor appears 0x`` -- correctly counted as NOT a kill,
+    but only because someone read the output. A guard that is never exercised looks exactly
+    like a guard that passes, so the anchors are checked here instead of being trusted to a
+    line in a log.
+
+    Source-only, so it runs under both interpreters and needs neither torch nor scikit-learn.
+    """
+    import ast
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[2]
+    harness = root / "selfevo/tests/mutate_cluster_lora.py"
+    names = {
+        "ADAPTERS": "adapters.py", "MERGE": "merge.py", "PARTITION": "partition.py",
+        "SKETCH": "sketch.py", "DUMP": "interference_dump.py",
+        "ANALYZE": "interference_analyze.py",
+    }
+    sources = {
+        k: (root / "selfevo/cluster_lora" / v).read_text() for k, v in names.items()
+    }
+    bad, checked = [], 0
+    for node in ast.walk(ast.parse(harness.read_text())):
+        if not (isinstance(node, ast.Tuple) and len(node.elts) == 5):
+            continue
+        if not isinstance(node.elts[0], ast.Name) or node.elts[0].id not in sources:
+            continue
+        try:
+            label = ast.literal_eval(node.elts[2])
+            find = ast.literal_eval(node.elts[3])
+        except ValueError:
+            continue
+        checked += 1
+        n = sources[node.elts[0].id].count(find)
+        if n != 1:
+            bad.append((node.elts[0].id, label, n))
+    assert checked > 50, f"only {checked} anchors were parsed; the harness shape changed"
+    assert not bad, bad

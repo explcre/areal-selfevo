@@ -295,11 +295,136 @@ analysis venv has NO torch and the training venv has NO hdbscan, so the dependen
 tested rather than assumed. Values are not asserted there: a random tiny model has no
 behaviour to cluster, and this proves the arithmetic, not the science.
 
-### 6.4 Costs of the dump
+### 6.4 The dump OOMed at 32B, because the wrong thing was budgeted
+
+**Measured on an 80 GiB H100, 2026-09-02**, failing in the FIRST group about 17 s in, on all
+three checkpoints, inside the LM head:
+
+    torch.OutOfMemoryError: Tried to allocate 58.00 MiB. 50.31 MiB free. 78.23 GiB allocated.
+
+The arithmetic at 32B, vocab 152,064, G=8. The old `group_losses` built every response in a
+group as ONE padded batch and ran it through the causal-LM wrapper, whose forward ends in a
+full-vocabulary `lm_head` over every position at once. The worst group is 8 x 2,089 = **16,712
+padded tokens**: bf16 logits 4.73 GB, the `.float()` copy 9.47 GB, and the copy keeps the bf16
+node alive, so **14.20 GB resident** -- against **61.02 GB of weights**, i.e. 75.22 GB of 79.18
+usable, leaving under 4 GB for 64 layers of backward activations. `expandable_segments:True`
+moved the shortfall from 114 MiB to 58 MiB, so it was capacity, not fragmentation.
+
+**The defect was in this document as much as in the code.** Section 6.6 below budgeted the
+full-gradient STORE (~1.07 GB, guarded by `--max-full-grad-gb`) and never budgeted the
+per-group LOGITS, which at this scale are 13x larger and are the binding constraint. The guard
+that existed could not fire, because the failure was inside the forward.
+
+Worse than the diagnosis: the old code materialised a THIRD full-vocabulary tensor. It did
+`.float()` and *then* `log_softmax` on the result, so a successful allocation would have held
+bf16 + fp32 + fp32 = 23.7 GB for that group.
+
+#### What the batch actually looks like
+
+All 128 groups have n_seq=8, so B is constant and the whole spread is in T. Padded tokens per
+group (B*T): min 2,392 / median 7,000 / p90 9,320 / p99 11,712 / **max 16,712**.
+
+**The tail is a long PROMPT, not long responses.** Prompt lengths are min 56 / median 102 /
+p90 215 / **max 1,330**, and the max group (id=11) is that 1,330-token prompt -- prepended to
+all eight samples, so one outlier prompt multiplies straight through B. p75 to p95 is nearly
+flat (8,856 -> 9,608) and then two groups sit far above everything: id=11 at 16,712 and id=94
+at 11,712.
+
+That is why **the chunk is a count of TOKENS, never of sequences.** At T=2,089 a single
+sequence is already 2,089 positions, so a chunk of one SEQUENCE still allocates 0.59 GB of
+bf16 logits for id=11, while a fixed B=2 would be twice the p90 group and 3.6x the median. A
+token chunk is uniform across groups; a sequence chunk is not.
+
+#### The fix, and why it does not change what is measured
+
+1. **The trunk is called directly** (`_decoder_and_unembedding`), so the forward yields hidden
+   states of B x T x 5120 -- 171 MB for the worst group -- instead of B x T x 152,064. LoRA
+   still applies because PEFT replaces the Linear MODULES in place; that is PEFT's design and
+   not this project's, so it is asserted by a test rather than assumed.
+2. **The unembedding is applied in chunks of positions**, each freed as it goes. The loss is a
+   sum over positions and chunking reassociates that sum, so the value and the gradient are
+   unchanged -- exact arithmetic, not an approximation.
+3. **The reduction is `log_softmax(logits, dtype=torch.float32)`**, which does the same fp32
+   reduction WITHOUT first materialising an fp32 copy. Measured on CPU at bf16 over a 19k
+   vocabulary: **bit-identical** to the old `.float()` form, while dropping the `dtype`
+   argument and reducing in bf16 costs **0.044 in log-probability**.
+4. **Per-chunk checkpointing** recomputes a chunk's logits in the backward rather than
+   retaining them, so only one chunk's logits are ever alive.
+5. **Whole-model gradient checkpointing, on by default.** Not optional at 32B: fixing the
+   unembedding leaves the decoder's own retained activations as the binding constraint.
+6. **The trunk is sub-batched over SEQUENCES** (`group_backward`), because checkpointing alone
+   is not enough. Under it the decoder still retains one hidden-state tensor per layer:
+   `layers x tokens x hidden x 2` is **640 KB per token** at 64 x 5120, so the worst group's
+   16,712 padded tokens retain **10.95 GB** on top of 61.02 GB of weights -- which would have
+   OOMed again after the head was fixed. Sequences in a GRPO group are independent (causal
+   attention, right padding) and the loss is a sum over them under a denominator that does not
+   depend on the split, so `sum_s L_s` has gradient `sum_s grad L_s`: each sub-batch is
+   backwarded immediately and its activations freed, accumulating into the same `.grad`.
+
+   `--activation-budget-gb` (default 6.0) gives 9,830 tokens per forward, so id=11 at T=2,089
+   runs as **two forwards of four sequences** retaining 5.48 GB instead of 10.95, while the
+   median group (T=875) still runs as ONE forward -- only the tail pays for the split.
+
+   The subtle failure this could have introduced, and it is a test: a sub-batch must NOT
+   recompute its own advantages. GRPO advantages are the rewards centred and scaled WITHIN the
+   group, so a slice that recomputed them would centre a subset -- for a two-sample slice,
+   nearly meaningless -- and the run would complete with plausible numbers. The parent's
+   advantages are passed down and the test uses rewards chosen so every slice has a different
+   mean from the whole.
+
+Points 4 and 5 both differentiate a RECOMPUTED forward, which is only exact if the forward is
+deterministic. So the dump **refuses to run with any dropout active**, naming the modules --
+a recomputed dropout mask would give a plausible gradient with no error anywhere, which is the
+failure class this project distrusts most and has already recorded once for checkpointing. The
+shipped configs set `disable_dropout` and `lora_dropout` 0, so the assertion passes and
+train/eval are provably equivalent.
+
+Equivalence is tested, not argued. Loss and every LoRA gradient are compared against the
+ORIGINAL unchunked path at chunk sizes 1, 3, 7 and 10,000, for both losses; at sub-batch sizes
+1, 2, 3 and 8; checkpointed and unchecked gradients are asserted BIT-equal; and a test records
+the size of every unembedding output and requires that none exceeds `chunk x V`, which is the
+guarantee the fix exists for rather than a consequence of it.
+
+**Projected peak for the worst group at the defaults**: 61.02 GB weights + 5.48 GB retained
+trunk activations + ~1.4 GB one layer's recompute + 4.0 GB head chunk + 0.09 GB hidden states
+= **about 72 GB of 79.18**, roughly 7 GB spare. That is a projection from the measured
+constants, not a measurement; the run itself will settle it.
+
+#### The budget, as a guard that fires before the forward
+
+`LOGIT_PEAK_BYTES_PER_ELEMENT = 12` -- bf16 matmul output (2), fp32 log-softmax output (4),
+and during the recomputed backward the gradients of both (4 + 2). It is **derived, an upper
+bound, and not measured**, so it is exposed as `--logit-peak-bytes` for a box that measures
+otherwise. The old unchunked path cost 10 bytes per element over the whole group at once.
+
+`--logits-budget-gb` (default 4.0) is a ceiling on the head's transient memory, and the chunk
+is DERIVED from it: at vocab 152,064 that is **~2,190 tokens**, inside the 2,048-4,096 band the
+length distribution calls for. Deriving from a memory budget rather than fixing a token count
+is what makes the same setting mean the same memory at another vocabulary -- a count that is
+comfortable at 32k is five times the intended footprint at 152k. Sizing near p90 (9,320) would
+leave about the ~10 GB headroom at which the run died.
+
+`assert_logits_fit` runs **before any forward**, twice: once for the whole batch's worst group
+before the loop, and once per group. It refuses if the chunk exceeds the budget, or if 1.5x the
+estimate exceeds free device memory -- above 1 because the estimate covers the head only and
+the decoder's activations share the same pool. The refusal names the group, its token count,
+the chunked estimate and what the unchunked one would have been. Group id=11 is 11th of 128 in
+file order, so a refusal costs the first minute rather than an hour, and it is an explicit test
+case.
+
+**Not done, deliberately.** All eight sequences in a group share an identical prompt prefix, so
+at id=11 the same 1,330 tokens are forwarded eight times; sharing that prefix would cut the
+worst group by most of its cost but needs KV-cache reuse across the eight continuations, and it
+is not worth taking on without a proof that the resulting gradient is identical. The chunked
+path plus gradient checkpointing is sufficient. Sharding the model across cards was likewise
+left alone: it adds complexity and does not remove the waste.
+
+### 6.5 Other costs of the dump
 
 * **Per group stored**: 2 sketches x 8192 float64 = **128 KB**, plus the behavioural vector
   (`n_layers/2` floats). Negligible; 128 groups is ~16 MB.
-* **Full gradients**: `n_groups x n_lora_params x 4` bytes. For a 134 MB adapter (~33M params
+* **Full gradients**: `n_groups x n_lora_params x 4` bytes. This is the store the
+  original `--max-full-grad-gb` guard covers, and it was never the binding constraint. For a 134 MB adapter (~33M params
   in fp32) at the default 8 groups that is **~1.07 GB**. The script REFUSES above
   `--max-full-grad-gb` (default 8) and names the size, so the count is lowered on purpose
   rather than discovered after the GPUs are allocated.
@@ -312,7 +437,7 @@ behaviour to cluster, and this proves the arithmetic, not the science.
   the dump prints `seconds_gradients` / `seconds_features` / `seconds_total` so the real
   figure comes from the run itself.
 
-### 6.5 The rollout schema
+### 6.6 The rollout schema
 
 `load_rollouts` accepts both shapes -- one line per SAMPLE (`response`, scalar `reward`) and
 one line per GROUP (`responses` list, `rewards` list), which is what the harness writes -- and
@@ -439,11 +564,23 @@ SKIPs** -- an anchor that stopped being unique is reported as NOT a kill, and on
 
 | arm | interpreter | mutations applicable | killed | survivors |
 |---|---|---|---|---|
-| `torch` | `~/venv312b` | 43 (10 not applicable) | **43** | none |
-| `cluster` | `~/venv_probe` | 27 (26 not applicable) | **27** | none |
+| `torch` | `~/venv312b` | 63 (10 not applicable) | **63** | none |
+| `cluster` | `~/venv_probe` | 27 (45 not applicable) | **27** | none |
 
-Mutations by area: adapter isolation 11, merge 5, partition and control 15, sketch 6, dump 9,
-analysis 7.
+72 distinct mutations by area: adapter isolation 11, merge 5, partition and control 15,
+sketch 6, dump 26 (of which 19 cover the OOM fix), analysis 7. All six mutation targets were
+verified sha256-identical in both copies after the run.
+
+**A seventh survivor, from the OOM fix, and a stale anchor.** Rewriting the dump's loss made
+one mutation's anchor match zero lines, which the harness reported as `anchor appears 0x --
+NOT a kill` rather than as a pass; it is re-anchored, and
+`test_every_mutation_anchor_still_occurs_exactly_once` now fails loudly on a stale anchor
+instead of leaving a silent SKIP for someone to notice in a log. The survivor was
+*"sub-batching is disabled, restoring the trunk activation cost"*: every test of
+`group_backward` asserted the GRADIENT was unchanged, and it is unchanged when the split never
+happens -- so all of them passed on a version that runs one forward over the whole group and
+OOMs exactly as before. What had to be checked was the number of trunk forwards, which is now
+asserted directly. That is the third defect in this file whose symptom was a correct answer.
 
 **Five defects survived the first pass and each produced a new test.** They are recorded
 because the tests that missed them looked entirely reasonable:
@@ -475,7 +612,12 @@ because the tests that missed them looked entirely reasonable:
    actually gets wrong: a zero-width interval claims a precision the estimate does not have.
 
 Two of those five (1 and 4) are defects that would have produced a plausible, publishable
-number rather than an error.
+number rather than an error. The OOM fix added a sixth of the same kind -- see the survivor
+note above -- and the running theme is now explicit: **on this feature, the dangerous defects
+do not raise; they return a reasonable-looking number.** Every guard here is therefore written
+to be falsifiable by a mutation, and the ones that could not be (the `only()` leak check, the
+merge verification, the budget refusals) have tests that break the surrounding machinery on
+purpose to make them fire.
 
 ## 11. How to run it on the H100 box
 
@@ -489,8 +631,17 @@ installs. Nothing here starts a training job.
         --adapter ~/runs/.../$CKPT \
         --rollouts ~/runs/harnessT_trunc/rollouts_math64.jsonl \
         --out    ~/runs/interference_$CKPT.npz \
-        --sketch-dim 8192 --full-grad-groups 8 --device cuda --dtype bfloat16
+        --sketch-dim 8192 --full-grad-groups 8 --device cuda --dtype bfloat16 \
+        --logits-budget-gb 4.0 --activation-budget-gb 6.0
     done
+
+The chunked unembedding, the sequence sub-batching and gradient checkpointing are on by
+default and are what make this fit at 32B; `--no-checkpoint` and `--no-gradient-checkpointing` exist only to reproduce the
+old memory behaviour and will OOM there. If a group is still refused, the message names it and
+its estimate: lower `--logits-budget-gb` (the chunk follows) rather than raising it, and
+lower `--activation-budget-gb` if the failure is in the trunk rather than the head. Use
+`~/runs/harnessT_trunc/rollouts_math64_probe.jsonl`, whose per-response rewards are already
+lifted into group-level `rewards` lists.
 
 `--adapter` is not optional in practice: without it `B = 0`, `dL/dA` is exactly zero and half
 of every gradient vanishes. The dump prints `zero_block_fraction` so a run made without it is

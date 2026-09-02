@@ -30,11 +30,16 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("peft")
 
 from selfevo.cluster_lora.interference_dump import (  # noqa: E402
+    LOGIT_PEAK_BYTES_PER_ELEMENT,
     DumpConfig,
     Group,
+    LogitsBudgetExceeded,
     RolloutSchemaError,
+    assert_logits_fit,
+    chunk_tokens_for_budget,
     group_losses,
     load_rollouts,
+    logits_peak_bytes,
     run_dump,
 )
 
@@ -522,3 +527,620 @@ def test_the_dump_and_the_analysis_run_in_their_two_SEPARATE_venvs(ckpt, rollout
         "meds", "random_matched", "elrea", "task"
     ]
     assert res["n_groups"] == 6
+
+
+# =========================================================================================
+# The OOM fix: the unembedding is chunked, and the budget is a guard rather than a stack
+# trace. Measured on an 80 GiB H100 at 32B / vocab 152,064: the old path built every
+# response in a group as ONE padded batch, and the worst group of the probe batch is
+# 8 x 2,089 = 16,712 padded tokens -- 4.73 GB of bf16 logits plus a 9.47 GB fp32 copy with
+# the bf16 node still alive, 14.20 GB, against 61.02 GB of resident weights. It died inside
+# the LM head in the first group, where no guard could see it.
+# =========================================================================================
+
+
+def tiny_lm(vocab=VOCAB, seed=0, lora=True):
+    """A small causal LM, optionally LoRA-wrapped, for the equivalence checks."""
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    torch.manual_seed(seed)
+    conf = AutoConfig.for_model(
+        "qwen2", hidden_size=16, intermediate_size=32, num_hidden_layers=2,
+        num_attention_heads=4, num_key_value_heads=2, vocab_size=vocab,
+        max_position_embeddings=128, tie_word_embeddings=False,
+    )
+    model = AutoModelForCausalLM.from_config(conf)
+    if not lora:
+        return model
+    from peft import LoraConfig, TaskType, get_peft_model
+
+    m = get_peft_model(
+        model,
+        LoraConfig(task_type=TaskType.CAUSAL_LM, r=4, lora_alpha=8,
+                   target_modules=["q_proj", "v_proj"], bias="none"),
+        autocast_adapter_dtype=False,
+    )
+    # B is zero at init, so dL/dA vanishes and half the gradient would be trivially equal
+    # under any refactor. Randomise so both halves of every adapter carry signal.
+    with torch.no_grad():
+        for n, prm in m.named_parameters():
+            if prm.requires_grad and "lora_" in n:
+                prm.normal_(0.0, 0.05, generator=torch.Generator().manual_seed(seed + 1))
+    return m
+
+
+def reference_losses(model, group, *, token_denominator, prompt_denominator):
+    """The ORIGINAL unchunked path, kept as the thing the refactor has to reproduce.
+
+    This is the code that OOMed: one forward through the causal-LM wrapper, ``.float()`` on
+    the full-vocabulary logits, a log-softmax over all of them, then a gather. It is fine at
+    this size and is the only honest reference for "the measured gradient did not change".
+    """
+    adv = group.advantages()
+    n_prompt = len(group.prompt_ids)
+    seqs = [group.prompt_ids + r for r in group.response_ids]
+    width = max(len(s) for s in seqs)
+    ids = torch.zeros((len(seqs), width), dtype=torch.long)
+    attn = torch.zeros((len(seqs), width), dtype=torch.long)
+    for i, sq in enumerate(seqs):
+        ids[i, : len(sq)] = torch.tensor(sq, dtype=torch.long)
+        attn[i, : len(sq)] = 1
+    logits = model(input_ids=ids, attention_mask=attn, use_cache=False).logits.float()
+    logp = torch.log_softmax(logits[:, :-1, :], dim=-1)
+    target = ids[:, 1:]
+    picked = logp.gather(-1, target.unsqueeze(-1)).squeeze(-1)
+    valid = attn[:, 1:].bool()
+    pos = torch.arange(width - 1).unsqueeze(0)
+    resp_mask = valid & (pos >= n_prompt - 1)
+    prompt_mask = valid & (pos < n_prompt - 1)
+    a = torch.tensor(adv, dtype=torch.float32).unsqueeze(1)
+    return (
+        -(a * picked * resp_mask).sum() / token_denominator,
+        -(picked * prompt_mask).sum() / prompt_denominator,
+    )
+
+
+def lora_grads(model):
+    """LoRA gradients by name, so two paths can be compared parameter by parameter."""
+    return {
+        n: (p.grad.detach().clone() if p.grad is not None else torch.zeros_like(p))
+        for n, p in model.named_parameters()
+        if p.requires_grad and "lora_" in n
+    }
+
+
+def probe_group(n_seq=4, n_prompt=9, n_resp=7):
+    """A group shaped like a real one: one shared prompt, several sampled responses."""
+    rng = torch.Generator().manual_seed(3)
+    prompt = torch.randint(0, VOCAB, (n_prompt,), generator=rng).tolist()
+    resp = [torch.randint(0, VOCAB, (n_resp,), generator=rng).tolist() for _ in range(n_seq)]
+    return Group("g", "math", prompt, resp, [float(i % 2) for i in range(n_seq)])
+
+
+@pytest.mark.parametrize("chunk", [1, 3, 7, 10_000])
+def test_the_chunked_path_is_numerically_identical_to_the_unchunked_one(chunk):
+    """The hard requirement: the fix must not change WHAT IS MEASURED.
+
+    Both the loss and every LoRA gradient are compared against the original full-vocabulary
+    path, at four chunk sizes including one token per chunk and one chunk for everything. If
+    any of them differed, the whole four-partition comparison would be measuring a different
+    gradient than the one the paper claims.
+
+    Chunking is a reassociation of a sum over positions, so this is exact arithmetic rather
+    than an approximation, and the tolerance is set accordingly.
+    """
+    g = probe_group()
+    resp = sum(len(r) for r in g.response_ids)
+    prompt = len(g.prompt_ids) * g.size
+
+    ref_model = tiny_lm(seed=5)
+    ref_model.zero_grad(set_to_none=True)
+    ref_grpo, _ = reference_losses(
+        ref_model, g, token_denominator=resp, prompt_denominator=prompt
+    )
+    ref_grpo.backward()
+    ref = lora_grads(ref_model)
+
+    got_model = tiny_lm(seed=5)
+    got_model.zero_grad(set_to_none=True)
+    got_grpo, _ = group_losses(
+        got_model, g, device="cpu", token_denominator=resp, prompt_denominator=prompt,
+        chunk_tokens=chunk,
+    )
+    got_grpo.backward()
+    got = lora_grads(got_model)
+
+    assert float(got_grpo.detach()) == pytest.approx(float(ref_grpo.detach()), abs=1e-6)
+    assert set(got) == set(ref) and ref
+    for k in ref:
+        assert torch.allclose(got[k], ref[k], atol=1e-6, rtol=1e-5), (
+            k, chunk, (got[k] - ref[k]).abs().max()
+        )
+    # And the gradient is not trivially zero, or the comparison above is vacuous.
+    assert max(float(v.abs().max()) for v in ref.values()) > 0
+
+
+def test_the_prompt_loss_is_identical_under_chunking_too():
+    """The ELREA feature is the other half of the measurement and gets the same check."""
+    g = probe_group()
+    resp = sum(len(r) for r in g.response_ids)
+    prompt = len(g.prompt_ids) * g.size
+
+    ref_model = tiny_lm(seed=6)
+    ref_model.zero_grad(set_to_none=True)
+    _, ref_nll = reference_losses(
+        ref_model, g, token_denominator=resp, prompt_denominator=prompt
+    )
+    ref_nll.backward()
+    ref = lora_grads(ref_model)
+
+    got_model = tiny_lm(seed=6)
+    got_model.zero_grad(set_to_none=True)
+    _, got_nll = group_losses(
+        got_model, g, device="cpu", token_denominator=resp, prompt_denominator=prompt,
+        chunk_tokens=4,
+    )
+    got_nll.backward()
+    got = lora_grads(got_model)
+    assert float(got_nll.detach()) == pytest.approx(float(ref_nll.detach()), abs=1e-6)
+    for k in ref:
+        assert torch.allclose(got[k], ref[k], atol=1e-6, rtol=1e-5)
+
+
+def test_checkpointing_the_chunks_does_not_change_the_gradient():
+    """Recomputing a chunk's logits in the backward must be exact, not merely close.
+
+    It is only exact for a deterministic forward, which is why the dump refuses to run with
+    dropout active rather than trusting it.
+    """
+    g = probe_group()
+    resp = sum(len(r) for r in g.response_ids)
+    prompt = len(g.prompt_ids) * g.size
+    out = {}
+    for flag in (True, False):
+        m = tiny_lm(seed=7)
+        m.zero_grad(set_to_none=True)
+        loss, _ = group_losses(
+            m, g, device="cpu", token_denominator=resp, prompt_denominator=prompt,
+            chunk_tokens=5, use_checkpoint=flag,
+        )
+        loss.backward()
+        out[flag] = lora_grads(m)
+    for k in out[True]:
+        assert torch.equal(out[True][k], out[False][k]), k
+
+
+def test_the_chunked_path_still_reaches_every_lora_parameter():
+    """Calling the trunk directly bypasses the causal-LM wrapper's forward.
+
+    PEFT replaces the Linear MODULES in place, so LoRA is inside the trunk and is reached
+    whichever forward calls them -- but that is PEFT's design, not this project's, and a
+    prompt-learning method would live on the wrapper instead. Asserted rather than assumed.
+    """
+    g = probe_group()
+    m = tiny_lm(seed=8)
+    m.zero_grad(set_to_none=True)
+    loss, _ = group_losses(
+        m, g, device="cpu", token_denominator=sum(len(r) for r in g.response_ids),
+        prompt_denominator=len(g.prompt_ids) * g.size, chunk_tokens=6,
+    )
+    loss.backward()
+    grads = lora_grads(m)
+    assert grads, "no LoRA parameters at all"
+    reached = [k for k, v in grads.items() if float(v.abs().sum()) > 0]
+    assert len(reached) == len(grads), sorted(set(grads) - set(reached))
+
+
+# ------------------------------------------------------------------ the budget arithmetic --
+
+
+def test_the_budget_prices_the_measured_failure():
+    """The estimate must reproduce the allocation that actually died.
+
+    32B, vocab 152,064, the probe batch's worst group at 8 x 2,089 = 16,712 padded tokens.
+    The old path held bf16 logits, an fp32 copy and the log-softmax output at 10 bytes per
+    element over the WHOLE group; this is the number that has to be recognisable as 14.20 GB.
+    """
+    v, tokens = 152_064, 16_712
+    assert logits_peak_bytes(tokens, v, peak_bytes=10) / 1e9 == pytest.approx(25.4, abs=0.1)
+    # bf16 alone, which is the figure the traceback's allocator was working against.
+    assert logits_peak_bytes(tokens, v, peak_bytes=2) / 1e9 == pytest.approx(5.08, abs=0.05)
+
+
+def test_the_default_budget_lands_in_the_measured_safe_band():
+    """2,048-4,096 padded tokens per chunk is what the length distribution calls for.
+
+    p90 is 9,320 padded tokens per group and the max 16,712, so a chunk sized near p90 would
+    leave roughly the ~10 GB headroom at which the run died. Deriving the chunk from a memory
+    BUDGET rather than fixing a token count is what makes the same setting mean the same
+    memory at another vocabulary.
+    """
+    n = chunk_tokens_for_budget(152_064, 4 * 1024**3)
+    assert 2048 <= n <= 4096, n
+    # Half the budget halves the chunk; a smaller vocabulary buys a larger one.
+    assert chunk_tokens_for_budget(152_064, 2 * 1024**3) == n // 2
+    assert chunk_tokens_for_budget(32_000, 4 * 1024**3) > n
+
+
+def test_the_chunk_is_capped_at_the_work_available():
+    """A 200-token group must not plan a 2,000-token chunk and pretend to price it."""
+    assert chunk_tokens_for_budget(152_064, 4 * 1024**3, cap=200) == 200
+
+
+def test_a_budget_too_small_for_one_token_is_refused_not_rounded_up():
+    """No chunk size can fix it, so silently returning 1 would guarantee the OOM anyway."""
+    with pytest.raises(LogitsBudgetExceeded, match="no chunk size"):
+        chunk_tokens_for_budget(152_064, 1024)
+
+
+def test_the_guard_refuses_the_worst_real_group_on_a_full_card():
+    """Group id 11 of the probe batch: a 1,330-token prompt multiplied across eight samples.
+
+    It is the only group far beyond p99 and it is 11th of 128 in file order, so a guard that
+    fires does so in the first minute rather than after a hundred groups of work. Priced here
+    against the memory that was actually free when the run died.
+    """
+    with pytest.raises(LogitsBudgetExceeded, match="id=11") as e:
+        assert_logits_fit(
+            group_id="id=11", n_tokens=16_712, vocab=152_064, chunk_tokens=2192,
+            budget_bytes=4 * 1024**3, free_bytes=int(0.05 * 1e9),
+        )
+    msg = str(e.value)
+    assert "16712 padded tokens" in msg and "Unchunked" in msg
+
+
+def test_the_guard_passes_the_same_group_when_the_memory_is_there():
+    """The refusal has to be about memory, not about the group being large."""
+    rec = assert_logits_fit(
+        group_id="id=11", n_tokens=16_712, vocab=152_064, chunk_tokens=2192,
+        budget_bytes=4 * 1024**3, free_bytes=int(18 * 1e9),
+    )
+    assert rec["n_tokens"] == 16_712 and rec["chunk_tokens"] == 2192
+    assert rec["unchunked_peak_bytes"] > rec["chunk_peak_bytes"] * 7
+
+
+def test_a_chunk_over_the_budget_is_refused_even_with_memory_free():
+    """The budget is the declared plan; exceeding it silently would make it decoration."""
+    with pytest.raises(LogitsBudgetExceeded, match="over the"):
+        assert_logits_fit(
+            group_id="g", n_tokens=1000, vocab=152_064, chunk_tokens=100_000,
+            budget_bytes=4 * 1024**3, free_bytes=int(80 * 1e9),
+        )
+
+
+def test_the_guard_fires_BEFORE_the_forward_runs():
+    """The entire point. The old failure happened inside the LM head, unguardable.
+
+    A model that raises if it is called at all makes "before" checkable rather than implied
+    by argument order.
+    """
+    class Exploding:
+        """Reports a decoder and an unembedding, and refuses to be run."""
+
+        def __init__(self):
+            self.calls = 0
+            self.weight = torch.zeros(152_064, 8)
+
+        def get_decoder(self):
+            """Return a callable that must never be reached."""
+            def _boom(**_kw):
+                self.calls += 1
+                raise AssertionError("the forward ran despite the guard")
+            return _boom
+
+        def get_output_embeddings(self):
+            """An unembedding of the real vocabulary, so the estimate is realistic."""
+            return self
+
+    m = Exploding()
+    with pytest.raises(LogitsBudgetExceeded):
+        group_losses(
+            m, probe_group(n_seq=8, n_prompt=1330, n_resp=759), device="cpu",
+            token_denominator=100, prompt_denominator=100,
+            chunk_tokens=2192, free_bytes=int(0.05 * 1e9),
+        )
+    assert m.calls == 0
+
+
+def test_active_dropout_is_refused_because_the_forward_is_recomputed():
+    """Checkpointing differentiates the SECOND forward, which draws a different mask.
+
+    The result would be a plausible gradient with no error anywhere -- the failure class this
+    project distrusts most, and one it has already recorded once for checkpointing.
+    """
+    from selfevo.cluster_lora.interference_dump import _assert_deterministic_forward
+
+    m = tiny_lm(seed=9)
+    _assert_deterministic_forward(m)  # the shipped config has no active dropout
+    m.add_module("noisy", torch.nn.Dropout(p=0.1))
+    with pytest.raises(RuntimeError, match="dropout is active"):
+        _assert_deterministic_forward(m)
+
+
+def test_the_dump_records_the_budget_it_ran_under(ckpt, rollouts, tmp_path,
+                                                  patched_tokenizer):
+    """A completed dump must be readable against its plan, not against assumed defaults."""
+    out = tmp_path / "dump.npz"
+    meta = run_dump(cfg_for(ckpt, rollouts, out))
+    assert meta["vocab"] == VOCAB
+    assert meta["chunk_tokens"] >= 1
+    assert meta["gradient_checkpointing"] is True and meta["use_checkpoint"] is True
+    assert meta["logits_budget"]["n_tokens"] > 0
+    assert meta["logits_budget"]["unchunked_peak_bytes"] >= \
+        meta["logits_budget"]["chunk_peak_bytes"]
+
+
+def test_a_dump_whose_worst_group_will_not_fit_refuses_up_front(ckpt, rollouts, tmp_path,
+                                                                patched_tokenizer):
+    """Priced once before the loop, so the refusal costs seconds rather than an hour."""
+    with pytest.raises(LogitsBudgetExceeded):
+        run_dump(cfg_for(ckpt, rollouts, tmp_path / "d.npz", chunk_tokens=10**7))
+
+
+def test_no_full_vocabulary_tensor_is_ever_larger_than_one_chunk():
+    """The guarantee the fix exists for, asserted on the allocations rather than inferred.
+
+    Every other test here checks that the ANSWER is unchanged. This one checks the thing that
+    changed: the widest full-vocabulary tensor the forward builds. Under the old path it was
+    ``B * T x V`` -- 16,712 x 152,064 at 32B, which is what did not fit; under the new one no
+    single unembedding output exceeds ``chunk x V``, whatever the group.
+
+    Measured by recording the size of every ``F.linear`` output whose last dimension is the
+    vocabulary, which is exactly the unembedding and nothing else.
+    """
+    import torch.nn.functional as F
+
+    g = probe_group(n_seq=6, n_prompt=11, n_resp=9)
+    m = tiny_lm(seed=11)
+    seen = []
+    real = F.linear
+
+    def recording(inp, weight, bias=None):
+        """Record the unembedding outputs, pass everything else through untouched."""
+        out = real(inp, weight, bias)
+        if out.shape[-1] == VOCAB:
+            seen.append(int(out.numel()))
+        return out
+
+    chunk = 7
+    positions = g.size * (len(g.prompt_ids) + len(g.response_ids[0]) - 1)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(F, "linear", recording)
+        loss, _ = group_losses(
+            m, g, device="cpu", token_denominator=sum(len(r) for r in g.response_ids),
+            prompt_denominator=len(g.prompt_ids) * g.size, chunk_tokens=chunk,
+            use_checkpoint=False,
+        )
+        loss.backward()
+
+    assert seen, "no unembedding output was observed at all"
+    assert max(seen) <= chunk * VOCAB, (max(seen), chunk * VOCAB)
+    # And the group genuinely needed several chunks, or the bound is met trivially.
+    assert positions > chunk * 2
+    assert len(seen) >= positions // chunk
+    # The old path would have built one tensor of positions * VOCAB; nothing here is close.
+    assert max(seen) < positions * VOCAB
+
+
+def test_the_reduction_is_done_in_fp32_without_materialising_an_fp32_copy():
+    """Half the old peak was an fp32 COPY of the logits, and it was not buying accuracy.
+
+    ``log_softmax(x.float())`` allocates a second full-vocabulary tensor and keeps the bf16
+    node alive beside it; ``log_softmax(x, dtype=torch.float32)`` performs the same reduction
+    in fp32 with no such copy. MEASURED on CPU at bf16 over a 19k vocabulary: the new form is
+    BIT-IDENTICAL to the old one, while dropping the ``dtype`` argument and reducing in bf16
+    costs 0.044 in log-probability -- which at 152k vocabulary would move every cosine in the
+    analysis for no reason anyone could see.
+    """
+    from selfevo.cluster_lora.interference_dump import _chunk_weighted_logp
+
+    torch.manual_seed(0)
+    v, c, h = 19_008, 4, 32
+    hidden = (torch.randn(c, h) * 2).to(torch.bfloat16)
+    unembed = (torch.randn(v, h) * 0.5).to(torch.bfloat16)
+    targets = torch.randint(0, v, (c,))
+    w = torch.ones(c)
+
+    got = _chunk_weighted_logp(hidden, targets, (w,), unembed)
+    logits = torch.nn.functional.linear(hidden, unembed)
+    ref = (torch.log_softmax(logits.float(), dim=-1)
+           .gather(1, targets.unsqueeze(1)).squeeze(1) * w).sum()
+    assert torch.equal(got[0], ref), (float(got[0]), float(ref))
+
+    bf16_only = (torch.log_softmax(logits, dim=-1).float()
+                 .gather(1, targets.unsqueeze(1)).squeeze(1) * w).sum()
+    assert not torch.equal(bf16_only, ref), "bf16 reduction happens to be exact here"
+
+
+def test_a_model_with_no_decoder_trunk_is_refused():
+    """Falling back to the wrapper's forward would silently restore the OOM.
+
+    The chunked path exists only because the trunk can be called without the LM head; a model
+    where it cannot be found has to say so rather than quietly take the path that does not
+    fit.
+    """
+    from selfevo.cluster_lora.interference_dump import _decoder_and_unembedding
+
+    with pytest.raises(RuntimeError, match="could not locate the decoder trunk"):
+        _decoder_and_unembedding(torch.nn.Linear(4, 4))
+
+
+@pytest.mark.parametrize("seq_chunk", [1, 2, 3, 8])
+def test_sub_batching_the_trunk_gives_the_same_gradient_as_one_backward(seq_chunk):
+    """The other half of the OOM fix, and it has the same hard requirement.
+
+    Sequences in a GRPO group are independent -- causal attention with right padding gives no
+    path between them -- and the loss is a sum over them under a denominator that does not
+    depend on the split, so backwarding each sub-batch accumulates exactly the gradient one
+    backward over the whole group would. Checked at every sub-batch size including one
+    sequence at a time and the whole group at once.
+    """
+    from selfevo.cluster_lora.interference_dump import group_backward
+
+    g = probe_group(n_seq=4, n_prompt=8, n_resp=6)
+    resp = sum(len(r) for r in g.response_ids)
+    prompt = len(g.prompt_ids) * g.size
+
+    whole = tiny_lm(seed=12)
+    whole.zero_grad(set_to_none=True)
+    ref_loss, _ = group_losses(
+        whole, g, device="cpu", token_denominator=resp, prompt_denominator=prompt
+    )
+    ref_loss.backward()
+    ref = lora_grads(whole)
+
+    split = tiny_lm(seed=12)
+    split.zero_grad(set_to_none=True)
+    got_value = group_backward(
+        split, g, which="grpo", device="cpu", token_denominator=resp,
+        prompt_denominator=prompt, seq_chunk=seq_chunk,
+    )
+    got = lora_grads(split)
+
+    assert got_value == pytest.approx(float(ref_loss.detach()), abs=1e-6)
+    for k in ref:
+        assert torch.allclose(got[k], ref[k], atol=1e-6, rtol=1e-5), (
+            k, seq_chunk, (got[k] - ref[k]).abs().max()
+        )
+    assert max(float(v.abs().max()) for v in ref.values()) > 0
+
+
+def test_a_sub_batch_keeps_the_PARENT_groups_advantages():
+    """The subtle way sub-batching could silently change the measurement.
+
+    GRPO advantages are the group's rewards centred and scaled WITHIN the group. If a
+    sub-batch recomputed them from its own slice it would centre a subset -- a different, and
+    for a two-sample slice a nearly meaningless, quantity -- and the run would complete with
+    plausible numbers. Here the rewards are chosen so that slicing changes the centring:
+    every slice of two has a different mean from the whole.
+    """
+    from selfevo.cluster_lora.interference_dump import group_backward
+
+    rng = torch.Generator().manual_seed(4)
+    prompt = torch.randint(0, VOCAB, (7,), generator=rng).tolist()
+    resp = [torch.randint(0, VOCAB, (5,), generator=rng).tolist() for _ in range(4)]
+    g = Group("g", "math", prompt, resp, [0.0, 0.0, 0.0, 1.0])
+    # Sanity: the whole group's advantages are not the concatenation of its slices' own.
+    from numpy import allclose as np_allclose
+
+    slice_own = Group("g", "math", prompt, resp[:2], [0.0, 0.0]).advantages()
+    assert not np_allclose(slice_own, g.advantages()[:2])
+
+    resp_d = sum(len(r) for r in g.response_ids)
+    prompt_d = len(g.prompt_ids) * g.size
+
+    whole = tiny_lm(seed=13)
+    whole.zero_grad(set_to_none=True)
+    ref_loss, _ = group_losses(
+        whole, g, device="cpu", token_denominator=resp_d, prompt_denominator=prompt_d
+    )
+    ref_loss.backward()
+    ref = lora_grads(whole)
+
+    split = tiny_lm(seed=13)
+    split.zero_grad(set_to_none=True)
+    group_backward(
+        split, g, which="grpo", device="cpu", token_denominator=resp_d,
+        prompt_denominator=prompt_d, seq_chunk=2,
+    )
+    for k in ref:
+        assert torch.allclose(lora_grads(split)[k], ref[k], atol=1e-6, rtol=1e-5), k
+
+
+def test_the_forward_token_budget_prices_the_measured_activation_cost():
+    """64 layers x 5120 wide is 655 KB of retained activations per token.
+
+    The probe batch's worst group at 16,712 padded tokens therefore retains 10.95 GB under
+    gradient checkpointing, on top of 61.02 GB of weights -- which is why the trunk is
+    sub-batched and not only the head.
+    """
+    from selfevo.cluster_lora.interference_dump import forward_tokens_for_budget
+
+    per_token = 64 * 5120 * 2
+    assert per_token / 1024 == pytest.approx(640.0)
+    assert 16_712 * per_token / 1e9 == pytest.approx(10.95, abs=0.05)
+    # The 6 GB default, and what it buys on the two groups that matter.
+    n = forward_tokens_for_budget(64, 5120, 6 * 1024**3)
+    assert n == 9830, n
+    # id=11 at T=2089: four of its eight sequences per forward, so two forwards, retaining
+    # 8,356 x 640 KB = 5.48 GB instead of 10.95. With 61.02 GB of weights and a 4 GB head
+    # chunk that leaves roughly 7 GB spare on an 80 GiB card.
+    assert n // 2089 == 4
+    assert 4 * 2089 * 64 * 5120 * 2 / 1e9 == pytest.approx(5.48, abs=0.02)
+    # The median group (T=875) still runs as ONE forward, so only the tail pays for the split.
+    assert n // 875 >= 8
+
+
+def test_an_unknown_loss_name_is_refused():
+    from selfevo.cluster_lora.interference_dump import group_backward
+
+    with pytest.raises(ValueError, match="unknown loss"):
+        group_backward(None, probe_group(), which="both", device="cpu",
+                       token_denominator=1, prompt_denominator=1)
+
+
+@pytest.mark.parametrize("seq_chunk,expected", [(1, 4), (2, 2), (3, 2), (4, 1), (99, 1)])
+def test_the_trunk_really_is_split_into_that_many_forwards(seq_chunk, expected):
+    """Sub-batching that produces the right ANSWER while never splitting saves nothing.
+
+    Every other test of ``group_backward`` asserts the gradient is unchanged -- and it is
+    unchanged when the split never happens, so those tests pass on a version that runs one
+    forward over the whole group and OOMs at 32B exactly as before. Measured: the mutation
+    forcing ``seq_chunk = group.size`` SURVIVED all of them. What has to be checked is the
+    number of trunk forwards.
+    """
+    import selfevo.cluster_lora.interference_dump as dump
+
+    g = probe_group(n_seq=4, n_prompt=8, n_resp=6)
+    m = tiny_lm(seed=14)
+    calls = []
+    real = dump.group_losses
+
+    def counting(model, group, **kw):
+        """Record each sub-batch's size, then delegate untouched."""
+        calls.append(group.size)
+        return real(model, group, **kw)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(dump, "group_losses", counting)
+        dump.group_backward(
+            m, g, which="grpo", device="cpu",
+            token_denominator=sum(len(r) for r in g.response_ids),
+            prompt_denominator=len(g.prompt_ids) * g.size, seq_chunk=seq_chunk,
+        )
+    assert len(calls) == expected, calls
+    assert sum(calls) == g.size, calls
+    assert max(calls) <= min(seq_chunk, g.size)
+
+
+def test_the_default_sub_batch_follows_the_activation_budget():
+    """With no explicit seq_chunk the split must come from the budget, not from the group.
+
+    A default that silently ran the whole group would be the OOM again, and would pass every
+    gradient-equality test.
+    """
+    import selfevo.cluster_lora.interference_dump as dump
+
+    g = probe_group(n_seq=4, n_prompt=8, n_resp=6)
+    m = tiny_lm(seed=15)
+    width = len(g.prompt_ids) + len(g.response_ids[0])
+    per_token = m.config.num_hidden_layers * m.config.hidden_size * 2
+    # A budget deliberately small enough that only two sequences fit per forward.
+    budget = 2 * width * per_token
+    calls = []
+    real = dump.group_losses
+
+    def counting(model, group, **kw):
+        """Record each sub-batch's size, then delegate untouched."""
+        calls.append(group.size)
+        return real(model, group, **kw)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(dump, "group_losses", counting)
+        dump.group_backward(
+            m, g, which="grpo", device="cpu",
+            token_denominator=sum(len(r) for r in g.response_ids),
+            prompt_denominator=len(g.prompt_ids) * g.size,
+            activation_budget_bytes=budget,
+        )
+    assert calls == [2, 2], calls

@@ -1243,6 +1243,18 @@ class WorkflowExecutor:
 
                 assert traj is None or isinstance(traj, dict), traj
 
+                # The gold seam for EVERY workflow, placed here because this is where the
+                # two ways of building a trajectory converge: RLVRWorkflow returns tensors
+                # directly, while the OpenAI-proxy workflow the live MATH runs use returns
+                # interactions that were turned into tensors just above. One call here means
+                # both reach the same tested padding, rather than two copies of it drifting
+                # in two files. Inert unless the dataset row carries a gold, so a run that
+                # did not ask for one is bit-identical.
+                if traj is not None and "gold_ids" in pending_task.data:
+                    from selfevo.gold.attach import attach_gold_from_data
+
+                    traj = attach_gold_from_data(traj, pending_task.data)
+
                 if traj is None:
                     should_accept_traj = False
                     reason = "returned_none"

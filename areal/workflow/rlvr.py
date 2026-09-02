@@ -177,4 +177,18 @@ class RLVRWorkflow(RolloutWorkflow):
             "attention_mask": torch.ones(len(seq), dtype=torch.bool),
             "rewards": torch.tensor(reward, dtype=torch.float32),
         }
-        return {k: v.unsqueeze(0) for k, v in res.items()}
+        out = {k: v.unsqueeze(0) for k, v in res.items()}
+        # The dataset's gold solution, when the adapter was asked to keep one. Two tensors,
+        # padded to THIS trajectory's width so that after collation they have exactly
+        # input_ids' shape and are packed and split by the same code as everything beside
+        # them -- a gold tensor of its own natural length passes check_trajectory_format
+        # with a warning and breaks one stage later, inside the engine.
+        #
+        # Imported locally and only on the gold path, so `areal` keeps working with no
+        # `selfevo` on the path for every run that does not ask for gold, exactly as the
+        # actor imports its routing seam.
+        if "gold_ids" in data:
+            from selfevo.gold.attach import attach_gold_from_data
+
+            out = attach_gold_from_data(out, data)
+        return out
