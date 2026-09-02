@@ -1475,12 +1475,26 @@ The third check did not succeed, and its failure is more informative than its su
 have been. A frontier 27B model reports $90.3$ on our code benchmark's name, so we scored it
 through our grader and obtained $0.251$ to $0.269$ across seeds. That gap does not measure our
 grader: $131$ to $136$ of $175$ generations, about $76\%$, exhausted the token budget and were
-graded as failures, and $43\%$ still truncated at a cap raised to $24{,}576$. A thinking-mode
-model at this scale does not fit the generation budget our harness allows, and a benchmark
-number quoted without its cap cannot be placed beside one measured under a different cap. We
-record the code grader as unvalidated against an external number, and note that its internal
-checks --- gold self-verifying on all 175 problems, a known-wrong set failing on all of them,
-and every mutant killed --- remain the only evidence for it.
+graded as failures, and $43\%$ still truncated at a cap raised to $24{,}576$. Raising the cap resolves it, and the
+resolution is the measurement. At $16{,}384$ tokens the model scores $0.251$ with $76\%$ of
+generations truncated; at $61{,}440$ it scores $0.749$, $[0.679, 0.807]$, with truncation down to
+$23.4\%$. Nothing about the grader changed between those two runs. The entire difference is the
+token budget.
+
+That corroborates the code grader rather than reproducing the published figure exactly, and the
+residual gap is accounted for. Forty-one generations still exhausted even the raised cap and were
+scored as failures, so $0.749$ is a lower bound and the attainable ceiling on this run is
+$172/175 = 0.983$. The published $0.903$ sits inside that band, and reaching it requires about
+two thirds of the truncated generations to have been correct, which is unremarkable given that
+only $12$ of the $134$ that finished were wrong. We therefore treat the code path as externally
+corroborated, alongside its internal checks: gold self-verifying on all 175 problems, a
+known-wrong set failing on all of them, and every mutant killed.
+
+The general point outlives this particular check. A code benchmark score is not interpretable
+without the generation budget that produced it, and a difference of four times in that budget
+moved the same model on the same problems through the same grader from $0.251$ to $0.749$. Almost
+no published card reports its cap. Our own baseline truncated on no problems at all, so its score
+is a property of the policy, but that is a fact we had to measure rather than assume.
 
 \subsection{Baseline scores}
 \label{sec:baseline}

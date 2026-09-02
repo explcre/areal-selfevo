@@ -3791,3 +3791,36 @@ Script: `/tmp/meds_targeting.py` (run under `~/venv_probe`). Recorded contrasts 
 analysis, for the record: `meds_minus_random_matched` = +0.000158 / +0.000964 / +0.009078 and
 `meds_minus_elrea` = -0.002556 / -0.003572 / -0.005761 at mcs 2 / 3 / 5. Both wrong-signed for the
 hypothesis at every setting.
+
+## The code grader IS corroborated once the token cap is raised, and the cap is the whole story (2026-09-02)
+
+Validation 3 was recorded as inconclusive at a 16,384-token cap. Raising the cap resolves it.
+Same model (Qwen3.8-27B, TP=4), same 175-problem bare-v6 slice, same bwrap grader, same
+temperature 0.2 / top_p 0.95. **Only `max_tokens` changed.**
+
+| max_tokens | accuracy | Wilson 95% | truncated | pass | wrong answer | runtime error | timeout |
+|---|---|---|---|---|---|---|---|
+| 16,384 | 0.251 | [0.193, 0.321] | 136/175 (78%) | 44 | -- | -- | -- |
+| 24,576 | -- | -- | 75/175 (43%) | -- | -- | -- | -- |
+| 61,440 | **0.749** | [0.679, 0.807] | 41/175 (23.4%) | 131 | 12 | 16 | 0 |
+
+**Verdict: CORROBORATED, not exactly reproduced, and the residual gap is fully accounted for.**
+41 generations still exhausted the raised cap and are scored as failures, so 0.749 is a LOWER
+BOUND and the attainable ceiling on this run is 172/175 = 0.983. The card's **90.3** sits inside
+that band. Reaching it needs about two thirds of the 41 truncated generations to have been
+correct, which is unremarkable given that only 12 of the 134 that finished were wrong.
+
+**The general finding, which outlives this check.** A code benchmark score is not interpretable
+without the generation budget that produced it. A 3.75x change in that budget moved the SAME model
+on the SAME problems through the SAME grader from 0.251 to 0.749, a swing of 50 points. Almost no
+published model card reports its cap. Any table that places our number beside a card number
+without cap-matching is comparing token budgets, not policies.
+
+**This also retires the earlier concern about our own baseline.** A0 truncated on ZERO of 175
+problems at 16,384 tokens and `cap_limited` was false, so its 0.3086 is a property of the policy
+rather than of the budget. That was measured, not assumed, and the contrast with a thinking-mode
+model on the identical harness is what makes it credible.
+
+Artifacts: `~/runs/validate_v3/noncap2_livecodebench_v6_seed0.json` and its `.records.jsonl`.
+Only seed 0 was run: the question was binary (does the grader agree with an external measurement)
+and further seeds would add precision to a number we will never report.
