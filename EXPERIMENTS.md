@@ -3855,3 +3855,160 @@ logprobs showed to be live.
 
 A0 itself is running: step 15 of a 2000-step bound at the time of writing, W&B online, four cards
 busy, `recover.mode=auto` at `freq_steps=25`.
+
+## 2026-09-02 — The unsolved branch is 33% of the silent channel on DeepMath, not 61%: the source lever is worth about half what the MATH figure implied
+
+The figure that motivates the whole source axis — "about 61% of the routed channel is UNSOLVED
+groups that have no target by construction" (`GOAL.md:1029`, `paper_src/results.tex`
+Table `tab:flip`) — was measured with **Qwen2.5-1.5B-Instruct**, on MATH, over `n=11` batches.
+The arm now trains on decontaminated DeepMath with **Qwen2.5-32B-Instruct**. Re-measured, from
+artifacts already on the box and with no GPU touched.
+
+**Source.** The four `*_group_fraction` series the actor logs unconditionally on every step
+(`areal/trainer/ppo/actor.py:1009-1017`), read out of the A0 baseline arm's own training logs:
+`runs/a0_math/train.log.1788336152` (32 steps), `train.log.1788344500` (202) and the live
+`train.log` (11) — 245 step-observations, all three confirmed to be running on
+`/home/ubuntu/data/deepmath_decontam`. Parser: `~/tmp/supply/measure_split.py`, which matches
+the cell delimiter in front of the key because `solved_group_fraction` is a SUBSTRING of
+`unsolved_group_fraction` and a bare grep for the first matches every row of the second — the
+retraction recorded on 2026-08-31.
+
+| run | task | model | n steps | silent | solved | unsolved | unclassified |
+|---|---|---|---|---|---|---|---|
+| paper `tab:flip` | GSM8K | 1.5B | 98 | 0.359 | 0.315 | 0.045 | n/a |
+| paper `tab:flip` | MATH | 1.5B | 11 | 0.419 | 0.164 | 0.255 | n/a |
+| **A0 baseline** | **DeepMath** | **32B** | **245** | **0.5046** | **0.3378** | **0.1668** | **0.0000** |
+| A0, second half | DeepMath | 32B | 123 | 0.5173 | 0.3415 | 0.1758 | 0.0000 |
+
+**Composition of the channel.** Solved 66.9%, unsolved 33.1% (second half: 66.0 / 34.0).
+Against 87.5 / 12.5 on GSM8K and 39.1 / **60.9** on MATH.
+
+**The split has moved substantially, and it moved AGAINST the lever.** The quantity the source
+axis is sized by — the unsolved share of the silent channel — is 33.1% here, roughly **half**
+the 60.9% the MATH column reports and the number `GOAL.md` and the directive both quote. As a
+fraction of all groups the unsolved branch is 0.167, between GSM8K's 0.045 and MATH's 0.255.
+At the live 64 groups per batch that is about **10.7 groups per batch with no target of any
+kind**, against the ~16 the 61% figure implies.
+
+**The confound is stated rather than buried: the MODEL changed too.** The paper's two columns
+hold the model fixed and vary the task; this row varies both, 1.5B → 32B and MATH →
+decontaminated DeepMath. A 32B model solves more, so a smaller share of its silent channel is
+unsolved, and this measurement cannot separate "DeepMath is easier for this model than MATH was
+for that one" from "scale shrinks the unsolved branch". Both readings point the same way for
+the decision at hand, which is why it is reported as one number and not as an attribution.
+
+**Worth recording on its own: the unclassified bucket is exactly 0.0000 on every one of the 245
+steps**, and the residual `silent - solved - unsolved - unclassified` is 0.000000. The
+composition ratio is therefore WELL-POSED here in a way it was not on GSM8K, where 20-28 points
+of the channel were neither solved nor unsolved but truncated, and where the quoted
+`solved/(solved+unsolved)` ratio was inflated by roughly 1.8x. On this arm no group is silent
+for a reason the correctness split cannot express, so `unsolved/silent` and
+`unsolved/(solved+unsolved)` are the same number.
+
+**Consequence for the plan.** The lever survives — a sixth of every batch still reaches the
+update with nothing to learn from, and that is the only branch a supplier can act on — but it is
+worth about half what the quoted figure claims on the arm we are actually training. The "~61%"
+phrasing must not be carried into any DeepMath result. `paper_src/method.tex` now records the
+re-measurement beside the GSM8K and MATH columns.
+
+## 2026-09-02 — The data supplier behind the batch-construction seam is now an axis, with gold as its first implementation
+
+Follow-on to the two MEDS nulls of the same day. Clustering separates neither gradients nor
+solve rates against a size-matched control, so per-cluster adapters and cluster-targeted
+generation are retired. What survives is the SOURCE axis, and it survives because it needs no
+clusters at all: it acts on the branch that has no target, which is located by the rule's own
+predicate and not by a partition.
+
+**The seam was reused, not replaced.** `selfevo/gold/substitute.py` keeps the splice, the two
+reach guards, the counters and the off-policy protocol; what moved is the four lines that read
+the gold. `selfevo/supply/` now holds the interface and four implementations:
+
+| source | file | where the row comes from |
+|---|---|---|
+| `gold` | `selfevo/supply/gold.py` | the dataset's own solution, exactly the arithmetic that was inline before |
+| `self` | `selfevo/supply/self_gen.py` + `store.py` | a correct rollout of the SAME prompt from an earlier step, or a higher-temperature resample (a declared seam, not implemented — it needs an engine) |
+| `corpus` | `selfevo/supply/corpus.py` | a solved example for this prompt from an offline pool |
+| `teacher` | `selfevo/supply/teacher.py` | a stronger model's VERIFIED completion; interface plus an offline replay client only — no model is served and no GPU is touched |
+
+**Prompt identity is the prompt-credit ledger's, reached two ways and asserted equal.**
+`unit_id` is batch-local by construction, so a store keyed on it would never find a prompt again
+on a later step — which is the entire premise of the self-generated source. Both
+`SupplyRequest.identity()` (a live row) and `key_for_prompt()` (an offline prompt) route to
+`selfevo/routing/prompt_credit.py::prompt_key`; a test pins that they agree, because two
+independent hashes agree today and diverge silently on the first change to either.
+
+**Every refusal is typed and counted, and no supplier may fabricate.** Eight reasons
+(`no_gold`, `no_fit`, `no_match`, `no_identity`, `not_verified`, `unavailable`, `empty`,
+`no_source`), each with its own counter, emitted as zeros as well as non-zeros so a one-source
+arm and a four-source arm produce the same key set. Two counter families rather than one:
+`refusals` is attempt-level and `unserved_groups` is group-level, so a group rescued by a later
+link of the chain is not reported as a loss of reach. `groups_no_gold` and `groups_no_fit` keep
+their old meaning exactly. The corpus refuses rather than serving another prompt's row, and the
+teacher REQUIRES a verifier at construction — a teacher is stronger, not correct, and on the
+unsolved branch an unverified completion is a wrong target that still looks like a target.
+
+**One treatment of the off-policy problem, not four.** No supplier writes `logprobs`. Every
+substituted row, whatever its source, takes the gold path's finite sentinel and is filled by
+`reconcile_gold_logprobs` from the trainer's own recomputed `prox_logp`. `is_gold` keeps its
+name because LSPO's router and the reconciler both read it, and what it means to them — "this
+row was not emitted by the current policy" — is true of every source; `source_ids`, a per-TOKEN
+`(B, T)` tensor, says which supplier served the row.
+
+**The routing decision is fixed, and its control is mandatory and non-vacuous.**
+`FixedSourcePolicy` is an explicit ordered chain (`gold, self, corpus, teacher`,
+cheapest-and-most-trusted first). Nothing learns it, deliberately: this project has now recorded
+three separate mechanisms matching a feature-blind control once the control was finally run, and
+a learned source router wired before the fixed one is measured would be the fourth.
+`MatchedSourceControl` replays the treatment's own realised source vector, permuted
+(`selfevo/routing/proportions.py`'s construction, one axis over). Three properties are asserted
+rather than assumed: the multiset matches exactly, the assignment does NOT (a control that
+returned the vector unshuffled would be the treatment wearing another label), and the control's
+constructor structurally admits no features. Both arms are compared through the same
+`ForcedSourcePolicy` — one attempt per group — so targeting is not confounded with the chain's
+fallback depth, and groups nothing could serve keep their slot as an empty decision so the
+proportions include the unserved rate. On the six-group fixture the treatment serves 6/6 and the
+permuted control serves fewer, which is the gap a learned router would have to beat.
+
+**Gating.** `suppliers=None` and `source_policy=None` are the OFF state and mean the gold-only
+path; `GoldRule.NONE` above that is still a true no-op, and it stays inert even when the
+supplier mapping is misconfigured, following `_safe_sizes`. `source_ids` is added only when the
+axis is engaged, so an arm that never asked for multiple sources pays no extra tensor through
+collation and packing.
+
+**Proof, entirely on CPU. No GPU was touched; GPUs 0-3 were running the A0 baseline and a
+validation throughout.**
+
+* **One-sample full-pipeline dry run first** (`~/tmp/supply/dryrun_one_sample.py`): one prompt
+  solved at an earlier step, harvested into the store, all four rollouts wrong now, served by
+  the `self` supplier, spliced, sentinel refused before reconciliation, reconciled against
+  `prox_logp`, then through the real `PPOActor._compute_advantages`. Masked advantage +4.50 on
+  the supplied row and -1.00 on a sibling; every advantage finite.
+* **Rollback asserted against a digest measured on the pre-refactor checkout**, not argued: a
+  copy of the tree with `selfevo/supply/` removed and the original `substitute.py` restored
+  produces `63ebf46e8afd6dbe7c03ec31f5dac2bfb17cb804cd70f5f3a8066fe55219534d` over every
+  returned tensor and every `gold/` metric of a three-group fixture, and the refactored default
+  path produces the same digest.
+* **42 tests** in `selfevo/tests/test_supply_sources.py`, all passing.
+* **Mutation: 25/25 killed, 0 survived, 0 skipped**, with kill attribution by test id
+  (`selfevo/tests/mutate_supply_sources.py`, against an rsynced copy sha256-verified identical
+  to live before the first mutation and after the last). The five mutations named in the brief
+  are all in the table and all killed: a refusing supplier that returns the unmodified row and
+  reports success; a substituted row that keeps the original response's token mask; an
+  off-policy path that leaves the rollout's own log-probabilities in place; a counter that never
+  increments (both the served and the unserved one); and a random control that silently reuses
+  the treatment's own choices.
+* **Full suite, from the run and not from a pytest cache.** With the delta:
+  **54 failed, 1916 passed, 12 skipped, 5 deselected, 4 xfailed** in 275s. With the delta
+  reverted (same tree, `selfevo/supply/` and the two new test files removed, `substitute.py`
+  restored): **54 failed, 1874 passed, 12 skipped, 5 deselected, 4 xfailed**. The two failure
+  SETS are byte-identical — `comm` reports nothing on either side — so the delta adds 42 passing
+  tests and changes no pre-existing outcome. The 54 are other agents' work in progress:
+  `test_cluster_lora_export` (20), `test_cluster_lora_engine` (14), `test_harness_route_trainer`
+  (11), `test_audit_2026_09_02` (3), `test_gold_batch_path` (3, all in the workflow/executor
+  ATTACH seam, none in substitution), `test_code_policy` (2), `test_cluster_lora_wired` (1).
+
+**What this does NOT establish.** Nothing about whether a non-gold source helps; that needs a
+GPU run. Nothing about the rate at which a store fills on a real run, which depends on the
+recurrence interval and is only observable in training — the counters exist to report it. And
+the teacher path is an interface exercised with an offline client, so a defect in a real served
+teacher would not be caught by this suite.
