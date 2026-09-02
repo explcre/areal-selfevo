@@ -56,24 +56,53 @@ def _clear_stats_tracker(clear_stats_tracker):
     """Apply the shared conftest fixture to every test in this module."""
 
 
-@pytest.fixture(scope="module")
-def world(tmp_path_factory):
-    """A world of one, over a FILE store so no port is taken from the live job.
+def start_world(store) -> bool:
+    """Initialise the world-of-one these tests run in, over a FILE store.
 
-    Torn down at the end of the module: the default process group is process-global state
-    and leaving it initialised would change how unrelated test modules behave.
+    A file store rather than a port, so nothing is taken from the live job.
+
+    Args:
+        store: Path for the rendezvous file.
+
+    Returns:
+        True if this call created the group, False if one was already initialised and this
+        call did nothing. The caller must not destroy a group it did not create.
     """
     if dist.is_initialized():
-        yield
-        return
-    store = tmp_path_factory.mktemp("pg") / "store"
+        return False
     dist.init_process_group(
         backend="gloo", init_method=f"file://{store}", rank=0, world_size=1
     )
+    return True
+
+
+def stop_world() -> None:
+    """Destroy the process group AND, in the same breath, the mesh built on it.
+
+    The two are one operation and separating them is the bug this exists to prevent: see
+    :func:`reset_mesh_cache`.
+    """
+    reset_mesh_cache()
+    dist.destroy_process_group()
+
+
+@pytest.fixture(scope="module")
+def world(tmp_path_factory):
+    """A world of one, torn down at the end of the module.
+
+    The default process group is process-global state and leaving it initialised would
+    change how unrelated test modules behave. Other modules reuse this fixture's helpers
+    rather than their own copies, so there is one implementation of the lifecycle and one
+    place where the mesh invariant is maintained.
+    """
+    store = tmp_path_factory.mktemp("pg") / "store"
+    if not start_world(store):
+        yield
+        return
     try:
         yield
     finally:
-        dist.destroy_process_group()
+        stop_world()
 
 
 def tiny_hf_config():
@@ -150,15 +179,42 @@ def make_engine(tmp_path, names=NAMES, *, seed=0, n_mbs=1, weight_decay=0.01):
 
 
 _MESH = None
+_MESH_GROUP = None
+
+
+def reset_mesh_cache() -> None:
+    """Forget the cached mesh, because the group it was built on is going away.
+
+    THE INVARIANT: **no module leaves a resolvable-looking mesh behind a destroyed process
+    group.** A ``DeviceMesh`` holds its subgroups by NAME, and ``destroy_process_group``
+    unregisters those names without touching the mesh object, so a cached mesh survives its
+    group looking perfectly well-formed and raises only when a subgroup is finally
+    resolved -- ``RuntimeError: Could not resolve the process group registered under the
+    name 1`` -- inside whichever module happens to run next. That makes the symptom
+    order-dependent while the cause is not, which is why the invariant is maintained here
+    and asserted directly rather than defended against downstream.
+    """
+    global _MESH, _MESH_GROUP
+    _MESH = None
+    _MESH_GROUP = None
 
 
 def _mesh():
-    """One shared device mesh: building a new one per engine creates new subgroups."""
-    global _MESH
-    if _MESH is None:
+    """One shared device mesh PER PROCESS GROUP: a new one per engine creates new subgroups.
+
+    Keyed on the live default group rather than merely memoised. ``stop_world`` already
+    clears the cache, and this makes the invariant hold even for a group destroyed by
+    something that never heard of this module -- the cache is invalid exactly when the group
+    it was built on is no longer the live one, which is a fact this function can check
+    rather than a discipline callers have to keep.
+    """
+    global _MESH, _MESH_GROUP
+    group = dist.group.WORLD if dist.is_initialized() else None
+    if _MESH is None or _MESH_GROUP is not group:
         from torch.distributed.device_mesh import init_device_mesh
 
         _MESH = init_device_mesh("cpu", (1, 1), mesh_dim_names=("dp_sp", "tp"))
+        _MESH_GROUP = group
     return _MESH
 
 
@@ -597,3 +653,67 @@ def test_with_a_roster_every_expert_exists_before_the_optimizer_does(tmp_path, m
     for name in NAMES:
         for _k, param in engine._selfevo_adapters.parameters(name):
             assert id(param) in optimised, f"{name} is outside model.parameters()"
+
+
+# ---------------------------------------------- the invariant, not the symptom -----------
+
+
+def test_no_mesh_outlives_the_process_group_it_was_built_on(world, tmp_path):
+    """A mesh cached across a ``destroy_process_group`` is a red suite in another module.
+
+    Asserted as the invariant rather than as an ordering, because the ordering is what
+    changes when someone adds a test file. Both counterfactuals are live, and the second is
+    the one that makes this worth a test at all:
+
+    * a stale mesh RAISES while no replacement exists, which is the red suite we saw;
+    * once a replacement mesh is built it stops raising, because the new mesh registers the
+      same subgroup NAMES -- so the stale mesh silently resolves to somebody else's group
+      instead. A cached mesh outliving its group is therefore not merely fragile, it is a
+      wrong-collective waiting for the right ordering, and clearing the cache is the only
+      thing that rules both out.
+
+    Placed last in the module on purpose -- it cycles the process group, and no test after
+    it should have to know that.
+    """
+    stale = _mesh()
+    assert _mesh() is stale, "the mesh is not cached at all, so this proves nothing"
+
+    stop_world()
+    assert _MESH is None, (
+        "the mesh outlived the group it was built on; the next module to call _mesh() "
+        "would get subgroups that no longer exist"
+    )
+    assert start_world(tmp_path / "store"), "the replacement group was not created"
+
+    with pytest.raises(RuntimeError, match="Could not resolve the process group"):
+        stale["dp_sp"].get_group()
+
+    fresh = _mesh()
+    assert fresh is not stale, "the cache handed back a mesh built on the destroyed group"
+    assert fresh["dp_sp"].get_group() is not None
+    assert stale["dp_sp"].get_group() is fresh["dp_sp"].get_group(), (
+        "the stale mesh was expected to start resolving to the REPLACEMENT group once one "
+        "registered the same subgroup name; if it does not, this file's account of why the "
+        "cache must be cleared is wrong and should be rewritten rather than relaxed"
+    )
+
+
+def test_the_mesh_cache_follows_the_group_even_when_nobody_calls_stop_world(
+    world, tmp_path
+):
+    """The second half of the fix, for a group destroyed by code that never heard of this.
+
+    ``stop_world`` clearing the cache is a discipline; keying the cache on the live group is
+    a fact. This test destroys the group WITHOUT clearing the cache, which is exactly what
+    another module's teardown would do, and requires ``_mesh()`` to notice.
+    """
+    global _MESH, _MESH_GROUP
+
+    stale = _mesh()
+    dist.destroy_process_group()  # deliberately NOT stop_world
+    assert _MESH is stale, "this test is meant to leave the cache populated"
+    assert start_world(tmp_path / "store2"), "the replacement group was not created"
+
+    fresh = _mesh()
+    assert fresh is not stale, "a mesh built on a destroyed group was handed back"
+    assert fresh["dp_sp"].get_group() is not None
