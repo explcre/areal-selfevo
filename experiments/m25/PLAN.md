@@ -262,6 +262,25 @@ dump takes ~25 minutes at `globalstep199`, then R-learned, then R-control config
 R-learned's measured proportions. R-rule last if time allows, since DyME and HPT are also cloned
 and their published numbers exist.
 
+## Eval protocol — fixed 2026-09-02, before any arm number exists
+
+`math_bench` carries a committed 250/250 held-out split (`--split search|report|all`), and the
+standing rule is that any decision READING eval uses `search`, with the full set reported once at
+the end. Running the baseline on all 675 would otherwise spend that budget at the beginning, since
+the baseline is the left-hand side of every arm comparison.
+
+Resolution, which costs nothing because per-problem records are written either way:
+
+- **Baseline A0 is scored on all 675** and reported in three labelled views — 675, search-250,
+  report-250. A baseline is a reference point, not a decision, and 675 gives the tightest CI for
+  the number every arm is measured against.
+- **Every arm DECISION reads `search` (250) only** — which arm looks better, whether to run
+  another, where a comparison lands.
+- **`report` (250) is quoted once, in the final write-up**, for arms already chosen.
+
+The test is not whether a number exists but whether it steers a choice. Wanting to look at
+`report` before the arms are settled is a signal the protocol has slipped, not a reason to look.
+
 ## Discipline
 
 - Config asserted from `process_env.json` inside every run, never the launcher line.
