@@ -3099,3 +3099,85 @@ is wrong and anyone reading it later would conclude the wrong corpus. The export
 `train_dataset.path` from the run's own `config.yaml` and refuses to label a batch it cannot
 resolve. Fire-tested five ways, including that a superseded run resolves to a DIFFERENT corpus,
 which is what proves the function reads its argument instead of returning a constant.
+
+## External validation of the eval harness (2026-09-02)
+
+No published score exists for Qwen2.5-32B-Instruct on either OlympiadBench or our LiveCodeBench
+slice, so until now nothing external had ever checked our graders and every arm comparison would
+have silently inherited any offset in them. Two proxies close that on the math side. **Bands were
+written down before the numbers existed** and nothing was adjusted afterwards.
+
+| check | model / set | protocol | target | band | measured | Wilson 95% | verdict |
+|---|---|---|---|---|---|---|---|
+| V1 | Qwen2.5-7B-Instruct, OlympiadBench 675 | t=0.6, pass@1, n=1 | 39.7 | 37.0-42.0 | **39.41** | [35.79, 43.14] | **PASS** |
+| V2 | Qwen2.5-32B-Instruct, MATH-500 | greedy, pass@1, n=1 | 84.0-84.6 | 82.0-86.0 | **82.40** | [78.82, 85.49] | **PASS** |
+
+**V1 is the check that matters and it lands 0.29 points from target.** It runs the SAME 675-problem
+file the arms use through the SAME grader; the target is LUFFY arXiv 2504.14945v2 Table 13, whose
+own eval parquet has an `olympiad_bench` split of exactly 675 rows, so this is the identical
+problem set rather than a similarly named one. Budgeted spread was ~2.3 points, since HPT scores
+LUFFY's own checkpoint at 54.1 where LUFFY reports 56.4. We used a fraction of it. 2 generations
+of 675 hit the cap, 12 produced no boxed answer, `cap_limited` false.
+
+**V2 passes but sits at the bottom edge of its band and this is stated rather than glossed.**
+82.40 is 1.6 below the published 84.0-84.6 and 1.4 below the third-party 83.8 reproduction, and
+the band it passed against (82.0-86.0) was one I chose, since the coordinator fixed a band only
+for V1. The Wilson interval [78.82, 85.49] does contain the published range, so the result is
+statistically consistent with it, and 0 of 500 generations truncated and 0 produced no boxed
+answer, so neither the cap nor the extractor is losing answers. The honest reading is that the
+answer-extraction path is validated but the point estimate runs low, and a second reading of
+this check should not treat 82.4 as confirming 84.3.
+
+Sampling parameters for both were asserted from each result file's own recorded `params`, not
+from the launcher line, and the served model id was checked to name the intended snapshot before
+either benchmark ran, so neither number can be the base-model-served-silently failure.
+
+### Validation 3, Qwen3.8-27B on LiveCodeBench: what the card does and does not say
+
+The claim that no published number can validate our code grader was wrong; the Qwen3.8-27B card
+reports LiveCodeBench v6 at **90.3** (Qwen3.6-27B 83.9, Qwen3.7-Plus 89.6, Opus4.6 Max 88.8).
+Two things had to be settled from the card's own text before spending a GPU, and both came out
+against assuming the obvious.
+
+**Which v6 is unstated.** The string "LiveCodeBench v6" occurs exactly once in the card, as a bare
+row label. The card contains no problem count, no date window, and none of the strings
+`release_v6`, `1055`, `175`, `incremental` or `cumulative`. Our set is the bare v6 *incremental*
+slice; the cache's `code_generation_lite` snapshot resolves both candidates exactly:
+
+| file | n | date range | platforms |
+|---|---|---|---|
+| test.jsonl | 400 | 2023-05-07 to 2024-03-02 | 210 atcoder, 181 leetcode, 9 codeforces |
+| test2-test5 | 480 | 2024-03-09 to 2025-01-04 | atcoder / leetcode |
+| **test6.jsonl** | **175** | **2025-01-04 to 2025-04-06** | **112 atcoder, 63 leetcode** |
+| union (release_v6) | **1055** | 2023-05-07 to 2025-04-06 | cumulative |
+
+`test6.jsonl` has md5 `7e54179572530b58002d14178c19886b`, which is exactly the `dataset_md5`
+recorded in our A0 result file, confirming our 175 is that slice. Since the card does not say
+which set 90.3 refers to, **both are scored and reported separately and labelled**. A number
+compared against the wrong set is worse than no number.
+
+**The protocol is unstated too.** The card carries fifteen footnotes, including sampling protocol
+for SWE-bench Pro, NL2Repo-Bench, DeepSWE 1.1, QwenSWEBench, MathVision, ClawEval-MM, Vision2Web,
+SWE-MM, WebArena-Verified and HLE. **None mentions LiveCodeBench.** Enumerated exhaustively rather
+than grepped. We therefore use the canonical LiveCodeBench defaults -- n=10, temperature 0.2,
+top_p 0.95, max_tokens 2000, pass@1 averaged over n -- and record that their protocol was
+unstated. Our harness has no `--n` flag, so n=10 is ten single-sample passes at seeds 0-9 whose
+accuracies are averaged; that is the definition of pass@1 averaged over n, not an approximation.
+
+**A risk recorded before any number exists.** This model's chat template sets `enable_thinking`
+true when undefined, so it emits a `<think>` trace by default. The canonical 2000-token cap
+predates thinking models and may truncate before any code is emitted, which would produce a low
+score that says nothing about the grader. Cap-binding diagnostics are therefore reported with the
+score, and if the cap binds materially a second pass at a non-binding cap is reported separately
+-- triggered by the cap binding, a mechanism, and never by the score's distance from 90.3.
+
+**This validates the grader, not our arms.** Qwen3.8-27B is a different and much newer model than
+the one we train, so agreement says our code path measures what the vendor's measures and says
+nothing about A0 or any R arm.
+
+**Context that decides part of the benchmark table.** The Qwen3.8-27B card reports no competition
+math benchmark at all, not AIME, HMMT, OlympiadBench or MATH-500, only visual math. Its code and
+agentic rows -- SWE-bench Pro 61.7, Terminal Bench 2.1 73.0, NL2Repo-Bench 42.3, DeepSWE 1.1 42.2
+-- are produced with the Claude Code harness at temperature 1.0 and a 256K context window, a
+scaffold we do not have. Those are not numbers our stack can approach or be compared against.
+LiveCodeBench v6 is the only row on that card we can meet on equal terms.
