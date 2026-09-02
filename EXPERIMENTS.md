@@ -2942,3 +2942,44 @@ two can agree by construction:
 
 All five failure modes are tested and refuse: variable unset, all-RL default, set but not the
 measured values, no measured file, and (passing) the correct measured values.
+
+## Pre-registration for the R arms, fixed before any R-arm number exists
+
+Written 2026-09-02 while A0 was at step ~175 and no routed arm had run. Nothing below was
+chosen after seeing a result.
+
+**Settings.** `router` per arm, `credit=prompt` (with `baseline="last"`; `self_mean` is not
+reachable from config), `solved_advantage=0.5` -- Result 7's operating point, so the credit fix
+is the single changed variable. Corpus, seed, batch shape, cap, `adv_norm=null`, `kl_ctl=0` and
+checkpoint cadence are A0's, by deriving the launcher from A0's rather than writing a new one.
+
+**Stop rule.** Halt an arm when `route/truncated_row_fraction` exceeds **0.20**, and report the
+step it crossed. The threshold is not moved after seeing data.
+
+**Evaluation point.** Both arms are compared at `min(149, first crossing in either arm)`. A
+comparison at different steps is not a comparison, so a control that has not crossed is NOT run
+on to 149 merely because it could.
+
+**Power, reported alongside the comparison and not instead of it.** A0's truncation with no
+routing at all drifted 7.8% -> 12.7% over 150 steps, so the 0.20 threshold sits about 1.6x the
+corpus floor and an early crossing is plausible for reasons that have nothing to do with the
+router. The paired comparison remains VALID at any step, but validity and informativeness are
+different properties. So at whatever step the comparison lands, also report whether **either R
+arm differs from A0 by more than the benchmark's own noise floor** (0.008 to 0.027 depending on
+the benchmark). If neither does, the arms have not yet diverged from the baseline and the
+R-learned versus R-control difference is being read inside a region where nothing is
+resolvable -- which must be said in those words. **A null at low power is not evidence of no
+effect and must not be written as one.**
+
+**The crossing PATTERN is the diagnostic, not the crossing.**
+
+| observed | reading |
+|---|---|
+| both arms cross at similar steps | the SFT constant or the corpus, not the router. The 1.5B data already showed the random control collapsing as completely as the learned one (99.8% versus 97.8%) |
+| only R-learned crosses | the router is doing something, and that is a finding in its own right |
+| neither crosses by 149 | the cleanest case; compare at 149 as planned |
+
+**Comparators.** R-control is the primary comparator for R-learned, because it is routed at the
+same realised proportions and differs only in WHICH unit gets which mode. A0 differs in routing
+entirely, so an R-learned-versus-A0 gap confounds "routing collapses termination" with "this
+router collapses termination". All three series are reported; the R pair carries the meaning.
