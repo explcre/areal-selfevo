@@ -1383,6 +1383,121 @@ modes recorded in this paper produced a plausible number from a process that exi
 none of them is detectable anywhere downstream of the score; these columns are the only place
 they are visible.
 
+\subsection{A fifth failure mode: a guard that could not fail}
+\label{sec:liveness}
+
+The four modes above all produce a plausible \emph{number} from a broken process. This one is
+worse in kind: it is a \emph{check} that was installed to catch a specific failure, that ran
+on schedule, that reported a healthy verdict every time --- and that would have reported the
+same healthy verdict if the thing it was watching for had been happening continuously. It was
+found by pointing it at a case whose answer is known in advance, which is the only way this
+class of defect is ever found.
+
+\paragraph{The check, and why it was there.} An arm trained with a LoRA adapter is served by
+the same endpoint as its base model, addressed by model id. If the id fails to resolve, the
+server answers HTTP 200 with the \emph{base} model, and the arm's accuracy is then the base
+model's accuracy wearing the arm's label. The periodic evaluation therefore carries an adapter
+liveness probe: six fixed prompts, one greedy completion from the adapter id and one from the
+base id, per-token logprobs from each, and a verdict from
+$\max_i |\,\ell^{\text{adapter}}_i - \ell^{\text{base}}_i|$ over the $6\times 32=192$ generated
+positions, against a threshold of $10^{-4}$.
+
+\paragraph{The negative control, which is the whole result.} We pointed that probe at the base
+model with no adapter, so the two things being compared were the same weights and the correct
+answer is \emph{not live, difference zero}. Table~\ref{tab:liveness} gives what it returned,
+beside a real adapter measured minutes earlier on the same server. The probe reported the base
+model as \textbf{live}, at a value that does not separate from a genuinely different set of
+weights. Every liveness verdict this project had recorded was therefore uninformative, and in
+particular the two that had been read as confirming an arm was not silently scoring its base.
+
+\begin{table}[t]
+\centering\small
+\caption{The liveness probe's two controls, measured against the training run's own rollout
+server while it was training. A working difference metric must report the first row at or near
+zero and must separate the two rows. The original probe does neither. The repaired probe is
+the same six prompts on the same server minutes later; its signal column is exactly zero on
+identical weights because the comparison is now between the same tokens in the same contexts.}
+\label{tab:liveness}
+\begin{tabular}{llccc}
+\toprule
+probe & control & compared quantity & value & verdict \\
+\midrule
+original & base vs.\ base (identical weights) & $\max|\Delta\ell|$  & $0.978$ & \textbf{live} \\
+original & adapter vs.\ base                  & $\max|\Delta\ell|$  & $1.007$ & live \\
+\midrule
+repaired & base vs.\ base (identical weights) & mean $|\Delta\ell|$ & $0.00000$ & not live \\
+repaired & adapter vs.\ base                  & mean $|\Delta\ell|$ & $0.0446$--$0.0534$ & live \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{The cause is that the two sides were never compared at the same tokens.} The probe
+generated \emph{independently} from each side and then subtracted the two logprob streams by
+position. Greedy decoding on a continuously batching server is not reproducible: the same
+weights produced different text on one of the six prompts, and after the argmax paths diverge,
+position $i$ holds a different token on each side, so the subtraction compares the logprob of
+one token under one model with that of another token under the other. Divergence happens only
+at near-ties, where the losing branch sits near $\log \tfrac12 = -0.693$ and the winning branch
+near $0$; the maximum therefore lands near $1$ regardless of the adapter. That is a saturation,
+not a measurement, and it explains the observation that first drew suspicion --- two evaluation
+points fifty steps and fifty adapter versions apart agreeing to five decimal places,
+$1.04127$ and $1.04126$.
+
+\paragraph{The run's own record already contained the refutation.} At steps $50$ and $100$ the
+probe reported a text-divergence fraction of $0.167$ --- exactly one prompt in six, the same
+same-weights flip we reproduced --- with $\max|\Delta\ell| = 1.041$. At step $150$ no prompt
+diverged, and the reported difference fell to $0.117$: a ninefold drop on an adapter that had
+only trained further. The series was tracking a coin flip in the decoder, not the weights.
+
+\paragraph{A second defect the control exposed, which no threshold could have absorbed.}
+Scoring one fixed $61$-token sequence on the base route $24$ times returned exactly two
+distinct logprob vectors, $22$ and $2$ times, differing by $0.605$ nats at a single position.
+It is not adapter leakage: the deviant vector is equidistant from the adapter and from the
+modal base. So the same-weights noise on this server is of the same order as the adapter
+signal, and the shipped threshold of $10^{-4}$ was never usable no matter how the difference
+was computed.
+
+\paragraph{What the repair has to do, and how it is held in place.} The probe now generates
+nothing. It \emph{scores} a fixed token sequence under each set of weights, so every compared
+position is the same token in the same context; it scores each side twice and takes the
+smallest cross-pair difference as signal and the largest within-side difference as an in-band
+negative control, so the server's own nondeterminism is measured beside the signal on every
+call rather than assumed; and it decides on the mean over positions rather than the maximum,
+which no single near-tie can carry. Pooled over six prompts and $465$ positions, base against
+base is exactly $0$ on seven independent sweeps while the adapter differs at $378$ of the $465$
+positions with a pooled mean of $0.0525$. The negative control is now a test rather than
+something someone has to think to run, and eight distinct mutations of the repaired probe ---
+including comparing a distribution with itself, defaulting the verdict when nothing was
+compared, and reporting the configured adapter name rather than the served one --- are each
+caught by it.
+
+\paragraph{One calibration item remains open, stated as a number.} The threshold is still
+$10^{-4}$ while the largest same-weights pooled mean we have measured is $0.0095$ and the
+weakest real adapter signal is $0.0446$. In $39$ negative controls against the intermediate
+form of the repair, one came back live at $0.0095$. The final form suppresses this --- $0$ of
+$27$ --- because the minimum over cross-pairs finds a clean pairing whenever only one scoring
+lands on the deviant path, but two scorings of the same side landing there together is not
+excluded, and at that point the threshold is the only thing standing between the base model and
+a verdict of live. The usable window is bounded below by $0.0095$ and above by $0.0446$.
+
+\paragraph{The cost of the check, and what does not explain it.} The evaluation's cost is
+rising: $104.2$, $139.5$ and $177.4$ wall seconds at steps $50$, $100$ and $150$, or $7.8\%$,
+$10.3\%$ and $12.9\%$ of training throughput. The obvious explanation, that generations lengthen
+as training proceeds, is false here: mean generated length is flat at $2289$, $2336$ and $2287$
+characters, the finish-reason mix is identical at $61$ stopped and $3$ truncated, all $64$
+problems graded with no failures at every point, and the log records no aborted requests. Nor
+is the run slowing: implied step time moves only from $26.7$ to $27.5$ seconds. The growth is
+confined to the benchmark generation phase ($88.7$, $123.9$, $155.4$ seconds) and is not the
+liveness probe, which after the repair is prefill-only and cannot grow with completion length
+at all. Three points cannot separate a linear trend from a saturating one, and step count and
+wall-clock are collinear here, so we do not claim a mechanism; we record that nothing measured
+so far bounds it, and that on the observed slope the cadence reaches the whole of training
+throughput near step $1900$. The remedy that follows from this is a ceiling on projected cost
+rather than a change to what an evaluation measures: project each point's duration from the
+previous point and the measured step time, and skip the point with a distinct status code when
+the projection exceeds a configured fraction of throughput, so that the gap is visible on the
+curve instead of silent.
+
 \subsection{Not yet measured}
 
 Stated explicitly so the gap is not mistaken for an omission: whether training on the
