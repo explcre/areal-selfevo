@@ -28,8 +28,14 @@ FOUR partitions on the same batch: (1) MEDS behavioural clusters, (2) size-match
   for every partition. Read it as internal coherence, not as a conflict measure.
 - **Adapter identity must be overlap-matched, not label-matched** — HDBSCAN renames clusters on
   every refit (churn 1.0 naive, 0.0-0.083 fixed). Any arm must report `churn` per step.
-- **The MEDS features need an extra forward pass**; its cost as a fraction of a step must be
-  counted against A0 for the matched-budget claim.
+- **The MEDS features need an extra forward pass, and its cost is MEASURED at ~half a step, not a third.**
+  Under LoRA the base is frozen, so a training step is ~2 forward-equivalents and the bound is `f/2`,
+  not the `f/3` a full fine-tune would give. CPU proxy across three widths: 0.319, 0.451, **0.483** of a
+  step as the model widens. **A0 must therefore be given half a step of extra budget** (as extra rollouts)
+  for the matched-budget arm A0'. Truncating the trace at the answer token is exact but **buys nothing**,
+  because MEDS reads the token inside `\boxed{}` which sits at the END of a math rollout. On GPU the
+  largest unimplemented saving is batching the trace (it currently runs one sequence at a time against a
+  packed microbatch); the largest realised saving is the one-row unembedding dot against a 151,936-row vocab.
 Per partition: pairwise cosine of per-cluster LoRA gradients, conflict rate, cancellation
 `||Σg_c||/Σ||g_c||`, sizes, bootstrap CI on mean cosine. Three checkpoints (early/mid/late) if
 available, since interference plausibly grows as the policy specialises.
