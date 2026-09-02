@@ -998,6 +998,8 @@ demotion, applied to training instead of to a supplier:
 - The same logic that retracted M7 applies here: **reach is a function of difficulty**, so a
   training set that is too easy suppresses the very signal the method exists to exploit.
 
+**MEASURED 2026-09-02: MATH is exhausted as a training corpus at 32B.** 384 Level 5 prompts (the hardest tier), G=8, step-49 adapter, 3,072 rollouts, 0 grader crashes. Raw histogram `k=0:78 k=1:28 k=2:24 k=3:19 k=4:11 k=5:16 k=6:18 k=7:37 k=8:153` -> **only 39.8% of groups are informative (0<k<8)**, against the >=60% the probe precondition requires. Level 4-5 gave 29.7%, so restricting to Level 5 bought +10 points **almost entirely by converting k=8 into partials while k=0 barely moved** (21.9% -> 20.3%). Extrapolating, no level restriction within MATH reaches 60%: **the corpus is the limit, not the tier.** Truncation was checked and is not the cause — 11.8% of responses hit the 1024 cap, but no kept group has all 8 truncated and 14 truncated responses still graded correct, so no kept group is a truncation artifact. A usable probe batch therefore needs over-sampling and filtering: 384 sampled -> 153 kept, **2.51 prompts per keeper**.
+
 **Math training corpus — needed.** Nothing harder than MATH-lighteval is on disk. The natural
 choice is **DeepMath-103K**, because it is what **LSPO (2607.27787) trained on**, and LSPO is arm
 A4 in `experiments/m25/PLAN.md` — matching its corpus makes that baseline comparison like-for-like
