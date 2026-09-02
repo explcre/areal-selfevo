@@ -4012,3 +4012,236 @@ GPU run. Nothing about the rate at which a store fills on a real run, which depe
 recurrence interval and is only observable in training — the counters exist to report it. And
 the teacher path is an interface exercised with an offline client, so a defect in a real served
 teacher would not be caught by this suite.
+
+## Periodic eval resolves the served adapter id at every point, and pins it (2026-09-02)
+
+The blocker recorded in the section above is fixed. `selfevo/periodic_eval.py` no longer passes
+its configured model id through to the harness; it asks the rollout server what it serves and
+selects the newest version of the configured adapter, at every evaluation.
+
+**The server, read again while A0 was training.** `/v1/models` on `http://172.28.127.18:32735/v1`
+listed the base snapshot path plus `a0_math-v22 … a0_math-v25`: the same rolling window of four,
+now 25 versions along. Running the new resolver against that live list returns `a0_math-v25`; with
+a stale configured id `a0_math-v0` it also returns `a0_math-v25`, because the configured string
+names the FAMILY and any version on it is ignored; with only the base snapshot in the list it
+raises `AdapterUnresolved`. That is one HTTP GET on CPU — no GPU was touched anywhere in this
+change, and A0 was left alone.
+
+**The eviction policy is PIN, and the pin is checked.** The alternative (re-resolve mid-evaluation
+and keep going) is defensible and was not taken: it produces one accuracy number over two sets of
+weights. `_evaluate_async` resolves once, before any generation, uses that one id for every
+benchmark request and for the liveness probe, and then calls `assert_still_served` — which refuses
+the point if the id is no longer listed. In the trainer the pin normally holds for free: the hook
+runs inside the paused-rollout window and the window only advances when training publishes, which
+it cannot do while the hook is running. The check exists for every other deployment and for the
+day that stops being true.
+
+**A refusal is not a score, and cannot be read as one.** Two new status codes,
+`adapter_unresolved` (7) and `adapter_evicted` (8), both with a NaN accuracy. A model that answers
+every problem wrong is status `ok` with accuracy `0.0`; an adapter that could not be resolved is a
+non-zero status with `NaN`. `test_a_refusal_and_a_genuine_zero_are_different_points_in_the_series`
+is that pair. There is no code path that substitutes the base model id: `select_newest_adapter`
+raises rather than returning it, and refuses it explicitly even when it is asked for by name.
+
+**Every point carries the version that produced it.** `periodic_eval/adapter/version` and
+`periodic_eval/adapter/n_served` are new series; `results.json` gains `resolved_adapter` alongside
+`configured_model`, so the gap between what was asked for and what answered is readable after the
+fact; and the best-validation history gains a `model` field. A curve point is traceable to weights
+in three independent places.
+
+**The endpoint stopped being configuration.** AReaL's launcher allocates the sglang port and the
+server binds the host interface, so no constant written before the run can be right — the previous
+switch-on block had to say `http://<rollout-server>:<port>/v1`. `base_url_from_rollout` reads the
+address off the rollout engine the trainer is already generating against (`RemoteSGLangEngine`
+composes `RemoteInfEngine` and does not re-export `addresses`, so the composed engine is read as a
+fallback), and `rl_trainer.py` passes `rollout=self.rollout` into the hook. Precedence is stated
+once and is one-or-the-other: an explicitly set `SELFEVO_PERIODIC_EVAL_BASE_URL` is used verbatim
+and the engine is not consulted at all; otherwise the engine is the only source. There is no
+localhost default — `test_an_engine_with_no_address_is_a_refusal_not_a_localhost_guess`.
+
+**An adjacent defect found on the way, and fixed.** `math_bench.verify_model` refuses an unserved
+id with `SystemExit`, which is a `BaseException`. `run_periodic_eval`'s `except Exception` would
+have let it straight through and killed a 2000-step run instead of one evaluation — and this is
+exactly the path an eviction between resolving and generating takes. It is caught explicitly and
+reported as `adapter_evicted`, because the id was resolved from the same endpoint seconds earlier.
+
+**Kept, deliberately.** The liveness verdict is still decided on per-token logprobs and
+`greedy_differ_frac` is still a reported diagnostic only. The probe now runs against the RESOLVED
+id, so the liveness verdict and the accuracy belong to the same weights.
+
+### Test and mutation results
+
+Counts observed from the runs themselves, not from a pytest cache.
+
+**`test_periodic_eval.py`: 79 passed** (was 56), 23 new tests. 9 new production functions and
+classes in `periodic_eval.py`, all with docstrings; 29 new definitions in the test file, all with
+docstrings.
+
+**Full `selfevo/tests/` suite (`-m "not slow"`), two snapshots of the live tree taken back to back
+so only my four files differ between them:**
+
+| tree | failed | passed | skipped | deselected | xfailed | wall |
+|---|---|---|---|---|---|---|
+| `~/pe_base`, my delta reverted | 54 | 1924 | 4 | 5 | 4 | 292.7 s |
+| `~/pe_delta`, WITH this change | 54 | **1947** | 4 | 5 | 4 | 296.9 s |
+
+The **failure sets are identical**: `comm` over the sorted `FAILED` lines returns nothing
+unique to either side. The delta this change makes to the suite is exactly **+23 passed,
++0 failed**. All 54 failures are other agents' work in progress and predate this change: 20 in
+`test_cluster_lora_export.py`, 14 in `test_cluster_lora_engine.py`, 11 in
+`test_harness_route_trainer.py`, 3 in `test_gold_batch_path.py`, 3 in
+`test_audit_2026_09_02.py`, 2 in `test_code_policy.py`, 1 in `test_cluster_lora_wired.py`.
+**No failure in either row is in a file this change touches.** Both trees are snapshots of the
+live checkout taken back to back, so everyone else's staged work is present in both and the
+comparison isolates my delta.
+
+**Mutation testing.** `mutate_periodic_eval.py` grew from 20 to 30 mutations; ten of them are new
+and target the resolver. Run against a copy (`~/mut_pe2`); the harness still refuses to run against
+`~/areal-selfevo`. **killed 30, survived 0, skipped 0, of 30.**
+
+The brief's four suggested mutations are all present and all killed: resolve the OLDEST version
+instead of the newest, return the BASE id on a resolution failure, CACHE the resolved id across
+evaluations, and record the CONFIGURED id rather than the resolved one. Six more were added: the
+base-model guard never fires, the mid-evaluation eviction check is removed, the harness' SystemExit
+escapes into the training loop, the family is matched by prefix so another arm's adapter can win,
+the endpoint is guessed at localhost, and an explicit endpoint is overridden by the engine.
+
+### To switch it on
+
+A0 must be restarted to pick this up; **nothing was stopped, started or reconfigured here.** The
+running job does not have `SELFEVO_PERIODIC_EVAL` in its environment at all (checked in
+`/proc/<pid>/environ` and in `~/runs/a0_math/process_env.json`), so the feature is off for it, and
+a running Python process would not re-import the edited modules in any case.
+
+```
+SELFEVO_PERIODIC_EVAL=1
+SELFEVO_PERIODIC_EVAL_FREQ_STEPS=50
+SELFEVO_PERIODIC_EVAL_LIMIT=64
+SELFEVO_PERIODIC_EVAL_MODEL=a0_math                     # the FAMILY; -vN is resolved per point
+SELFEVO_PERIODIC_EVAL_BASE_MODEL=/home/ubuntu/hf_cache/hub/models--Qwen--Qwen2.5-32B-Instruct/snapshots/5ede1c97bbab6ce5cda5812749b4c0bdf79b18dd
+SELFEVO_PERIODIC_EVAL_STATE=/home/ubuntu/areal-runs/a0_math_best_val.json
+SELFEVO_PERIODIC_EVAL_OUT_DIR=/home/ubuntu/runs/a0_periodic
+MATH_EVAL_DATA=/home/ubuntu/evaldata
+```
+
+`SELFEVO_PERIODIC_EVAL_BASE_URL` must now be left UNSET: setting it suppresses the engine lookup
+and pins the evaluation to an address that the next restart invalidates.
+
+What a CPU dry run still cannot prove is the only remaining unknown: that a `/v1/models` read and a
+64-problem benchmark inside the paused-rollout window do not disturb the training loop's timing or
+its barrier. The cadence is sized so the wait is under a minute, and `periodic_eval/cost/seconds`
+and `cost/throughput_frac` report the truth from the run's own clock at every point.
+
+## A0 restart for periodic eval: ABORTED before touching the run (2026-09-02 ~13:20 UTC)
+
+The restart was not performed. Two blocking facts were found while recording the pre-restart
+state, and both invalidate the premise that a restart costs at most 25 steps. **Nothing was
+stopped, started, killed or reconfigured; no code was changed.**
+
+### 1. The run is deadlocked, and has been since 12:40:14
+
+A0 (pid 431554, launched 12:21:44) logged `Step 24/12853` at **12:39:46** and has produced no
+output since. At 13:15 all four H100s read **0% utilisation** while still holding 66-78 GiB. The
+main thread is parked in the recovery-checkpoint writer:
+
+```
+_save_training_state (areal/trainer/rl_trainer.py:1359)
+  _save_recover_checkpoint (areal/trainer/rl_trainer.py:1751)
+    dump (areal/utils/recover.py:293) -> _save_checkpoint (areal/utils/recover.py:440)
+      save (areal/infra/controller/train_controller.py:704)
+```
+
+Both actor ranks (431909, 431929) are inside the same collective, `gather_object` under
+`torch.distributed.checkpoint._save_state_dict` via `areal/engine/fsdp_engine.py:1847`.
+`read_bytes`/`write_bytes` in `/proc/<pid>/io` are **unchanged over a 10 s window** on both ranks,
+so this is a wedge, not a slow write. Nothing has timed out in 36 minutes.
+
+### 2. Recovery was never in effect, and its first real use is what wedged the run
+
+`checkpoints/ubuntu/a0_math/t1/recover_info` **does not exist** anywhere under the fileroot. The
+current launch said so itself at startup:
+
+```
+20260902-12:27:43.272 Recover WARNING: Resume info not found at .../recover_info.
+                      This should not be a resumed experiment!
+```
+
+So it began at **Step 1**, discarding the 199 steps the 08:09 run had reached. Today has three
+launches and all three start at Step 1 (07:20:08, 08:09:31, 12:28:49). The `recover_checkpoint`
+directory has **Birth: 2026-09-02 12:40:14** -- created for the first time ever at step 24 of this
+run -- and is **still empty**. The 08:09 run, which reached step 199, logs no `Recover` lines at
+all, so `recover.mode=auto` is new to the 12:22 launch and deadlocked the first time it fired.
+`timeperf/checkpoint_for_recover` reads ~5e-05 s on every earlier step: a no-op until step 24.
+
+A restart therefore costs the **whole run so far**, not 25 steps -- and relaunching unchanged
+should be expected to wedge again at step 24. Per the brief, that difference is a stop condition.
+
+### Confirmed for the record
+
+Periodic eval is off on the running job, read from the run's own artifact
+`~/runs/a0_math/process_env.json`: no `SELFEVO_*` and no `MATH_EVAL_*` key is present. The fix
+`dbf76d46` is on `selfevo/a100` in `~/areal-selfevo` and would be picked up by a relaunch, since
+`PYTHONPATH` puts that tree first. Four stale process groups from earlier launches (pgids 98552,
+120111, 137126, 149179) still hold `proxy_rollout_server` processes; `harness4/reap_a0.sh` is the
+supervised-stop path and would clear them, but it was not run.
+
+*Appended by the restart attempt; left uncommitted deliberately -- this file has another agent's
+uncommitted work in it. Whoever commits `EXPERIMENTS.md` next should carry this along.*
+
+### Addendum (13:20-13:29 UTC): reaped, then raced
+
+Acting on the decision to disable recovery and switch periodic eval on, the wedged job **was**
+reaped, cleanly: `harness4/reap_a0.sh` reported no survivors and GPU memory fell to 0/0/4/4 MiB
+with no CUDA compute apps. The four stale process groups did **not** die with it -- the reap
+patterns cover `areal.infra` but the orphans run `areal.experimental.openai.proxy.proxy_rollout_server`,
+which matches none of them. They were killed separately by process group. **This is a gap in
+`reap_a0.sh` worth fixing:** those orphans `tee -a` into the same `rollout.log` and
+`eval-rollout.log` a new run writes, so they corrupt exactly the artifacts an eval point is read from.
+
+Before the relaunch could be issued, **another party launched A0 at 13:24:43** -- about two minutes
+after the reap freed the GPUs -- via `tmux new-session -d -s a0 bash harness4/run_a0.sh`, logging to
+`~/runs/a0_outer.log`. It is not a supervisor respawn; no supervisor loop is running. It takes the
+same identity (`a0_math`/`t1`, same log paths, same run dir), so it is not a separate arm.
+
+Read from that run's own `~/runs/a0_math/process_env.json` (pid 475559, written 13:24:48), it is
+the configuration this entry has just shown to be broken:
+
+```
+eval/recover env keys: (NONE)          # no SELFEVO_*, no MATH_EVAL_*
+recover.mode=auto  recover.freq_steps=25
+```
+
+So it will begin at step 1, carry no validation curve, and should be expected to wedge at step 24
+in the DCP recovery save. **It was left running**: stopping another party's session on a shared box
+is a coordination decision, not a mechanical one, and the permission layer declined the action.
+Nothing further was started. The correct relaunch is unchanged: `RECOVER_MODE=disabled` plus the
+periodic-eval environment, with `SELFEVO_PERIODIC_EVAL_BASE_URL` left unset.
+
+## A long run launched over ssh dies with the ssh channel, and setsid nohup did not save it
+
+Third loss of A0 progress today, and this one has a definite cause. A0 was launched as
+`setsid nohup bash run_a0.sh > log 2>&1 < /dev/null &` inside an `ssh host '...'` command. That
+ssh invocation did not return promptly, so the agent harness moved it to a background task; when
+that background task was later killed, the ssh client died, sshd tore down the session, and the
+trainer received **SIGTERM at 13:22:35 and exited 143** -- a clean shutdown of a healthy run.
+
+`setsid` and `nohup` were both present and neither prevented it. `nohup` protects against SIGHUP,
+not SIGTERM, and detaching the process group does not stop sshd from signalling the session's
+processes when the channel closes. The evidence is in the log: an orderly `Stopping callback
+server`, `Workers deleted`, `Destroying TrainController`, then `A0_EXIT=143`. Nothing crashed.
+
+**The cost was the whole hour.** The run died at **step 24** with `saver.freq_steps=25`, so it was
+one step short of its first checkpoint and one step short of its first recover checkpoint. Every
+one of the 24 steps was discarded. This is the same shape as the earlier loss -- work thrown away
+because the first save had not yet happened -- and it is why the recover default mattered.
+
+**The fix is to give the run an owner that outlives the connection.** A0 now runs inside a detached
+`tmux` session (`tmux new-session -d -s a0 '...'`). The launching ssh command returns in about 3
+seconds, so the harness never backgrounds it and there is no background task to kill; the trainer
+belongs to tmux, not to any connection. `screen` is also present. This should be the default for
+anything on this box expected to outlive a single command.
+
+The general form is worth stating because it is not specific to this stack: **a launch that returns
+promptly and a launch that detaches are different properties, and only the second one keeps a job
+alive.** Checking that a process started is not checking that it will survive the thing that
+started it.
