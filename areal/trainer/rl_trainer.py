@@ -1014,15 +1014,21 @@ class PPOTrainer:
     #
     # WHY HERE AND NOT IN THE ACTOR. ``PPOActor._route_groups`` already builds a
     # ``HarnessDispatcher``, and that is the right home for a harness action a ROUTER emits.
-    # It is the wrong home for one that has to change generation length, for two reasons
-    # that are properties of this stack rather than preferences. The actor runs in the train
+    # It is the wrong home for one that has to change generation length, for two reasons that
+    # are properties of this stack rather than preferences. The actor runs in the train
     # WORKERS -- ``self.actor`` is a ``TrainController`` that dispatches ``compute_advantages``
     # over RPC -- so at ``fsdp:d2p1t1`` there would be two dispatchers, each seeing half the
-    # batch and each keeping its own active variant, which diverge silently. And the thing a
+    # batch and each keeping its own active variant, diverging silently. And the thing a
     # generation budget must be written into, ``workflow_kwargs``, is a driver-side dict that
-    # ``RolloutController.submit`` serialises into EVERY rollout task, so the worker could not
-    # reach it. Here there is exactly one dispatcher, it sees the whole batch, and the value
-    # it writes is on the path to the next rollout.
+    # ``RolloutController.submit`` serialises into EVERY rollout task, so no worker can reach
+    # it. Here there is exactly one dispatcher, it sees the whole batch, and the value it
+    # writes is on the path to the next rollout.
+    #
+    # The selector is consulted through the dispatcher, not around it: ``observe()`` opens the
+    # decision epoch and ``HarnessDispatcher.apply`` calls the selector, catching
+    # ``HarnessSelectionRefused`` and recording ``refused=True``. So a refusal is a logged
+    # outcome of a PROPOSE rather than something this loop decides not to send, and the
+    # treatment and the control are driven through an identical call site.
 
     def _harness_group_routing(self):
         """This run's ``GroupRoutingConfig`` if it configures a harness arm, else ``None``.
@@ -1056,7 +1062,8 @@ class PPOTrainer:
         """
         self._harness = None
         self._harness_selector = None
-        self._harness_observation = None
+        self._harness_rows = None
+        self._harness_summary = None
         self._harness_budget = None
         self._harness_log_path = None
         gr = self._harness_group_routing()
@@ -1113,10 +1120,9 @@ class PPOTrainer:
             The budget written, in tokens.
 
         Raises:
-            ValueError: If the kwargs do not already carry ``max_completion_tokens``.
+            ValueError: If the kwargs do not carry ``max_completion_tokens``, or the active
+                variant carries no budget in ``settings``.
         """
-        from selfevo.harness.selectors import budget_of
-
         if "max_completion_tokens" not in workflow_kwargs:
             raise ValueError(
                 f"workflow_kwargs {sorted(workflow_kwargs)} has no "
@@ -1125,30 +1131,42 @@ class PPOTrainer:
                 f"other key would change nothing about the rollout while the run reported "
                 f"harness switches."
             )
-        budget = budget_of(self._harness.active)
+        variant = self._harness.active
+        budget = variant.settings.get("max_new_tokens")
+        if not isinstance(budget, int) or isinstance(budget, bool) or budget < 1:
+            raise ValueError(
+                f"variant {variant.name!r} carries settings['max_new_tokens']={budget!r}; a "
+                f"harness arm on this path needs a positive integer generation budget, or "
+                f"dispatching to it would not change the rollout"
+            )
         workflow_kwargs["max_completion_tokens"] = budget
         self._harness_budget = budget
         return budget
 
     def _harness_record(self, rollout_batch: list[dict[str, Any]]) -> None:
-        """Measure how much of this batch reached the ACTIVE budget, for the next decision.
+        """Measure per-group truncation against the ACTIVE budget, for the next decision.
 
-        Uses ``_truncated_rows``' definition -- response tokens at or above the cap --
-        imported rather than restated, so the selector's input cannot drift from the
-        quantity the actor reports. ``ppo_actor/no_eos_ratios`` is deliberately NOT used:
-        it is ``seqlens == attn_mask.shape[-1]``, a comparison against the row's own padded
-        batch width, so it counts the longest row of every batch whether or not anything
-        truncated.
+        Produces exactly the rows ``TruncationStepLimitSelector.observe`` expects: one
+        mapping per routed group, keyed as ``selfevo.observability.GroupFeatures.as_extra``
+        keys them. Built here rather than reusing the actor's ``group_features`` because that
+        runs in the train workers on half a batch each, and because it measures against
+        ``PPOActorConfig.max_new_tokens``, a config constant that stops describing the run the
+        moment the budget moves.
+
+        The truncation test is ``_truncated_rows``' -- response tokens at or above the cap --
+        imported rather than restated so the selector's input cannot drift from the quantity
+        the actor reports. ``ppo_actor/no_eos_ratios`` is deliberately NOT used: it is
+        ``seqlens == attn_mask.shape[-1]``, a comparison against the row's own padded batch
+        width, so it counts the longest row of every batch whether or not anything truncated.
 
         Args:
             rollout_batch: The trajectories just produced, one dict per prompt group.
 
         Raises:
             ValueError: If a trajectory carries no ``loss_mask``, or the batch is empty.
-            TypeError: If a ``loss_mask`` is neither a tensor nor an ``RTensor``. Every one
-                of these is refused rather than skipped, because the failure mode of a
-                silently unmeasurable batch is a truncated fraction of 0.0 -- which reads as
-                a real observation, sends the selector down the ladder, and cannot be told
+            TypeError: If a ``loss_mask`` is neither a tensor nor an ``RTensor``. Refused
+                rather than skipped: an unmeasurable batch would report truncation 0.0, which
+                reads as a real observation, proposes a SHORTER budget, and cannot be told
                 apart from a batch that genuinely did not truncate.
         """
         if self._harness is None:
@@ -1160,8 +1178,8 @@ class PPOTrainer:
         from areal.trainer.ppo.actor import _truncated_rows
 
         budget = int(self._harness_budget)
+        rows: list[dict[str, float]] = []
         lengths: list[int] = []
-        truncated: list[bool] = []
         for traj in rollout_batch:
             mask = traj.get("loss_mask") if isinstance(traj, dict) else None
             if mask is None:
@@ -1180,18 +1198,22 @@ class PPOTrainer:
             if mask.ndim == 1:
                 mask = mask.unsqueeze(0)
             lengths.extend(int(x) for x in mask.sum(dim=-1).tolist())
-            truncated.extend(bool(x) for x in _truncated_rows(mask, budget).tolist())
+            rows.append(
+                {"truncated_fraction": float(_truncated_rows(mask, budget).float().mean())}
+            )
 
-        if not lengths:
+        if not rows:
             raise ValueError(
-                "the rollout batch produced no rows, so there is nothing for the harness "
+                "the rollout batch produced no groups, so there is nothing for the harness "
                 "selector to observe"
             )
-        self._harness_observation = {
-            "truncated_fraction": sum(truncated) / len(truncated),
+        self._harness_rows = rows
+        self._harness_summary = {
+            "truncated_fraction": sum(r["truncated_fraction"] for r in rows) / len(rows),
             "mean_response_len": sum(lengths) / len(lengths),
             "max_response_len": max(lengths),
             "min_response_len": min(lengths),
+            "n_groups": len(rows),
             "n_rollouts": len(lengths),
             "budget": budget,
         }
@@ -1199,79 +1221,74 @@ class PPOTrainer:
     def _harness_route(
         self, workflow_kwargs: dict[str, Any] | None, global_step: int
     ) -> None:
-        """Consume the previous batch's observation, move the budget at most once, and log.
+        """Observe the previous batch, let the dispatcher decide once, and log.
 
-        One observation opens one epoch, and the epoch IS the training step, so the
-        selector's one-observation-one-decision contract and the trainer's loop are the same
-        boundary rather than two that have to be kept in step by hand. Calling this per group
-        instead would open an epoch per group, have every call after the first refused, and
-        decide on one group's features while the log looked identical.
+        One observation per training step, taken BEFORE the rollout it governs. That is the
+        only ordering in which a decision can reach a rollout: the budget written here is the
+        budget the batch below is generated under, and the features it was taken on came from
+        the batch generated under the previous one. Calling this per group instead would open
+        an epoch per group and decide on one group's features while the log looked identical.
 
-        A refusal does not propose. ``HarnessDispatcher.apply`` treats a PROPOSE it cannot
-        act on as a caller error, so a refusal is expressed as ``HarnessAction.NONE`` and is
-        still CONSUMED: a step where nothing moved emits the same key set as one where
-        something did, which is what lets two arms share a panel.
+        The refusal path is the dispatcher's. A PROPOSE is issued whenever an observation
+        exists, and ``HarnessDispatcher.apply`` catches ``HarnessSelectionRefused`` and
+        records ``refused=True`` with the rule's own words, so the dead band, the ends of the
+        ladder and a control's scheduled STAY are all counted the same way for both arms.
 
         Args:
             workflow_kwargs: The kwargs the next rollout is built from; mutated in place.
-            global_step: The decision epoch.
+            global_step: The training step, recorded as the decision's epoch.
         """
         if self._harness is None:
             return
 
         from selfevo.routing.base import HarnessAction
 
-        obs = self._harness_observation
+        rows = self._harness_rows
+        summary = self._harness_summary or {}
         record: dict[str, Any] = {
             "global_step": global_step,
             "active_before": self._harness.active.name,
             "budget_before": self._harness_budget,
-            "move": 0,
         }
-        if obs is None:
-            record["reason"] = "no observation yet: nothing has been generated"
-        elif self._harness_selector is None:
-            record["reason"] = "no selector configured; the variant set is fixed"
-            record.update(obs)
+        record.update(summary)
+        if rows is None or self._harness_selector is None:
+            action = HarnessAction.NONE
+            record["reason"] = (
+                "no observation yet: nothing has been generated"
+                if rows is None
+                else "no selector configured; the variant set is fixed"
+            )
         else:
-            decision = self._harness_selector.observe(
-                global_step,
-                obs["truncated_fraction"],
-                variants=self._harness.variants,
-                current=self._harness.active,
-            )
-            record.update(obs)
-            record.update(
-                move=decision.move, reason=decision.reason, blocked=decision.blocked
-            )
+            self._harness_selector.observe(rows)
+            action = HarnessAction.PROPOSE
 
-        action = (
-            HarnessAction.PROPOSE if record["move"] != 0 else HarnessAction.NONE
-        )
         batch = self._harness.consume([action])
         budget = self._harness_apply_budget(workflow_kwargs)
+        first = batch.records[0] if batch.records else None
         record.update(
             action=action.name,
             active_after=self._harness.active.name,
             budget_after=budget,
             switches=batch.switches,
+            refused=bool(first.refused) if first is not None else False,
+            reason=record.get("reason") or (first.reason if first is not None else ""),
         )
 
         # The full key set every step. A sentinel of -1 for the two observed quantities
         # before the first rollout, because it is outside their range and so cannot be read
-        # as a measurement, whereas a 0.0 would look like a batch that never truncated.
+        # as a measurement, whereas 0.0 would look like a batch that never truncated.
         metrics = batch.as_metrics()
         if self._harness_selector is not None:
             metrics.update(self._harness_selector.as_metrics())
         metrics.update(
             {
                 "route/harness_budget": float(budget),
-                "route/harness_has_observation": float(obs is not None),
+                "route/harness_has_observation": float(rows is not None),
                 "route/harness_observed_truncation": float(
-                    obs["truncated_fraction"] if obs else -1.0
+                    summary.get("truncated_fraction", -1.0)
                 ),
                 "route/harness_observed_mean_len": float(
-                    obs["mean_response_len"] if obs else -1.0
+                    summary.get("mean_response_len", -1.0)
                 ),
             }
         )
@@ -1285,17 +1302,18 @@ class PPOTrainer:
             fh.write(json.dumps(record) + "\n")
             fh.flush()
         logger.info(
-            "harness step %d: %s -> %s (%d tokens), move=%d, %s",
+            "harness step %d: %s -> %s (%d tokens), switches=%d, %s",
             global_step,
             record["active_before"],
             record["active_after"],
             budget,
-            record["move"],
-            record.get("reason", ""),
+            record["switches"],
+            record["reason"],
         )
-        # Consumed exactly once: leaving it in place would let a step with no rollout reuse
-        # the previous step's batch as if it were fresh.
-        self._harness_observation = None
+        # Consumed exactly once: leaving them in place would let a step with no rollout
+        # decide again on the previous step's batch as if it were fresh.
+        self._harness_rows = None
+        self._harness_summary = None
 
     def _save_training_state(
         self,

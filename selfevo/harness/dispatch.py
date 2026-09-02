@@ -51,9 +51,41 @@ __all__ = [
     "DispatchRecord",
     "DispatchBatch",
     "HarnessDispatcher",
+    "HarnessSelectionRefused",
     "round_robin",
     "build_dispatcher",
 ]
+
+
+class HarnessSelectionRefused(ValueError):
+    """A selector declined to move the harness, for a reason in the DATA not in the code.
+
+    The seam that lets a feature-driven rule say "not now" without lying and without
+    killing a run. :meth:`HarnessDispatcher.apply` refuses a selector that returns the
+    already-active variant, and it is right to: a proposal that silently resolves to the
+    current scaffold is a no-op the log reports as a proposal, which is the failure this
+    whole axis exists to make impossible. But that guard demands a TOTAL rule -- every
+    PROPOSE must move -- and the rule this project actually wants to test is not total.
+    A rule keyed on ``truncated_fraction`` has three answers, not two: longer, shorter,
+    and "the feature names no direction", and the third is the ORDINARY case rather than
+    an error. Under ``round_robin`` that case does not exist, which is precisely why
+    round-robin cannot test the claim.
+
+    So the two kinds of "no" are separated by TYPE rather than merged:
+
+    * a DATA condition -- the feature is in the dead band, the set has nothing longer to
+      move to -- raises this, and :meth:`HarnessDispatcher.apply` turns it into a
+      :class:`DispatchRecord` with ``changed=False``, ``refused=True`` and the selector's
+      own words. The run continues, the refusal is counted in ``route/harness_refused``,
+      and it is never counted as a switch.
+    * a PROGRAMMER condition -- the features never arrived, the caller's variant set and
+      the dispatcher's disagree, the selector returned something unconfigured -- still
+      raises an ordinary ``ValueError`` and still stops the run, because a decision taken
+      on absent or contradictory evidence is not a decision.
+
+    Subclasses ``ValueError`` so a caller already handling selector errors keeps working;
+    ``apply`` catches it BY TYPE, so no other ``ValueError`` is swallowed by the seam.
+    """
 
 
 def round_robin(
@@ -115,6 +147,14 @@ class DispatchRecord:
             a PROPOSE that could not move is the failure mode this whole guard exists for.
         reason: Short human-readable justification, in the same spirit as
             ``RoutingDecision.reason``.
+        refused: Whether a PROPOSE was DECLINED -- by the dispatcher because there was
+            nowhere to go, or by the selector because the feature named no direction.
+            Distinct from ``not changed``, which is also true of an inert NONE and of a
+            proposal aggregated behind a switch that already happened this batch. A
+            feature-driven arm spends most of its decisions declining, so without this
+            field those steps would be indistinguishable in the logs from steps on which
+            no proposal ever arrived -- and "the rule looked and said no" is the single
+            most informative thing such an arm does.
     """
 
     action: HarnessAction
@@ -122,6 +162,7 @@ class DispatchRecord:
     after: str | None
     changed: bool
     reason: str
+    refused: bool = False
 
 
 @dataclass(frozen=True)
@@ -159,6 +200,21 @@ class DispatchBatch:
         """
         return sum(1 for r in self.records if r.changed)
 
+    @property
+    def refusals(self) -> int:
+        """How many records were proposals that were declined rather than acted on.
+
+        The companion to :attr:`switches`, and what makes a feature-driven arm readable
+        from its logs. ``propose`` counts what the router asked for and ``switches``
+        counts what the harness did; the gap between them is made of two very different
+        things -- decisions the rule DECLINED, and duplicate proposals aggregated behind
+        a switch that already happened -- and only the first is a statement about the
+        rule. An arm whose refusals are all "nothing longer to move to" is an arm whose
+        variant set is too small for its rule, and that is a configuration error a run
+        should not have to be re-read to discover.
+        """
+        return sum(1 for r in self.records if r.refused)
+
     def count(self, action: HarnessAction) -> int:
         """How many records carried ``action``."""
         return sum(1 for r in self.records if r.action is action)
@@ -185,6 +241,7 @@ class DispatchBatch:
             "route/harness_switches": float(self.switches),
             "route/harness_n_variants": float(len(self.variant_names)),
             "route/harness_can_evolve": float(self.can_evolve),
+            "route/harness_refused": float(self.refusals),
         }
         for name in self.variant_names:
             out[f"route/harness_active_{name}"] = float(name == self.active)
@@ -264,11 +321,12 @@ class HarnessDispatcher:
     def selector(self):
         """The rule that picks the next variant on PROPOSE.
 
-        Exposed because a feature-driven selector carries the counters an arm is REPORTED
-        on -- how many decisions it took, how many it refused -- and a matched control is
-        configured from the treatment's realised rates. Reading them off the object that
-        made the decisions is the alternative to recomputing them from a log, which is how
-        a control comes to be matched to a number the treatment never produced.
+        Exposed because a feature-driven selector carries the counters an arm is REPORTED on
+        -- how many decisions it took, how many it declined -- and because the matched control
+        is constructed from the treatment's realised ``moves`` and ``decisions``. Reading them
+        off the object that made the decisions is the alternative to recomputing them from a
+        log, which is how a control comes to be matched to a number the treatment never
+        produced.
         """
         return self._selector
 
@@ -303,7 +361,12 @@ class HarnessDispatcher:
 
         Returns:
             A :class:`DispatchRecord`. A PROPOSE that could not move reports
-            ``changed=False`` with the reason, and is NEVER reported as a switch.
+            ``changed=False`` with the reason, and is NEVER reported as a switch. That
+            covers the two DATA conditions as well: a selector that raises
+            :class:`HarnessSelectionRefused` -- the feature named no direction, or the
+            set had nothing in the direction it named -- yields a record with
+            ``refused=True`` carrying the selector's own explanation, rather than
+            stopping the run over a decision the rule was entitled to make.
 
         Raises:
             ValueError: If ``action`` is not a :class:`~selfevo.routing.base.HarnessAction`;
@@ -335,9 +398,26 @@ class HarnessDispatcher:
                 False,
                 f"proposal refused: {len(self._variants)} variant(s) configured, "
                 "nothing to move to",
+                refused=True,
             )
 
-        chosen = self._selector(self._variants, self._active)
+        try:
+            chosen = self._selector(self._variants, self._active)
+        except HarnessSelectionRefused as refusal:
+            # A DATA condition, not a bug: the rule looked and did not want to move, or
+            # wanted to and found the set had nothing in that direction. Recorded with
+            # the rule's own explanation and counted as a refusal, never as a switch.
+            # Caught by type, so every other ValueError the selector can raise -- an
+            # unconfigured variant, a set the caller disagrees about, features that never
+            # arrived -- still stops the run.
+            return DispatchRecord(
+                action,
+                before,
+                before,
+                False,
+                f"selector refused: {refusal}",
+                refused=True,
+            )
         if chosen not in self._variants:
             raise ValueError(
                 f"selector returned {getattr(chosen, 'name', chosen)!r}, which is not in "
@@ -450,11 +530,11 @@ def build_dispatcher(
             :data:`selfevo.harness.base.VARIANTS`. ``None`` or empty means no harness arm.
         selector: Name of a rule in :data:`selfevo.harness.selectors.SELECTORS`, or ``None``
             for :func:`round_robin`. Resolved HERE rather than by the caller so that "which
-            selectors exist?" has one answer, the same way variant names do; a trainer that
-            did its own lookup would be a second place for an unknown name to be dropped.
-        selector_args: Keyword arguments for the selector factory. This is how a matched
-            CONTROL is configured from the treatment's measured move rate, so it carries
-            numbers rather than a mode name.
+            selectors exist?" has one answer, the same way variant names do; a trainer doing
+            its own lookup would be a second place for an unknown name to be dropped.
+        selector_args: Keyword arguments for the selector factory. This is how the matched
+            CONTROL is configured from the treatment's measured ``moves`` and ``decisions``,
+            so it carries counts rather than a mode name.
 
     Returns:
         A :class:`HarnessDispatcher`, or ``None`` when no variant set was configured.
@@ -463,9 +543,6 @@ def build_dispatcher(
         ValueError: If a name is not registered. Skipping an unknown name would silently
             shrink a two-variant arm to a one-variant one, which reports ``can_evolve``
             False and trains exactly like the control under a name that says otherwise.
-            Also if a selector is named without a set it can walk: a feature-driven rule
-            over fewer than two rungs refuses every decision, which is a control arm and
-            must be configured as one rather than arrived at by accident.
     """
     if not names:
         return None
@@ -476,13 +553,9 @@ def build_dispatcher(
             f"Dropping an unknown name would shrink the variant set and silently turn a "
             f"harness-evolving arm into its own control"
         )
-    variants = [VARIANTS[n] for n in names]
     rule = None
     if selector is not None:
-        from selfevo.harness.selectors import build_selector, ladder
+        from selfevo.harness.selectors import build_selector
 
         rule = build_selector(selector, selector_args)
-        # Refuses here, before any GPU is touched, on a set the rule cannot walk: a variant
-        # with no generation budget, two rungs of the same length, or fewer than two rungs.
-        ladder(variants)
-    return HarnessDispatcher(variants, selector=rule)
+    return HarnessDispatcher([VARIANTS[n] for n in names], selector=rule)

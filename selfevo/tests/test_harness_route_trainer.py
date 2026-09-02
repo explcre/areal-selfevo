@@ -139,7 +139,9 @@ def test_the_dead_band_leaves_the_budget_exactly_where_it_was(tmp_path):
     t._harness_record(_batch([160, 160, 100, 100, 100, 100, 100, 100]))
     t._harness_route(kw, 2)
     assert kw["max_completion_tokens"] == 160
-    assert t._harness_selector.refusals == 1 and t._harness_selector.decisions == 2
+    assert t._harness_selector.decisions == 2 and t._harness_selector.moves == 1
+    rows = [json.loads(line) for line in open(t._harness_log_path)]
+    assert rows[-1]["refused"] is True and "dead band" in rows[-1]["reason"]
 
 
 def test_truncation_is_measured_against_the_ACTIVE_budget_not_a_constant(tmp_path):
@@ -156,11 +158,11 @@ def test_truncation_is_measured_against_the_ACTIVE_budget_not_a_constant(tmp_pat
     t._harness_record(_batch([96] * 8))
     t._harness_route(kw, 1)  # now at gen160
     t._harness_record(_batch([160] * 8))
-    assert t._harness_observation["truncated_fraction"] == 1.0
+    assert t._harness_summary["truncated_fraction"] == 1.0
     t._harness_route(kw, 2)  # -> gen256
     assert t._harness.active.name == "gen256"
     t._harness_record(_batch([160] * 8))
-    assert t._harness_observation["truncated_fraction"] == 0.0, (
+    assert t._harness_summary["truncated_fraction"] == 0.0, (
         "the identical batch is not truncated under the larger budget"
     )
 
@@ -172,10 +174,11 @@ def test_one_observation_per_step_and_it_is_consumed(tmp_path):
     t._harness_init(kw)
     t._harness_record(_batch([96] * 8))
     t._harness_route(kw, 1)
-    assert t._harness_observation is None, "the observation is consumed exactly once"
+    assert t._harness_rows is None, "the observation is consumed exactly once"
+    assert t._harness_summary is None
     t._harness_route(kw, 2)
     assert t._harness_selector.decisions == 1, "a step with no rollout takes no decision"
-    assert t._harness_selector.repeat_observations == 0
+    assert t._harness_selector.repeat_calls == 0
 
 
 def test_a_batch_with_no_loss_mask_is_refused_not_scored_as_zero_truncation(tmp_path):
@@ -185,7 +188,7 @@ def test_a_batch_with_no_loss_mask_is_refused_not_scored_as_zero_truncation(tmp_
     t._harness_init(kw)
     with pytest.raises(ValueError, match="no 'loss_mask'"):
         t._harness_record([{"input_ids": torch.zeros(4, 8)}])
-    with pytest.raises(ValueError, match="no rows"):
+    with pytest.raises(ValueError, match="no groups"):
         t._harness_record([])
 
 
@@ -216,7 +219,7 @@ def test_every_step_writes_one_auditable_record(tmp_path):
     # would have reported "truncated" both times and ratcheted upwards forever.
     assert [r["budget_before"] for r in rows] == [96, 160, 96]
     assert [r["budget_after"] for r in rows] == [160, 96, 160]
-    assert [r["move"] for r in rows] == [1, -1, 1]
+    assert [r["switches"] for r in rows] == [1, 1, 1]
     assert [round(r["truncated_fraction"], 3) for r in rows] == [1.0, 0.0, 1.0]
     assert all("route/harness_budget" in r["metrics"] for r in rows)
     keys = {frozenset(r["metrics"]) for r in rows}
@@ -228,7 +231,9 @@ def test_the_control_arm_runs_through_the_same_path(tmp_path):
     gr = GroupRoutingConfig(
         harness_variants=["gen96", "gen160", "gen256"],
         harness_selector="rate_matched_control",
-        harness_selector_args={"move_rate": 1.0, "up_share": 1.0, "seed": 1},
+        # The audited control replays a MULTISET: 3 moves out of every 3 decisions, shuffled.
+        # It is configured from the treatment's realised counts, not from a probability.
+        harness_selector_args={"moves": 3, "decisions": 3, "seed": 1},
     )
     t = _Trainer(gr, tmp_path)
     kw = _kwargs()
@@ -238,8 +243,20 @@ def test_the_control_arm_runs_through_the_same_path(tmp_path):
         t._harness_record(_batch([10] * 8))  # nothing truncates; the control ignores it
         t._harness_route(kw, step)
         budgets.append(kw["max_completion_tokens"])
-    assert budgets == [160, 256, 160], "up, up, then flipped inward at the top"
-    assert t._harness_selector.moves == 3 and t._harness_selector.flips == 1
+    assert t._harness_selector.decisions == 3
+    assert t._harness_selector.moves == 3, "a full deck moves on every decision"
+    assert t._harness_selector.switch_rate == 1.0
+    assert len(set(budgets)) > 1, "the control moved, feature-blind, at the matched rate"
+    # It read nothing: the same seed against the opposite batch gives the same sequence.
+    other = _Trainer(gr, tmp_path)
+    kw2 = _kwargs()
+    other._harness_init(kw2)
+    blind = []
+    for step in range(1, 4):
+        other._harness_record(_batch([250] * 8))  # everything truncates; still ignored
+        other._harness_route(kw2, step)
+        blind.append(kw2["max_completion_tokens"])
+    assert blind == budgets
 
 
 def test_the_registered_ladder_matches_the_measured_probe():

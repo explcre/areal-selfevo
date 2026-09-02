@@ -192,7 +192,7 @@ def test_a_harness_arm_with_neither_a_router_nor_a_selector_is_refused():
     itself as something it is not, and one the refusal guard cannot catch, because a router
     that never runs emits no action to refuse.
 
-    ``PPOTrainer._harness_route`` is now a second consumer, on the driver rather than in the
+    ``RLTrainer._harness_route`` is now a second consumer, on the driver rather than in the
     actor, and it is driven by ``harness_selector`` rather than by a router. So the
     requirement is the disjunction: a variant set with NEITHER still dispatches nothing and
     is still refused, which is what this asserts. What is no longer refused -- and must not
