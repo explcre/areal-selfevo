@@ -168,6 +168,46 @@ noise floor. A3 next (decides the "rollouts needed" claim). A4/A5 need the gold 
   single-expert difference). Applying it to the training forward would make the arm its own
   baseline.
 
+
+## AMENDED 2026-09-02 (PI): run the routing comparison that does NOT depend on cluster-LoRA
+
+Gate 0 returned a null — MEDS clusters are indistinguishable from a size-matched random partition
+on GRPO-gradient separation (p 0.44-0.74 at every setting, sign flipping, corroborated on exact
+gradients at mean cosine +0.0025 with 46% of pairs negative). One confirmatory run is scheduled at
+`globalstep199`, but the method is not the only thing this repo can test, and the rest has been
+waiting on it unnecessarily.
+
+**The experiment that is runnable today, with everything already built and config-reachable:**
+
+| arm | config | what it is |
+|---|---|---|
+| **A0** | no `group_routing` | vanilla GRPO + one shared LoRA. RUNNING on decontaminated DeepMath |
+| **R-rule** | `router=rule` | the hand-written predicate. Our own audit showed it is behaviourally identical to a solve-rate threshold, i.e. **the published DyME + DAPO rule**. The baseline to beat |
+| **R-learned** | `router=contextual`, **`credit=prompt`** | the learned router WITH the credit fix. **Never GPU-tested** |
+| **R-control** | `router=random` at R-learned's REALISED proportions | the matched control. Differs only in WHICH unit gets which mode |
+
+**Why this is the paper's live question.** GOAL.md Result 7 records the null this overturns or
+confirms: `router=contextual` vs `router=random` at matched proportions, `globalstep149`, MATH-500
+**-0.0020**, OlympiadBench **+0.0000**. That was measured with `credit="batch"` — the setting since
+proven, as an identity, to make every arm converge to the same parameters. The learned router in
+that null **could not** have learned. `credit="prompt"` is the fix, validated on CPU at 0.098 ->
+0.779 subset contrast with a shuffle control collapsing it to 0.102, and it is already reachable
+from config (`actor.py:558`).
+
+So the claim under test is precise and pre-registered: **with per-prompt credit, does the learned
+router beat its rate-matched control at matched budget — where with batch credit it provably could
+not?** A null here is also publishable, because the identity explains the mechanism either way.
+
+**Corpus**: decontaminated DeepMath-103K (53.9% informative, versus 23.3% on MATH — the earlier
+null ran on the saturated corpus). **Benchmarks**: OlympiadBench (675, gold 675/675) and
+LiveCodeBench v6 (175/7000, gold 175/175). **Controls**: rate-matched at realised proportions,
+subset contrast rather than L1-from-uniform, paired McNemar with the error bar on the DIFFERENCE.
+
+**Sequencing on one box**: A0 continues (it is the baseline for every arm), the confirmatory Gate 0
+dump takes ~25 minutes at `globalstep199`, then R-learned, then R-control configured from
+R-learned's measured proportions. R-rule last if time allows, since DyME and HPT are also cloned
+and their published numbers exist.
+
 ## Discipline
 
 - Config asserted from `process_env.json` inside every run, never the launcher line.
