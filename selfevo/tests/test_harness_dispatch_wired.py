@@ -182,17 +182,39 @@ def test_a_one_name_variant_set_is_still_a_legal_config():
     assert cfg.harness_variants == ["plain"]
 
 
-def test_a_harness_arm_without_a_router_is_refused():
-    """The fixed solved/unsolved rule emits no decision, so it can emit no harness action.
+def test_a_harness_arm_with_neither_a_router_nor_a_selector_is_refused():
+    """A variant set needs SOMETHING that will consume it, or it dispatches nothing.
 
-    Without a router ``_route_groups`` never runs, no dispatcher is ever built, and the run
-    would carry a ``harness_variants`` line in its config while dispatching nothing. That is
-    an arm reporting itself as something it is not, which is the exact failure the refusal
-    guard exists to make loud -- and the guard cannot catch it, because a router that never
-    runs emits no action to refuse.
+    Updated when the harness axis gained its second consumer. The original rule was "a
+    harness arm requires a router", which was right while ``_route_groups`` was the only
+    place a dispatcher was built: without a router that method never runs, so the run would
+    carry a ``harness_variants`` line in its config and dispatch nothing -- an arm reporting
+    itself as something it is not, and one the refusal guard cannot catch, because a router
+    that never runs emits no action to refuse.
+
+    ``PPOTrainer._harness_route`` is now a second consumer, on the driver rather than in the
+    actor, and it is driven by ``harness_selector`` rather than by a router. So the
+    requirement is the disjunction: a variant set with NEITHER still dispatches nothing and
+    is still refused, which is what this asserts. What is no longer refused -- and must not
+    be, or the arm this validation protects could not be configured -- is a selector arm with
+    no router, covered below.
     """
-    with pytest.raises(ValueError, match="requires a router"):
+    with pytest.raises(ValueError, match="either a router or a harness_selector"):
         GroupRoutingConfig(enabled=True, harness_variants=["plain", "long"])
+
+
+def test_a_selector_is_a_sufficient_consumer_without_a_router():
+    """The driver-side consumer needs no router, and requiring one would confound the arm.
+
+    A router rewrites advantages. Forcing a harness arm to carry one would make the two arms
+    of a harness experiment differ in the harness AND in the advantage path, so a difference
+    between them could not be attributed to either.
+    """
+    cfg = GroupRoutingConfig(
+        harness_variants=["gen96", "gen160", "gen256"],
+        harness_selector="truncation_step_limit",
+    )
+    assert cfg.router is None and cfg.harness_selector == "truncation_step_limit"
 
 
 # ------------------------------------------------ can_evolve_harness, in production ------

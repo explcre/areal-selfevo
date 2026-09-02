@@ -140,3 +140,52 @@ def register_variant(v: HarnessVariant) -> HarnessVariant:
 register_variant(HarnessVariant("plain", "default agent, standard step budget", step_limit=40))
 register_variant(HarnessVariant("long", "same agent, 2.5x the step budget", step_limit=100))
 register_variant(HarnessVariant("short", "same agent, reduced budget; the cheap arm", step_limit=15))
+
+# A second variant set, for single-turn RLVR, differing on GENERATION BUDGET.
+#
+# The three above vary ``step_limit``, and on a single-turn math run nothing reads it: the
+# workflow issues exactly one completion request per rollout, so dispatching between them
+# would change no bit of the rollout while the log reported switches -- an arm that is its
+# own control, and the one failure ``HarnessDispatcher`` cannot catch, because the field it
+# compares for uniqueness is the field nothing reads. ``step_limit`` is therefore 1 here,
+# which is the truth (one agent step), and the axis of variation moves into ``settings``,
+# where ``selfevo.harness.selectors.GENERATION_BUDGET_KEY`` names the field the rollout
+# genuinely reads. It reaches the engine as ``max_completion_tokens`` on the OpenAI proxy
+# path and lands in ``GenerationHyperparameters.max_new_tokens``.
+#
+# The three budgets are MEASURED, not guessed. Qwen2.5-32B-Instruct on GSM8K at temperature
+# 1.0, 60 rollouts sampled at a 1024-token cap (``~/runs/probe1024``; nothing reached that
+# cap, so the distribution is uncensored; median response 155 tokens) truncates at:
+#
+#     cap  64   96   128  160  192  224  256  288  320
+#     frac 0.97 0.83 0.62 0.42 0.20 0.13 0.07 0.02 0.00
+#
+# so 96 / 160 / 256 put one rung above ``TruncationStepLimitSelector``'s upper threshold
+# (0.5), one inside its dead band, and one at its lower threshold (0.05). A ladder whose
+# rungs all sat above 320 would differ only in a number nothing could respond to: every rung
+# reports truncation 0.0, the selector ratchets to the bottom and stays, and that looks like
+# a working controller while measuring nothing.
+register_variant(
+    HarnessVariant(
+        "gen96",
+        "single-turn; 96-token generation budget, where ~83% of rollouts never terminate",
+        step_limit=1,
+        settings={"max_new_tokens": 96},
+    )
+)
+register_variant(
+    HarnessVariant(
+        "gen160",
+        "single-turn; 160-token generation budget, about the median response length",
+        step_limit=1,
+        settings={"max_new_tokens": 160},
+    )
+)
+register_variant(
+    HarnessVariant(
+        "gen256",
+        "single-turn; 256-token generation budget, where ~7% of rollouts never terminate",
+        step_limit=1,
+        settings={"max_new_tokens": 256},
+    )
+)

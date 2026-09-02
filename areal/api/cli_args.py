@@ -1953,6 +1953,8 @@ class GroupRoutingConfig:
     zero_mean: bool = False
     exclude_truncated_from_sft: bool = False
     harness_variants: list[str] | None = None
+    harness_selector: str | None = None
+    harness_selector_args: dict[str, float] | None = None
 
     def __post_init__(self):
         if self.credit not in ("batch", "prompt", "prompt_centered"):
@@ -1994,14 +1996,39 @@ class GroupRoutingConfig:
                     f"harness_variants names unregistered variant(s) {unknown}; "
                     f"registered: {sorted(VARIANTS)}"
                 )
-            if not self.router:
+            if not self.router and not self.harness_selector:
                 raise ValueError(
-                    "harness_variants requires a router: the fixed solved/unsolved rule "
-                    "produces no RoutingDecision and therefore no HarnessAction, and "
-                    "_route_groups -- the only place a dispatcher is built -- never runs "
-                    "without one. This configuration would carry a harness_variants line "
-                    "and dispatch nothing, reporting itself as an arm it is not."
+                    "harness_variants requires either a router or a harness_selector: the "
+                    "fixed solved/unsolved rule produces no RoutingDecision and therefore "
+                    "no HarnessAction, and _route_groups -- the actor-side place a "
+                    "dispatcher is built -- never runs without a router. With neither, "
+                    "this configuration would carry a harness_variants line and dispatch "
+                    "nothing, reporting itself as an arm it is not."
                 )
+        if self.harness_selector is not None:
+            from selfevo.harness.selectors import SELECTORS
+
+            if self.harness_selector not in SELECTORS:
+                raise ValueError(
+                    f"harness_selector={self.harness_selector!r} is not registered; "
+                    f"known: {sorted(SELECTORS)}. Resolved HERE, before any GPU is "
+                    f"touched, because a name that fell back to the default rule would "
+                    f"report a selector arm that never ran."
+                )
+            if not self.harness_variants or len(self.harness_variants) < 2:
+                raise ValueError(
+                    f"harness_selector={self.harness_selector!r} needs at least two "
+                    f"harness_variants to choose between, got "
+                    f"{self.harness_variants!r}. A selector over one rung refuses every "
+                    f"decision, which is a control arm and must be configured as one "
+                    f"rather than arrived at by accident."
+                )
+        elif self.harness_selector_args:
+            raise ValueError(
+                f"harness_selector_args={self.harness_selector_args!r} was given with no "
+                f"harness_selector to receive them. Silently ignoring them would run a "
+                f"control at a move rate nobody set."
+            )
         if self.solved_advantage < 0:
             raise ValueError(
                 f"solved_advantage must be >= 0 (it is SFT on samples known to be "
