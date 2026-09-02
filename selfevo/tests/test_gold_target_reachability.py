@@ -292,6 +292,8 @@ def math_columns():
     return raw, adapted
 
 
+# Marked slow: reaches the network. CI runs -m "not slow".
+@pytest.mark.slow
 def test_the_raw_dataset_does_carry_a_gold_solution(math_columns):
     """Anti-vacuity for the drop test: the gold really is there to begin with.
 
@@ -304,6 +306,8 @@ def test_the_raw_dataset_does_carry_a_gold_solution(math_columns):
     assert non_empty == len(raw), f"{non_empty}/{len(raw)} rows carry a solution"
 
 
+# Marked slow: reaches the network. CI runs -m "not slow".
+@pytest.mark.slow
 def test_the_math_adapter_drops_the_gold_solution_text(math_columns):
     """The gold derivation does not survive the adapter, so it never reaches a rollout.
 

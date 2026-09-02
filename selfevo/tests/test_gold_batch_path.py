@@ -189,6 +189,8 @@ def _math_dataset(**kwargs):
     )
 
 
+# Marked slow: reaches the network. CI runs -m "not slow".
+@pytest.mark.slow
 def test_the_adapter_default_is_byte_identical_to_before_the_flag_existed():
     """Rollback, asserted against a digest and not against a column list.
 
@@ -209,6 +211,8 @@ def test_the_adapter_default_is_byte_identical_to_before_the_flag_existed():
     assert h.hexdigest() == MATH_TRAIN_DIGEST
 
 
+# Marked slow: reaches the network. CI runs -m "not slow".
+@pytest.mark.slow
 def test_keep_solution_adds_a_tokenised_gold_and_changes_nothing_else(math_tokenizer):
     """The flag adds exactly one column and leaves the other two alone.
 
@@ -257,6 +261,8 @@ def test_keep_solution_without_a_tokenizer_is_refused():
         )
 
 
+# Marked slow: reaches the network. CI runs -m "not slow".
+@pytest.mark.slow
 def test_the_gold_template_is_applied_and_is_not_a_constant(math_tokenizer):
     """The template seam exists because no default is right for every chat template.
 

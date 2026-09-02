@@ -1,0 +1,139 @@
+name: SelfEvo Tests
+
+# Until this file existed, no CI job ran a single selfevo test.
+#
+#   * test-areal.yml is the only workflow that calls pytest, and it passes an explicit path
+#     list (tests/test_*.py tests/experimental/ tests/infra/ tests/v2/) that excludes
+#     selfevo/tests/ and experiments/. It is also workflow_call/workflow_dispatch only and
+#     gated on a self-hosted GPU runner.
+#   * install-test.yml is path-filtered to pyproject.toml, uv.lock and areal/**, so a
+#     selfevo-only pull request triggers nothing.
+#   * pre-commit.yml runs ruff, mdformat and a licence header, and no tests.
+#
+# So ~1,800 collected nodes were green-by-hand only, and a local run recorded five failing
+# tests that nothing in CI would have caught either way.
+#
+# CPU only, deliberately. No selfevo test references torch.cuda; a GPU runner would buy
+# nothing and would queue behind the training jobs.
+
+on:
+  pull_request:
+    paths:
+      - 'selfevo/**'
+      - 'areal/api/cli_args.py'
+      - 'areal/dataset/**'
+      - 'areal/engine/fsdp_engine.py'
+      - 'areal/trainer/ppo/actor.py'
+      - 'areal/utils/data.py'
+      - 'areal/workflow/rlvr.py'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - '.github/workflows/selfevo-tests.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'selfevo/**'
+      - 'areal/api/cli_args.py'
+      - 'areal/dataset/**'
+      - 'areal/engine/fsdp_engine.py'
+      - 'areal/trainer/ppo/actor.py'
+      - 'areal/utils/data.py'
+      - 'areal/workflow/rlvr.py'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - '.github/workflows/selfevo-tests.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: selfevo-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  selfevo-tests:
+    name: selfevo/tests (CPU, not slow)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install package and test dependencies
+        run: uv sync
+
+      - name: Install scikit-learn
+        # Three cluster_lora test files, 75 nodes between them, open with
+        # importorskip("sklearn"). sklearn is in no dependency group because the training
+        # box deliberately does not carry it -- the probe asserts that. Without this step
+        # those 75 would skip and the job would still be green, which is exactly the
+        # failure this workflow exists to close.
+        run: uv pip install scikit-learn
+
+      - name: Refuse a vacuous run
+        # Almost every file in this suite opens with pytest.importorskip: torch in 17,
+        # datasets in 9, peft in 6, transformers in 5, sklearn in 3. A missing import turns
+        # the suite into a green no-op instead of a red failure, so the imports it depends
+        # on are asserted here, where absence is an error rather than a skip.
+        run: |
+          uv run python - <<'PY'
+          import importlib
+
+          for name in ("torch", "transformers", "datasets", "peft", "numpy", "sklearn",
+                       "safetensors"):
+              importlib.import_module(name)
+              print(f"{name}: importable")
+          PY
+
+      - name: Run the selfevo suite
+        env:
+          # Five tests reach the Hub and carry @pytest.mark.slow; they are deselected
+          # below. Offline mode makes any OTHER download fail fast rather than hang the
+          # runner for six minutes before skipping. New downloading tests should be marked
+          # slow rather than allowed to rely on this.
+          HF_HUB_OFFLINE: '1'
+          HF_DATASETS_OFFLINE: '1'
+        run: |
+          uv run pytest selfevo/tests \
+            -m "not slow" \
+            -q --durations=20 \
+            --junitxml=selfevo-tests.xml
+
+      - name: Refuse a hollow run
+        # A green run that executed almost nothing is worse than no run, because it reads
+        # as a signal. 1,793 nodes are collected under -m "not slow" and three skip on this
+        # box today, so anything below 1,500 executed means a whole subpackage went missing
+        # and the floor should be investigated, not lowered.
+        if: always()
+        run: |
+          uv run python - <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          FLOOR = 1500
+
+          root = ET.parse("selfevo-tests.xml").getroot()
+          suite = root if root.tag == "testsuite" else root.find("testsuite")
+          total = int(suite.get("tests", 0))
+          skipped = int(suite.get("skipped", 0))
+          ran = total - skipped
+          print(f"collected {total}, skipped {skipped}, executed {ran}")
+          if ran < FLOOR:
+              print(f"::error::only {ran} tests executed, floor is {FLOOR}")
+              sys.exit(1)
+          PY
+
+      - name: Upload the JUnit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: selfevo-tests-junit
+          path: selfevo-tests.xml
