@@ -203,6 +203,31 @@ null ran on the saturated corpus). **Benchmarks**: OlympiadBench (675, gold 675/
 LiveCodeBench v6 (175/7000, gold 175/175). **Controls**: rate-matched at realised proportions,
 subset contrast rather than L1-from-uniform, paired McNemar with the error bar on the DIFFERENCE.
 
+**PRE-REGISTERED for R-learned / R-control, fixed 2026-09-02 before any number exists.**
+`solved_advantage=0.5` — the value Result 7 used, so the credit fix is the SINGLE changed variable.
+0.0 is not an option: an SFT decision writing zero makes the two arms byte-identical, a guaranteed
+null for a trivial reason.
+
+But 0.5 is recorded as *slow-acting and harmful*, not inert: truncation 4/60 at step 199 -> 59/60 at
+224, MATH-500 0.52 -> 0.19 — **and the random control collapses just as completely** (0.3080 with
+499/500 truncated), so the constant causes it, not the routing. Mechanism: a positive constant on
+solved groups reinforces every token of an already-correct rollout uniformly, including the
+tendency to continue, with no term opposing continuation — so termination decays. Same altitude
+error as gold: the advantage seam multiplies tokens the model ACTUALLY EMITTED, so a constant
+there reinforces the emission pattern rather than the content.
+
+1. **Primary evaluation at `globalstep149`**, matching Result 7's point exactly.
+2. **Stop rule**: halt an arm when `route/truncated_row_fraction` > **0.20**; report the crossing step.
+3. **Both arms compared at `min(149, first crossing in either arm)`.** Different steps is not a
+   comparison. If the crossing precedes 149 the comparison does not exist and **the collapse
+   threshold IS the result**, reported as such rather than evaluated at whatever checkpoint survived.
+4. R-learned's REALISED mode proportions reported regardless — R-control cannot be configured
+   without them.
+
+The earlier collapse data is 1.5B on MATH; nobody has measured the threshold at 32B on DeepMath,
+and `route/truncated_row_fraction` is the live instrument those runs lacked. Earlier, later or
+absent is a finding either way.
+
 **Sequencing on one box**: A0 continues (it is the baseline for every arm), the confirmatory Gate 0
 dump takes ~25 minutes at `globalstep199`, then R-learned, then R-control configured from
 R-learned's measured proportions. R-rule last if time allows, since DyME and HPT are also cloned
