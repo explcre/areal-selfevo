@@ -164,12 +164,96 @@ looking like the unclaimed contribution:
 
 ---
 
-## 4. Pending: credit-assignment and degeneracy novelty search
+## 4. Are our three "methodological findings" already known? — Yes, all three, in some form
 
-*(appended when the third search lands: is the identity a known folk result; is "everything
-collapses to the solve-rate predicate under binary graders" already stated; is self-selection
-drift masquerading as learning documented.)*
+Third search, web-grounded, ~40 targeted queries; empty searches listed at the end.
 
-## 5. Pending: judgement
+### 4.1 The credit identity — a special case of a 1999 result; the fix is a re-derivation
 
-*(appended after §4.)*
+| claim | status | canonical citation |
+|---|---|---|
+| batch-scalar credit ⇒ a linear meta-controller cannot learn a preference | **special case** of Wolpert & Tumer's *zero-learnability* limit in the COIN framework (a global utility handed unchanged to every agent has learnability → 0); in bandit terms the degenerate case `r(x,a)=r(x)` where every policy is optimal — "arguably too trivial to have been written down." Exact linear-estimator identity NOT found in 14 phrasings | Wolpert & Tumer [cs/9905004](https://arxiv.org/abs/cs/9905004); COMA [1705.08926](https://arxiv.org/abs/1705.08926) (difference rewards) |
+| every working predecessor measures credit per-arm or restores contrast by resampling | Graves et al. 2017 §3.3 analyses estimator bias and uses per-arm prediction gain; Learning-to-Teach and AutoLoss use a single terminal scalar but run ~50 independent episodes so different action sequences get different rewards — **our controller is single-stream, so the shared scalar never varies with the action** | [1704.03003](https://arxiv.org/abs/1704.03003), [1805.03643](https://arxiv.org/abs/1805.03643), [1810.02442](https://arxiv.org/abs/1810.02442) |
+| per-prompt credit across time as the fix | **ESTABLISHED, not novel.** SPO keeps a persistent per-prompt Beta value tracker with KL-adaptive discount, replacing GRPO's group baseline (+3.4pp maj@32); DBB, BV-Blend, GRESO (per-prompt zero-variance streak for a *routing* decision), and **PAC (Aug 31 2026)** — Thompson sampling over per-task arms with progress = least-squares slope of that task's own reward history — are the same prescription | SPO [2509.13232](https://arxiv.org/abs/2509.13232); DBB [2603.18444](https://arxiv.org/abs/2603.18444); BV-Blend [2606.28707](https://arxiv.org/abs/2606.28707); GRESO [2506.02177](https://arxiv.org/abs/2506.02177); PAC [2608.30528](https://arxiv.org/abs/2608.30528) |
+| adaptive SFT/RL mode control | all *global* weights or heuristic switches: AMFT (meta-gradient global μ), SRFT (entropy), SuperRL, SASR, DyME, GAC. None is a per-prompt bandit; none addresses controller credit | AMFT [2508.06944](https://arxiv.org/abs/2508.06944) Table 1 |
+
+**Recommendation from the search:** frame the identity as a *lemma* — "a concrete instantiation of the zero-learnability regime for a linear meta-controller in LLM RL post-training" — cite Graves §3.3 / L2T / AutoLoss for the design contrast, and cite SPO and PAC for the fix. Claiming a novel theorem invites an easy rebuttal.
+
+### 4.2 The pass-count collapse — published repeatedly, once as an entire paper's thesis
+
+| result | where it is already in print |
+|---|---|
+| GRPO / Dr.GRPO / DAPO are three operations on one number `σ = √(k(G−k))/G`; DAPO's dynamic sampling "is simply a keep rule on the same scalar: retain the group when σ>0" | **Bay & Yearick, [2607.00152](https://arxiv.org/abs/2607.00152), 30 Jun 2026 — Theorem 1** |
+| reward entropy `H(p)`, group-filter survival `S_N(p)`, RLOO advantage energy `k(N−k)/(N−1)²`, pair count `k(N−k)` are four closed forms in the one scalar `p`, all peaking at 0.5 — "all identify the same target" | Rollout Pass-Rate Control (Baidu), [2605.05112](https://arxiv.org/abs/2605.05112), Eq. 1 |
+| the binary-reward family is SGA on `E_x[h(p_θ(C|x))]`; the per-prompt update depends on the prompt only through `p` | Davis & Recht, [2510.13651](https://arxiv.org/abs/2510.13651) |
+| `Σ|A_i| = 2G√(p(1−p))`; `A⁺ ∝ √((1−p)/p)`; gradient variance ∝ `p(1−p)` | [2602.05548](https://arxiv.org/abs/2602.05548), [2605.27765](https://arxiv.org/abs/2605.27765), [2602.01601](https://arxiv.org/abs/2602.01601) |
+| **the RL/SFT/SKIP solve-rate rule our policy collapsed to is itself a published method** | **DyME** [2506.23061](https://arxiv.org/abs/2506.23061): `mode(x) = GRPO if max_k r(ỹ_k)=1 else SFT` — ablated against reward thresholding, SFT annealing, SFT budget, and claimed "parameter-free, efficient, and empirically optimal." Plus **DAPO** [2503.14476](https://arxiv.org/abs/2503.14476): `0 < |correct| < G` for skip. The three-way combination is unclaimed; both halves are not |
+| successors, all pass-rate predicates | GRESO, DA3PO [2608.27982] (`λÂ if R>0 and p̂<0.5`), Skywork-OR1, Online Difficulty Filtering [2504.03380] (EACL 2026 — improvement lower-bounded by variance of task success probs), Prompt Replay, Prompt Curriculum Learning [2510.01135] (ICLR 2026), CurES, MoPPS |
+
+So the memory-file theorem "every estimator = α(k)·(r−r̄)" is confirmed and already published — it is exactly 2607.00152. **This kills the "pass-count bottleneck" reframing as a headline.** It survives only as the *setup* for §4.3.
+
+### 4.3 The one thing NOT found — and the two papers that claim the opposite
+
+**"Length / truncation / token-level entropy carry no routing information beyond p" — NOTHING FOUND either way (8 queries).** No theorem forces covariates to collapse (the memory-file table already notes GraphRPO *escapes* because its baseline conditions on length). So our 102/102 behavioural-equivalence result is potentially a **novel negative result** — but two papers actively claim the converse and must be addressed head-on:
+
+- **RL-ZVP / No Prompt Left Behind** [2509.21880](https://arxiv.org/abs/2509.21880) (ICLR camera-ready Feb 2026) — uses **token-level** entropy to shape advantages on zero-variance prompts (p∈{0,1}), where a solve-rate predicate has zero resolution: +8.61 over GRPO. The distinction that matters: the entropy of the *binary reward distribution* is `H(p)` and collapses; **token/policy entropy does not.**
+- **HIVE / Train at the Moving Edge** [2603.25184](https://arxiv.org/abs/2603.25184) — a routing paper fusing pass-rate history with prompt entropy, with the ablation (Fig. 6d) that removing either stage worsens the accuracy–rollout tradeoff. The most direct challenge to a 102/102 equivalence claim.
+- Beyond Variance [2602.03452] attacks the *optimality* of the p-threshold, not its sufficiency.
+
+**Obvious reviewer objection to our 102/102:** the 102 contexts may not span the p∈{0,1} degenerate regime where both papers locate their gains. **Before claiming anything, verify which of the 7 observability features are pure functions of the reward vector and which are covariates.**
+
+### 4.4 Self-selection drift masquerading as learning — it has a theorem and a name
+
+**"Incomplete learning."** Kalvit & Zeevi, NeurIPS 2021, [2106.02126](https://arxiv.org/abs/2106.02126), Theorem 2: two arms both Bernoulli(q); under Thompson sampling with q=1, `N₁(n)/n ⇒ Uniform[0,1]` — the allocation converges to a **non-degenerate random variable**, not to ½. Their words: sample paths "evolve in such a way that the algorithm is 'deceived' into incorrectly believing one of the arms to be inferior … a perpetual 'imbalance' in the sample-counts." Consequence for our metric: `L1 = 2|N₁/n − ½|` has limiting mean ½ from near 0 at small n — **it rises monotonically to a positive constant under an exact null.** Generalised by Han [2601.21131](https://arxiv.org/abs/2601.21131): pull counts are deterministic iff the arm is suboptimal or the unique optimum; under a null (all arms optimal) allocation is always a random limit. Stable TS [2505.23260] (COLT 2026), Optimism-stabilised TS [2602.06014], null-hypothesis BRAR [2510.01734] are the fixes; Chen et al. [2205.03820] is the plain-language warning: TS "tends to 'select' an arm … even when there is no treatment difference … this can falsely promote the idea that the experimental arm is better."
+
+**Undocumented in our exact framing (~20 queries):** nobody uses L1-from-uniform of a *training-mode controller's* mix as a learning metric, shows it rising on a provably-non-learning controller, or names a null-controller baseline as the fix. That transfer — plus the subset-contrast + shuffle-control replacement — is the reusable methodological piece. The correct diagnostics per the literature: Allocation Probability Test [2111.00137], randomization tests for adaptively collected data [2301.05365].
+
+### 4.5 Coverage
+
+Semantic Scholar API returned 429 both attempts (reached only via web search). OpenReview full text not searchable; ICLR 2027 not public. Empty query lists are in the subagent transcript.
+
+---
+
+## 5. Judgement
+
+### 5.1 Answering the three questions asked
+
+**Q1 — Is "learned routing beats fixed-rule routing" strong enough? No, not as framed, and the reframing I floated is dead too.**
+The framing is factually wrong for two of three comparisons (frozen LLM, not fixed rule); the idea is publicly staked (SIA §9, 2607.01120); the fixed-rule baseline we collapsed to is a *published method* (DyME + DAPO); HASE already learns what-to-evolve end-to-end; and our own GPU measurement (Result 7) is a null at matched proportions. The "pass-count bottleneck" reframing — every routing rule over outcome statistics is a partition of {0..G} — is a true and useful setup, but 2607.00152, 2605.05112 and Davis–Recht already own the theorem. **Making the confound the subject is right; making the theorem the headline is not available.**
+
+**Q2 — Harness or model axis? Model axis, decisively.** The harness space has ≥9 papers since April, a published null at matched budget from AI2 (with Co-Harness co-authors), Lilian Weng's public skepticism of SIA, and Evo-Bench's early-saturation result. Our dispatcher varies a generation-length ladder, which no reviewer will accept as "harness evolution." Use truncation→length **only** as one covariate in the test below; do not headline it.
+
+**Q3 — Is the sharpest claim already measured? Partly — but the parts that are measured are the parts that are already published.** The identity is a Wolpert–Tumer corollary; the fix is SPO/PAC; the collapse is 2607.00152; the drift is Kalvit–Zeevi. What is *not* published, and what the project is uniquely positioned to measure, is the question all of those results leave open:
+
+> **Under verifiable binary rewards, can any covariate — length, truncation, token-level entropy, representation-space clusters — carry routing information beyond the pass count, at matched budget?**
+
+Nothing found either way. Two papers claim yes for specific cases (RL-ZVP on p∈{0,1} via token entropy; HIVE via pass-rate history + entropy). We have the instrument nobody else has built: a learned per-group router over {target}×{loss}, rate-matched and permutation-controlled, with per-prompt credit so it *can* learn, and the subset-contrast metric so we know whether it *did*.
+
+### 5.2 The strongest available paper
+
+**A measurement paper whose instrument is the learned router, framed as the escape route from a published bottleneck.** Structure:
+
+1. **Setup (cite, don't claim):** under binary rewards every outcome statistic is a function of `k` (2607.00152, 2605.05112, Davis–Recht). *Extend it one step to routing*: therefore every routing rule over outcome statistics — DAPO, DyME, HPT, SRPO, RSTG, LSPO, GRESO — is a partition of {0..G}, and a learned router over outcome features can at best learn that partition. Our 102/102 collapse is the empirical instance. This extension is small but, as far as three searches found, unstated.
+2. **Why learned routers have been failing (lemma + transfer):** batch-scalar credit is the zero-learnability regime (Wolpert–Tumer); L1-from-uniform rising under a null is incomplete learning (Kalvit–Zeevi). Both stated for training-mode controllers for the first time, with the subset-contrast + shuffle-control + null-controller protocol as the reusable fix. Cite SPO/PAC for per-prompt credit; do not claim it.
+3. **The experiment (the paper's content):** covariate-conditioned learned router vs the k-partition (DyME+DAPO — which is also our own rule policy), vs SRPO, at matched rollout and feedback budget, on OlympiadBench and LiveCodeBench at 32B, held-out split, with a repeated-sampling TTS baseline per AI2. Each covariate tested with its rate-matched control: truncation (via the length ladder — the *only* legitimate use of the harness machinery), token-level entropy (RL-ZVP's claim), MEDS clusters (the feature GOAL.md already wants). Report positive or negative with the error bar on the difference.
+4. **Framing chosen by the result, honestly:** if a covariate carries signal → "the first learned router that beats the pass-count partition, and why prior ones couldn't"; if none does → "a bound: at 32B on frontier math and code, adaptive routing collapses to the pass count, and here is the protocol that shows it." The 2026 venue record accepts both genres (2603.19335, 2604.23747, 2605.30621, 2607.12227 are all sobering-measurement papers at strong groups).
+
+**What this is not:** it is not "beats Ornith-1.5 on Terminal-Bench." That was never reachable with 8×A100 + 4×H100 for two days. It *can* be "beats DyME/SRPO/HPT at matched budget on OlympiadBench+LCB at 32B" — a real SOTA claim in the adaptive-post-training niche — if and only if a covariate carries signal.
+
+### 5.3 What must be true for a top venue, and what would change my mind
+
+Necessary, in order of how fast we learn the answer:
+- **Feature audit (hours, CPU):** classify the 7 observability features into pure-`k` vs covariate. If all 7 are functions of the reward vector, the 102/102 is a corollary of 2607.00152 and there is no escape route in the current feature set — MEDS and token entropy must be added before anything runs.
+- **Truncation covariate arm (H100, in progress):** treatment vs rate-matched control. A clean positive at matched budget is the single result that would move this from bound-paper to method-paper. A null is informative and publishable but drops the venue ceiling.
+- **Loss-weighting audit against 2604.23747** before any SFT/RL-mixing number is reported. E1's bit-identical rollback proves vanilla is reachable, not that mixed weights are correct.
+- **Matched inference and feedback budgets** (GOAL.md §4: both NOT MET). AI2 will reject on exactly these rows.
+- **Baselines that must be run:** DyME rule, SRPO rule, HPT threshold, LSPO for the k=0 branch, repeated-sampling TTS at matched budget.
+
+What would change my mind toward the original framing: a covariate-router win over SRPO *and* DyME at matched budget on both benchmarks with a held-out split. What would change it toward "not a top venue in any framing": the feature audit showing all 7 are `k`-functions *and* the truncation arm null *and* token-entropy null — then the honest paper is a short bound with the protocol, aimed one tier down.
+
+### 5.4 Corrections to make regardless
+
+- GOAL.md 2b: done today (`3ccc18e9`). M8 row: cite Wolpert–Tumer, SPO, PAC, Kalvit–Zeevi; demote "identity" to "lemma."
+- The memory-file theorem `finding_binary_reward_collapse` should cite 2607.00152 as its published form.
+- The k=0 gold arm: do not build; run LSPO as a baseline instead.
+- Stop describing the harness ladder as harness evolution anywhere.
