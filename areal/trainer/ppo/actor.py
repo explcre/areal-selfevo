@@ -2,6 +2,7 @@
 
 import functools
 import math
+import os
 from typing import Any
 
 import torch
@@ -525,6 +526,26 @@ class PPOActor:
         #
         # ONE call per unit either way: a router may be stateful, and routing twice to read the
         # weights and then the label would double every update it makes.
+        # SEAM 1 (selfevo/FINDINGS_cluster_lora.md section 9): the behavioural feature
+        # vector that RoutingContext.extra cannot carry. `extra` is Mapping[str, float], so
+        # a MEDS vector reaches the key function only through this call, and without it
+        # cluster_lora.partition=meds REFUSES rather than collapsing to one adapter.
+        #
+        # Gated on the environment variable ALONE, and on nothing else: with cluster-LoRA
+        # unconfigured -- every run to date -- this branch imports nothing, allocates
+        # nothing and leaves the update bit-identical. The literal is duplicated from
+        # selfevo.cluster_lora.wiring.CLUSTER_LORA_ENV precisely so the default path does
+        # not import selfevo.cluster_lora at all; a test asserts the two agree.
+        if os.environ.get("SELFEVO_CLUSTER_LORA", "").strip():
+            from selfevo.cluster_lora.wiring import begin_cluster_batch
+
+            # Emitted into the same stream as the route/* keys, so an arm's log says what
+            # the partition did: how many clusters, how much noise, how much churn, and the
+            # size of every adapter separately.
+            stats_tracker.scalar(
+                **begin_cluster_batch(self, router, data, contexts, list(sizes))
+            )
+
         decisions = route_all(router, contexts, harness_consumer=dispatcher is not None)
 
         # Consume the harness coordinate. Declared as a consumer above on the presence of the

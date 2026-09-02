@@ -782,6 +782,15 @@ class FSDPEngine(TrainEngine):
 
         input_batched, _ = self._normalize_batch_input(input_)
 
+        # SEAM 2b: one microbatch stream per cluster, so each cluster's gradient lands in
+        # its own expert. The attribute is set only by an armed cluster-LoRA run, so with
+        # cluster-LoRA off this is one getattr and the step below is unchanged.
+        cluster_plan = getattr(self, "_selfevo_cluster_plan", None)
+        if cluster_plan is not None:
+            return self._train_batch_by_cluster(
+                input_batched, loss_fn, loss_weight_fn, cluster_plan
+            )
+
         # Step 1: Prepare micro-batches
         mb_list = self._prepare_mb_list(input_batched).to(self.device)
 
@@ -809,6 +818,123 @@ class FSDPEngine(TrainEngine):
         # Step 4: Optimizer step
         stats = self.optimizer_step()
         stats["num_micro_batches"] = len(mb_list.mbs)
+        return stats
+
+    def _train_batch_by_cluster(
+        self,
+        input_batched: dict[str, Any],
+        loss_fn: Callable[..., torch.Tensor],
+        loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
+        cluster_plan,
+    ) -> dict[str, float]:
+        """One training step with each cluster's loss confined to its own LoRA expert.
+
+        The isolation itself is not implemented here. ``ClusterAdapterSet.step`` owns it and
+        is the guard the whole method rests on -- one adapter active per microbatch stream,
+        ``set_to_none=True`` so an idle expert is skipped by the optimizer entirely rather
+        than decayed, and a refusal if a cluster's backward leaves its own expert without a
+        gradient. This method supplies that guard with the engine's own forward/backward and
+        with the engine's own optimizer step, so a cluster-routed run clips, schedules and
+        reports ``grad_norm`` exactly as an unrouted one does.
+
+        Two details are load-bearing:
+
+        * ``total_loss_weight`` is computed over the WHOLE batch, not per cluster. Every
+          group's loss then carries the same global denominator, so the per-cluster losses
+          sum to the batch loss and the partition changes only WHERE the gradient lands, not
+          how large it is. A per-cluster denominator would rescale each cluster by its own
+          token count, and a small cluster would silently get a large learning rate.
+        * The LAST microbatch of each cluster is handed back to ``ClusterAdapterSet.step``
+          instead of being backwarded here (``process_output`` returning ``None`` is the
+          engine's own supported way to skip a backward). ``step`` ends each cluster with
+          exactly one ``loss.backward()``, and this keeps that contract without ever holding
+          more than one microbatch graph alive -- summing the cluster's microbatch losses
+          and backwarding once would retain every graph, which is the memory the microbatch
+          loop exists to avoid.
+
+        Args:
+            input_batched: The batch, already normalised to one dict.
+            loss_fn: The per-microbatch loss, as ``train_batch`` receives it.
+            loss_weight_fn: The per-microbatch loss weight, as ``train_batch`` receives it.
+            cluster_plan: A ``selfevo.cluster_lora.wiring.ClusterPlan``, armed by the actor.
+
+        Returns:
+            The optimizer stats ``train_batch`` returns, plus this step's per-cluster
+            losses, gradient norms and row counts.
+
+        Raises:
+            AdapterIsolationError: From ``ClusterAdapterSet``, if the partition names an
+                adapter the model does not carry or a cluster's loss reached no expert.
+            ClusterWiringError: If a row's group is not named by the plan, or the batch
+                carries no ``group_ids`` to route on.
+        """
+        from selfevo.cluster_lora.wiring import (
+            ClusterWiringError,
+            EngineOptimizer,
+            rows_by_adapter,
+            select_rows,
+        )
+
+        adapters = getattr(self, "_selfevo_adapters", None)
+        if adapters is None:
+            raise ClusterWiringError(
+                "a cluster plan is armed but this engine has no ClusterAdapterSet; set "
+                "SELFEVO_CLUSTER_LORA_ADAPTERS so the experts are created before the "
+                "optimizer, or the plan would route gradients to adapters that do not exist"
+            )
+        if "group_ids" not in input_batched:
+            raise ClusterWiringError(
+                "a cluster plan is armed but the batch carries no 'group_ids'; the plan is "
+                "keyed on group identity because microbatch splitting reorders rows, and "
+                "routing on positions would hand each row another row's expert"
+            )
+        rows = rows_by_adapter(
+            input_batched["group_ids"][:, 0].tolist(), cluster_plan.key_of_group
+        )
+
+        # Over the whole batch, before it is split by cluster. See the docstring.
+        total_loss_weight = compute_total_loss_weight(
+            self._prepare_mb_list(input_batched), loss_weight_fn, self.dp_group
+        )
+        n_micro_batches = 0
+
+        def cluster_loss(_model, row_ids):
+            """Forward/backward this cluster, returning its LAST microbatch's loss."""
+            nonlocal n_micro_batches
+            mb_list = self._prepare_mb_list(
+                select_rows(input_batched, row_ids)
+            ).to(self.device)
+            n_micro_batches += len(mb_list.mbs)
+            remaining = len(mb_list.mbs)
+            held: list[torch.Tensor] = []
+
+            def process_output(
+                logits: torch.Tensor, ctx_dict: dict[str, Any]
+            ) -> torch.Tensor | None:
+                nonlocal remaining
+                remaining -= 1
+                loss = self._compute_logprobs_and_loss(
+                    logits,
+                    FSDPTrainContext(**ctx_dict),
+                    loss_fn,
+                    loss_weight_fn,
+                    total_loss_weight,
+                    loss_multiplier=self.parallel_helper.dp_size,
+                )
+                if remaining == 0:
+                    held.append(loss)
+                    return None
+                return loss
+
+            self.forward_backward_batch(mb_list, process_output, forward_only=False)
+            return held[0]
+
+        optimizer = EngineOptimizer(self)
+        record = adapters.step(rows, cluster_loss, optimizer)
+        stats = dict(optimizer.stats)
+        stats["num_micro_batches"] = n_micro_batches
+        stats["cluster_lora/plan_step"] = float(cluster_plan.step)
+        stats.update(record.as_metrics())
         return stats
 
     @torch.no_grad()
@@ -1138,11 +1264,30 @@ class FSDPEngine(TrainEngine):
         # base and adapter params to compute dtype during forward/backward.
         # The fp32 adapter path is not exercised by tests/test_fsdp_optimizer_dtype.py
         # (full-model only); LoRA + fp32 master is a known untested combination.
-        self.model = get_peft_model(
-            self.model,
-            peft_config,
-            autocast_adapter_dtype=False,
-        )
+        # SEAM 2a (selfevo/FINDINGS_cluster_lora.md section 9): one LoRA expert per
+        # cluster plus a shared one for HDBSCAN noise. Created HERE because this is the only
+        # point that is after the base model exists and before BOTH FSDP sharding and
+        # _create_optimizer, so every expert is sharded and optimised exactly like the
+        # single adapter and every expert has the same number of steps behind it. An expert
+        # created once a cluster is discovered mid-run would have no optimizer state and no
+        # shard, and would train nothing while reporting a loss.
+        #
+        # Default off: with SELFEVO_CLUSTER_LORA_ADAPTERS unset this is the get_peft_model
+        # call this file has always made, with the same arguments.
+        if os.environ.get("SELFEVO_CLUSTER_LORA_ADAPTERS", "").strip():
+            from selfevo.cluster_lora.adapters import ClusterAdapterSet
+            from selfevo.cluster_lora.wiring import adapter_roster
+
+            self._selfevo_adapters = ClusterAdapterSet.build(
+                self.model, adapter_roster(), peft_config
+            )
+            self.model = self._selfevo_adapters.model
+        else:
+            self.model = get_peft_model(
+                self.model,
+                peft_config,
+                autocast_adapter_dtype=False,
+            )
 
         if self.rank == 0:
             self.model.print_trainable_parameters()
