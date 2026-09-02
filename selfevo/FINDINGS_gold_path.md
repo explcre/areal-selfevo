@@ -367,3 +367,29 @@ start of this session was 1631 passed; the difference is NOT all this work --
 `selfevo/tests/test_gold_batch_path.py` contributes 47 and three other agents landed tests in
 the same tree while this ran. What is attributable here is that 47, and that nothing else in
 the suite changed state.
+
+## 11. Provenance of this change, and a shared-checkout race
+
+The nine files of this change were staged by name, and between the `git add` and the `git
+commit` another agent working in the same checkout ran a whole-tree add and swept them into
+`31ca3056`, whose message is about an unrelated out-of-memory fix in the interference dump.
+The content is intact -- every blob at that commit is byte-identical to the tested state, and
+the worktree matches HEAD -- but the message does not describe it, so this section is where
+the change is actually described, and the commit that adds this section is the one carrying
+its message.
+
+History was NOT rewritten to correct the attribution. Three agents were working in this
+checkout at the time and that commit was HEAD; rewriting it is how the same race happens
+again, worse. Recorded rather than fixed.
+
+The files, all committed at `31ca3056`:
+
+    areal/dataset/competition_math.py     the keep_solution flag and the tokenised gold
+    areal/workflow/rlvr.py                the attach seam for the RLVR path
+    areal/infra/workflow_executor.py      the attach seam for every other workflow
+    selfevo/gold/__init__.py              the package
+    selfevo/gold/attach.py                padding the gold to the trajectory width
+    selfevo/gold/substitute.py            the pure substitution, guards and counts
+    selfevo/tests/test_gold_batch_path.py 47 tests
+    selfevo/tests/mutate_gold_path.py     the mutation harness, 33/33
+    selfevo/FINDINGS_gold_path.md         this file
