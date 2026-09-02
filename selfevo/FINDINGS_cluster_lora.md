@@ -405,12 +405,63 @@ comfortable at 32k is five times the intended footprint at 152k. Sizing near p90
 leave about the ~10 GB headroom at which the run died.
 
 `assert_logits_fit` runs **before any forward**, twice: once for the whole batch's worst group
-before the loop, and once per group. It refuses if the chunk exceeds the budget, or if 1.5x the
-estimate exceeds free device memory -- above 1 because the estimate covers the head only and
-the decoder's activations share the same pool. The refusal names the group, its token count,
-the chunked estimate and what the unchunked one would have been. Group id=11 is 11th of 128 in
-file order, so a refusal costs the first minute rather than an hour, and it is an explicit test
-case.
+before the loop, and once per group. It refuses if the chunk exceeds the budget, or if 1.5x
+the estimate exceeds free device memory -- above 1 because the estimate covers the head only
+and the decoder's activations share the same pool. The refusal names the group, its token
+count, the chunked estimate and what the unchunked one would have been.
+
+**VERIFIED ON THE BOX 2026-09-02.** On all three adapters the guard refused cleanly before the
+forward, with a named group and a full estimate, instead of dying in the LM head. Two defects
+showed up only by running it, and both are now fixed and tested.
+
+#### The advice was inverted in one branch
+
+`assert_logits_fit` has two raise paths and the second reused the first's closing clause:
+
+    ... but only 4.60 GB is. Lower --chunk-tokens, raise --logits-budget-gb, or give the
+    probe a card with more free memory
+
+In the FREE-MEMORY branch, raising `--logits-budget-gb` is strictly counterproductive. The
+chunk is DERIVED from the budget, so a larger budget makes a larger chunk, which makes a
+larger `peak` -- the very quantity being compared against free memory. Only a smaller chunk,
+or more free memory, can satisfy it. The message sent the reader in exactly the wrong
+direction at the moment they were stuck.
+
+It now says which way to move, and computes the value:
+
+    ... but only 4.2 GiB is. Unchunked this group would have needed 14.9 GiB. LOWER the
+    budget: set --logits-budget-gb 2.8 or less (equivalently --chunk-tokens 1680 or less),
+    or free memory on the card. Do NOT raise --logits-budget-gb: the chunk is derived from
+    it, so a larger budget means a larger chunk and a larger requirement
+
+Every number needed was already in hand -- free bytes, the headroom factor, the vocabulary,
+the per-element cost -- so leaving the arithmetic to the reader was a choice, and the run that
+hit it had to derive 2.5 by hand. `satisfying_plan` computes the largest budget and chunk that
+pass, and a **round-trip test** feeds that value back into the guard and requires it to pass,
+so the suggestion cannot drift from the check it is offered to satisfy. Units were wrong too:
+the flag is GiB (`logits_budget_gb * 1024**3`) while the message printed decimal GB, ~7% adrift
+at this scale; the guard now prints GiB throughout and floors rather than rounds, because a
+suggestion rounded up does not satisfy.
+
+#### The refusal was systematic, not a tail case
+
+The group that was refused is **group 2, with 8,824 padded tokens -- p75 of the batch**
+(p75 = 8,856), not the 16,712-token outlier. Because the per-chunk requirement is
+near-constant across groups, a fixed `--logits-budget-gb 4.0` on an 80 GB card already holding
+61 GB of weights leaves ~4.60 GB free against a 6.44 GB requirement and would have refused
+**the majority of the 128 groups**. That is a misconfigured default, not a hard batch.
+
+So the default is no longer a fixed number. `resolve_logits_budget` derives it from MEASURED
+free memory -- `free / headroom`, capped at the 4 GiB ceiling -- and records which branch it
+took in the dump's metadata and on stdout. An explicit `--logits-budget-gb` is honoured
+exactly, including one that will not fit: a flag the caller set is a statement of intent, and
+silently overriding it would make the refusal that follows unattributable to anything they
+did. On the real card the derivation picks 2.8 GiB; on an emptier one it stays at the ceiling.
+
+There is a second consequence, and it is a better operating point than was planned for: a
+smaller chunk fits in the headroom a concurrent TRAINING run leaves, so the probe does not
+need the card to itself. The probe now runs at `--logits-budget-gb 2.5` alongside the A0
+baseline.
 
 **Not done, deliberately.** All eight sequences in a group share an identical prompt prefix, so
 at id=11 the same 1,330 tokens are forwarded eight times; sharing that prefix would cut the
@@ -501,11 +552,12 @@ arms because the two halves live in two venvs, and a mutation whose tests cannot
 chosen interpreter is reported NOT APPLICABLE rather than killed -- a mutation that was never
 exercised is not a passing one. Kill table in section 10.
 
-Seven tests exist only because the mutation harness found survivors, and each pins a
+Ten tests exist only because the mutation harness found survivors or a run on the box did, and each pins a
 property no other test could see: bit-equality in `unchanged()`, the merge verification
 actually firing, per-parameter hashing in the sketch, the control's own size-match assertion,
 the prompt loss covering the prompt positions, the trunk actually splitting into sub-batches,
-and the harness's own anchors still matching.
+the harness's own anchors still matching, the refusal pointing the reader the right way, the
+suggested value actually satisfying the check, and the budget following measured free memory.
 
 `git status --porcelain` shows only files in this agent's territory:
 `selfevo/cluster_lora/`, eight `selfevo/tests/test_cluster_lora_*.py`,
@@ -565,18 +617,20 @@ See section 8 for the harness. Results are appended below when both arms have ru
 
 Run against `/home/ubuntu/mutcopy` and `/home/ubuntu/mutcopy2`, each verified sha256-identical
 to the originals for every `cluster_lora` module before starting and verified restored clean
-afterwards. **73 distinct mutations, two arms, every one killed and no SKIPs.**
+afterwards. **82 distinct mutations, two arms, every one killed and no SKIPs.**
 
 | arm | interpreter | applicable | killed | survivors |
 |---|---|---|---|---|
-| `torch` | `~/venv312b` | 63 | **63** | none |
+| `torch` | `~/venv312b` | 72 | **72** | none |
 | `cluster` | `~/venv_probe` | 27 | **27** | none |
 
-17 mutations run on both arms, so the union is 73: every mutation is exercised somewhere. By
-area: the dump 29, the partition and control 15, adapter isolation 11, the analysis 7, the
-sketch 6, the merge 5.
+17 mutations run on both arms, so the union is 82: every mutation is exercised somewhere. By
+area: the dump 38, the partition and control 15, adapter isolation 11, the analysis 7, the
+sketch 6, the merge 5. Nine of the dump's cover the memory guard's ADVICE and the derived
+budget, and were added after the guard was run on the box -- including one that restores the
+inverted clause it shipped with.
 
-**Seven defects survived a first pass and each produced a new test.** They are recorded
+**Eight defects survived a first pass and each produced a new test.** They are recorded
 because the tests that missed them all looked entirely reasonable, and because five of the
 seven would have produced a plausible number rather than an error:
 
@@ -606,10 +660,18 @@ seven would have produced a plausible number rather than an error:
    parses the harness and requires every anchor to occur exactly once in its target. It is
    source-only, so it runs under both interpreters.
 
-Lessons 6 and 7 are the general ones. An optimisation whose whole purpose is to use less
+8. *The guard's advice was inverted in one branch, and no test looked at advice at all.*
+   Every test asserted that the refusal FIRED, which it did, correctly, on the real card.
+   None asserted what it then told the reader to do, so reusing the wrong clause was
+   invisible until a person followed it. The message is now checked for direction, and a
+   round-trip test feeds the value it suggests back into the guard and requires it to pass.
+
+Lessons 6, 7 and 8 are the general ones. An optimisation whose whole purpose is to use less
 memory cannot be validated by asserting the answer is unchanged, because the answer is
 unchanged when the optimisation does not happen -- the mechanism has to be observed, not the
-result. And a mutation harness silently decays as the code it points at is rewritten.
+result. And a mutation harness silently decays as the code it points at is rewritten. The third:
+a guard is not finished when it refuses correctly -- what it says next is part of it, and
+asserting only that it raised leaves the half a human actually reads untested.
 
 ### 10.1 A process failure worth recording
 
@@ -638,11 +700,16 @@ installs. Nothing here starts a training job.
       python -m selfevo.cluster_lora.interference_dump \
         --model  <base model path> \
         --adapter ~/runs/.../$CKPT \
-        --rollouts ~/runs/harnessT_trunc/rollouts_math64.jsonl \
+        --rollouts ~/runs/harnessT_trunc/rollouts_math64_probe.jsonl \
         --out    ~/runs/interference_$CKPT.npz \
         --sketch-dim 8192 --full-grad-groups 8 --device cuda --dtype bfloat16 \
-        --logits-budget-gb 4.0 --activation-budget-gb 6.0
+        --logits-budget-gb 2.5 --activation-budget-gb 6.0
     done
+
+`--logits-budget-gb` may be omitted entirely: it then derives from measured free memory,
+which on a card holding 61 GB of weights picks about 2.8 GiB. It is given explicitly above
+because the probe is sharing the card with the A0 baseline, and an explicit value is honoured
+exactly rather than re-derived under whatever happens to be free at that instant.
 
 The chunked unembedding, the sequence sub-batching and gradient checkpointing are on by
 default and are what make this fit at 32B; `--no-checkpoint` and `--no-gradient-checkpointing` exist only to reproduce the

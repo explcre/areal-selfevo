@@ -90,12 +90,133 @@ LOGIT_PEAK_BYTES_PER_ELEMENT = 12
 #: binding constraint, which is why the trunk is sub-batched over SEQUENCES as well.
 DEFAULT_ACTIVATION_BUDGET_BYTES = 6 * 1024**3
 
-#: Default ceiling on the chunked head's transient memory. At vocab 152,064 this gives a
-#: chunk of about 2,190 tokens, inside the 2,048-4,096 band that the measured length
-#: distribution of the probe batch calls for: p90 is 9,320 padded tokens per group and the
-#: max is 16,712, so a chunk near p90 would leave roughly the ~10 GB headroom at which the
-#: run died, while this leaves the binding constraint on activations instead.
+#: CEILING on the chunked head's transient memory when no budget is given. It is a ceiling
+#: and not the value used: the actual budget is derived from MEASURED free memory (see
+#: :func:`resolve_logits_budget`), because a fixed default is wrong on any card whose free
+#: memory differs from the one it was chosen for.
+#:
+#: MEASURED 2026-09-02, and this is why the derivation exists. At 4 GiB the chunk is ~2,190
+#: tokens at vocab 152,064 -- inside the 2,048-4,096 band the length distribution calls for --
+#: but on an 80 GB card already holding 61 GB of weights only ~4.60 GB is free at check time
+#: against a 6.44 GB requirement, so the guard refused group 2 of 128. Group 2 has 8,824
+#: padded tokens, which is p75 of the batch (p75 = 8,856) and NOT the 16,712-token outlier:
+#: because the per-chunk requirement is near-constant across groups, a fixed 4 GiB would have
+#: refused the majority of the batch. That is a systematic misconfiguration, not a tail case.
+#:
+#: The derived budget also turns out to be the better operating point for a different reason:
+#: a smaller chunk fits in the headroom a concurrent training run leaves, so the probe does
+#: not need the card to itself.
 DEFAULT_LOGITS_BUDGET_BYTES = 4 * 1024**3
+
+
+#: Multiple of the head's estimate that must be free before a forward is allowed.
+#:
+#: Above 1 because the estimate covers the HEAD only and the decoder's activations share the
+#: same pool. Defined once because the guard and the derived default must agree: a default
+#: computed at one headroom and checked at another would refuse the very plan it just chose.
+DEFAULT_HEADROOM = 1.5
+
+
+def satisfying_plan(
+    free_bytes: int,
+    *,
+    vocab: int,
+    headroom: float = DEFAULT_HEADROOM,
+    peak_bytes: int = LOGIT_PEAK_BYTES_PER_ELEMENT,
+) -> tuple[int, int]:
+    """The largest budget and chunk that would pass the free-memory check.
+
+    Exists so the refusal can print the value that FIXES it rather than leaving the reader to
+    derive it. Every number needed is already in hand -- free memory, the headroom factor, the
+    vocabulary and the per-element cost -- and the run that first hit this guard had to work
+    out 2.5 by hand from the message.
+
+    Args:
+        free_bytes: Free device memory at the moment of the check.
+        vocab: Vocabulary size.
+        headroom: Multiple of the estimate that must be free.
+        peak_bytes: Bytes per (token, vocab-entry).
+
+    Returns:
+        ``(budget_bytes, chunk_tokens)``. ``chunk_tokens`` is 0 when not even one token fits,
+        which no setting can repair and which the caller must say rather than suggest.
+
+    Raises:
+        ValueError: On a non-positive argument.
+    """
+    if free_bytes < 0 or vocab <= 0 or headroom <= 0 or peak_bytes <= 0:
+        raise ValueError(
+            f"free_bytes must be >= 0 and the rest positive; got {free_bytes}, {vocab}, "
+            f"{headroom}, {peak_bytes}"
+        )
+    max_peak = int(free_bytes / headroom)
+    return max_peak, int(max_peak // (int(vocab) * int(peak_bytes)))
+
+
+def _gib(n: float) -> float:
+    """Bytes as GiB, floored to one decimal so a printed suggestion is never rounded UP.
+
+    The flag is interpreted in GiB (``logits_budget_gb * 1024**3``), so a suggestion printed
+    in decimal GB would not be directly usable and a value rounded up would not satisfy the
+    check it was offered to satisfy.
+    """
+    import math
+
+    return math.floor(n / 1024**3 * 10) / 10
+
+
+def resolve_logits_budget(
+    requested_gb: float | None,
+    free_bytes: int | None,
+    *,
+    vocab: int,
+    ceiling_bytes: int = DEFAULT_LOGITS_BUDGET_BYTES,
+    headroom: float = DEFAULT_HEADROOM,
+    peak_bytes: int = LOGIT_PEAK_BYTES_PER_ELEMENT,
+) -> tuple[int, str]:
+    """Decide the logits budget, from measured free memory unless one was asked for.
+
+    An explicit ``--logits-budget-gb`` is honoured exactly, including one that will not fit:
+    a flag the caller set is a statement of intent, and silently overriding it would make the
+    refusal that follows unattributable to anything the caller did.
+
+    Otherwise the budget is what the card can actually take -- ``free / headroom`` -- capped
+    at ``ceiling_bytes``. A fixed default was measured refusing the majority of a 128-group
+    batch on an 80 GB card holding 61 GB of weights, and it would have been equally wrong in
+    the other direction on an emptier card.
+
+    Args:
+        requested_gb: The flag, in GiB, or ``None`` to derive.
+        free_bytes: Measured free device memory, or ``None`` where it cannot be asked.
+        vocab: Vocabulary size, for reporting the resulting chunk.
+        ceiling_bytes: Never derive a budget above this.
+        headroom: Multiple of the estimate that must be free.
+        peak_bytes: Bytes per (token, vocab-entry).
+
+    Returns:
+        ``(budget_bytes, why)``. ``why`` is recorded in the dump's metadata so a completed run
+        says which branch it took rather than leaving it to be inferred from the value.
+
+    Raises:
+        ValueError: If an explicit budget is not positive.
+    """
+    if requested_gb is not None:
+        if requested_gb <= 0:
+            raise ValueError(f"--logits-budget-gb must be positive, got {requested_gb}")
+        return int(requested_gb * 1024**3), f"explicit --logits-budget-gb {requested_gb}"
+    if free_bytes is None:
+        return int(ceiling_bytes), (
+            f"ceiling {_gib(ceiling_bytes):.1f} GiB; free memory could not be measured"
+        )
+    fit, chunk = satisfying_plan(
+        free_bytes, vocab=vocab, headroom=headroom, peak_bytes=peak_bytes
+    )
+    budget = min(int(ceiling_bytes), max(0, fit))
+    return budget, (
+        f"derived from {_gib(free_bytes):.1f} GiB free / {headroom}x headroom "
+        f"= {_gib(fit):.1f} GiB, capped at the {_gib(ceiling_bytes):.1f} GiB ceiling "
+        f"-> {_gib(budget):.1f} GiB (~{chunk} tokens per chunk at vocab {vocab})"
+    )
 
 
 class LogitsBudgetExceeded(RuntimeError):
@@ -212,7 +333,7 @@ def assert_logits_fit(
     chunk_tokens: int,
     budget_bytes: int = DEFAULT_LOGITS_BUDGET_BYTES,
     free_bytes: int | None = None,
-    headroom: float = 1.5,
+    headroom: float = DEFAULT_HEADROOM,
     peak_bytes: int = LOGIT_PEAK_BYTES_PER_ELEMENT,
 ) -> dict:
     """Refuse a group whose unembedding will not fit, BEFORE any forward runs.
@@ -253,19 +374,40 @@ def assert_logits_fit(
         "free_bytes": None if free_bytes is None else int(free_bytes),
     }
     if peak > budget_bytes:
+        # Here the budget is the binding limit, so raising it IS a fix.
         raise LogitsBudgetExceeded(
             f"group {group_id!r}: a chunk of {chunk_tokens} tokens at vocab {vocab} needs "
-            f"{peak / 1e9:.2f} GB, over the {budget_bytes / 1e9:.2f} GB logits budget. "
-            "Lower --chunk-tokens or raise --logits-budget-gb"
+            f"{_gib(peak):.1f} GiB, over the {_gib(budget_bytes):.1f} GiB logits budget. "
+            f"Lower --chunk-tokens, or raise --logits-budget-gb to at least "
+            f"{peak / 1024**3:.1f}"
         )
     if free_bytes is not None and peak * headroom > free_bytes:
+        # Here it is NOT. The chunk is DERIVED from the budget, so a larger budget makes a
+        # larger chunk and a larger peak -- the very quantity being compared against free
+        # memory. Advising "raise --logits-budget-gb" in this branch, as an earlier version
+        # did by reusing the clause above, sends the reader in exactly the wrong direction at
+        # the moment they are stuck. Only a SMALLER chunk, or more free memory, can satisfy it.
+        fit_budget, fit_chunk = satisfying_plan(
+            free_bytes, vocab=vocab, headroom=headroom, peak_bytes=peak_bytes
+        )
+        if fit_chunk < 1:
+            advice = (
+                "not even a single token fits in the free memory, so no setting can repair "
+                "this: free memory on the card or give the probe another one"
+            )
+        else:
+            advice = (
+                f"LOWER the budget: set --logits-budget-gb {_gib(fit_budget):.1f} or less "
+                f"(equivalently --chunk-tokens {fit_chunk} or less), or free memory on the "
+                f"card. Do NOT raise --logits-budget-gb: the chunk is derived from it, so a "
+                f"larger budget means a larger chunk and a larger requirement"
+            )
         raise LogitsBudgetExceeded(
             f"group {group_id!r} has {n_tokens} padded tokens at vocab {vocab}; the chunked "
-            f"unembedding needs {peak / 1e9:.2f} GB and {headroom}x that must be free for "
-            f"the decoder's own activations, but only {free_bytes / 1e9:.2f} GB is. "
+            f"unembedding needs {_gib(peak):.1f} GiB and {headroom}x that must be free for "
+            f"the decoder's own activations, but only {_gib(free_bytes):.1f} GiB is. "
             f"Unchunked this group would have needed "
-            f"{record['unchunked_peak_bytes'] / 1e9:.2f} GB. Lower --chunk-tokens, raise "
-            "--logits-budget-gb, or give the probe a card with more free memory"
+            f"{_gib(record['unchunked_peak_bytes']):.1f} GiB. {advice}"
         )
     return record
 
@@ -339,7 +481,7 @@ class DumpConfig:
     chunk_tokens: int | None = None
     seq_chunk: int | None = None
     activation_budget_gb: float = 6.0
-    logits_budget_gb: float = 4.0
+    logits_budget_gb: float | None = None
     logit_peak_bytes: int = LOGIT_PEAK_BYTES_PER_ELEMENT
     use_checkpoint: bool = True
     gradient_checkpointing: bool = True
@@ -1052,7 +1194,12 @@ def run_dump(cfg: DumpConfig) -> dict[str, Any]:
 
     _decoder, _unembed = _decoder_and_unembedding(model)
     vocab = int(_unembed.shape[0])
-    budget_bytes = int(cfg.logits_budget_gb * 1024**3)
+    budget_bytes, budget_why = resolve_logits_budget(
+        cfg.logits_budget_gb, _free_bytes(cfg.device), vocab=vocab,
+        peak_bytes=cfg.logit_peak_bytes,
+    )
+    logger_line = f"cluster_lora probe: logits budget {budget_why}"
+    print(logger_line, flush=True)
 
     # The whole batch's worst group, priced BEFORE any of it runs. The probe batch's tail is
     # one 1,330-token prompt repeated across eight samples, and that group is 11th of 128 in
@@ -1174,6 +1321,8 @@ def run_dump(cfg: DumpConfig) -> dict[str, Any]:
         "seq_chunk": cfg.seq_chunk,
         "activation_budget_gb": cfg.activation_budget_gb,
         "logits_budget_gb": cfg.logits_budget_gb,
+        "logits_budget_bytes": int(budget_bytes),
+        "logits_budget_why": budget_why,
         "logit_peak_bytes": cfg.logit_peak_bytes,
         "use_checkpoint": cfg.use_checkpoint,
         "gradient_checkpointing": cfg.gradient_checkpointing,

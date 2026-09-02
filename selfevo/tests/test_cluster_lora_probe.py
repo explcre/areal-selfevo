@@ -1144,3 +1144,163 @@ def test_the_default_sub_batch_follows_the_activation_budget():
             activation_budget_bytes=budget,
         )
     assert calls == [2, 2], calls
+
+
+# =========================================================================================
+# The guard's ADVICE. Found by running it on the box: the free-memory branch reused the
+# budget branch's clause and told the reader to raise --logits-budget-gb, which is strictly
+# counterproductive there -- the chunk is derived from the budget, so a larger budget makes a
+# larger chunk and a larger requirement. A guard that refuses correctly and then misdirects
+# is worse than one that says nothing, because the reader is stuck at that moment.
+# =========================================================================================
+
+
+REAL_FREE = int(4.60e9)   # measured free memory on the 80 GB card holding 61 GB of weights
+REAL_VOCAB = 152_064
+
+
+def test_the_free_memory_branch_does_not_advise_raising_the_budget():
+    """The bug. Raising the budget enlarges the very quantity being compared."""
+    with pytest.raises(LogitsBudgetExceeded) as e:
+        assert_logits_fit(
+            group_id="2", n_tokens=8824, vocab=REAL_VOCAB, chunk_tokens=2192,
+            budget_bytes=4 * 1024**3, free_bytes=REAL_FREE,
+        )
+    msg = str(e.value)
+    # Every mention of raising the budget must be a NEGATED one. Asserted as a count rather
+    # than as absence, because the correct message necessarily contains the phrase inside
+    # "Do NOT raise ...", and a bare `not in` check fails on the fixed version.
+    assert msg.count("raise --logits-budget-gb") == msg.count(
+        "Do NOT raise --logits-budget-gb"
+    ), msg
+    assert "Do NOT raise --logits-budget-gb" in msg
+    assert "LOWER the budget" in msg
+    assert "--chunk-tokens" in msg
+
+
+def test_the_budget_branch_DOES_advise_raising_the_budget():
+    """The other branch is the one where raising it is the fix, and it must still say so."""
+    with pytest.raises(LogitsBudgetExceeded) as e:
+        assert_logits_fit(
+            group_id="g", n_tokens=1000, vocab=REAL_VOCAB, chunk_tokens=100_000,
+            budget_bytes=4 * 1024**3, free_bytes=int(80e9),
+        )
+    assert "raise --logits-budget-gb to at least" in str(e.value)
+
+
+def test_the_refusal_names_a_value_that_actually_satisfies_it():
+    """A round trip, which is the only way to know the advice is arithmetic and not prose.
+
+    The run that first hit this guard had to derive the working value by hand from the
+    message. The message now computes it, and this test takes the number the message would
+    print, feeds it back in, and requires the guard to pass -- so the suggestion cannot drift
+    from the check it is offered to satisfy.
+    """
+    from selfevo.cluster_lora.interference_dump import satisfying_plan
+
+    budget, chunk = satisfying_plan(REAL_FREE, vocab=REAL_VOCAB)
+    assert chunk >= 1
+    # The suggested chunk must pass, at the suggested budget.
+    rec = assert_logits_fit(
+        group_id="2", n_tokens=8824, vocab=REAL_VOCAB, chunk_tokens=chunk,
+        budget_bytes=budget, free_bytes=REAL_FREE,
+    )
+    assert rec["chunk_tokens"] == chunk
+    # And one token more must NOT, or the suggestion is not the largest satisfying value.
+    with pytest.raises(LogitsBudgetExceeded):
+        assert_logits_fit(
+            group_id="2", n_tokens=8824, vocab=REAL_VOCAB, chunk_tokens=chunk + 1,
+            budget_bytes=budget + REAL_VOCAB * 12, free_bytes=REAL_FREE,
+        )
+
+
+def test_a_card_too_full_for_even_one_token_says_no_setting_can_fix_it():
+    """Suggesting a chunk of zero would be advice that cannot be followed."""
+    with pytest.raises(LogitsBudgetExceeded, match="no setting can repair"):
+        assert_logits_fit(
+            group_id="g", n_tokens=8824, vocab=REAL_VOCAB, chunk_tokens=2192,
+            budget_bytes=4 * 1024**3, free_bytes=1024,
+        )
+
+
+def test_the_suggested_units_match_the_flag_that_consumes_them():
+    """The flag is GiB (``logits_budget_gb * 1024**3``), so the message must print GiB.
+
+    A suggestion printed in decimal GB would be ~7% too large at this scale and would not
+    satisfy the check it was offered for.
+    """
+    from selfevo.cluster_lora.interference_dump import _gib
+
+    assert _gib(4 * 1024**3) == 4.0
+    # Floored, never rounded up: a rounded-up suggestion does not satisfy.
+    assert _gib(int(2.99 * 1024**3)) == 2.9
+    with pytest.raises(LogitsBudgetExceeded) as e:
+        assert_logits_fit(group_id="2", n_tokens=8824, vocab=REAL_VOCAB,
+                          chunk_tokens=2192, budget_bytes=4 * 1024**3, free_bytes=REAL_FREE)
+    assert "GiB" in str(e.value) and " GB" not in str(e.value)
+
+
+# ------------------------------------------------- the budget derived from free memory ----
+
+
+def test_the_default_budget_follows_MEASURED_free_memory():
+    """A fixed default was measured refusing the majority of a real batch.
+
+    Group 2 has 8,824 padded tokens -- p75 of the batch, not the 16,712-token outlier -- and
+    the per-chunk requirement is near-constant across groups, so a fixed 4 GiB on a card with
+    4.60 GB free refuses most of the 128 groups. The derived budget has to fix that.
+    """
+    from selfevo.cluster_lora.interference_dump import resolve_logits_budget
+
+    budget, why = resolve_logits_budget(None, REAL_FREE, vocab=REAL_VOCAB)
+    assert "derived from" in why
+    assert budget < 4 * 1024**3
+    # The whole point: the group that WAS refused now passes.
+    chunk = budget // (REAL_VOCAB * 12)
+    assert_logits_fit(group_id="2", n_tokens=8824, vocab=REAL_VOCAB, chunk_tokens=chunk,
+                      budget_bytes=budget, free_bytes=REAL_FREE)
+
+
+def test_an_explicit_budget_is_honoured_even_when_it_will_not_fit():
+    """A flag the caller set is a statement of intent.
+
+    Silently overriding it would make the refusal that follows unattributable to anything the
+    caller did, which is worse than refusing.
+    """
+    from selfevo.cluster_lora.interference_dump import resolve_logits_budget
+
+    budget, why = resolve_logits_budget(4.0, REAL_FREE, vocab=REAL_VOCAB)
+    assert budget == 4 * 1024**3 and "explicit" in why
+
+
+def test_the_derived_budget_is_capped_on_an_empty_card():
+    """Free memory buys a bigger chunk only up to the ceiling; past that it buys nothing."""
+    from selfevo.cluster_lora.interference_dump import resolve_logits_budget
+
+    budget, why = resolve_logits_budget(None, int(78e9), vocab=REAL_VOCAB)
+    assert budget == 4 * 1024**3 and "capped" in why
+
+
+def test_an_unmeasurable_card_falls_back_to_the_ceiling_and_says_so():
+    from selfevo.cluster_lora.interference_dump import resolve_logits_budget
+
+    budget, why = resolve_logits_budget(None, None, vocab=REAL_VOCAB)
+    assert budget == 4 * 1024**3 and "could not be measured" in why
+
+
+def test_a_non_positive_explicit_budget_is_refused():
+    from selfevo.cluster_lora.interference_dump import resolve_logits_budget
+
+    with pytest.raises(ValueError, match="must be positive"):
+        resolve_logits_budget(0.0, REAL_FREE, vocab=REAL_VOCAB)
+
+
+def test_the_dump_records_which_budget_branch_it_took(ckpt, rollouts, tmp_path,
+                                                      patched_tokenizer):
+    """A completed run must say how its budget was chosen, not leave it to be inferred."""
+    out = tmp_path / "dump.npz"
+    meta = run_dump(cfg_for(ckpt, rollouts, out))
+    assert "logits_budget_why" in meta and meta["logits_budget_bytes"] > 0
+    meta2 = run_dump(cfg_for(ckpt, rollouts, out, logits_budget_gb=1.0))
+    assert "explicit" in meta2["logits_budget_why"]
+    assert meta2["logits_budget_bytes"] == 1024**3
