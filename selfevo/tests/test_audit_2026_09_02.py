@@ -128,14 +128,6 @@ def gold_traj(reward: float, gold_len: int, seed: int = 0) -> dict:
 # ============================================================ CONFIRMED DEFECTS ==========
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-    "CONFIRMED DEFECT 1: a configured expert roster with no partition armed runs the unrouted "
-    "step, trains one expert and emits no cluster_lora/* key. Fix: refuse in "
-    "FSDPEngine.train_batch when _selfevo_adapters exists and no plan is armed "
-    ),
-)
 def test_defect_a_roster_of_experts_with_no_plan_armed_trains_one_and_says_nothing(
     world, tmp_path
 ):
@@ -155,35 +147,36 @@ def test_defect_a_roster_of_experts_with_no_plan_armed_trains_one_and_says_nothi
     one seam that has no guard. ``test_an_unarmed_engine_never_looks_for_a_plan`` deletes
     ``_selfevo_adapters`` before it runs, so this state is not covered by it.
 
-    FAILS ON CURRENT CODE. The fix is a refusal in ``FSDPEngine.train_batch``: if
-    ``self._selfevo_adapters`` exists and no plan is armed, raise, exactly as the mirrored
-    case (a plan armed with no adapter set) already does.
+    FIXED 2026-09-02, and the marker is gone with the fix. ``FSDPEngine.train_batch`` now
+    refuses when ``self._selfevo_adapters`` exists and no plan is armed, exactly as the
+    mirrored case (a plan armed with no adapter set) already did. The assertion below is the
+    refusal rather than the two measurements above, because a step that refuses returns no
+    stats to inspect -- and a run that cannot start is the outcome asked for: there is no
+    partition for a dashboard to report, only a configuration that has to be fixed before
+    the accelerators are spent. What survives from the measurement is the second assertion:
+    no expert may have moved, since a refusal taken after the optimizer step would train
+    ``cluster_0`` alone and still raise.
+
+    ``test_an_unarmed_engine_never_looks_for_a_plan`` covers the OTHER state -- no roster and
+    no plan, the rollback path -- and ``test_a_roster_of_experts_with_no_plan_armed_is_refused``
+    in that same module now covers this one, so the gap between them is closed at the source
+    as well as here.
     """
+    from selfevo.cluster_lora.wiring import ClusterWiringError
+
     engine, adapters = make_engine(tmp_path)
     before = {n: adapters.snapshot(n) for n in NAMES}
-    stats = engine.train_batch(
-        make_batch(seed=0), loss_fn=linear_loss, loss_weight_fn=weight_fn
-    )
+    with pytest.raises(ClusterWiringError, match="no partition is armed"):
+        engine.train_batch(
+            make_batch(seed=0), loss_fn=linear_loss, loss_weight_fn=weight_fn
+        )
     moved = [n for n in NAMES if not adapters.unchanged(n, before[n])]
-    assert not moved or len(moved) == len(NAMES), (
-        f"a step with {len(NAMES)} experts created and no partition armed trained {moved} "
-        f"and left {[n for n in NAMES if n not in moved]} at their LoRA init. The arm is "
-        "the shared-LoRA baseline wearing the method name, and the engine did not refuse"
-    )
-    assert any(k.startswith("cluster_lora/") for k in stats), (
-        "the step reported no cluster_lora/* key whatever, so a dashboard cannot even see "
-        f"that the partition never reached the engine; keys were {sorted(stats)}"
+    assert not moved, (
+        f"the engine refused and {moved} moved anyway, so the refusal is downstream of the "
+        "optimizer step and the arm still trained one expert on the whole batch"
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-    "CONFIRMED DEFECT 1 (reachability): SELFEVO_CLUSTER_LORA is read only inside "
-    "_route_groups, which needs group_routing.enabled and group_routing.router. Fix: check "
-    "the variable outside the routing branch, or refuse in the engine "
-    ),
-)
 def test_defect_the_actor_arms_nothing_when_group_routing_is_off(monkeypatch):
     """The reachability of the defect above, at the seam that is supposed to refuse.
 
@@ -193,9 +186,16 @@ def test_defect_the_actor_arms_nothing_when_group_routing_is_off(monkeypatch):
     switch set and group routing left at its default the actor computes advantages, arms
     nothing, and returns without a word.
 
-    FAILS ON CURRENT CODE. The fix belongs where the switch is read: either the actor checks
-    the variable outside the routing branch and refuses when routing cannot carry it, or the
-    engine refuses as in the test above. One of the two has to.
+    FIXED 2026-09-02, and the marker is gone with the fix. The switch is now read outside
+    the routing branch, into ``PPOActor._arm_unrouted_cluster_batch``. ``partition=none`` is
+    the vanilla shared-LoRA arm expressed in the method's type and needs neither features nor
+    a router, so it is ARMED there -- every group on the shared adapter, which is what that
+    arm means -- and the baseline runs the identical engine path as the method. ``meds`` and
+    ``random_matched`` need vectors that reach the partitioner only through the routing seam,
+    so those are REFUSED; both cases are asserted in ``test_cluster_lora_wired.py``.
+
+    The mirrored guard in the engine, for a roster armed with no plan at all, is the subject
+    of the test above and is still open.
     """
     from selfevo.cluster_lora import wiring
     from selfevo.tests.test_cluster_lora_wired import FakeEngine
@@ -516,6 +516,10 @@ def test_refuted_the_cluster_denominator_is_not_rescaled_by_cluster_size(world, 
     fe.compute_total_loss_weight = spy
     try:
         plain, _ = make_engine(tmp_path, seed=21)
+        # The unrouted step is now refused on an engine that carries a roster, which is the
+        # misconfigured arm; the comparison here is against a run with no cluster-LoRA at
+        # all, so the adapter set goes with the plan.
+        del plain._selfevo_adapters
         plain.train_batch(
             make_batch(seed=4), loss_fn=linear_loss, loss_weight_fn=weight_fn
         )

@@ -398,6 +398,11 @@ def test_the_none_arm_reproduces_the_unrouted_step_bit_for_bit(world, tmp_path, 
     """
     a, ad_a = make_engine(tmp_path, names=("shared",), seed=7, n_mbs=n_mbs)
     b, ad_b = make_engine(tmp_path, names=("shared",), seed=7, n_mbs=n_mbs)
+    # The unrouted comparison is a run with NO cluster-LoRA at all, which is an engine
+    # carrying no adapter set: a roster with no plan armed is the misconfigured arm and
+    # is now refused. make_engine attaches one so the snapshots can be read, and the
+    # deletion touches neither the model nor the weights, so this is the same comparison.
+    del a._selfevo_adapters
     start = ad_a.snapshot("shared")
     assert ad_b.unchanged("shared", start), "the two engines did not start identical"
 
@@ -466,6 +471,12 @@ def test_the_default_path_is_the_committed_one_bit_for_bit(world, tmp_path):
         pytest.skip("no pre-seam fsdp_engine.py in this checkout's history to compare with")
     a, ad_a = make_engine(tmp_path, names=("shared",), seed=11)
     b, ad_b = make_engine(tmp_path, names=("shared",), seed=11)
+    # "No cluster config" means no ADAPTER SET, which is what _apply_peft_wrapper leaves
+    # when SELFEVO_CLUSTER_LORA_ADAPTERS is unset. make_engine always attaches one so that
+    # the snapshots can be read, and an engine that carries a roster and arms no partition
+    # is now refused -- correctly, since that state IS the misconfigured arm. The model and
+    # the weights are untouched by the deletion, so the comparison is the same one.
+    del b._selfevo_adapters
     start = ad_a.snapshot("shared")
     assert ad_b.unchanged("shared", start), "the two engines did not start identical"
 
@@ -478,7 +489,14 @@ def test_the_default_path_is_the_committed_one_bit_for_bit(world, tmp_path):
 
 
 def test_an_unarmed_engine_never_looks_for_a_plan(world, tmp_path):
-    """With no plan the engine must not require a roster, a group_ids column, or anything."""
+    """With no plan AND no roster the engine must not require a group_ids column, or anything.
+
+    This is the ROLLBACK path: a run that never configured cluster-LoRA, where
+    ``_apply_peft_wrapper`` attached no ``ClusterAdapterSet``. It is deliberately not the
+    misconfigured path -- a roster with no plan -- which is a different state and is refused
+    by :func:`test_a_roster_of_experts_with_no_plan_armed_is_refused` below. The two were one
+    test until the second state was found to be silently trainable.
+    """
     engine, adapters = make_engine(tmp_path, names=("shared",))
     del engine._selfevo_adapters
     data = make_batch()
@@ -486,6 +504,32 @@ def test_an_unarmed_engine_never_looks_for_a_plan(world, tmp_path):
     before = adapters.snapshot("shared")
     run(engine, data)
     assert not adapters.unchanged("shared", before)
+
+
+def test_a_roster_of_experts_with_no_plan_armed_is_refused(world, tmp_path):
+    """The misconfigured arm: every expert created, no partition armed, nothing said.
+
+    Two variables switch this arm on at two seams. ``SELFEVO_CLUSTER_LORA_ADAPTERS`` creates
+    the experts here, on every run that sets it. ``SELFEVO_CLUSTER_LORA`` arms the partition
+    from the actor, at a seam reached only under ``group_routing.enabled`` with a router. Out
+    of step, the step below used to run unrouted: ``cluster_0`` trained for the whole batch,
+    the others stayed at their LoRA init where ``B = 0`` makes them add exactly zero to
+    ``merge_sum``, and the returned stats carried no ``cluster_lora/*`` key at all -- the
+    shared-LoRA baseline, bit for bit, reporting itself as the method.
+
+    The mirrored case, a plan armed with no adapter set, was already refused. Asserted with
+    the weights BEFORE and AFTER, because a refusal taken after the optimizer step would
+    leave the same silent training behind and still raise.
+    """
+    from selfevo.cluster_lora.wiring import ClusterWiringError
+
+    engine, adapters = make_engine(tmp_path)
+    before = {n: adapters.snapshot(n) for n in NAMES}
+    with pytest.raises(ClusterWiringError, match="no partition is armed"):
+        run(engine, make_batch())
+    assert all(adapters.unchanged(n, before[n]) for n in NAMES), (
+        "the refusal came after the step, so an expert trained anyway"
+    )
 
 
 # ------------------------------------------------------------------ the denominator ------
@@ -521,6 +565,11 @@ def test_the_loss_denominator_is_the_WHOLE_batch_and_is_taken_once(world, tmp_pa
 
     monkeypatch.setattr(fe, "compute_total_loss_weight", spy)
     plain, _ = make_engine(tmp_path, seed=13)
+    # The unrouted comparison is a run with NO cluster-LoRA at all, which is an engine
+    # carrying no adapter set: a roster with no plan armed is the misconfigured arm and
+    # is now refused. make_engine attaches one so the snapshots can be read, and the
+    # deletion touches neither the model nor the weights, so this is the same comparison.
+    del plain._selfevo_adapters
     run(plain, make_batch(seed=2))
     clustered, _ = make_engine(tmp_path, seed=13)
     run(clustered, make_batch(seed=2), plan_of({0: "cluster_0", 1: "cluster_0",

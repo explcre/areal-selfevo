@@ -823,6 +823,30 @@ class FSDPEngine(TrainEngine):
             return self._train_batch_by_cluster(
                 input_batched, loss_fn, loss_weight_fn, cluster_plan
             )
+        adapters = getattr(self, "_selfevo_adapters", None)
+        if adapters is not None:
+            # The mirror of the refusal inside _train_batch_by_cluster, which rejects a plan
+            # armed with no adapter set. THIS direction had no guard, and it is the one a
+            # misconfiguration actually takes: the experts are created from
+            # SELFEVO_CLUSTER_LORA_ADAPTERS in _apply_peft_wrapper on every run that sets it,
+            # while the partition is armed from SELFEVO_CLUSTER_LORA at a seam a run with
+            # group_routing off never reaches. Falling through to the unrouted step then
+            # trains whichever expert happened to be active for the WHOLE batch and leaves
+            # the rest at their LoRA init -- where B = 0 makes them contribute exactly zero
+            # to merge_sum, so the deployed model is the shared-LoRA baseline bit for bit,
+            # under the method's name, with no cluster_lora/* key in the returned stats to
+            # say the partition never arrived.
+            from selfevo.cluster_lora.wiring import ClusterWiringError
+
+            raise ClusterWiringError(
+                f"this engine carries the cluster-LoRA experts {list(adapters.names)} and no "
+                "partition is armed for this batch, so the step would train one of them for "
+                "the whole batch and leave the rest at their LoRA init, which merges to "
+                "exactly the shared-LoRA baseline while the config names the method. Either "
+                "arm a plan -- SELFEVO_CLUSTER_LORA with a group_routing.router the "
+                "partition can travel through -- or unset SELFEVO_CLUSTER_LORA_ADAPTERS so "
+                "no expert is created"
+            )
 
         # Step 1: Prepare micro-batches
         mb_list = self._prepare_mb_list(input_batched).to(self.device)

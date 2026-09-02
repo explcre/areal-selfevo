@@ -29,7 +29,10 @@ torch = pytest.importorskip("torch")
 from areal.api.cli_args import GroupRoutingConfig  # noqa: E402
 from areal.utils import stats_tracker  # noqa: E402
 from selfevo.cluster_lora import wiring  # noqa: E402
-from selfevo.cluster_lora.partition import PartitionUnavailable  # noqa: E402
+from selfevo.cluster_lora.partition import (  # noqa: E402
+    SHARED_CLUSTER,
+    PartitionUnavailable,
+)
 from selfevo.cluster_lora.wiring import (  # noqa: E402
     ClusterLoRAConfig,
     ClusterPlan,
@@ -274,6 +277,104 @@ def test_random_matched_without_features_refuses_too(monkeypatch):
     actor = routed_actor(monkeypatch, "random_matched", engine=FakeEngine())
     with pytest.raises(PartitionUnavailable):
         advantages(actor, MIXED)
+
+
+def test_an_unroutable_none_arm_is_armed_rather_than_silently_left_as_the_baseline(
+    monkeypatch, emitted
+):
+    """The switch is read outside the routing branch, so the two variables cannot drift apart.
+
+    ``SELFEVO_CLUSTER_LORA_ADAPTERS`` creates every expert in the engine on every run that
+    sets it; ``SELFEVO_CLUSTER_LORA`` used to be read only inside ``_route_groups``, which is
+    reached only under ``group_routing.enabled`` with a router. With both variables set and
+    ``group_routing`` at its default the run created every expert, armed nothing, trained the
+    first expert for the whole batch and emitted no ``cluster_lora/*`` key at all.
+
+    ``none`` is the arm that CAN be armed without a router, and it is: it needs no features
+    and no clustering, and putting every group on the shared adapter is what it means. The
+    baseline then runs the identical engine path as the method, which is the property the
+    degenerate partition exists for.
+    """
+    monkeypatch.setenv(wiring.CLUSTER_LORA_ENV, "none")
+    monkeypatch.setenv(wiring.ROSTER_ENV, "cluster_0,cluster_1,shared")
+    actor = make_actor(GroupRoutingConfig(enabled=False))
+    actor.engine = FakeEngine()
+    advantages(actor, MIXED)
+    plan = actor.engine._selfevo_cluster_plan
+    assert set(plan.key_of_group.values()) == {SHARED_CLUSTER}
+    assert len(plan.key_of_group) == B // G
+    assert emitted["cluster_lora/plan_armed"] == 1.0
+    assert emitted["cluster_lora/adapters_available"] == 3.0
+
+
+def test_the_unrouted_arm_advances_the_step_the_plan_records(monkeypatch):
+    """The plan's step is the only thing that identifies a stale plan, so it has to move."""
+    monkeypatch.setenv(wiring.CLUSTER_LORA_ENV, "none")
+    actor = make_actor(GroupRoutingConfig(enabled=False))
+    actor.engine = FakeEngine()
+    steps = []
+    for _ in range(3):
+        advantages(actor, MIXED)
+        steps.append(actor.engine._selfevo_cluster_plan.step)
+    assert steps == [0, 1, 2]
+
+
+@pytest.mark.parametrize("partition", ["meds", "random_matched"])
+def test_an_arm_that_needs_features_is_refused_when_routing_cannot_carry_them(
+    monkeypatch, partition
+):
+    """The vectors reach the partitioner only through the routing seam, so there is nothing
+    to arm -- and one adapter for everything under the method's label is the failure every
+    other refusal in this module exists to prevent.
+    """
+    monkeypatch.setenv(wiring.CLUSTER_LORA_ENV, partition)
+    monkeypatch.setenv(wiring.ROSTER_ENV, "cluster_0,cluster_1,shared")
+    actor = make_actor(GroupRoutingConfig(enabled=False))
+    actor.engine = FakeEngine()
+    with pytest.raises(ClusterWiringError, match="group-routing seam"):
+        advantages(actor, MIXED)
+
+
+def test_group_routing_enabled_with_no_router_is_the_same_unroutable_state(monkeypatch):
+    """``_route_groups`` needs BOTH halves, so half a routing configuration is not routing."""
+    monkeypatch.setenv(wiring.CLUSTER_LORA_ENV, "meds")
+    actor = make_actor(GroupRoutingConfig(enabled=True, router=None))
+    actor.engine = FakeEngine()
+    with pytest.raises(ClusterWiringError, match="router=None"):
+        advantages(actor, MIXED)
+
+
+def test_the_unrouted_none_arm_needs_a_shared_adapter_in_the_roster(monkeypatch):
+    """Every group goes to ``shared``; a roster without one names an expert that is absent."""
+    monkeypatch.setenv(wiring.CLUSTER_LORA_ENV, "none")
+    monkeypatch.setenv(wiring.ROSTER_ENV, "cluster_0,cluster_1")
+    actor = make_actor(GroupRoutingConfig(enabled=False))
+    actor.engine = FakeEngine()
+    with pytest.raises(ClusterWiringError, match="does not have one"):
+        advantages(actor, MIXED)
+
+
+def test_an_arm_with_no_engine_says_so_rather_than_reporting_nothing(monkeypatch, emitted):
+    """Zero on that key is "the partition did not reach an engine", which is not the same as
+    "there was no cluster-LoRA arm" -- and telling those two apart from the log is the whole
+    point of emitting a cluster_lora key on this branch at all.
+    """
+    monkeypatch.setenv(wiring.CLUSTER_LORA_ENV, "none")
+    actor = make_actor(GroupRoutingConfig(enabled=False))
+    actor.engine = None
+    advantages(actor, MIXED)
+    assert emitted["cluster_lora/plan_armed"] == 0.0
+    assert emitted["cluster_lora/plan_groups"] == float(B // G)
+
+
+def test_an_unconfigured_run_arms_nothing_outside_the_routing_branch_either(monkeypatch):
+    """The rollback, on the branch that is now reachable with group routing switched off."""
+    monkeypatch.delenv(wiring.CLUSTER_LORA_ENV, raising=False)
+    actor = make_actor(GroupRoutingConfig(enabled=False))
+    actor.engine = FakeEngine()
+    advantages(actor, MIXED)
+    assert not hasattr(actor.engine, "_selfevo_cluster_plan")
+    assert not hasattr(actor, "_selfevo_batch")
 
 
 def test_a_router_that_cannot_carry_a_partition_is_refused(monkeypatch):
