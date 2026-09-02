@@ -249,3 +249,51 @@ def test_unchanged_is_bit_equality_and_not_a_tolerance():
     with torch.no_grad():
         next(iter(a.parameters("cluster_0")))[1].add_(1e-9)
     assert not a.unchanged("cluster_0", before), "a 1e-9 perturbation was called unchanged"
+
+
+def test_an_expert_that_is_IDLE_this_step_does_not_decay():
+    """The realistic leak, and the one the two-step test above cannot reach.
+
+    ``zero_grad(set_to_none=False)`` only zeroes gradients that already EXIST, so an adapter
+    that has never had a backward pass still has ``.grad is None`` and is skipped by the
+    optimizer either way. The leak appears once a cluster has been trained and is then absent
+    from a later batch -- which happens constantly, since a cluster with no groups this step
+    is the normal case. Its gradient is then a zero TENSOR, the optimizer steps it, and
+    decoupled weight decay shrinks an expert that saw no data.
+
+    Measured: the mutation replacing ``set_to_none=True`` SURVIVED the two-step test and is
+    killed by this one.
+    """
+    a = tiny_peft()
+    opt = optimiser(a)
+    a.step({"cluster_0": batch(seed=0), "cluster_1": batch(seed=1)}, lm_loss, opt)
+    trained = a.snapshot("cluster_0")
+    for step in (1, 2, 3):
+        a.step({"cluster_1": batch(seed=step)}, lm_loss, opt)
+    assert a.unchanged("cluster_0", trained), (
+        "a trained expert moved while it was idle; weight decay is reaching it"
+    )
+
+
+def test_the_leak_check_fires_if_PEFT_stops_freezing_the_other_experts():
+    """The guard inside ``only()`` is defensive, so nothing else can make it fire.
+
+    PEFT's ``set_adapter`` currently flips ``requires_grad`` as well as the active set, and
+    that semantics belongs to PEFT rather than to this project -- an upgrade could change it
+    and the isolation would then rest on the forward loop alone. Here ``set_adapter`` is
+    replaced by one that activates without freezing, and the refusal has to fire.
+    """
+    a = tiny_peft()
+
+    def activate_only(name):
+        """Switch the active adapter but leave every parameter trainable."""
+        for _mod_name, mod in a._tuner_layers():
+            mod._active_adapter = [name]
+
+    a.model.set_adapter = activate_only
+    for n in NAMES:
+        for _k, param in a.parameters(n):
+            param.requires_grad_(True)
+    with pytest.raises(AdapterIsolationError, match="could accumulate into adapter"):
+        with a.only("cluster_0"):
+            pass

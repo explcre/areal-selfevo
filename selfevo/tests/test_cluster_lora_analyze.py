@@ -212,9 +212,15 @@ def test_the_bootstrap_spread_separates_a_real_partition_from_a_permuted_one():
         "random_matched", random_matched_partition(truth, seed=1), sketch,
         floor=0.05, n_boot=400, seed=0,
     )
-    assert a["bootstrap_mean_cosine"]["n_effective"] > 300
-    assert a["bootstrap_mean_cosine"]["std"] < 0.5 * b["bootstrap_mean_cosine"]["std"]
-    assert a["bootstrap_mean_cosine"]["lo"] <= a["bootstrap_mean_cosine"]["hi"]
+    ci_a, ci_b = a["bootstrap_mean_cosine"], b["bootstrap_mean_cosine"]
+    assert ci_a["n_effective"] > 300
+    assert ci_a["std"] < 0.5 * ci_b["std"]
+    # A zero-width interval claims a precision the estimate does not have, and it is what a
+    # bootstrap that forgot to resample produces. Checked on WIDTH rather than on the ratio
+    # of the two standard deviations: with no resampling both are ~1e-17 and the ratio
+    # compares float noise, which was measured passing.
+    assert ci_a["hi"] - ci_a["lo"] > 1e-6, ci_a
+    assert ci_b["hi"] - ci_b["lo"] > 1e-6, ci_b
 
 
 def test_a_cosine_under_the_resolution_floor_is_not_reported_as_resolved():

@@ -171,7 +171,7 @@ def test_the_group_losses_sum_to_the_batch_loss():
             lp = torch.log_softmax(model(input_ids=seq).logits[:, :-1, :], -1)
             picked = lp.gather(-1, seq[:, 1:].unsqueeze(-1)).squeeze(-1)[0]
             n_p = len(g.prompt_ids)
-            ref += -float(adv[i]) * float(picked[n_p - 1:].sum())
+            ref += -float(adv[i]) * float(picked[n_p - 1:].sum().detach())
     ref /= resp
     assert total == pytest.approx(ref, abs=1e-5)
 
@@ -371,6 +371,46 @@ def test_a_full_gradient_dump_over_the_size_limit_is_refused(ckpt, rollouts, tmp
     with pytest.raises(RuntimeError, match="over the"):
         run_dump(cfg_for(ckpt, rollouts, tmp_path / "d.npz",
                          full_grad_groups=6, max_full_grad_gb=1e-9))
+
+
+def test_the_prompt_nll_covers_exactly_the_prompt_positions():
+    """The ELREA feature is a different LOSS, not the RL loss under another mask.
+
+    Checked against an independent reference over the prompt positions, because a mask that
+    quietly covered the response instead would still produce a plausible gradient, a
+    plausible sketch and a plausible clustering -- and the ELREA ablation would then be
+    comparing the method against itself. Measured: the mutation replacing the prompt mask
+    with the response mask SURVIVED a test that only checked the two sketches were not
+    parallel.
+
+    Position t predicts token t+1, so the prompt region in emitter coordinates is
+    ``t < n_prompt - 1``: the position at ``n_prompt - 1`` emits the response's first token
+    and belongs to the response.
+    """
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    torch.manual_seed(0)
+    conf = AutoConfig.for_model(
+        "qwen2", hidden_size=16, intermediate_size=32, num_hidden_layers=2,
+        num_attention_heads=4, num_key_value_heads=2, vocab_size=VOCAB,
+        max_position_embeddings=64, tie_word_embeddings=False,
+    )
+    model = AutoModelForCausalLM.from_config(conf).eval()
+    g = Group("p", "math", [1, 2, 3, 4], [[5, 6, 7], [8, 9, 10]], [1.0, 0.0])
+    resp = sum(len(r) for r in g.response_ids)
+    prompt = len(g.prompt_ids) * g.size
+    _grpo, pnll = group_losses(
+        model, g, device="cpu", token_denominator=resp, prompt_denominator=prompt
+    )
+
+    ref = 0.0
+    n_p = len(g.prompt_ids)
+    for r in g.response_ids:
+        seq = torch.tensor([g.prompt_ids + r])
+        lp = torch.log_softmax(model(input_ids=seq).logits[:, :-1, :], -1)
+        picked = lp.gather(-1, seq[:, 1:].unsqueeze(-1)).squeeze(-1)[0]
+        ref += -float(picked[: n_p - 1].sum())
+    assert float(pnll.detach()) == pytest.approx(ref / prompt, abs=1e-5)
 
 
 def test_the_two_gradients_are_different_gradients(ckpt, rollouts, tmp_path,

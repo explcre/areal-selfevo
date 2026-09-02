@@ -165,3 +165,24 @@ def test_two_parameters_do_not_share_a_hash():
     first = sketch_vector([("a", x), ("b", z)], plan)
     second = sketch_vector([("a", z), ("b", x)], plan)
     assert not np.allclose(first, second), "the two parameters share a hash and alias"
+
+
+def test_the_random_signs_are_what_keep_disjoint_vectors_orthogonal():
+    """Drop the signs and the CountSketch becomes a hashed SUM, which is not a projection.
+
+    Two non-negative vectors on disjoint supports are exactly orthogonal. With signs, the
+    cross terms that collide in a bucket cancel and the sketched cosine stays near zero;
+    without them every collision adds, and the sketched cosine goes strongly positive -- so a
+    probe would report clusters as agreeing whenever their gradients merely overlapped in a
+    hash bucket.
+
+    Zero-mean random vectors do NOT reveal this: the unsigned estimator is still unbiased on
+    them, only noisier, which is why the angle-preservation test above cannot catch it.
+    """
+    plan = SketchPlan(dim=64, seed=0)
+    n = 4000
+    a = np.concatenate([np.ones(n), np.zeros(n)])
+    b = np.concatenate([np.zeros(n), np.ones(n)])
+    sa, sb = sketch_vector([("w", a)], plan), sketch_vector([("w", b)], plan)
+    cos = float(np.dot(sa, sb) / (np.linalg.norm(sa) * np.linalg.norm(sb)))
+    assert abs(cos) < 0.3, f"sketched cosine {cos} for exactly orthogonal vectors"

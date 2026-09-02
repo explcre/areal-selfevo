@@ -91,7 +91,8 @@ MUTATIONS = [
     (MERGE, [T_MERGE], "the merge verification never fires",
      "        if err > atol + rtol * scale and err > worst:", "        if False:"),
     (MERGE, [T_MERGE], "cat becomes linear, which is a different merge at these ranks",
-     'combination_type="cat"', 'combination_type="linear"'),
+     'adapter_name=target, combination_type="cat"',
+     'adapter_name=target, combination_type="linear"'),
     (MERGE, [T_MERGE], "the ragged-module refusal never fires",
      "        elif here != modules:", "        elif False:"),
     (MERGE, [T_MERGE], "weights are ignored, so a weighted merge is silently a plain sum",
@@ -142,7 +143,11 @@ MUTATIONS = [
     (SKETCH, [T_SKETCH], "the random signs are dropped, so the sketch is a sum not a projection",
      "        np.add.at(out, idx, sign * flat.astype(dtype, copy=False))",
      "        np.add.at(out, idx, flat.astype(dtype, copy=False))"),
-    (SKETCH, [T_SKETCH], "the torch path drops the signs, diverging from the numpy one",
+    # T_PROBE as well as T_SKETCH: the agreement test inside T_SKETCH importorskips torch,
+    # so on the analysis interpreter it SKIPS and the mutation would be reported as surviving
+    # a test that never ran. Naming a torch-only file makes the mutation not-applicable there
+    # instead, which is the honest label.
+    (SKETCH, [T_SKETCH, T_PROBE], "the torch path drops the signs, diverging from the numpy one",
      "        contrib.index_add_(0, idx_t, sign_t * flat.to(torch.float64))",
      "        contrib.index_add_(0, idx_t, flat.to(torch.float64))"),
     (SKETCH, [T_SKETCH], "a layout change between groups is accepted, so sketches stop being comparable",

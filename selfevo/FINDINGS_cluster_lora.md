@@ -430,3 +430,49 @@ Needing a GPU:
 ## 10. Kill table
 
 See section 8 for the harness. Results are appended below when both arms have run.
+
+Run against `/home/ubuntu/mutcopy` and `/home/ubuntu/mutcopy2`, each verified sha256-identical
+to the originals for all nine `cluster_lora` modules before starting and verified restored
+clean afterwards. 53 distinct mutations, two arms, **every applicable mutation killed and no
+SKIPs** -- an anchor that stopped being unique is reported as NOT a kill, and one was
+(`combination_type="cat"` appeared twice) until the anchor was made specific.
+
+| arm | interpreter | mutations applicable | killed | survivors |
+|---|---|---|---|---|
+| `torch` | `~/venv312b` | 43 (10 not applicable) | **43** | none |
+| `cluster` | `~/venv_probe` | 27 (26 not applicable) | **27** | none |
+
+Mutations by area: adapter isolation 11, merge 5, partition and control 15, sketch 6, dump 9,
+analysis 7.
+
+**Five defects survived the first pass and each produced a new test.** They are recorded
+because the tests that missed them looked entirely reasonable:
+
+1. *`zero_grad(set_to_none=False)` survived the isolation guard.* The two-step test trained
+   only `cluster_1`, so `cluster_0` never had a `.grad` at all and was skipped by the
+   optimizer either way. The leak needs an expert that was trained and is then IDLE -- the
+   normal case, since most clusters are absent from most batches. `test_an_expert_that_is_
+   IDLE_this_step_does_not_decay` trains every expert once and then leaves one idle for three
+   steps.
+2. *The `requires_grad` leak check inside `only()` survived.* It is defensive, so nothing
+   fires it while PEFT behaves. `test_the_leak_check_fires_if_PEFT_stops_freezing_the_other_
+   experts` replaces `set_adapter` with one that activates without freezing and requires the
+   refusal -- the semantics belong to PEFT, not to this project, and an upgrade could change
+   them.
+3. *Masking the prompt NLL to the RESPONSE survived.* The test only asserted the two sketches
+   were not parallel, and they still were not -- the GRPO loss is advantage-weighted and the
+   NLL is not, so a response-masked NLL is a different vector from the RL gradient while being
+   useless as the ELREA feature. `test_the_prompt_nll_covers_exactly_the_prompt_positions`
+   checks against an independent reference over the prompt positions.
+4. *Dropping the CountSketch's random signs survived.* On zero-mean random vectors the
+   unsigned estimator is still unbiased, only noisier, so the angle-preservation test could
+   not see it. It breaks on non-negative vectors, where every hash collision ADDS:
+   `test_the_random_signs_are_what_keep_disjoint_vectors_orthogonal` sketches two exactly
+   orthogonal non-negative vectors and requires the cosine to stay near zero.
+5. *A bootstrap that stopped resampling survived.* Every replicate identical gives
+   `std = 0.0` for one partition and `5.6e-17` for the other, so the ratio assertion compared
+   float noise and passed. Now checked on interval WIDTH, which is what a degenerate bootstrap
+   actually gets wrong: a zero-width interval claims a precision the estimate does not have.
+
+Two of those five (1 and 4) are defects that would have produced a plausible, publishable
+number rather than an error.
