@@ -257,3 +257,73 @@ What would change my mind toward the original framing: a covariate-router win ov
 - The memory-file theorem `finding_binary_reward_collapse` should cite 2607.00152 as its published form.
 - The k=0 gold arm: do not build; run LSPO as a baseline instead.
 - Stop describing the harness ladder as harness evolution anywhere.
+
+---
+
+## 6. The PI's extended proposal, assessed
+
+Proposed 2026-09-01: frozen LLM as router cold start, then a LoRA on the router trained by RL;
+per-task LoRA on the policy and, within a task, per-MEDS-cluster LoRA; distillation as a
+routable source with every loss choice; per-task harness co-evolution cold-started from each
+task's best known harness, down to per-sample-group.
+
+### 6.1 As a whole system — structural objection, not taste
+
+Every axis routes on the same information. Under binary rewards that is `k` plus whatever
+covariates carry signal (§4.3). Actuators — LoRA experts, harnesses, distillation sources —
+add places to route TO; none adds information about WHERE. If covariates carry nothing beyond
+`k`, every actuator is routed by `k` and the system reduces to DyME + DAPO + LSPO with more
+parts. The feature audit (§5.3) remains the gate for the whole proposal.
+
+Credit multiplies: four simultaneous decisions per group against one per-prompt credit scalar
+per step is a harder attribution problem than the single-decision one just solved, and the
+meta-controller literature solves even that only by many independent episodes (L2T, AutoLoss;
+§4.1), infeasible when an episode is a training run.
+
+Venue: it would be the fifth system paper in the cell (SIA, EvoTrainer, 2607.01120, HASE). A
+system with more axes wins only by beating them at matched budget, which the compute window
+cannot run.
+
+### 6.2 Two pieces worth extracting — each is a covariate test WITH a mechanism
+
+**(a) MEDS-cluster-routed LoRA experts.** Parameter-space routing by discovered behavioural
+cluster, generalising LSPO's two-expert split (`k=0` → adapter, else → base) to N clusters.
+Hypothesis with a measurable mechanism: subpopulations need conflicting updates and a shared
+adapter averages them — **gradient interference**. Risks: MEDS clusters RESPONSES, so
+inference-time routing needs cluster-from-prompt (circular); LSPO avoids this by merging at
+inference, making the benefit training-time only. Cluster-then-merge is adjacent to task
+arithmetic (TIES, DARE); the novelty is "discovered clusters during RL", not the merge.
+Novelty search launched (results appended as §6.4).
+
+**(b) Frozen-LLM router, LoRA-trained via per-prompt credit.** SIA §9's future work, executed.
+Its value is being the richest covariate extractor — it reads trajectory text, exactly what
+escapes the pass-count collapse. Costs an LLM call per group per batch; must clear the noise
+floor against a free threshold (GOAL.md's own scepticism). Credit must be cited as SPO/PAC.
+
+Not contributions: per-task LoRA at task granularity (standard multi-task adaptation);
+per-sample-group harness (Adaptive Auto-Harness 2606.01770 does per-input harness routing, and
+the AI2 null applies).
+
+### 6.3 The interference measurement — ready to run when a GPU frees, no new training needed
+
+On an existing checkpoint (any lora30b or smoke32b ckpt), one rollout batch, per-group GRPO
+loss:
+1. Cluster groups two ways: MEDS (HDBSCAN over latter-half layer logits at the answer token)
+   and a **random partition with the same cluster sizes** (the control — cluster labels drawn
+   feature-blind).
+2. For each cluster `c`, compute the LoRA-parameter gradient `g_c` of the summed GRPO loss over
+   its groups.
+3. Report pairwise `cos(g_c, g_c')`, the fraction of pairs with negative cosine (conflict
+   rate), and the norm ratio `||Σ_c g_c|| / Σ_c ||g_c||` (cancellation). Interference is
+   real only if MEDS clusters show lower cosine / higher cancellation than the size-matched
+   random partition — otherwise the "clusters" are noise and per-cluster adapters would only
+   add parameters.
+4. Repeat on 3 checkpoints (early / mid / late) since interference plausibly grows as the
+   policy specialises.
+
+Cost: forward+backward over one batch per checkpoint, ~minutes on one H100. This is the
+cheapest possible test of whether (a) has a mechanism, and it is measurable before any
+per-cluster adapter is built. If the size-matched random control shows the same conflict, do
+not build (a).
+
+### 6.4 Pending: cluster-routed-LoRA novelty search
