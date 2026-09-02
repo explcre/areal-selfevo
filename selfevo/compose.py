@@ -3,12 +3,24 @@
 The framework is a factorial design: each axis is swappable so methods can be ablated
 against each other. The axes are
 
-    shaper        modifies advantages before the loss        none | entropy_bonus
-    router        selects a training signal per unit         static_* | solve_rate | bandit
+    shaper        modifies advantages before the loss        none
+    router        selects a training signal per unit         static | solve_rate | cluster |
+                                                             random | coharness | contextual |
+                                                             code_policy | rule
     gate          token-level masking within a sequence      none | prefix_dead
-    evolve_target what an evolution step changes             model | harness | both
+    evolve_target what an evolution step changes             model | harness | reward | both
     evolve_policy what decides that step                     rule | learned_weights |
                                                              learned_code
+    critic        scores candidates before they are trained  none | scalar | two_level
+    cadence       when an evolving evaluator updates         frozen | alternating |
+                                                             simultaneous
+
+This table is prose; the registries below are the authority and nothing checks that the two
+agree. It was wrong until 2026-09-02: it named a ``bandit`` router that has never existed,
+omitted the five routers added since it was written, and left out the ``reward`` evolve
+target and the critic and cadence axes entirely. ``entropy_bonus`` is likewise a shaper
+``_BREAKS_CENTRING`` knows about but ``SHAPERS`` does not ship -- it arrives only through
+:func:`register_shaper`. Adding an axis value means editing here as well as the registry.
 
 **Some combinations are invalid, and silently so.** That is the reason this module exists
 rather than a config dict. The clearest case, proved in
