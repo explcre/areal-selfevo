@@ -477,7 +477,14 @@ class PPOTrainer:
             logger.warning(f"selfevo periodic eval unavailable, continuing without it: {_selfevo_exc}")
             self._selfevo_periodic_eval = None
         else:
-            self._selfevo_periodic_eval = PeriodicEvalHook(logger=logger)
+            # `rollout=` is how the evaluation learns WHERE to evaluate. The sglang port is
+            # allocated by the launcher and the server binds the host interface, so there is
+            # no address anyone can write into the environment before the run; the engine
+            # above is the only thing that knows it, and the hook reads it there rather than
+            # adding a second place it is recorded.
+            self._selfevo_periodic_eval = PeriodicEvalHook(
+                logger=logger, rollout=self.rollout
+            )
 
         # Set up checkpointing for recover
         self.recover_info = self.recover_handler.load(

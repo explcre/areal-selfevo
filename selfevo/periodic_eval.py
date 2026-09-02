@@ -7,7 +7,7 @@ produced 0.4696 on OlympiadBench while its own adapter-liveness probe printed *"
 outputs differ between adapter and base"* -- and the eval ran on anyway. Without a curve, a
 12853-step run can train to completion before anyone discovers the adapter never moved.
 
-FOUR THINGS THIS MODULE REFUSES TO DO, each because the tree already records the incident.
+FIVE THINGS THIS MODULE REFUSES TO DO, each because the tree already records the incident.
 
 1. **It does not implement a second scorer.** Generation and grading go through
    ``experiments/bench/math_bench.run_bench`` -- the same function that produced the 0.4696 --
@@ -36,6 +36,19 @@ FOUR THINGS THIS MODULE REFUSES TO DO, each because the tree already records the
    emits NaN plus a non-zero ``status_code`` series -- never a zero that reads as "the model
    got everything wrong".
 
+5. **It does not pass a configured model id straight through.** The rollout server publishes
+   the adapter as ``<lora_name>-v<version>`` and keeps only a rolling window of them; on A0
+   the window advances every 10 to 20 seconds as training publishes weights, so an id written
+   into the environment at launch is evicted long before the first evaluation at step 50 and
+   every point on the curve would fail. The id is instead RESOLVED from ``/v1/models`` at each
+   evaluation (:func:`resolve_adapter`), PINNED for the whole of that evaluation, and checked
+   again afterwards (:func:`assert_still_served`): an evaluation that spanned an eviction is
+   refused rather than reported as one number over two sets of weights. The resolved id and
+   its version are recorded with the score, so a curve point can always be traced to the
+   weights that produced it. It never falls back to the base model id -- scoring the base and
+   labelling it with the arm's name is the exact failure this project has already recorded --
+   and a resolution failure emits a status code and NaN, never a zero.
+
 READING THE CURVE. Two series answer two different questions and both are needed:
 ``liveness/is_live`` says whether the adapter is doing anything at all, and
 ``<bench>/accuracy`` says whether what it is doing helps. :func:`diagnose` combines them into
@@ -51,6 +64,12 @@ and a small ``limit`` buys a wide Wilson interval: at 64 problems the interval i
 curve is here to show gross trend and catch collapse; the liveness curve, which costs
 seconds, is the sensitive early warning.
 
+THE ENDPOINT is not configuration. AReaL's launcher allocates the sglang port and the server
+binds the host interface rather than localhost, so no constant written before the run can be
+right. :func:`base_url_from_rollout` reads it off the inference engine the trainer is itself
+generating against; ``SELFEVO_PERIODIC_EVAL_BASE_URL`` remains only as an explicit override
+for use outside a trainer, and when it is set the engine is not consulted at all.
+
 CONFIGURATION is by environment variable, following ``SELFEVO_CLUSTER_LORA`` (``actor.py``)
 and ``SELFEVO_CLUSTER_LORA_ADAPTERS`` (``fsdp_engine.py``), the established shape in this tree
 for a selfevo feature on the live path. Unset means off, and off means the trainer does one
@@ -64,9 +83,10 @@ import io
 import json
 import math
 import os
+import re
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 __all__ = [
@@ -74,6 +94,8 @@ __all__ = [
     "EVAL_SPLIT",
     "METRIC_KEYS",
     "REPORT_SPLIT",
+    "AdapterEvicted",
+    "AdapterUnresolved",
     "BestValDecision",
     "BestValTracker",
     "EmptyEvaluation",
@@ -82,13 +104,19 @@ __all__ = [
     "PeriodicEvalConfig",
     "PeriodicEvalHook",
     "ReportSplitTouched",
+    "ResolvedAdapter",
     "assert_scored_something",
     "assert_search_only",
+    "assert_still_served",
+    "base_url_from_rollout",
     "bench_namespace",
     "diagnose",
     "metrics_from",
     "require_committed_split",
+    "resolve_adapter",
     "run_periodic_eval",
+    "select_newest_adapter",
+    "split_adapter_version",
     "throughput_fraction",
 ]
 
@@ -127,6 +155,8 @@ STATUS = {
     "report_touched": 4,
     "liveness_unavailable": 5,
     "endpoint_error": 6,
+    "adapter_unresolved": 7,  # /v1/models lists no version of the configured adapter
+    "adapter_evicted": 8,  # the pinned version disappeared while this evaluation ran
 }
 
 #: Every key this module can emit. Declared, and asserted against the real emission in
@@ -145,6 +175,8 @@ METRIC_KEYS = frozenset(
         "periodic_eval/liveness/max_abs_dlogprob",
         "periodic_eval/liveness/mean_abs_dlogprob",
         "periodic_eval/liveness/is_live",
+        "periodic_eval/adapter/version",
+        "periodic_eval/adapter/n_served",
         "periodic_eval/best_val/score",
         "periodic_eval/best_val/step",
         "periodic_eval/best_val/steps_since_best",
@@ -234,6 +266,26 @@ class LivenessUnavailable(RuntimeError):
     """
 
 
+class AdapterUnresolved(RuntimeError):
+    """``/v1/models`` lists no version of the configured adapter.
+
+    A refusal, never a substitution. The one substitution available is the base model id,
+    which the server *does* serve, and scoring the base under the arm's name is the failure
+    this project has already recorded once. The caller emits ``adapter_unresolved`` and NaN,
+    which is distinguishable in the series from an accuracy of zero.
+    """
+
+
+class AdapterEvicted(RuntimeError):
+    """The pinned adapter version stopped being served while the evaluation was running.
+
+    The server keeps a rolling window of published versions, so a version valid when it was
+    resolved can be evicted mid-evaluation. The alternative to refusing is to re-resolve and
+    keep generating, which produces one accuracy number over two different sets of weights
+    and reports it as a point on a curve. This module pins one version and refuses instead.
+    """
+
+
 def _math_bench():
     """Import ``experiments/bench/math_bench.py``, the harness that scores our arms.
 
@@ -256,6 +308,188 @@ def _math_bench():
             f"eval deliberately has no scorer of its own; there is nothing to fall back to."
         ) from exc
     return math_bench
+
+
+#: Adapter ids are ``<name>-v<version>``. That shape has exactly one writer,
+#: ``areal.api.io_struct.get_versioned_lora_name``, and ``test_periodic_eval.py`` derives its
+#: expectation from that function rather than from this pattern, so the two cannot drift
+#: apart silently. Anchored at both ends: ``a0_math_code-v3`` must not match ``a0_math``.
+_ADAPTER_VERSION_RE = re.compile(r"^(?P<name>.+)-v(?P<version>\d+)$")
+
+
+def split_adapter_version(model_id: str) -> tuple[str, int | None]:
+    """Split a served model id into its adapter name and its version number.
+
+    Args:
+        model_id: A served id, e.g. ``"a0_math-v13"``.
+
+    Returns:
+        ``(name, version)``. ``version`` is None when the id carries no ``-v<N>`` suffix,
+        which is what a base snapshot path or a stable alias looks like.
+    """
+    m = _ADAPTER_VERSION_RE.match(model_id or "")
+    if m is None:
+        return (model_id or ""), None
+    return m.group("name"), int(m.group("version"))
+
+
+def select_newest_adapter(served, configured: str, base_model: str = "") -> str:
+    """The newest served version of the configured adapter, or a refusal.
+
+    The server publishes a new version of the adapter every training step and keeps only a
+    rolling window of them, so "the adapter" is a moving id and the configured string names
+    the FAMILY, not the version. Versions are compared as integers: ``-v10`` is newer than
+    ``-v9``, which a lexicographic comparison gets backwards.
+
+    Args:
+        served: Model ids the endpoint reported, in any order.
+        configured: The configured adapter id. A version suffix on it is ignored -- what is
+            written in the environment at launch is stale by construction.
+        base_model: The base model id, refused explicitly below.
+
+    Returns:
+        The id to generate against.
+
+    Raises:
+        AdapterUnresolved: If no served id belongs to the configured adapter. The endpoint
+            always serves the base model, so "nothing matched" and "use the base" are one
+            keystroke apart, and taking the second is how a base-model score acquires an
+            arm's name.
+    """
+    name, _ = split_adapter_version(configured)
+    if not name:
+        raise AdapterUnresolved(
+            "no adapter id was configured, so there is nothing to resolve against the "
+            "served list. An unregistered id is answered by the BASE model."
+        )
+    candidates = []
+    for mid in served:
+        n, v = split_adapter_version(mid)
+        if n == name and v is not None:
+            candidates.append((v, mid))
+    if candidates:
+        chosen = max(candidates, key=lambda t: t[0])[1]
+    elif configured in served:
+        # No versioned member: the endpoint serves the name itself, which is what a stable
+        # alias (or a hand-launched single-adapter server) looks like. Not a fallback to
+        # something else -- it is the configured id, verbatim, and only when it is served.
+        chosen = configured
+    else:
+        raise AdapterUnresolved(
+            f"{sorted(served)} contains no version of adapter {name!r}. Refusing to "
+            f"substitute: the base model IS served here, and scoring it under this arm's "
+            f"name is the failure this check exists for."
+        )
+    if base_model and chosen == base_model:
+        raise AdapterUnresolved(
+            f"resolving adapter {name!r} selected the BASE model id {chosen!r}. Refusing: "
+            f"an evaluation of the base labelled with the arm's name is worse than no point."
+        )
+    return chosen
+
+
+@dataclass(frozen=True)
+class ResolvedAdapter:
+    """Which weights one evaluation was pinned to, recorded alongside its score.
+
+    Attributes:
+        model: The served id every generation in this evaluation used.
+        version: Its integer version, or None for an unversioned id.
+        n_served: How many ids the endpoint listed, so the size of the rolling window an
+            eviction came out of is visible rather than assumed.
+    """
+
+    model: str
+    version: int | None
+    n_served: int
+
+
+async def resolve_adapter(session, cfg) -> ResolvedAdapter:
+    """Ask the endpoint what it serves and pin the newest version of the configured adapter.
+
+    Called at every evaluation, never cached: the window advances every 10 to 20 seconds, so
+    an id resolved at the previous evaluation is gone by this one.
+
+    Args:
+        session: An open ``aiohttp.ClientSession``.
+        cfg: The resolved configuration.
+
+    Returns:
+        The pinned adapter.
+
+    Raises:
+        AdapterUnresolved: If no served id belongs to the configured adapter.
+        RuntimeError: From the harness' own model listing, if the endpoint cannot be read.
+    """
+    served = await _math_bench().list_served_models(session, cfg.base_url)
+    model = select_newest_adapter(served, cfg.model, cfg.base_model)
+    return ResolvedAdapter(
+        model=model, version=split_adapter_version(model)[1], n_served=len(served)
+    )
+
+
+async def assert_still_served(session, cfg, pinned: ResolvedAdapter) -> None:
+    """Refuse an evaluation that outlived the version it was pinned to.
+
+    The generations already happened; this decides whether the number they produced may be
+    recorded. It may not, because a window that moved during the run means some completions
+    could have been served by weights this point does not name -- and a curve point that
+    cannot be traced to one set of weights is not a measurement.
+
+    Args:
+        session: An open ``aiohttp.ClientSession``.
+        cfg: The resolved configuration.
+        pinned: What :func:`resolve_adapter` selected before any generation.
+
+    Raises:
+        AdapterEvicted: If the pinned id is no longer listed.
+    """
+    served = await _math_bench().list_served_models(session, cfg.base_url)
+    if pinned.model not in served:
+        raise AdapterEvicted(
+            f"{pinned.model!r} was served when this evaluation started and is gone now "
+            f"(now serving {sorted(served)}). The rolling window advanced mid-evaluation, so "
+            f"this score cannot be attributed to one set of weights and is not recorded."
+        )
+
+
+def base_url_from_rollout(rollout) -> str:
+    """The ``/v1`` endpoint of the inference server the TRAINER is generating against.
+
+    The address cannot be configured ahead of the run: AReaL's launcher allocates the sglang
+    port, and on A0 the server binds the host interface (``172.28.127.18:32735``) rather than
+    localhost, so a probe of localhost finds nothing and a constant is a guess. The trainer
+    already holds the engine that knows, so this reads it there instead of adding a second
+    place the address is written down.
+
+    ``RemoteSGLangEngine`` composes ``RemoteInfEngine`` and does not re-export its
+    ``addresses``, so the composed engine is read as a fallback. Narrow and deliberate: the
+    alternative is an environment variable that nobody can fill in correctly.
+
+    Args:
+        rollout: The trainer's inference engine.
+
+    Returns:
+        ``http://<host>:<port>/v1`` for the first server the engine is using.
+
+    Raises:
+        RuntimeError: If the engine holds no address. There is deliberately no default: an
+            evaluation against a guessed endpoint is an evaluation of unknown weights.
+    """
+    addrs = getattr(rollout, "addresses", None) or getattr(
+        getattr(rollout, "_engine", None), "addresses", None
+    )
+    if not addrs:
+        raise RuntimeError(
+            f"{type(rollout).__name__} exposes no inference server address, so there is no "
+            f"endpoint to evaluate against. Set {ENV_PREFIX}BASE_URL explicitly if this "
+            f"deployment keeps the address somewhere else."
+        )
+    addr = str(addrs[0]).strip()
+    if "://" not in addr:
+        addr = "http://" + addr
+    addr = addr.rstrip("/")
+    return addr if addr.endswith("/v1") else addr + "/v1"
 
 
 def split_path(bench: str) -> Path:
@@ -452,10 +686,13 @@ class PeriodicEvalConfig:
             so every point on the curve scores the SAME problems.
         max_tokens, temperature, top_p, n, concurrency, timeout, seed: Generation
             parameters, passed to the harness exactly as the CLI would.
-        base_url: OpenAI-compatible ``/v1`` endpoint. During training this is the run's own
-            inference server, which already serves both the base weights and the adapter.
-        model: The model id to score. An id the endpoint does not serve is answered HTTP 200
-            by the BASE model, so the harness verifies it before generating.
+        base_url: OpenAI-compatible ``/v1`` endpoint. Empty under a trainer, where
+            :func:`base_url_from_rollout` supplies it from the engine the run is already
+            generating against; set explicitly only outside one.
+        model: The configured adapter, which names a FAMILY rather than a version. The
+            served id is ``<model>-v<N>`` and only a rolling window of ``N`` exists at any
+            moment, so :func:`resolve_adapter` picks the newest at each evaluation. A version
+            suffix written here is ignored: it is stale by the first evaluation.
         base_model: The base model id on the same endpoint, used only by the liveness probe.
         probe_prompts: Prompts for the liveness probe.
         probe_max_tokens: Tokens generated per probe. Small: this is a distribution
@@ -494,7 +731,7 @@ class PeriodicEvalConfig:
     explicit_gen_keys: frozenset[str] = frozenset()
 
     @classmethod
-    def from_env(cls, env=None) -> "PeriodicEvalConfig":
+    def from_env(cls, env=None, require_base_url: bool = True) -> "PeriodicEvalConfig":
         """Build the configuration from the environment, validating eagerly.
 
         Every problem that can be detected without a GPU is detected here, at trainer
@@ -505,6 +742,11 @@ class PeriodicEvalConfig:
 
         Args:
             env: Environment mapping; defaults to ``os.environ``.
+            require_base_url: Whether an endpoint must be named here. False when the caller
+                holds the trainer's inference engine, which knows the address that no
+                constant can: AReaL allocates the port and the server binds the host
+                interface. Never a licence to guess -- :func:`base_url_from_rollout` refuses
+                rather than defaulting, and :func:`_evaluate_async` refuses an empty one.
 
         Returns:
             A configuration. When the master switch is unset, a disabled default whose other
@@ -558,9 +800,11 @@ class PeriodicEvalConfig:
                 f"liveness probe would compare the adapter with itself and report a "
                 f"difference of exactly zero forever."
             )
-        if not base_url:
+        if require_base_url and not base_url:
             raise ValueError(
-                f"{ENV_PREFIX}BASE_URL is required: the /v1 endpoint serving this run."
+                f"{ENV_PREFIX}BASE_URL is required: the /v1 endpoint serving this run. "
+                f"Under the trainer it is read from the rollout engine instead and this "
+                f"variable should be left unset."
             )
 
         explicit = frozenset(
@@ -622,7 +866,7 @@ class PeriodicEvalConfig:
         )
 
 
-def bench_namespace(cfg: PeriodicEvalConfig, bench: str):
+def bench_namespace(cfg: PeriodicEvalConfig, bench: str, model: str):
     """The argument namespace ``run_bench`` is called with, with the split forced.
 
     Built here rather than by the caller so ``split`` has exactly one assignment in this
@@ -632,6 +876,9 @@ def bench_namespace(cfg: PeriodicEvalConfig, bench: str):
     Args:
         cfg: The resolved configuration.
         bench: The benchmark this namespace is for.
+        model: The RESOLVED served id, required rather than defaulted to ``cfg.model``: the
+            configured id is a family name whose version is stale by the first evaluation,
+            and a default here would let a caller skip resolution without saying so.
 
     Returns:
         An ``argparse.Namespace`` with every attribute ``run_bench`` and ``resolve_params``
@@ -641,7 +888,7 @@ def bench_namespace(cfg: PeriodicEvalConfig, bench: str):
 
     return argparse.Namespace(
         base_url=cfg.base_url,
-        model=cfg.model,
+        model=model,
         model_path=cfg.model_path,
         benchmarks=bench,
         limit=cfg.limit,
@@ -713,12 +960,15 @@ class _GraderCounter:
         self._original = None
 
 
-async def run_one_benchmark(cfg: PeriodicEvalConfig, bench: str) -> tuple[dict, list[dict], int]:
+async def run_one_benchmark(
+    cfg: PeriodicEvalConfig, bench: str, model: str
+) -> tuple[dict, list[dict], int]:
     """Score one benchmark's ``search`` half through the production harness.
 
     Args:
         cfg: The resolved configuration.
         bench: Benchmark name.
+        model: The pinned served id, from :func:`resolve_adapter`.
 
     Returns:
         ``(row, records, grader_calls)``: the harness's own results row, every generation it
@@ -730,7 +980,7 @@ async def run_one_benchmark(cfg: PeriodicEvalConfig, bench: str) -> tuple[dict, 
     """
     mb = _math_bench()
     require_committed_split(bench)  # before any generation is paid for
-    args = bench_namespace(cfg, bench)
+    args = bench_namespace(cfg, bench, model)
     buf = io.StringIO()
     t0 = time.time()
     with _GraderCounter(mb) as counter:
@@ -820,7 +1070,7 @@ async def _greedy_with_logprobs(session, url: str, model: str, prompt: str, cfg)
     return text, [float(x) for x in lps]
 
 
-async def measure_liveness(session, cfg: PeriodicEvalConfig) -> LivenessReport:
+async def measure_liveness(session, cfg: PeriodicEvalConfig, model: str) -> LivenessReport:
     """Compare the adapter against the base model on a fixed probe set.
 
     Both ids are served by the same endpoint -- sglang routes a LoRA adapter by model id --
@@ -829,6 +1079,8 @@ async def measure_liveness(session, cfg: PeriodicEvalConfig) -> LivenessReport:
     Args:
         session: An open ``aiohttp.ClientSession``.
         cfg: The resolved configuration.
+        model: The pinned served id. The probe must measure the SAME weights the benchmark
+            scored, or the liveness verdict belongs to a different point than the accuracy.
 
     Returns:
         The measurement.
@@ -843,7 +1095,7 @@ async def measure_liveness(session, cfg: PeriodicEvalConfig) -> LivenessReport:
     sum_d = 0.0
     n_tok = 0
     for prompt in cfg.probe_prompts:
-        a_text, a_lp = await _greedy_with_logprobs(session, url, cfg.model, prompt, cfg)
+        a_text, a_lp = await _greedy_with_logprobs(session, url, model, prompt, cfg)
         b_text, b_lp = await _greedy_with_logprobs(session, url, cfg.base_model, prompt, cfg)
         if a_text != b_text:
             differ += 1
@@ -964,6 +1216,7 @@ class BestValTracker:
         score: float,
         checkpoint: str = "",
         wilson: tuple[float, float] | None = None,
+        model: str = "",
     ) -> BestValDecision:
         """Record one evaluation and decide whether it is the new best.
 
@@ -979,6 +1232,10 @@ class BestValTracker:
                 found afterwards without re-deriving the cadence.
             wilson: The measurement's Wilson bounds, stored for the FIRST evaluation only and
                 used later as the baseline interval by :func:`diagnose`.
+            model: The RESOLVED served id these weights answered as, written into the history
+                so a point on the curve can be traced back to the weights that produced it.
+                The checkpoint path alone cannot do that here: the adapter id the server
+                answered is a different name from the checkpoint the trainer wrote.
 
         Returns:
             The decision.
@@ -995,7 +1252,14 @@ class BestValTracker:
             self.n_since_best = 0
         else:
             self.n_since_best += 1
-        self.history.append({"step": int(step), "score": float(score), "checkpoint": checkpoint})
+        self.history.append(
+            {
+                "step": int(step),
+                "score": float(score),
+                "checkpoint": checkpoint,
+                "model": model,
+            }
+        )
         decision = BestValDecision(
             is_best=is_best,
             should_stop=self.n_since_best >= self.patience,
@@ -1073,6 +1337,7 @@ def metrics_from(
     throughput_frac: float,
     status_code: int,
     diagnosis: int,
+    adapter: "ResolvedAdapter | None" = None,
 ) -> dict[str, float]:
     """Flatten one evaluation into the metric dict the trainer's own logger commits.
 
@@ -1089,6 +1354,9 @@ def metrics_from(
         throughput_frac: Share of training throughput it cost.
         status_code: One of :data:`STATUS`.
         diagnosis: One of :data:`DIAGNOSIS`.
+        adapter: The pinned adapter, or None when resolution never succeeded. Its version is
+            emitted as its own series so every point on the accuracy curve carries the
+            version of the weights that produced it.
 
     Returns:
         A flat mapping of metric key to float.
@@ -1105,6 +1373,10 @@ def metrics_from(
         "periodic_eval/liveness/max_abs_dlogprob": float(liveness.max_abs_dlogprob) if liveness else nan,
         "periodic_eval/liveness/mean_abs_dlogprob": float(liveness.mean_abs_dlogprob) if liveness else nan,
         "periodic_eval/liveness/is_live": float(liveness.is_live) if liveness else nan,
+        "periodic_eval/adapter/version": (
+            float(adapter.version) if adapter is not None and adapter.version is not None else nan
+        ),
+        "periodic_eval/adapter/n_served": float(adapter.n_served) if adapter is not None else nan,
         "periodic_eval/best_val/score": float(decision.best_score) if decision else nan,
         "periodic_eval/best_val/step": float(decision.best_step) if decision else nan,
         "periodic_eval/best_val/steps_since_best": float(decision.steps_since_best) if decision else nan,
@@ -1120,32 +1392,54 @@ def metrics_from(
 
 async def _evaluate_async(
     cfg: PeriodicEvalConfig,
-) -> tuple[dict[str, dict], dict[str, list], LivenessReport, int]:
-    """Run every benchmark and the liveness probe against the endpoint.
+) -> tuple[dict[str, dict], dict[str, list], LivenessReport, int, ResolvedAdapter]:
+    """Pin one adapter version, run every benchmark and the probe against it, then re-check.
+
+    THE PINNING DECISION, stated here because the alternative is defensible and this is not
+    the one taken: the served id is resolved ONCE, before any generation, and every request
+    in this evaluation uses it. Re-resolving mid-evaluation would keep the evaluation alive
+    across an eviction at the cost of averaging two sets of weights into one number, and a
+    curve point that cannot be attributed to one adapter version is not a measurement. So the
+    version is pinned and :func:`assert_still_served` refuses the point if it did not survive.
+
+    In the trainer this hook runs inside the paused-rollout window, and the window advances
+    only when training publishes a new version -- which it cannot do while this is running --
+    so the pin normally holds. The check is for every other deployment, and for the day that
+    stops being true.
 
     Args:
         cfg: The resolved configuration.
 
     Returns:
-        ``(rows, records, liveness, grader_calls)``.
+        ``(rows, records, liveness, grader_calls, pinned)``.
 
     Raises:
+        ValueError: If no endpoint was resolved at all.
+        AdapterUnresolved: If the endpoint serves no version of the configured adapter.
+        AdapterEvicted: If the pinned version was evicted before the evaluation finished.
         LivenessUnavailable: Propagated from the probe.
         ReportSplitTouched, EmptyEvaluation: Propagated from the benchmark run.
     """
     import aiohttp
 
+    if not cfg.base_url:
+        raise ValueError(
+            "no /v1 endpoint: neither the trainer's rollout engine nor "
+            f"{ENV_PREFIX}BASE_URL supplied one, and there is no default to guess."
+        )
     rows: dict[str, dict] = {}
     records: dict[str, list] = {}
     grader_calls = 0
-    for bench in cfg.benchmarks:
-        row, recs, calls = await run_one_benchmark(cfg, bench)
-        rows[bench], records[bench] = row, recs
-        grader_calls += calls
     conn = aiohttp.TCPConnector(limit=max(2, min(8, cfg.concurrency)))
     async with aiohttp.ClientSession(connector=conn) as session:
-        liveness = await measure_liveness(session, cfg)
-    return rows, records, liveness, grader_calls
+        pinned = await resolve_adapter(session, cfg)
+        for bench in cfg.benchmarks:
+            row, recs, calls = await run_one_benchmark(cfg, bench, pinned.model)
+            rows[bench], records[bench] = row, recs
+            grader_calls += calls
+        liveness = await measure_liveness(session, cfg, pinned.model)
+        await assert_still_served(session, cfg, pinned)
+    return rows, records, liveness, grader_calls, pinned
 
 
 def run_periodic_eval(
@@ -1179,11 +1473,26 @@ def run_periodic_eval(
     rows: dict[str, dict] = {}
     liveness: LivenessReport | None = None
     decision: BestValDecision | None = None
+    resolved: ResolvedAdapter | None = None
     status = STATUS["ok"]
     records: dict[str, list] = {}
     grader_calls = 0
     try:
-        rows, records, liveness, grader_calls = asyncio.run(_evaluate_async(cfg))
+        rows, records, liveness, grader_calls, resolved = asyncio.run(_evaluate_async(cfg))
+    except AdapterUnresolved as exc:
+        status = STATUS["adapter_unresolved"]
+        _log(logger, "error", f"periodic eval could not resolve an adapter at step {global_step}: {exc}")
+    except AdapterEvicted as exc:
+        status = STATUS["adapter_evicted"]
+        _log(logger, "error", f"periodic eval outlived its adapter at step {global_step}: {exc}")
+    except SystemExit as exc:
+        # `math_bench.verify_model` refuses an unserved id with SystemExit, which is a
+        # BaseException: an `except Exception` below would let it past and kill a run of many
+        # days. It is reported as an eviction because the id was resolved from this same
+        # endpoint seconds earlier, so the served set moved between resolving and using it;
+        # the message carries the harness' own text, which names the other possibilities.
+        status = STATUS["adapter_evicted"]
+        _log(logger, "error", f"periodic eval: the harness refused the pinned adapter at step {global_step}: {exc}")
     except ReportSplitTouched as exc:
         status = STATUS["report_touched"]
         _log(logger, "error", f"periodic eval REFUSED at step {global_step}: {exc}")
@@ -1204,7 +1513,13 @@ def run_periodic_eval(
     accuracy = float(rows.get(primary, {}).get("accuracy", float("nan")))
     if status == STATUS["ok"]:
         wilson = (rows[primary].get("wilson_lo"), rows[primary].get("wilson_hi"))
-        decision = tracker.update(global_step, accuracy, checkpoint, wilson)
+        decision = tracker.update(
+            global_step,
+            accuracy,
+            checkpoint,
+            wilson,
+            model="" if resolved is None else resolved.model,
+        )
     diagnosis = (
         diagnose(liveness, accuracy, tracker.first_wilson)
         if status == STATUS["ok"]
@@ -1213,7 +1528,7 @@ def run_periodic_eval(
     seconds = time.time() - t0
     frac = throughput_fraction(seconds, cfg.freq_steps, step_seconds)
     metrics = metrics_from(
-        global_step, rows, liveness, decision, seconds, frac, status, diagnosis
+        global_step, rows, liveness, decision, seconds, frac, status, diagnosis, resolved
     )
     metrics[EVAL_GRADER_KEY] = float(grader_calls)
     # Every key the configuration declares is emitted every time, NaN included. A key that
@@ -1221,11 +1536,12 @@ def run_periodic_eval(
     for key in cfg.metric_keys():
         metrics.setdefault(key, float("nan"))
     if cfg.out_dir:
-        _persist(cfg, global_step, rows, records, liveness, decision, metrics)
+        _persist(cfg, global_step, rows, records, liveness, decision, metrics, resolved)
     _log(
         logger,
         "info",
         f"periodic eval step={global_step} status={status} diagnosis={diagnosis} "
+        f"model={'UNRESOLVED' if resolved is None else resolved.model} "
         f"acc={accuracy:.4f} live={getattr(liveness, 'is_live', 'na')} "
         f"maxdlogp={getattr(liveness, 'max_abs_dlogprob', float('nan')):.5f} "
         f"best={getattr(decision, 'best_score', float('nan'))}@{getattr(decision, 'best_step', -1)} "
@@ -1234,7 +1550,7 @@ def run_periodic_eval(
     return metrics
 
 
-def _persist(cfg, global_step, rows, records, liveness, decision, metrics) -> None:
+def _persist(cfg, global_step, rows, records, liveness, decision, metrics, resolved=None) -> None:
     """Write the full artifact for one evaluation point.
 
     Every number this project reports must be re-auditable without regenerating it, so the
@@ -1248,6 +1564,9 @@ def _persist(cfg, global_step, rows, records, liveness, decision, metrics) -> No
         liveness: The probe result, or None.
         decision: The best-validation decision, or None.
         metrics: The emitted metric mapping.
+        resolved: The pinned adapter, or None when resolution failed. Written whole, so the
+            artifact says which served id produced these generations rather than which id
+            was configured months earlier.
     """
     d = Path(cfg.out_dir) / f"step{global_step}"
     d.mkdir(parents=True, exist_ok=True)
@@ -1256,6 +1575,8 @@ def _persist(cfg, global_step, rows, records, liveness, decision, metrics) -> No
             {
                 "global_step": global_step,
                 "split": EVAL_SPLIT,
+                "configured_model": cfg.model,
+                "resolved_adapter": None if resolved is None else resolved.__dict__,
                 "rows": rows,
                 "liveness": None if liveness is None else liveness.__dict__,
                 "best_val": None if decision is None else decision.__dict__,
@@ -1299,7 +1620,7 @@ class PeriodicEvalHook:
     #: and would drag a mean upward, making the evaluation look cheaper than it is.
     STEP_WINDOW = 20
 
-    def __init__(self, env=None, logger=None):
+    def __init__(self, env=None, logger=None, rollout=None):
         """Resolve configuration once, at trainer start.
 
         A misconfiguration raises here -- before any GPU work -- rather than an hour into
@@ -1308,9 +1629,12 @@ class PeriodicEvalHook:
         Args:
             env: Environment mapping; defaults to ``os.environ``.
             logger: Optional logger for the human-readable evaluation line.
+            rollout: The trainer's inference engine, read for the endpoint address at each
+                evaluation. None outside a trainer, where the address must be configured.
         """
         self.logger = logger
-        self.config = PeriodicEvalConfig.from_env(env)
+        self._rollout = rollout
+        self.config = PeriodicEvalConfig.from_env(env, require_base_url=rollout is None)
         self.tracker = (
             BestValTracker(self.config.patience, self.config.state_path)
             if self.config.enabled
@@ -1328,6 +1652,27 @@ class PeriodicEvalHook:
             True when the feature is switched on.
         """
         return bool(self.config.enabled)
+
+    def _eval_config(self) -> PeriodicEvalConfig:
+        """The configuration for one evaluation, with the endpoint filled in.
+
+        PRECEDENCE, written down once because two places to look for an address is how a run
+        scores the wrong server: an explicitly set ``SELFEVO_PERIODIC_EVAL_BASE_URL`` is used
+        verbatim and the engine is NOT consulted; otherwise the address comes from the
+        rollout engine the trainer is itself generating against. There is no third case and
+        no localhost default -- A0's server binds the host interface on a launcher-allocated
+        port, so a guess is simply wrong, and a wrong endpoint either fails to connect or,
+        worse, scores some other run's weights.
+
+        Returns:
+            The configuration to evaluate with.
+
+        Raises:
+            RuntimeError: From :func:`base_url_from_rollout`, if the engine holds no address.
+        """
+        if self.config.base_url or self._rollout is None:
+            return self.config
+        return replace(self.config, base_url=base_url_from_rollout(self._rollout))
 
     def step_seconds(self) -> float:
         """Median recent training step duration, measured from this hook's own clock.
@@ -1419,9 +1764,25 @@ class PeriodicEvalHook:
         metrics = self.budget_metrics()
         if not self.config.should_run(global_step):
             return metrics
+        try:
+            cfg = self._eval_config()
+        except Exception as exc:
+            # The endpoint could not be read off the engine. Reported here, where the reason
+            # is known, and then handed on with an empty base_url so the evaluation fails
+            # through the one path that emits a status code and NaN rather than raising into
+            # the training loop.
+            _log(
+                logger=self.logger,
+                level="error",
+                msg=(
+                    f"periodic eval cannot read the rollout endpoint at step {global_step}: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            )
+            cfg = self.config
         metrics.update(
             run_periodic_eval(
-                self.config,
+                cfg,
                 global_step,
                 self.tracker,
                 checkpoint=checkpoint,

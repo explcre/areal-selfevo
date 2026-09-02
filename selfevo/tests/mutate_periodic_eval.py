@@ -167,6 +167,83 @@ MUTATIONS = [
         repl="        if False:\n            raise ValueError(",
     ),
     Mutation(
+        label="THE BRIEF'S MUTATION: the OLDEST version in the window is resolved, not the newest",
+        rel="selfevo/periodic_eval.py",
+        find="        chosen = max(candidates, key=lambda t: t[0])[1]",
+        repl="        chosen = min(candidates, key=lambda t: t[0])[1]",
+    ),
+    Mutation(
+        label="THE BRIEF'S MUTATION: a resolution failure returns the BASE model id",
+        rel="selfevo/periodic_eval.py",
+        find=(
+            "    else:\n"
+            "        raise AdapterUnresolved(\n"
+            '            f"{sorted(served)} contains no version of adapter {name!r}. Refusing to "\n'
+        ),
+        repl=(
+            "    else:\n"
+            "        return base_model\n"
+            "    if False:\n"
+            "        raise AdapterUnresolved(\n"
+            '            f"{sorted(served)} contains no version of adapter {name!r}. Refusing to "\n'
+        ),
+    ),
+    Mutation(
+        label="the explicit base-model guard never fires, so the base id can be resolved",
+        rel="selfevo/periodic_eval.py",
+        find="    if base_model and chosen == base_model:",
+        repl="    if False:",
+    ),
+    Mutation(
+        label="THE BRIEF'S MUTATION: the resolved id is CACHED across evaluations",
+        rel="selfevo/periodic_eval.py",
+        find="        pinned = await resolve_adapter(session, cfg)",
+        repl=(
+            "        pinned = getattr(resolve_adapter, '_cache', None) or await resolve_adapter(session, cfg)\n"
+            "        resolve_adapter._cache = pinned"
+        ),
+    ),
+    Mutation(
+        label="THE BRIEF'S MUTATION: the recorded version is the CONFIGURED id, not the resolved one",
+        rel="selfevo/periodic_eval.py",
+        find="        model=model, version=split_adapter_version(model)[1], n_served=len(served)",
+        repl="        model=cfg.model, version=split_adapter_version(cfg.model)[1], n_served=len(served)",
+    ),
+    Mutation(
+        label="the mid-evaluation eviction check is removed, so a point can span two versions",
+        rel="selfevo/periodic_eval.py",
+        find="        await assert_still_served(session, cfg, pinned)",
+        repl="        pass",
+    ),
+    Mutation(
+        label="the harness' SystemExit escapes into the training loop and kills the run",
+        rel="selfevo/periodic_eval.py",
+        find="    except SystemExit as exc:",
+        repl="    except KeyboardInterrupt as exc:",
+    ),
+    Mutation(
+        label="the adapter family is matched by PREFIX, so another arm's adapter can win",
+        rel="selfevo/periodic_eval.py",
+        find="        if n == name and v is not None:",
+        repl="        if mid.startswith(name) and v is not None:",
+    ),
+    Mutation(
+        label="the endpoint is guessed at localhost instead of read off the trainer's engine",
+        rel="selfevo/periodic_eval.py",
+        find=(
+            '    addrs = getattr(rollout, "addresses", None) or getattr(\n'
+            '        getattr(rollout, "_engine", None), "addresses", None\n'
+            "    )"
+        ),
+        repl='    addrs = ["127.0.0.1:30000"]',
+    ),
+    Mutation(
+        label="an explicitly configured endpoint is overridden by the engine's address",
+        rel="selfevo/periodic_eval.py",
+        find="        if self.config.base_url or self._rollout is None:",
+        repl="        if self._rollout is None:",
+    ),
+    Mutation(
         label="declared keys are not filled in, leaving invisible gaps in the W&B series",
         rel="selfevo/periodic_eval.py",
         find="    for key in cfg.metric_keys():\n        metrics.setdefault(key, float(\"nan\"))",

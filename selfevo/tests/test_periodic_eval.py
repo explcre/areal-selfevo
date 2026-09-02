@@ -75,6 +75,15 @@ class _Policy:
 
     Attributes:
         models: Ids reported by ``/v1/models``.
+        on_models: Called with the list that was just SENT and the 1-based number of the
+            ``/v1/models`` request, and may replace the list for subsequent requests by
+            returning a new one. After, not before: the real server evicts on its own clock
+            between two reads, so a hook that rewrote the list being answered would move the
+            window one request earlier than the scenario under test.
+        n_models: ``/v1/models`` requests served.
+        chat_models: The ``model`` field of every chat completion asked for, in order, so a
+            test can prove which weights were generated against rather than which were
+            resolved.
         status: HTTP status for chat completions.
         text_for: ``(model, prompt) -> str``, the completion.
         logprobs_for: ``(model, prompt) -> list[float] | None``; None omits the logprobs
@@ -86,6 +95,9 @@ class _Policy:
     def __init__(self):
         """Start from a healthy endpoint serving both ids."""
         self.models = [BASE, ADAPTER]
+        self.on_models = None
+        self.n_models = 0
+        self.chat_models = []
         self.status = 200
         self.text_for = lambda model, prompt: "Reasoning. The answer is \\boxed{42}"
         self.logprobs_for = lambda model, prompt: [-0.10, -0.20, -0.30]
@@ -117,7 +129,13 @@ class _Handler(BaseHTTPRequestHandler):
         """Answer the model list the harness verifies against before generating."""
         p = self.server.policy
         if self.path.rstrip("/").endswith("/models"):
-            self._send(200, {"object": "list", "data": [{"id": m} for m in p.models]})
+            p.n_models += 1
+            sent = list(p.models)
+            self._send(200, {"object": "list", "data": [{"id": m} for m in sent]})
+            if p.on_models is not None:
+                replacement = p.on_models(sent, p.n_models)
+                if replacement is not None:
+                    p.models = replacement
         else:
             self._send(404, {"error": "not found"})
 
@@ -131,6 +149,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(p.status, {"error": "stub failure"})
             return
         model = req.get("model", "")
+        p.chat_models.append(model)
         prompt = (req.get("messages") or [{}])[0].get("content", "")
         choice = {
             "message": {"content": p.text_for(model, prompt)},
@@ -208,7 +227,7 @@ def test_premise_the_stub_really_drives_the_real_harness(endpoint):
     """
     url, policy = endpoint
     cfg = _config(url)
-    row, records, calls = _run(pe.run_one_benchmark(cfg, "olympiadbench"))
+    row, records, calls = _run(pe.run_one_benchmark(cfg, "olympiadbench", ADAPTER))
     assert policy.n_chat == 4, "the harness did not reach the endpoint four times"
     assert row["n_problems"] == 4 and row["n_graded"] == 4
     assert len(records) == 4
@@ -241,7 +260,9 @@ def test_the_real_path_grades_only_problems_from_the_search_half(endpoint):
     fails if `--split` is ever wired to the wrong half.
     """
     url, _ = endpoint
-    _row, records, _ = _run(pe.run_one_benchmark(_config(url, limit=12), "olympiadbench"))
+    _row, records, _ = _run(
+        pe.run_one_benchmark(_config(url, limit=12), "olympiadbench", ADAPTER)
+    )
     committed = json.loads((BENCH / "olympiadbench_split.json").read_text())
     seen = {r["idx"] for r in records}
     assert seen, "no generations came back, so nothing was checked"
@@ -258,7 +279,7 @@ def test_the_namespace_always_carries_the_search_split(freq, limit):
     it here pins it for every caller.
     """
     cfg = _config("http://x/v1", freq_steps=freq, limit=limit)
-    ns = pe.bench_namespace(cfg, "olympiadbench")
+    ns = pe.bench_namespace(cfg, "olympiadbench", ADAPTER)
     assert ns.split == pe.EVAL_SPLIT == "search"
     assert ns.split != pe.REPORT_SPLIT
 
@@ -479,7 +500,7 @@ def _liveness(cfg):
             The :class:`LivenessReport`.
         """
         async with aiohttp.ClientSession() as s:
-            return await pe.measure_liveness(s, cfg)
+            return await pe.measure_liveness(s, cfg, cfg.model)
 
     return asyncio.run(go())
 
@@ -700,3 +721,397 @@ def test_the_hook_reports_no_step_time_until_it_has_seen_enough_steps():
     for step in range(3, 8):
         hook.maybe_run(global_step=step)
     assert hook.step_seconds() > 0.0
+
+
+# ------------------------------------------------- the adapter id is a moving target ----
+#
+# A0's rollout server publishes the adapter as `a0_math-vN` and keeps a rolling window of
+# about four; the window advances every 10 to 20 seconds as training publishes weights. A
+# fixed id written into the environment at launch is evicted long before the first evaluation
+# at step 50, and asking for an evicted id returns HTTP 500 -- so before this section existed
+# every point on the curve failed. These tests are the resolution, the pin, and the three
+# ways it must refuse rather than substitute.
+
+
+def _window(newest: int, name: str = ADAPTER, size: int = 4) -> list[str]:
+    """A served list shaped like the real one: the base snapshot plus a rolling window.
+
+    Args:
+        newest: Version number of the newest member.
+        name: Adapter family name.
+        size: How many versions the window holds.
+
+    Returns:
+        The ids `/v1/models` would report, deliberately NOT in version order -- the real
+        server reports whatever order it likes and a resolver that relied on position would
+        pass a sorted fixture and fail in production.
+    """
+    versions = list(range(newest - size + 1, newest + 1))
+    return [f"{name}-v{n}" for n in reversed(versions)] + [BASE]
+
+
+class _FakeInner:
+    """The engine `RemoteSGLangEngine` composes, which is where AReaL keeps the addresses."""
+
+    def __init__(self, addresses):
+        """Hold one address list.
+
+        Args:
+            addresses: ``host:port`` strings.
+        """
+        self.addresses = list(addresses)
+
+
+class _FakeEngine:
+    """A rollout engine shaped like the real one: composition, no re-exported `addresses`.
+
+    `RemoteSGLangEngine.__init__` sets `self._engine = RemoteInfEngine(...)` and passes ~30
+    methods through without passing `addresses` through, so the shape this fixture pins is
+    the shape `base_url_from_rollout` actually meets.
+    """
+
+    def __init__(self, addresses):
+        """Wrap an inner engine holding the addresses.
+
+        Args:
+            addresses: ``host:port`` strings.
+        """
+        self._engine = _FakeInner(addresses)
+
+
+class _FakeEngineDirect:
+    """An engine that exposes `addresses` itself, which the public accessor would look like."""
+
+    def __init__(self, addresses):
+        """Hold one address list.
+
+        Args:
+            addresses: ``host:port`` strings.
+        """
+        self.addresses = list(addresses)
+
+
+class _ExplodingEngine:
+    """An engine whose every attribute raises, to prove it was not consulted at all."""
+
+    def __getattr__(self, name):
+        """Refuse every attribute access.
+
+        Args:
+            name: The attribute asked for.
+
+        Raises:
+            AssertionError: Always. Reaching this means the engine was read when the
+                documented precedence says an explicit base url wins outright.
+        """
+        raise AssertionError(f"the engine was consulted for {name!r} despite an explicit base url")
+
+
+# ------------------------------------------------------------- resolving the newest ----
+
+
+def test_the_newest_version_in_the_window_is_the_one_resolved():
+    """The whole defect in one line: the served list moves, so the id must be read from it."""
+    assert pe.select_newest_adapter(_window(13), ADAPTER, BASE) == f"{ADAPTER}-v13"
+
+
+def test_versions_are_compared_as_numbers_not_strings():
+    """`-v9` sorts after `-v10` lexicographically, which is the wrong adapter by four steps."""
+    served = [BASE, f"{ADAPTER}-v9", f"{ADAPTER}-v10", f"{ADAPTER}-v2"]
+    assert pe.select_newest_adapter(served, ADAPTER, BASE) == f"{ADAPTER}-v10"
+
+
+def test_an_id_from_another_adapter_family_never_matches():
+    """`a0_math_code-v99` is not a newer `a0_math`; a prefix match would score another arm."""
+    served = [BASE, f"{ADAPTER}_code-v99", f"{ADAPTER}-v3"]
+    assert pe.select_newest_adapter(served, ADAPTER, BASE) == f"{ADAPTER}-v3"
+
+
+def test_a_configured_version_suffix_is_ignored_because_it_is_stale():
+    """The environment names the FAMILY. Whatever version it carries is gone by step 50."""
+    assert pe.select_newest_adapter(_window(13), f"{ADAPTER}-v3", BASE) == f"{ADAPTER}-v13"
+
+
+def test_an_unversioned_id_is_used_only_when_the_endpoint_serves_it():
+    """The stable-alias case: the configured id verbatim, and only because it is listed.
+
+    Both halves matter. The first is what a hand-launched single-adapter server looks like;
+    the second is the difference between "use the configured id" and "use it whether or not
+    anyone serves it", which is the unregistered-id trap that serves the BASE model.
+    """
+    assert pe.select_newest_adapter([BASE, ADAPTER], ADAPTER, BASE) == ADAPTER
+    with pytest.raises(pe.AdapterUnresolved):
+        pe.select_newest_adapter([BASE], ADAPTER, BASE)
+
+
+def test_an_endpoint_serving_only_the_base_model_is_a_refusal_not_a_fallback():
+    """THE failure this project has already recorded: a base score wearing an arm's name."""
+    with pytest.raises(pe.AdapterUnresolved) as exc:
+        pe.select_newest_adapter([BASE], ADAPTER, BASE)
+    assert "base" in str(exc.value).lower()
+
+
+def test_resolution_refuses_to_return_the_base_model_id():
+    """The explicit base guard must be observed to FIRE, or it is not evidence.
+
+    Reached by asking for the base id itself, which the endpoint really does serve: without
+    the guard the `configured in served` branch would hand it straight back.
+    """
+    with pytest.raises(pe.AdapterUnresolved) as exc:
+        pe.select_newest_adapter([BASE], BASE, BASE)
+    assert "BASE" in str(exc.value)
+
+
+def test_the_version_shape_is_the_one_areal_writes():
+    """The expectation comes from AReaL's own formatter, not from a copy of the pattern.
+
+    `get_versioned_lora_name` is the single writer of the served id. Deriving the expectation
+    from it means a change there fails here instead of silently making the resolver blind.
+    """
+    io_struct = pytest.importorskip("areal.api.io_struct")
+    served_id = io_struct.get_versioned_lora_name(ADAPTER, 7)
+    assert pe.split_adapter_version(served_id) == (ADAPTER, 7)
+
+
+def test_an_id_with_no_version_reports_none_rather_than_a_number():
+    """A base snapshot path has no version, and inventing one would mislabel a curve point."""
+    assert pe.split_adapter_version(BASE) == (BASE, None)
+    assert pe.split_adapter_version(ADAPTER) == (ADAPTER, None)
+
+
+# ------------------------------------------------ resolution through the real path ----
+
+
+@needs_data
+def test_the_evaluation_resolves_the_newest_version_at_every_point_not_at_launch(endpoint, tmp_path):
+    """Two evaluations, a window that advanced between them, two different versions recorded.
+
+    The discriminating case for caching: an implementation that resolves once and reuses the
+    id passes every single-evaluation test in this file and produces a curve whose every
+    point after the first is generated against an id the server no longer has.
+    """
+    url, policy = endpoint
+    policy.models = _window(13)
+    cfg = _config(url, state_path=str(tmp_path / "best.json"))
+    tracker = pe.BestValTracker(cfg.patience, cfg.state_path)
+
+    first = pe.run_periodic_eval(cfg, 5, tracker)
+    assert first["periodic_eval/status_code"] == pe.STATUS["ok"]
+    assert first["periodic_eval/adapter/version"] == 13.0
+
+    policy.models = _window(17)
+    second = pe.run_periodic_eval(cfg, 10, tracker)
+    assert second["periodic_eval/status_code"] == pe.STATUS["ok"]
+    assert second["periodic_eval/adapter/version"] == 17.0
+    assert second["periodic_eval/adapter/n_served"] == 5.0
+
+
+@needs_data
+def test_generation_uses_the_resolved_id_and_never_the_configured_one(endpoint, tmp_path):
+    """Asserted on what the ENDPOINT was asked for, not on what the resolver returned.
+
+    The two are different claims: a resolver can return the right id and the benchmark still
+    generate against `cfg.model`, which is exactly the defect being fixed.
+    """
+    url, policy = endpoint
+    policy.models = _window(13)
+    cfg = _config(url, model=f"{ADAPTER}-v3", state_path=str(tmp_path / "best.json"))
+    m = pe.run_periodic_eval(cfg, 5, pe.BestValTracker(cfg.patience, cfg.state_path))
+    assert m["periodic_eval/status_code"] == pe.STATUS["ok"]
+    assert policy.chat_models, "no completion reached the endpoint, so nothing was checked"
+    assert set(policy.chat_models) == {f"{ADAPTER}-v13", BASE}
+    assert f"{ADAPTER}-v3" not in policy.chat_models
+
+
+@needs_data
+def test_the_recorded_version_is_the_resolved_one_not_the_configured_one(endpoint, tmp_path):
+    """A curve point must be traceable to the weights that produced it, in three places.
+
+    The metric series, the persisted artifact and the best-val history all carry the resolved
+    id; the artifact additionally carries the configured one, so the gap between what was
+    asked for and what answered is readable after the fact rather than inferred.
+    """
+    url, policy = endpoint
+    policy.models = _window(13)
+    cfg = _config(
+        url,
+        model=f"{ADAPTER}-v3",
+        out_dir=str(tmp_path / "out"),
+        state_path=str(tmp_path / "best.json"),
+    )
+    tracker = pe.BestValTracker(cfg.patience, cfg.state_path)
+    m = pe.run_periodic_eval(cfg, 5, tracker)
+
+    assert m["periodic_eval/adapter/version"] == 13.0
+    saved = json.loads((tmp_path / "out" / "step5" / "results.json").read_text())
+    assert saved["resolved_adapter"]["model"] == f"{ADAPTER}-v13"
+    assert saved["configured_model"] == f"{ADAPTER}-v3"
+    assert tracker.history[-1]["model"] == f"{ADAPTER}-v13"
+
+
+# ------------------------------------------------------- the window moves under us ----
+
+
+@needs_data
+def test_an_eviction_between_resolving_and_generating_is_refused_not_scored(endpoint, tmp_path):
+    """The window advances after resolution and before the first token. Refuse, do not adapt.
+
+    Also pins that the refusal cannot kill the trainer: the harness answers an unserved id
+    with `SystemExit`, a BaseException that an `except Exception` would let straight through
+    a 2000-step run.
+    """
+    url, policy = endpoint
+    policy.models = _window(13)
+    policy.on_models = lambda served, n: _window(17) if n == 1 else None
+    cfg = _config(url, state_path=str(tmp_path / "best.json"))
+    tracker = pe.BestValTracker(cfg.patience, cfg.state_path)
+
+    m = pe.run_periodic_eval(cfg, 5, tracker)
+    assert m["periodic_eval/status_code"] == pe.STATUS["adapter_evicted"]
+    assert math.isnan(m["periodic_eval/olympiadbench/accuracy"])
+    assert tracker.best_step == -1, "an evicted evaluation must not become the best checkpoint"
+
+
+@needs_data
+def test_an_eviction_after_generating_is_refused_by_the_post_check(endpoint, tmp_path):
+    """The generations succeeded and the number is still not recorded.
+
+    The window advances only after the SECOND model listing -- after resolution and after the
+    harness verified the id -- so every completion was served and a results row exists. It is
+    refused anyway: some of those completions may have come from weights this point does not
+    name, and a point that cannot be attributed to one adapter version is not a measurement.
+    """
+    url, policy = endpoint
+    policy.models = _window(13)
+    policy.on_models = lambda served, n: _window(19) if n == 2 else None
+    cfg = _config(url, state_path=str(tmp_path / "best.json"))
+    tracker = pe.BestValTracker(cfg.patience, cfg.state_path)
+
+    m = pe.run_periodic_eval(cfg, 5, tracker)
+    assert policy.n_chat > 0, "premise: the benchmark must have generated before the eviction"
+    assert m["periodic_eval/status_code"] == pe.STATUS["adapter_evicted"]
+    assert math.isnan(m["periodic_eval/olympiadbench/accuracy"])
+    assert tracker.best_step == -1
+
+
+@needs_data
+def test_a_window_that_holds_still_is_scored_normally(endpoint, tmp_path):
+    """The other direction: the post-check must not refuse every evaluation.
+
+    A guard that always fires guards nothing, and this one sits on the only path that
+    produces a curve point at all.
+    """
+    url, policy = endpoint
+    policy.models = _window(13)
+    cfg = _config(url, state_path=str(tmp_path / "best.json"))
+    m = pe.run_periodic_eval(cfg, 5, pe.BestValTracker(cfg.patience, cfg.state_path))
+    assert m["periodic_eval/status_code"] == pe.STATUS["ok"]
+    assert not math.isnan(m["periodic_eval/olympiadbench/accuracy"])
+
+
+# --------------------------------------------- a refusal is not a score of anything ----
+
+
+@needs_data
+def test_a_resolution_failure_is_a_status_code_and_a_nan_not_a_zero(endpoint, tmp_path):
+    """Nothing matching on the endpoint: the point is absent from the curve, with a reason."""
+    url, policy = endpoint
+    policy.models = [BASE]
+    cfg = _config(url, state_path=str(tmp_path / "best.json"))
+    tracker = pe.BestValTracker(cfg.patience, cfg.state_path)
+
+    m = pe.run_periodic_eval(cfg, 5, tracker)
+    assert m["periodic_eval/status_code"] == pe.STATUS["adapter_unresolved"]
+    assert math.isnan(m["periodic_eval/olympiadbench/accuracy"])
+    assert math.isnan(m["periodic_eval/adapter/version"])
+    assert policy.n_chat == 0, "a token was generated against an unresolved adapter"
+    assert tracker.best_step == -1
+    assert not (cfg.metric_keys() - set(m)), "a failed point must still fill every series"
+
+
+@needs_data
+def test_a_refusal_and_a_genuine_zero_are_different_points_in_the_series(endpoint, tmp_path):
+    """The discriminating pair. Both are "no accuracy to speak of" and they must not read alike.
+
+    A model that gets every problem wrong is a real measurement of 0.0 with status ok; an
+    adapter that could not be resolved is NaN with its own status code. Collapsing the second
+    onto the first is how a broken evaluation becomes a plotted collapse.
+    """
+    url, policy = endpoint
+    policy.models = _window(13)
+    policy.text_for = lambda model, prompt: "Reasoning. The answer is \\boxed{-99999}"
+    cfg = _config(url, state_path=str(tmp_path / "zero.json"))
+    genuine = pe.run_periodic_eval(cfg, 5, pe.BestValTracker(cfg.patience, cfg.state_path))
+
+    policy.models = [BASE]
+    refusal = pe.run_periodic_eval(
+        _config(url, state_path=str(tmp_path / "refused.json")),
+        5,
+        pe.BestValTracker(3, str(tmp_path / "refused.json")),
+    )
+
+    assert genuine["periodic_eval/status_code"] == pe.STATUS["ok"]
+    assert genuine["periodic_eval/olympiadbench/accuracy"] == 0.0
+    assert refusal["periodic_eval/status_code"] == pe.STATUS["adapter_unresolved"]
+    assert math.isnan(refusal["periodic_eval/olympiadbench/accuracy"])
+
+
+# ------------------------------------------------------------ where to evaluate ----
+
+
+def test_the_endpoint_comes_from_the_engine_the_trainer_generates_against():
+    """The port is allocated by the launcher and the host is not localhost, so it is read.
+
+    Both engine shapes: the composed one the real `RemoteSGLangEngine` is, and a direct
+    `addresses` attribute, because a future passthrough on the wrapper must not break this.
+    """
+    assert pe.base_url_from_rollout(_FakeEngine(["172.28.127.18:32735"])) == (
+        "http://172.28.127.18:32735/v1"
+    )
+    assert pe.base_url_from_rollout(_FakeEngineDirect(["10.0.0.2:9000"])) == (
+        "http://10.0.0.2:9000/v1"
+    )
+
+
+def test_an_engine_with_no_address_is_a_refusal_not_a_localhost_guess():
+    """A0's server binds the host interface: a probe of localhost finds nothing at all."""
+    with pytest.raises(RuntimeError) as exc:
+        pe.base_url_from_rollout(_FakeEngine([]))
+    assert "127.0.0.1" not in str(exc.value)
+
+
+def test_the_hook_takes_the_address_from_the_engine_when_none_is_configured():
+    """With no BASE_URL in the environment the hook still knows where to evaluate."""
+    env = _env()
+    del env[pe.ENV_PREFIX + "BASE_URL"]
+    hook = pe.PeriodicEvalHook(env=env, rollout=_FakeEngine(["172.28.127.18:32735"]))
+    assert hook.config.base_url == ""
+    assert hook._eval_config().base_url == "http://172.28.127.18:32735/v1"
+
+
+def test_an_explicit_base_url_wins_and_the_engine_is_not_consulted():
+    """The documented precedence, asserted on the engine never being touched.
+
+    Two places to look for an address is how a run scores the wrong server, so the rule is
+    one or the other and never a merge.
+    """
+    hook = pe.PeriodicEvalHook(env=_env(), rollout=_ExplodingEngine())
+    assert hook._eval_config().base_url == "http://127.0.0.1:1/v1"
+
+
+def test_a_missing_endpoint_is_a_status_code_not_a_crash():
+    """An engine that cannot say where it serves must not take the training run down."""
+    env = _env(FREQ_STEPS=1)
+    del env[pe.ENV_PREFIX + "BASE_URL"]
+    hook = pe.PeriodicEvalHook(env=env, rollout=_FakeEngine([]))
+    m = hook.maybe_run(global_step=1)
+    assert m["periodic_eval/status_code"] == pe.STATUS["endpoint_error"]
+    assert math.isnan(m["periodic_eval/olympiadbench/accuracy"])
+
+
+def test_the_base_url_is_still_required_outside_a_trainer():
+    """Without an engine there is nothing to read the address off, so it must be configured."""
+    env = _env()
+    del env[pe.ENV_PREFIX + "BASE_URL"]
+    with pytest.raises(ValueError):
+        pe.PeriodicEvalConfig.from_env(env)
