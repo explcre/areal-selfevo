@@ -3674,3 +3674,120 @@ have, on CPU.
 
 Written to `paper_src/results.tex` as Sec. "The interference probe returns a null".
 Artifacts: `~/runs/probe/analyze_step199_mcs{2,3,5}.json`, `~/runs/probe/analysis_outer.log`.
+
+### Validation 3 result: INCONCLUSIVE against 90.3, but the grader is not the reason
+
+Qwen3.8-27B, served by our sglang at tp=4, scored through our unedited grader. The served id was
+checked to name the Qwen3.8-27B snapshot before any problem ran. The card's target is 90.3 with
+neither the problem set nor the sampling protocol stated, so this was run on our 175-problem
+`test6.jsonl` slice at the canonical LiveCodeBench defaults.
+
+| max_tokens | n | pass@1 | cap-limited | no_code | wall |
+|---|---|---|---|---|---|
+| 2000 (canonical) | 10 seeds | **25.94** (sd 0.90, se 0.29) | 131-136 / 175 (75-78%) | ~126 | 140 s/seed |
+| 24576 | 1 seed | 64.57 | 75 / 175 (42.9%) | 36 | 1282 s |
+| 61440 | 1 seed | **74.86** | 41 / 175 (23.4%) | 16 | 2754 s |
+
+**Truncation did fall, substantially: 78% to 23.4%.** It did not reach zero even at a 61440-token
+budget with a 65536 context, and accuracy rose monotonically with the budget, 25.94 to 64.57 to
+74.86. So the 61440 number is still not comparable to 90.3 and no number here is.
+
+**The finding is about trace length, not about our grader.** Cross-tabulating grading status
+against `finish_reason` separates the two cleanly:
+
+| max_tokens | non-passes that were TRUNCATED | non-passes that finished normally |
+|---|---|---|
+| 2000 | 131 / 131 (100%) | **0** |
+| 24576 | 59 / 62 (95.2%) | 3 |
+| 61440 | 34 / 44 (77.3%) | 10 |
+
+At the canonical cap **every single failure was a truncation** and the grader rejected nothing that
+finished. At 61440, of the 134 generations that terminated normally, **124 passed -- 92.5%**,
+against a card figure of 90.3. Conditioning on completion selects the shorter, easier problems, so
+92.5% is not an unbiased estimate of the full-set score and must not be quoted as one. But it does
+answer the binary question this validation was for: our code path does not reject valid completed
+code, and the gap to 90.3 is a token-budget artifact.
+
+**Recorded as INCONCLUSIVE against the target, with the cause stated.** A thinking-mode model at
+this scale needs a generation budget far beyond what our harness allows -- observed traces ran
+about 17k tokens with a long tail past 61k -- and **a card number quoted without its cap is not
+comparable to ours**. This is worth more than the validation would have been, and it applies to
+every vendor LiveCodeBench figure we might otherwise have cited.
+
+The 1055-problem cumulative `release_v6` was built and wired (`livecodebench_v6_cumulative`,
+md5 `709876abd759280916a4873894f4513e`, verified to contain all 175 test6 problems) but not scored:
+at roughly 46 minutes per 175-problem seed at a non-truncating budget, the cumulative set is about
+4.6 hours for a single seed, which the box did not have. Adding it changed nothing about the
+existing path -- `SUITE`, the `livecodebench_v6` mapping and that file's md5 are all unchanged,
+which was asserted rather than assumed.
+
+**This validates the grader, not our arms.** Qwen3.8-27B is a different and much newer model than
+the one we train.
+
+## A0 restart: recovery was disabled, so every relaunch silently restarted from step 0
+
+Found while restarting A0 after the validations. `recover.mode` was **disabled** for the entire
+original run, and AReaL's `auto` mode recovers only when recover info exists, so none was ever
+written. The consequence, from the artifacts rather than from inference: the newest checkpoint is
+`globalstep199` written at 09:39, and the two relaunches at 10:21 and 10:38 produced **no
+checkpoint at all** despite `saver.freq_steps=25` and a cadence of about 11 minutes per 25 steps.
+They restarted from zero and were reaped before their first save.
+
+So **A0 could not be resumed from globalstep199**: the step-199 LoRA weights exist, but no
+optimizer or dataloader state does. The choice was between restarting from 0 and warm-starting
+from the step-199 adapter with a fresh optimizer and a reset counter. Restarting from 0 was
+chosen, because the arm protocol compares runs at a fixed step index and a warm-started baseline's
+step 149 is not the same object as A0's step 149. The cost is 199 of 2000 steps, about 1.5 hours.
+
+`recover.mode=auto` with `recover.freq_steps=25` is now set in the launcher and was asserted back
+from the run's own resolved config, so an interruption from here loses at most 25 steps. The
+general lesson is the familiar one in a new place: a default that silently discards work looks
+identical, in the launcher output, to one that preserves it.
+
+## MEDS carries no SOLVE-RATE signal either, so the targeting use dies with the partition use (2026-09-02)
+
+Gate 0 killed MEDS as a partition for separate adapters. The weaker use left standing was MEDS as
+a **targeting key** deciding WHERE a data supplier should act, which needs only that clusters
+differ in how often the model succeeds -- a much weaker condition than separable gradients. That
+is now tested and it fails too.
+
+**Statistic.** eta^2, the fraction of variance in per-group solve rate explained by the cluster
+labelling, computed on `meds_feature` (140 x 32) and `reward_mean` from
+`dump_a0_step199.npz`, re-clustered on the recorded basis (L2-normalise, euclidean HDBSCAN,
+`min_samples=1`). **Control:** size-matched random partitions with the SAME cluster sizes and
+feature-blind labels, 4000 permutations, HDBSCAN noise excluded from both and the control matched
+to the same non-noise rows.
+
+| min_cluster_size | K | n used | eta^2 MEDS | eta^2 random (mean) | p |
+|---|---|---|---|---|---|
+| 2 | 22 | 112 | 0.1786 | 0.1886 | 0.551 |
+| 3 | 17 |  85 | 0.1600 | 0.1902 | 0.669 |
+| 5 |  7 |  84 | 0.0713 | 0.0731 | 0.448 |
+
+**MEDS explains LESS solve-rate variance than a size-matched random partition at every setting**,
+with p between 0.45 and 0.67. Cluster mean solve rates do spread (0.208 to 0.875 at mcs=2), which
+is exactly the trap: **that spread is what random partitions of these sizes produce anyway.**
+
+**This is the clearest demonstration in the project of why the size-matched control is
+non-negotiable.** Reported alone, "MEDS clusters explain 18% of the variance in solve rate, with
+cluster success ranging from 21% to 88%" would read as a strong finding. The control shows the
+identical number arises from feature-blind labels of the same sizes, because with 22 clusters over
+112 points small groups inflate eta^2 mechanically. Same failure shape as the L1-from-uniform
+metric that rose on a router proven incapable of learning.
+
+**Consequence: MEDS is finished for this paper on this batch, in both of its uses.** Two
+independent tests, each against a pre-registered size-matched control, each a null, and in both
+the point estimate favours the control.
+
+**What is untouched by this.** The source axis does not need clusters -- it needs the ~61% of the
+channel that has no target at all, and it acts on that branch whether or not the branch can be
+subdivided. The anchored-evolving-reward spine does not involve MEDS at all.
+
+**Scope.** This batch was filtered to non-unanimous groups, so it is the informative
+subpopulation rather than what training sees. A signal that exists only among unanimous groups
+would be invisible here -- but it would also be useless, since those groups have no gradient.
+
+Script: `/tmp/meds_targeting.py` (run under `~/venv_probe`). Recorded contrasts from the gradient
+analysis, for the record: `meds_minus_random_matched` = +0.000158 / +0.000964 / +0.009078 and
+`meds_minus_elrea` = -0.002556 / -0.003572 / -0.005761 at mcs 2 / 3 / 5. Both wrong-signed for the
+hypothesis at every setting.
