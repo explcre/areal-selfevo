@@ -1390,3 +1390,113 @@ solved branch helps or costs entropy (Sec.~\ref{sec:split} locates the mass but 
 settle this); any arm in which routed units \emph{gain} a signal
 rather than only losing one; and the harness-destination arm of \eqref{eq:action}. Until a
 target is supplied, every routed arm is a gradient-deletion ablation and is labelled as one.
+
+\subsection{The interference probe returns a null, and the pre-registered gate closes}
+\label{sec:gate0}
+
+The method's central mechanism is that behavioural subpopulations inside one task want
+conflicting adapter updates, so that partitioning them and giving each its own adapter removes
+a conflict that a single shared adapter must average away. That claim is testable before any
+adapter is trained, and we fixed the decision rule before computing anything: proceed only if
+the behavioural partition's mean pairwise gradient cosine falls \emph{below} a size-matched
+random partition's by more than the bootstrap interval; treat parity with the random partition
+as evidence that the clusters are noise and stop.
+
+We dump exact per-cluster LoRA gradients at \texttt{globalstep199} over 140 informative
+groups, and compare four partitions on the same batch, the same checkpoint and the same
+gradients. Table~\ref{tab:gate0} reports the result at three settings of the clustering's
+minimum cluster size.
+
+\begin{table}[t]
+\centering
+\begin{tabular}{lrrrr}
+\toprule
+min.\ cluster size & clusters & behavioural & size-matched random & prompt-gradient \\
+\midrule
+2 & 23 & $-0.00122$ & $-0.00138$ & $+0.00134$ \\
+3 & 18 & $-0.00000$ & $-0.00097$ & $+0.00357$ \\
+5 & \phantom{0}8 & $+0.00579$ & $-0.00329$ & $+0.01155$ \\
+\bottomrule
+\end{tabular}
+\caption{Mean pairwise cosine between per-cluster gradients at \texttt{globalstep199}, 140
+informative groups. The hypothesis requires the behavioural column to sit \emph{below} the
+random column. It sits above it at every setting.}
+\label{tab:gate0}
+\end{table}
+
+The sign is opposite to the hypothesis at all three settings, and the magnitudes are within
+noise of zero throughout. Conflict rates tell the same story more plainly: the fraction of
+cluster pairs with negative cosine is $0.502$, $0.477$ and $0.500$ for the behavioural
+partition against $0.534$, $0.484$ and $0.500$ for the random one, and one half is what a
+coin gives. Prompt-gradient clusters, which require no rollouts at all, are consistently the
+\emph{least} conflicting of the three, which removes the secondary argument that behavioural
+features are what make the partition work.
+
+Two readings are available and we take the conservative one. The clustering is not degenerate:
+it finds between eight and twenty-three clusters depending on the setting, so this is not a
+failure to separate anything. What it does not do is separate \emph{gradients}. Cancellation
+sits between $0.24$ and $0.41$ for both the behavioural and the random partition, so conflict
+exists in the batch; it is simply isotropic with respect to any labelling we can compute. The
+honest summary is that there is very little structured gradient there to partition, and the
+pre-registered rule therefore closes: we build no per-cluster adapters on this signal.
+
+This does not touch the weaker use of the same clustering as a \emph{targeting} key, which
+requires only that clusters identify consistent error patterns rather than separable
+gradients, and which is tested separately.
+
+\subsection{Validating the graders against published numbers}
+\label{sec:harnessvalid}
+
+No published score exists for our base model on either of our evaluation sets, so neither
+grader had ever been checked against anyone else's run. We close that with two proxies chosen
+so that the target is fixed before the measurement.
+
+Our OlympiadBench file is the 675-row open-ended English competition subset, and a released
+math model's evaluation parquet contains that split at exactly 675 rows, so the problem sets
+are identical rather than similarly named. Scoring \textsc{Qwen2.5-7B-Instruct} through our own
+grader gives $0.394$ with a Wilson interval of $[0.358, 0.431]$ against a published $39.7$: the
+grader agrees with the literature to a third of a point. On MATH-500 our base model scores
+$0.824$, $[0.788, 0.855]$, against a published band of $84.0$ to $84.6$; the interval covers
+the target, and the point estimate sits at its low end, within the roughly $2.3$-point spread
+that separates two published evaluations of the same released checkpoint.
+
+The third check did not succeed, and its failure is more informative than its success would
+have been. A frontier 27B model reports $90.3$ on our code benchmark's name, so we scored it
+through our grader and obtained $0.251$ to $0.269$ across seeds. That gap does not measure our
+grader: $131$ to $136$ of $175$ generations, about $76\%$, exhausted the token budget and were
+graded as failures, and $43\%$ still truncated at a cap raised to $24{,}576$. A thinking-mode
+model at this scale does not fit the generation budget our harness allows, and a benchmark
+number quoted without its cap cannot be placed beside one measured under a different cap. We
+record the code grader as unvalidated against an external number, and note that its internal
+checks --- gold self-verifying on all 175 problems, a known-wrong set failing on all of them,
+and every mutant killed --- remain the only evidence for it.
+
+\subsection{Baseline scores}
+\label{sec:baseline}
+
+Table~\ref{tab:baseline} gives the vanilla arm at \texttt{globalstep149}, which is the
+reference every later comparison is relative to. Both sit in wide separable bands: the math
+score against roughly $0.83$ for a frontier 27B, and the code score against the $90.3$ discussed
+above. Neither is floored and neither is saturated, which is the property that makes an arm
+difference detectable at all.
+
+\begin{table}[t]
+\centering
+\begin{tabular}{lrrl}
+\toprule
+benchmark & problems & accuracy & Wilson 95\% \\
+\midrule
+OlympiadBench & 675 & $0.470$ & $[0.432, 0.507]$ \\
+LiveCodeBench (v6 slice) & 175 & $0.309$ & $[0.245, 0.381]$ \\
+\bottomrule
+\end{tabular}
+\caption{Baseline arm at \texttt{globalstep149}. Every problem graded, none failed. The math
+figure is a lower bound: 94 of 675 problems carry several gold answers in one string and
+exact-match scores them wrong regardless of the response.}
+\label{tab:baseline}
+\end{table}
+
+The code run truncated on no problems at all and was not budget-bound, so its $0.309$ is a
+property of the policy rather than of the cap --- the contrast with the frontier model above is
+the clearest illustration in this paper of why a generation budget must be reported alongside
+any code score.
