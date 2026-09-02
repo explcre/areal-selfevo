@@ -17,19 +17,50 @@ oversampling until the batch refills. We reuse it. Same phenomenon, opposite res
 DAPO is the baseline this claim must be measured against rather than a method to cite in
 passing, and Sec.~\ref{sec:cost} reports what its response costs.
 
-\paragraph{Choosing an algorithm per task.} SIA selects among training algorithms at the
-granularity of a \emph{task}, and demonstrates that the choice matters. That result is
-theirs and we do not re-derive it. What a task-level policy cannot express is that units
-\emph{within} one task differ in whether a gradient exists at all: by \eqref{eq:irl} the
-silent and informative units of a single task require different estimators, and no
-task-level assignment can separate them. Our claim is therefore about granularity, and the
-comparison that matters is against SIA at matched compute.
+\paragraph{Choosing what to update.} SIA is the nearest work on the \emph{decision} axis,
+and our earlier reading of it was wrong in a way worth stating rather than silently fixing:
+it is not task-level algorithm selection. It is a feedback agent that updates \emph{both} the
+harness and the weights, it is built on a 120B base, and it reports no mathematics or code
+benchmark at all. Two consequences follow. Its base is outside what our stack can train, and
+its evaluation domains do not intersect ours, so a head-to-head on its own benchmark would
+confound the method with the base model and with the domain. The defensible comparison is its
+rule reimplemented on our base at matched budget, and that is how we report it. The
+granularity argument itself is unaffected: what a task-level assignment cannot express is
+that units \emph{within} one task differ in whether a gradient exists at all, since by
+\eqref{eq:irl} the silent and informative units of a single task require different
+estimators.
 
 \paragraph{Deciding what to evolve.} Co-Harness co-evolves harness and weights and
 establishes the success$\to$model / failure$\to$harness assignment. EvoTrainer co-evolves a
 policy with its training harness. Both fix the assignment as a rule over outcomes. We keep
 their rule as a special case (\eqref{eq:action} constrained to a partition) and relax it,
 because a trajectory read by two different consumers need not be spent on only one of them.
+
+\paragraph{Evolving the reward itself, and the anchor that is missing.} Two recent systems
+bracket this question and, between them, leave the interesting case open. BigBang-v1 closes a
+generator--critic loop in which a code agent rewrites the \emph{data-synthesis program} while
+a critic filters what it produces, and a meta-critic corrects the critic against the training
+outcome it failed to predict; the loop is explicitly anchored on held-out real-task utility.
+It has no reward function anywhere, and no reinforcement learning. Ornith-1.5 is its mirror
+image: the harness it generates per task \emph{is} the reward function, and that harness is
+itself optimised by policy gradient against a score that includes a hack-resistance term. An
+evolving reward is therefore already shipped, and we do not claim it. What neither provides is
+the combination. BigBang has the anchor and nothing that moves; Ornith moves the reward and
+states no external anchor inside its loop. Its own predecessor held the verifier immutable and
+outside the model's reach, and the successor --- which now \emph{generates} the object that
+grades it --- does not say what replaced that boundary, while its hack-resistance term is
+named without being given a form or a scorer. An evolving reward anchored on a fixed external
+utility is thus unoccupied, and it is the claim we make.
+
+\paragraph{What neither system decides.} Neither has a router. BigBang's critic has a binary
+codomain --- a candidate is admitted, revised, or dropped --- and nothing about \emph{how} to
+learn from an admitted sample varies: one loss and one source throughout. Ornith operates at
+whole-task granularity, which is the finest thing it does, and what varies per task is
+artifact content rather than the learning mechanism. It states that per-category strategy
+emerges rather than being chosen, and it does not test that claim against a frozen or
+randomised scaffold, which is precisely the absorption control we impose on ourselves and
+therefore run against our own arms. Neither system conditions on behavioural clustering
+features or on trajectory statistics, which is where our decision variable is read.
 
 \paragraph{Deciding \emph{when} to evolve.} \emph{Learning, Fast and Slow} separates fast
 and slow adaptation and reports the stability benefit of a two-timescale schedule. That
@@ -40,7 +71,14 @@ than a contribution.
 lightweight representations of reasoning behaviour and clusters error patterns with HDBSCAN.
 We adopt this directly as the learned instantiation of our cluster key, against a derived
 key computed from the silence side of \eqref{eq:irl}; the two are a controlled ablation of
-\emph{how} to cluster, holding what is done with the clusters fixed.
+\emph{how} to cluster, holding what is done with the clusters fixed. \emph{Scope, narrowed by
+measurement.} A four-partition probe on exact per-cluster gradients finds MEDS clusters
+indistinguishable from a size-matched random partition, with the sign of the separation
+flipping across settings. We therefore do not claim that MEDS separates conflicting updates,
+and we do not build per-cluster experts on it. The use that survives is as a targeting key for
+\emph{where} a supplier should act, which requires only that clusters identify consistent
+error patterns rather than separable gradients, and which is a weaker and separately testable
+condition. A confirmatory run at a later checkpoint is in flight.
 
 \paragraph{Policies as weights and as code.} Contextual bandits are the standard tool for
 per-instance algorithm selection under a scalar reward, and we use LinUCB unmodified; the
