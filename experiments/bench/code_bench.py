@@ -108,13 +108,27 @@ is not an integer literal, so ``2025`` never matches ``2024`` while ``1.41421356
 recorded in the results row, because a grading tolerance that is not reported is a silent
 lever on the score.
 
-WHAT IS NOT VALIDATED HERE
---------------------------
-No live model was used to build this. Grading, loading, prompting and the artifact writer
-are exercised end to end from recorded completions (``--from-generations``); the generation
-path shares :func:`math_bench.generate` with the math suite, which is exercised against a
-local HTTP server in ``test_math_bench.py``, but the specific prompt-in/code-out loop
-against a real served checkpoint has not been run.
+WHAT IS AND IS NOT VALIDATED HERE
+--------------------------------
+GRADING is verified: gold 175/175, known-wrong 31/31, and every mutant killed. Grading,
+loading, prompting and the artifact writer are exercised end to end from recorded
+completions (``--from-generations``), with no GPU and no endpoint.
+
+GENERATION was first exercised against a real served 32B on 35 problems in September 2026,
+and that run found two silent scoring faults, both fixed here and both pinned by tests:
+
+* a valid submission followed by an EMPTY trailing ```python``` fence was discarded and
+  scored ``no_code`` (see :func:`extract_code`), understating the score by 1/20 on that
+  slice;
+* the request payload names a MODEL ID and nothing else -- an adapter is reached only
+  because sglang registers ``--lora-paths NAME=path`` as a model id -- and an unregistered
+  id is answered HTTP 200 by the BASE model. The harness recorded no model id at all, so a
+  run left on a default would have scored the base weights with nothing in results.json to
+  say so. Every run now verifies the id against ``<base-url>/models`` first and records the
+  id, the URL and the served list (see :func:`math_bench.verify_model`).
+
+Still unexercised against real output: the ``[PYTHON]``-tag and unfenced submission forms,
+which no observed completion has used and which this harness deliberately refuses.
 """
 
 from __future__ import annotations
@@ -147,7 +161,7 @@ from code_sandbox import (  # noqa: E402
 )
 # Reused rather than reimplemented: the endpoint client and the interval are benchmark
 # agnostic and are already tested against a misbehaving local server in test_math_bench.py.
-from math_bench import generate, wilson  # noqa: E402
+from math_bench import chat_url, generate, verify_model, wilson  # noqa: E402
 
 # One entry per frozen code benchmark, mirroring math_bench.SUITE. The value is the file
 # inside the HF snapshot, so adding LiveCodeBench v5 later is one line and no new code.
@@ -161,9 +175,10 @@ SUITE = ["livecodebench_v6"]
 # Where the snapshot lives. An environment variable rather than a constant for the same
 # reason math_bench uses MATH_EVAL_DATA: this path differs on every box.
 DATA_ENV = "LCB_DATA"
-_HF_CACHE = (
-    "~/.cache/huggingface/hub/datasets--livecodebench--code_generation_lite/snapshots"
-)
+# Where the HF hub cache keeps this dataset, relative to the cache root, and the root
+# used when HF_HOME says nothing.
+_HF_SUBPATH = "hub/datasets--livecodebench--code_generation_lite/snapshots"
+_HF_DEFAULT_HOME = "~/.cache/huggingface"
 
 # Generation parameters that differ from the CLI defaults, per benchmark. Code answers are
 # long -- a full program plus reasoning -- so the cap is higher than the math default.
@@ -205,17 +220,41 @@ def _ids(args):
     return {x.strip() for x in raw.split(",") if x.strip()}
 
 
+def hf_snapshot_roots() -> list:
+    """Cache directories that may hold the release, in the order they are tried.
+
+    ``$HF_HOME`` first, then the default cache. Hardcoding ``~/.cache/huggingface`` sent
+    the eval box -- which sets ``HF_HOME=~/hf_cache`` -- looking in a directory that does
+    not exist, so ``LCB_DATA`` had to be set by hand for a run that should have needed no
+    arguments. The old path stays as a SECOND candidate rather than a replacement,
+    because a box can hold the snapshot under the default cache while ``HF_HOME`` points
+    somewhere else entirely.
+
+    Returns:
+        The candidate snapshot directories, whether or not they exist, in search order.
+    """
+    roots = []
+    home = os.environ.get("HF_HOME")
+    if home:
+        roots.append(Path(os.path.expanduser(home)) / _HF_SUBPATH)
+    default = Path(os.path.expanduser(_HF_DEFAULT_HOME)) / _HF_SUBPATH
+    if default not in roots:
+        roots.append(default)
+    return roots
+
+
 def snapshot_dir() -> Path:
     """Directory holding the LiveCodeBench JSONL releases.
 
     Returns:
-        ``$LCB_DATA`` when set, otherwise the single snapshot under the HF hub cache.
+        ``$LCB_DATA`` when set, otherwise the newest snapshot under the first cache root
+        from :func:`hf_snapshot_roots` that holds one.
 
     Raises:
-        FileNotFoundError: When neither exists, or when the cache holds no snapshot. A
-            missing dataset must stop the run: left unchecked it yields an empty problem
-            list, which scores zero and is indistinguishable in the output from a model
-            that failed every problem.
+        FileNotFoundError: When ``$LCB_DATA`` is not a directory, or when no cache root
+            holds a snapshot. A missing dataset must stop the run: left unchecked it
+            yields an empty problem list, which scores zero and is indistinguishable in
+            the output from a model that failed every problem.
     """
     env = os.environ.get(DATA_ENV)
     if env:
@@ -223,16 +262,18 @@ def snapshot_dir() -> Path:
         if not p.is_dir():
             raise FileNotFoundError(f"{DATA_ENV}={env} is not a directory")
         return p
-    root = Path(os.path.expanduser(_HF_CACHE))
-    if not root.is_dir():
-        raise FileNotFoundError(
-            f"no LiveCodeBench snapshot at {root}. Set {DATA_ENV} to a directory holding "
-            f"the release JSONL files ({', '.join(sorted(RELEASES.values()))})."
-        )
-    snaps = sorted(d for d in root.iterdir() if d.is_dir())
-    if not snaps:
-        raise FileNotFoundError(f"{root} exists but holds no snapshot directory")
-    return snaps[-1]
+    roots = hf_snapshot_roots()
+    for root in roots:
+        if not root.is_dir():
+            continue
+        snaps = sorted(d for d in root.iterdir() if d.is_dir())
+        if snaps:
+            return snaps[-1]
+    raise FileNotFoundError(
+        f"no LiveCodeBench snapshot under any of {[str(r) for r in roots]} "
+        f"(HF_HOME={os.environ.get('HF_HOME') or 'unset'}). Set {DATA_ENV} to a directory "
+        f"holding the release JSONL files ({', '.join(sorted(RELEASES.values()))})."
+    )
 
 
 def require_dataset(bench: str) -> Path:
@@ -420,20 +461,44 @@ def build_prompt(problem: dict) -> str:
 
 
 _FENCE = re.compile(r"```(?P<lang>[A-Za-z0-9_+-]*)[ \t]*\r?\n(?P<body>.*?)```", re.S)
+# Fence tags that mean "this block is the program".
+_PY_TAGS = ("python", "py", "python3")
 
 
 def extract_code(text: str):
     """Return the submitted program, or ``None`` when the completion contains none.
 
-    The LAST fenced block wins, matching :func:`math_bench.extract_boxed` taking the last
-    box: a model that reasons in code before committing must be graded on what it committed
-    to. Python-tagged blocks are preferred over untagged ones so that a trailing block of
-    example output or shell commands does not displace the answer.
+    PRECEDENCE, highest level first. Within a level the LAST candidate wins; an EMPTY
+    candidate is never returned, and never ends the search either:
 
-    ``None`` is a real outcome and is graded ``no_code`` -- a FAIL that stays in the
-    denominator. Returning the whole completion as "probably code" instead would let a
-    prose answer be executed, and a prose answer that happens to be a valid Python
-    expression would then be graded on whatever it evaluated to.
+    1. python-tagged fenced blocks (``python``, ``py``, ``python3``): last non-empty one.
+    2. fenced blocks of any other tag, or of none: last non-empty one.
+    3. nothing else -- ``None``, graded ``no_code``.
+
+    "Last wins" matches :func:`math_bench.extract_boxed` taking the last box: a model that
+    reasons in code before committing must be graded on what it committed to. Python tags
+    outrank untagged blocks so that a trailing block of example output or shell commands
+    does not displace the answer.
+
+    "NON-EMPTY" is the half a live run found missing. One 32B completion ended with an
+    empty ```python``` fence after a 1102-character program that compiled; taking the last
+    python block, finding it empty and returning None discarded a valid submission and
+    scored it ``no_code`` -- 1 of 20 problems on that slice, understating the score. The
+    empty-block guard itself is right and is kept: an empty block is never executed, and a
+    completion whose ONLY block is empty is still ``no_code``. What changed is that an
+    empty choice falls back to the previous non-empty candidate instead of ending the
+    search. The fallback also crosses levels: if every python-tagged block is empty, the
+    untagged blocks are considered before giving up.
+
+    LEVEL 3 IS A REFUSAL, NOT AN OMISSION, and it is UNEXERCISED against real output. The
+    two other forms this space uses -- a ``[PYTHON]`` ... ``[/PYTHON]`` tagged submission,
+    and an unfenced program -- are deliberately NOT accepted, and no completion has ever
+    needed them: 0 of 35 completions in the live 32B run used ``[PYTHON]`` tags and 0 were
+    unfenced. Accepting them cannot be validated on evidence that does not exist, and it
+    can only make MORE text executable: returning the whole completion as "probably code"
+    would let a prose answer run, and a prose answer that happens to be a valid Python
+    expression would then be graded on whatever it evaluated to. ``None`` is a real
+    outcome and is graded ``no_code`` -- a FAIL that stays in the denominator.
 
     Args:
         text: The raw completion.
@@ -446,9 +511,12 @@ def extract_code(text: str):
     blocks = [(m.group("lang").lower(), m.group("body")) for m in _FENCE.finditer(text)]
     if not blocks:
         return None
-    py = [b for lang, b in blocks if lang in ("python", "py", "python3")]
-    body = (py or [b for _, b in blocks])[-1]
-    return body if body.strip() else None
+    py = [b for lang, b in blocks if lang in _PY_TAGS]
+    for level in (py, [b for _, b in blocks]):
+        for body in reversed(level):
+            if body.strip():
+                return body
+    return None
 
 
 # Names leetcode-style submissions assume are already imported. Only explicit names and
@@ -939,12 +1007,19 @@ async def _generate_all(bench, problems, args, params) -> list:
     """
     import aiohttp
 
-    url = args.base_url.rstrip("/") + "/chat/completions"
+    url = chat_url(args.base_url)
     sem = asyncio.Semaphore(params["concurrency"])
     conn = aiohttp.TCPConnector(limit=params["concurrency"])
     results = [None] * len(problems)
 
     async with aiohttp.ClientSession(connector=conn) as session:
+        # BEFORE any generation: refuse a model id this endpoint does not serve, and fold
+        # the resolved id, the URL and the served list into the parameters this row
+        # reports. Without the first half the run scores whatever weights happen to be
+        # loaded; without the second half nobody can tell afterwards which ones those were.
+        params.update(await verify_model(session, args.base_url,
+                                         getattr(args, "model", None)))
+
         async def one(i, p):
             async with sem:
                 results[i] = await generate(session, url, args.model, build_prompt(p),
@@ -1023,7 +1098,12 @@ def build_parser() -> argparse.ArgumentParser:
     """The command-line parser this script actually runs with."""
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--base-url", default="http://127.0.0.1:8404/v1")
-    ap.add_argument("--model", default="evalmodel")
+    ap.add_argument("--model", default=None,
+                    help="model id to score, as listed by <base-url>/models. Required "
+                         "unless --from-generations, and deliberately without a default: "
+                         "an unregistered id is answered HTTP 200 by the BASE model, so a "
+                         "default silently scores the wrong weights. A LoRA adapter "
+                         "registered with --lora-paths NAME=path is addressed as NAME.")
     ap.add_argument("--benchmarks", default=",".join(SUITE))
     ap.add_argument("--limit", type=int, default=0, help="problems per benchmark, 0 = all")
     ap.add_argument("--difficulty", default="", choices=["", "easy", "medium", "hard"])
@@ -1110,6 +1190,16 @@ def main() -> int:
     ap = build_parser()
     args = ap.parse_args()
     explicit = {a.lstrip("-").replace("-", "_") for a in sys.argv[1:] if a.startswith("--")}
+    # Refused here, before the dataset is loaded and before the endpoint is touched at all:
+    # a missing flag should be reported as a missing flag. --from-generations grades
+    # recorded text and needs no model, so it is exempt.
+    if not args.from_generations and not args.model:
+        raise SystemExit(
+            "ERROR: --model is required when generating. It names which weights answer: "
+            "an id the server does not serve is answered HTTP 200 by the BASE model, so "
+            "there is no safe default. Pass an id from <base-url>/models, or use "
+            "--from-generations to grade recorded completions."
+        )
     rows, exit_code = [], 0
     gen_fh = open(args.gen_out, "w") if args.gen_out else None
     try:
@@ -1121,7 +1211,12 @@ def main() -> int:
             print(f"{bench}: {len(problems)} problems, sandbox="
                   f"{params['sandbox_tier']} ({params['sandbox_describes']})",
                   file=sys.stderr, flush=True)
+            # Every row carries the same attribution schema, so "which model produced
+            # this score" is answerable from the artifact alone -- and a regrade says so
+            # rather than inheriting a model id it never called.
+            params["generations_source"] = args.from_generations or None
             if args.from_generations:
+                params.update({"model": None, "endpoint": None, "served_models": None})
                 completions = load_generations(args.from_generations, problems)
             else:
                 completions = asyncio.run(_generate_all(bench, problems, args, params))

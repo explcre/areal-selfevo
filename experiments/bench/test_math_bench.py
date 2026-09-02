@@ -18,16 +18,21 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import math_bench as mb  # noqa: E402
 from math_bench import (  # noqa: E402
     BENCH_OVERRIDES,
     GEN_KEYS,
     build_parser,
+    chat_url,
     explicit_gen_keys,
     extract_boxed,
     grade,
+    list_served_models,
     load,
+    models_url,
     resolve_params,
     run_bench,
+    verify_model,
     wilson,
 )
 
@@ -247,12 +252,32 @@ class _Args:
             setattr(self, k, v)
 
 
-async def _serve(handler):
-    """Start a local aiohttp server on an ephemeral port; yield its /v1 base url."""
+async def _serve(handler, models=("test",)):
+    """Start a local aiohttp server on an ephemeral port; yield its /v1 base url.
+
+    It answers /v1/models as well as /v1/chat/completions, because run_bench now verifies
+    the requested id against that list BEFORE generating -- an endpoint that cannot say
+    what it serves is refused, since an unregistered id is answered HTTP 200 by the base
+    model. ``models`` defaults to the id _Args asks for, so the check is satisfied; pass a
+    list without it to exercise the refusal.
+
+    Args:
+        handler: The chat-completions handler.
+        models: Ids this endpoint claims to serve.
+
+    Returns:
+        ``(runner, base_url)``.
+    """
     from aiohttp import web
 
     app = web.Application()
     app.router.add_post("/v1/chat/completions", handler)
+
+    async def _models(request):
+        return web.json_response({"object": "list",
+                                  "data": [{"id": m} for m in models]})
+
+    app.router.add_get("/v1/models", _models)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", 0)
@@ -261,9 +286,9 @@ async def _serve(handler):
     return runner, f"http://127.0.0.1:{port}/v1"
 
 
-def _run(handler, **kw):
+def _run(handler, models=("test",), **kw):
     async def go():
-        runner, url = await _serve(handler)
+        runner, url = await _serve(handler, models)
         try:
             return await run_bench("aime24", _Args(url, **kw))
         finally:
@@ -629,9 +654,173 @@ def test_main_threads_the_explicit_flags_into_every_benchmark(monkeypatch, capsy
     monkeypatch.setattr(math_bench, "run_bench", fake_run_bench)
     monkeypatch.setattr(math_bench, "_EXPLICIT", set())
     monkeypatch.setattr(sys, "argv",
-                        ["math_bench.py", "--benchmarks", "aime24,aime25",
-                         "--max-tokens", "32768"])
+                        ["math_bench.py", "--model", "test", "--benchmarks",
+                         "aime24,aime25", "--max-tokens", "32768"])
     assert math_bench.main() == 0
     capsys.readouterr()
     assert seen == [("aime24", {"max_tokens"}), ("aime25", {"max_tokens"})]
     assert math_bench._EXPLICIT == {"max_tokens"}
+
+
+# ----------------------------------------------------- which model actually answered
+#
+# The request payload names a MODEL ID and nothing else. sglang routes a LoRA adapter by
+# that id (--lora-paths NAME=path registers NAME), and answers HTTP 200 for an id it has
+# never heard of by serving the BASE model. So an unverified id scores the wrong weights
+# in silence, and a results row without the id cannot be attributed afterwards. These
+# tests pin the refusal and the record. A STUB endpoint, not a server: the interesting
+# cases are an endpoint that answers wrongly or not at all.
+
+
+class _StubResponse:
+    """One canned HTTP reply, shaped like aiohttp's response context manager."""
+
+    def __init__(self, status, payload):
+        self.status = status
+        self._payload = payload
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def json(self):
+        if isinstance(self._payload, Exception):
+            raise self._payload
+        return self._payload
+
+
+class _StubSession:
+    """Stand-in for ``aiohttp.ClientSession``: canned /models and /chat/completions.
+
+    Args:
+        models: Ids the endpoint claims to serve; an Exception to raise instead of
+            answering at all; or None to answer 200 with a body that is not a model list.
+        completion: The assistant text every chat request returns, or a callable taking
+            the request payload and returning it.
+        models_status: HTTP status for the model-list reply.
+    """
+
+    def __init__(self, models=("test",), completion="", models_status=200):
+        self.models = models
+        self.completion = completion
+        self.models_status = models_status
+        self.get_calls = []
+        self.post_calls = []
+        # Incremented by whoever installs this as aiohttp.ClientSession. A refusal that
+        # is supposed to happen before the endpoint is touched must leave this at 0.
+        self.opened = 0
+
+    def get(self, url, timeout=None):
+        self.get_calls.append(url)
+        if isinstance(self.models, Exception):
+            raise self.models
+        payload = ({"object": "list", "data": [{"id": m} for m in self.models]}
+                   if self.models is not None else {"not": "a model list"})
+        return _StubResponse(self.models_status, payload)
+
+    def post(self, url, json=None, timeout=None):
+        self.post_calls.append((url, json))
+        text = self.completion(json) if callable(self.completion) else self.completion
+        return _StubResponse(200, {"choices": [{"message": {"content": text},
+                                                "finish_reason": "stop"}]})
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+def _verify(model, **kw):
+    stub = _StubSession(**kw)
+    return asyncio.run(verify_model(stub, "http://stub.invalid/v1", model)), stub
+
+
+def test_the_urls_are_built_from_one_base():
+    assert chat_url("http://h:8404/v1") == "http://h:8404/v1/chat/completions"
+    assert chat_url("http://h:8404/v1/") == "http://h:8404/v1/chat/completions"
+    assert models_url("http://h:8404/v1/") == "http://h:8404/v1/models"
+
+
+def test_the_served_list_is_read_off_the_endpoint():
+    stub = _StubSession(models=("a", "b"))
+    assert asyncio.run(list_served_models(stub, "http://stub.invalid/v1")) == ["a", "b"]
+    assert stub.get_calls == ["http://stub.invalid/v1/models"]
+
+
+def test_a_non_200_model_list_is_not_a_model_list():
+    stub = _StubSession(models=("a",), models_status=404)
+    with pytest.raises(RuntimeError):
+        asyncio.run(list_served_models(stub, "http://stub.invalid/v1"))
+
+
+def test_a_body_that_is_not_a_model_list_is_rejected():
+    stub = _StubSession(models=None)
+    with pytest.raises(RuntimeError):
+        asyncio.run(list_served_models(stub, "http://stub.invalid/v1"))
+
+
+def test_an_empty_model_list_is_rejected_rather_than_returned():
+    """"serves nothing" and "could not tell" must not both look like a bad name."""
+    stub = _StubSession(models=())
+    with pytest.raises(RuntimeError):
+        asyncio.run(list_served_models(stub, "http://stub.invalid/v1"))
+
+
+def test_an_id_the_endpoint_does_not_serve_is_refused_and_both_sides_are_named():
+    with pytest.raises(SystemExit) as e:
+        _verify("harnessT49", models=("base-32b", "other"))
+    msg = str(e.value)
+    assert "harnessT49" in msg, "the refusal must name what was asked for"
+    assert "base-32b" in msg and "other" in msg, "and what is available"
+
+
+def test_an_unverifiable_endpoint_is_a_refusal_not_a_run():
+    with pytest.raises(SystemExit):
+        _verify("harnessT49", models=OSError("connection refused"))
+    with pytest.raises(SystemExit):
+        _verify("harnessT49", models=("harnessT49",), models_status=503)
+
+
+def test_no_model_named_is_itself_a_refusal():
+    for missing in (None, ""):
+        with pytest.raises(SystemExit) as e:
+            _verify(missing)
+        assert "--model" in str(e.value)
+
+
+def test_a_served_id_returns_the_attribution_block():
+    block, _ = _verify("harnessT49", models=("harnessT49", "base-32b"))
+    assert block == {"model": "harnessT49",
+                     "endpoint": "http://stub.invalid/v1/chat/completions",
+                     "served_models": ["harnessT49", "base-32b"]}
+
+
+def test_run_bench_refuses_a_model_the_endpoint_does_not_serve():
+    """The live exposure, end to end: the default name would have scored the base model."""
+    with pytest.raises(SystemExit) as e:
+        _run(_reply(r"\boxed{0}"), models=("base-32b",))
+    assert "test" in str(e.value) and "base-32b" in str(e.value)
+
+
+def test_the_row_records_the_model_the_endpoint_and_the_served_list():
+    r = _run(_reply(r"\boxed{0}"), models=("test", "base-32b"))
+    assert r["params"]["model"] == "test"
+    assert r["params"]["endpoint"].endswith("/v1/chat/completions")
+    assert r["params"]["served_models"] == ["test", "base-32b"]
+
+
+def test_the_model_flag_has_no_default_that_could_silently_resolve():
+    """A default id is exactly the failure: unregistered names are served by the base."""
+    assert build_parser().parse_args([]).model is None
+    assert build_parser().parse_args(["--model", "harnessT49"]).model == "harnessT49"
+
+
+def test_main_refuses_without_a_model(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["math_bench.py"])
+    with pytest.raises(SystemExit) as e:
+        mb.main()
+    assert e.value.code == 2
+    assert "--model" in capsys.readouterr().err

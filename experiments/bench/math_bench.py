@@ -22,6 +22,13 @@ The uncertainties that DO matter, all surfaced by that audit and handled below:
   score. Each is now counted and surfaced separately.
 * **Nothing was persisted**, so no reported number could be re-audited without regenerating
   it. Every completion is now written to disk.
+* **Which weights answered was neither checked nor recorded.** The payload names a MODEL ID
+  and nothing else -- sglang routes a LoRA adapter by that id, because `--lora-paths
+  NAME=path` registers NAME as one -- and an id the server does not have is answered HTTP
+  200 by the BASE model. The harness default was exactly such a name and no results row
+  recorded the id, so a run left on the default would have scored the base model in
+  silence. Every run now verifies the id against `<base-url>/models` BEFORE generating, and
+  records the id, the endpoint and the whole served list.
 
 Why not AZR's runner: `math_eval/eval/math_eval.py` does `from vllm import LLM`, and vLLM
 is not installed here. Installing it risks the torch/sglang environment. The runner is the
@@ -486,6 +493,142 @@ def wilson(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
     return (max(0.0, c - h), min(1.0, c + h))
 
 
+# --------------------------------------------------------------- endpoint identity ----
+#
+# WHICH WEIGHTS ANSWERED is not something the request payload says. The chat payload below
+# carries no `lora_path`; an adapter is reachable only because sglang's
+# `--lora-paths NAME=path` registers NAME as a MODEL ID, so `--model NAME` IS the routing
+# decision. And an id the server has never heard of is not an error: sglang answers HTTP
+# 200 and silently serves the BASE model. A run left on a plausible-looking default would
+# therefore score the base weights while every line of its output looked normal.
+#
+# So: ask the endpoint what it serves, refuse to generate against an id that is not on the
+# list, and record the id, the URL and the whole list in the results row. A score nobody
+# can attribute afterwards is not a measurement.
+
+CHAT_PATH = "/chat/completions"
+MODELS_PATH = "/models"
+# Seconds allowed for the model-list query. Deliberately NOT the generation timeout, which
+# is minutes: this is one small GET, and a stuck endpoint should fail fast rather than hold
+# a run open for the full generation budget before refusing.
+MODELS_TIMEOUT = 60.0
+
+
+def chat_url(base_url: str) -> str:
+    """The chat-completions URL for an OpenAI-compatible base url.
+
+    Args:
+        base_url: The ``/v1`` base url, with or without a trailing slash.
+
+    Returns:
+        The exact URL every completion in a run is POSTed to.
+    """
+    return base_url.rstrip("/") + CHAT_PATH
+
+
+def models_url(base_url: str) -> str:
+    """The model-list URL for an OpenAI-compatible base url.
+
+    Args:
+        base_url: The ``/v1`` base url, with or without a trailing slash.
+
+    Returns:
+        The URL listing the model ids this endpoint will route.
+    """
+    return base_url.rstrip("/") + MODELS_PATH
+
+
+async def list_served_models(session, base_url: str, timeout: float = MODELS_TIMEOUT):
+    """Model ids the endpoint declares it serves.
+
+    Args:
+        session: An open ``aiohttp.ClientSession`` (or anything with the same ``get``).
+        base_url: The ``/v1`` base url.
+        timeout: Seconds to wait for the reply.
+
+    Returns:
+        The ids, in the order the endpoint reported them.
+
+    Raises:
+        RuntimeError: If the endpoint cannot be reached, answers non-200, or returns
+            anything but a non-empty list of ids. It never returns an empty list, because
+            "this endpoint serves nothing" and "we could not tell what it serves" must not
+            both come out looking like a name that simply is not registered.
+    """
+    url = models_url(base_url)
+    try:
+        async with session.get(url, timeout=timeout) as r:
+            if r.status != 200:
+                raise RuntimeError(f"{url} answered HTTP {r.status}")
+            payload = await r.json()
+    except RuntimeError:
+        raise
+    except Exception as exc:  # transport error, timeout, non-JSON body
+        raise RuntimeError(
+            f"{url} could not be queried: {type(exc).__name__}: {exc}"
+        ) from exc
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, list):
+        raise RuntimeError(f"{url} returned no model list: {str(payload)[:200]!r}")
+    ids = [m.get("id") for m in data
+           if isinstance(m, dict) and isinstance(m.get("id"), str)]
+    if not ids:
+        raise RuntimeError(f"{url} listed no model ids: {str(payload)[:200]!r}")
+    return ids
+
+
+async def verify_model(session, base_url: str, model, timeout: float = MODELS_TIMEOUT):
+    """Refuse to generate unless the endpoint really serves ``model``, and describe the run.
+
+    This is the whole point of the endpoint-identity block above: it turns a silent
+    wrong-weights run into a loud failure before a single token is generated, and it
+    returns the provenance that makes the resulting score attributable.
+
+    Args:
+        session: An open ``aiohttp.ClientSession``.
+        base_url: The ``/v1`` base url.
+        model: The requested model id. Falsy is itself a refusal -- there is no safe
+            default, because an unregistered name is served by the base model.
+        timeout: Seconds to wait for the model list.
+
+    Returns:
+        The attribution block to record in the results row: ``model`` (the resolved id),
+        ``endpoint`` (the exact URL the completions are POSTed to) and ``served_models``
+        (every id the endpoint listed, so a wrong id is diagnosable after the fact).
+
+    Raises:
+        SystemExit: If no model was named, if the id is not served, or if the list could
+            not be fetched at all. Every one of those must stop the run: continuing means
+            scoring whatever the server happens to have loaded.
+    """
+    if not model:
+        raise SystemExit(
+            "REFUSING TO RUN: no model id was given. The model id is the routing "
+            f"decision -- {models_url(base_url)} lists what this endpoint serves, and an "
+            "UNREGISTERED name is answered HTTP 200 by the BASE model, so there is no "
+            "safe default. Pass --model with an id from that list."
+        )
+    try:
+        served = await list_served_models(session, base_url, timeout)
+    except RuntimeError as exc:
+        raise SystemExit(
+            f"REFUSING TO RUN: cannot verify that model {model!r} is served -- {exc}. "
+            "Generating without this check risks silently scoring the BASE model, so an "
+            "unverifiable endpoint is a hard stop, not a warning."
+        ) from exc
+    if model not in served:
+        raise SystemExit(
+            f"REFUSING TO RUN: {models_url(base_url)} does not serve the requested model.\n"
+            f"  asked for: {model!r}\n"
+            f"  available: {served}\n"
+            "sglang answers HTTP 200 for an unregistered id and silently serves the BASE "
+            "model, so this run would have scored the wrong weights with nothing in "
+            "results.json to say so. A LoRA adapter registers as its own id via "
+            "--lora-paths NAME=path; use an id exactly as printed above."
+        )
+    return {"model": model, "endpoint": chat_url(base_url), "served_models": list(served)}
+
+
 async def generate(session, url: str, model: str, prompt: str, params: dict) -> dict:
     """One completion.
 
@@ -547,11 +690,18 @@ async def run_bench(bench: str, args, gen_fh=None, explicit=None) -> dict:
     # Resolved ONCE per benchmark and threaded through, so every completion in this
     # benchmark provably used the same parameters and the results row can report them.
     params = resolve_params(bench, args, _EXPLICIT if explicit is None else explicit)
-    url = args.base_url.rstrip("/") + "/chat/completions"
+    url = chat_url(args.base_url)
     sem = asyncio.Semaphore(params["concurrency"])
     conn = aiohttp.TCPConnector(limit=params["concurrency"])
 
     async with aiohttp.ClientSession(connector=conn) as session:
+        # BEFORE any generation: refuse an id this endpoint does not serve, and fold the
+        # resolved id, the URL and the served list into the parameters this row reports.
+        # Without the first half a run scores whatever weights happen to be loaded; without
+        # the second half nobody can tell afterwards which ones those were.
+        params.update(await verify_model(session, args.base_url,
+                                         getattr(args, "model", None)))
+
         async def one(idx: int, p: dict, k: int) -> dict:
             async with sem:
                 r = await generate(session, url, args.model, PROMPT.format(problem=p["problem"]), params)
@@ -664,7 +814,12 @@ def build_parser() -> argparse.ArgumentParser:
     """
     ap = argparse.ArgumentParser()
     ap.add_argument("--base-url", default="http://127.0.0.1:8404/v1")
-    ap.add_argument("--model", default="evalmodel")
+    ap.add_argument("--model", default=None,
+                    help="model id to score, as listed by <base-url>/models. REQUIRED and "
+                         "deliberately without a default: an unregistered id is answered "
+                         "HTTP 200 by the BASE model, so a default silently scores the "
+                         "wrong weights. A LoRA adapter registered with "
+                         "--lora-paths NAME=path is addressed as NAME.")
     ap.add_argument("--benchmarks", default=",".join(SUITE))
     ap.add_argument("--limit", type=int, default=0, help="problems per benchmark, 0 = all")
     ap.add_argument("--split", default="all", choices=["all", "search", "report"],
@@ -696,6 +851,15 @@ def main() -> int:
     if args.n > 1 and args.temperature == 0.0:
         print("ERROR: --n > 1 at temperature 0 measures nondeterminism, not uncertainty. "
               "Raise --temperature or set --n 1.", file=sys.stderr)
+        raise SystemExit(2)
+
+    # Refused here as well as in run_bench, and before any dataset or endpoint work: the
+    # message a user sees for a missing flag should name the flag, not arrive as a failed
+    # lookup against a model list.
+    if not args.model:
+        print("ERROR: --model is required. It names which weights answer: an id the "
+              "server does not serve is answered HTTP 200 by the BASE model, so there is "
+              "no safe default. Pass an id from <base-url>/models.", file=sys.stderr)
         raise SystemExit(2)
 
     gen_fh = open(args.gen_out, "w") if args.gen_out else None
