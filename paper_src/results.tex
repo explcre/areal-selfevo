@@ -3254,3 +3254,70 @@ removed, and a dry run found that the field is on the dataclass but not in the c
 so the override needs hydra's append form. The preflight refuses a launch whose resolved
 config does not carry the arm the launcher asked for. Nothing was changed in the running
 baseline.
+
+\subsection{The post-credit window: one covariate survives both controls}
+\label{sec:m8post}
+
+All four arms ran to the end of their ten epochs, $640$ steps, and the per-prompt arms received
+exactly $4096$ credits each --- $512$ steps $\times$ $8$ groups, i.e.\ every step from $128$ on,
+which is what Eq.~\ref{eq:recurrence} predicts and not an approximation to it.
+Table~\ref{tab:m8post} reports the window $[128,640)$: $4096$ routing decisions per arm, made
+while credit was flowing.
+
+\begin{table}[t]
+\centering\small
+\caption{Post-credit window, steps $[128,640)$, $4096$ decisions per arm. Each column is a
+\emph{difference} against a different control and they answer different questions: the random
+router isolates \emph{does the router use the features at all}, the shuffle isolates \emph{is
+the credit attached to the prompt that earned it}. Brackets are $95\%$ bootstrap intervals over
+steps. Bold marks a difference whose interval excludes zero against \emph{both}.}
+\label{tab:m8post}
+\begin{tabular}{lccc}
+\toprule
+subset contrast & $-$ rate-matched random & $-$ correspondence shuffle & $-$ batch credit \\
+\midrule
+cov.\ \texttt{mean\_logprob}       & $\mathbf{+0.180}$ $[+0.113,+0.232]$ & $\mathbf{+0.156}$ $[+0.096,+0.210]$ & $-0.056$ $[-0.120,+0.007]$ \\
+cov.\ \texttt{mean\_response\_len} & $+0.193$ $[+0.125,+0.244]$ & $+0.061$ $[-0.006,+0.128]$ & $+0.065$ $[-0.006,+0.132]$ \\
+cov.\ \texttt{logprob\_dispersion} & $+0.095$ $[+0.031,+0.132]$ & $-0.079$ $[-0.136,-0.018]$ & $-0.201$ $[-0.252,-0.139]$ \\
+cov.\ \texttt{len\_dispersion}     & $+0.013$ $[-0.041,+0.074]$ & $-0.025$ $[-0.087,+0.039]$ & $+0.041$ $[-0.017,+0.090]$ \\
+silence (solved vs unsolved)       & $+0.153$ $[+0.094,+0.203]$ & $+0.065$ $[-0.004,+0.135]$ & $+0.107$ $[+0.052,+0.158]$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{What the two controls separate, and why only one row is bold.} Against the
+rate-matched random router the learned arm separates the covariate subsets on three of four
+covariates, the largest being \texttt{mean\_response\_len} at $+0.193$. Taken alone that reads
+as targeting. It is not: the correspondence control --- same ledger, same pairings, same
+multiset of credit values, only the prompt-to-credit correspondence destroyed --- reproduces
+almost all of it, leaving $+0.061$ with an interval containing zero. So the separation on
+\texttt{mean\_response\_len} comes from the router receiving a \emph{varying} signal at all, not
+from that signal being attached to the prompt that earned it. On
+\texttt{logprob\_dispersion} the shuffled arm is \emph{higher} than the treatment.
+
+\textbf{One covariate survives both: \texttt{mean\_logprob}, $+0.180$ against random and
+$+0.156$ against its own shuffle.} That second number is the one that carries the claim, and at
+$5.3$ standard errors it clears a Bonferroni threshold of $|z|>2.94$ for the fifteen
+comparisons in this table. It is the first evidence in this project that a learned router
+targets on a covariate rather than on the pass count, and it is one covariate out of five, from
+one seed.
+
+\paragraph{Three cautions that belong with the number.} First, \emph{the batch-credited arm is
+not inert on this statistic}: it beats the treatment on \texttt{logprob\_dispersion} by $0.201$.
+Subset contrast measures differential treatment of subsets, which any context-dependent router
+produces; it is evidence of targeting only in the difference against the shuffle, which is
+exactly why that control exists and why the $L_1$ signature was retracted as a validator.
+Second, \emph{the router's mixture moves once credit arrives}: the treatment realised
+$\mathtt{rl}=0.4471$ over the whole run against $\mathtt{rl}=0.3372$ inside the post-credit
+window, so a control matched to the whole-run mix would be matched to a regime the comparison
+never uses. The control reported here is matched to the window's own measured mix. Third,
+\emph{agreement with the hand-written rule falls} on two of three silence subsets
+($0.267$ vs $0.305$ on solved, $0.419$ vs $0.623$ on unsolved), so the learned router is not
+reproducing the rule; whether its disagreement is an improvement is a benchmark question these
+arms do not answer.
+
+\paragraph{Replication in flight.} A second seed of the treatment, its matched random control
+and the correspondence shuffle is running, together with the hand-written rule arm that the
+first round never launched. One covariate out of five surviving in one seed is a result to
+replicate before it is leaned on, and the comparison that must replicate is the
+\texttt{mean\_logprob} column against the shuffle.
