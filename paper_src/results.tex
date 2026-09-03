@@ -2425,3 +2425,193 @@ pre-registered rule closes the gate: the clusters are not a gradient-separating 
 no per-cluster adapters are built on this signal.} The one escape the plan had reserved --- that
 interference grows as the policy specialises --- is measured here across a $550$-step span and
 does not occur.
+
+\subsection{Per-prompt credit has a prerequisite that the corpus, not the controller, decides}
+\label{sec:recurrence}
+
+Per-prompt credit assignment pairs a routing decision with the \emph{next sighting of the same
+prompt}, so the interval at which any credit becomes available is a property of the data loader:
+%
+\begin{equation}
+\text{recurrence period} \;=\; \frac{n_{\text{prompts}}}{\text{batch size}}\ \text{steps.}
+\label{eq:recurrence}
+\end{equation}
+%
+This is arithmetic, and it disqualifies the configuration our own baseline runs in. A0 trains on
+$102{,}835$ decontaminated DeepMath rows at a batch of $8$, so its epoch is $12{,}853$ steps and
+it is presently at step $852$ of it. A learned-router arm launched on that corpus would emit
+thousands of routing decisions and receive \textbf{zero} credits for the entire run, while every
+logged quantity except \texttt{prompt\_credit/credited} reported it healthy. That is not a null
+result, it is a no-op that reads as one, and it is invisible in simulation because a simulated
+world recurs by construction.
+
+We therefore state it as a precondition rather than a detail: \emph{a per-unit credit rule across
+time is defined only on a corpus the run revisits}, and the revisit rate, not the estimator, sets
+how much signal exists. A second-order term follows from the self-baseline rule, under which a
+prompt's first delta is withheld because a zero baseline would hand the first-credited mode the
+whole common training trend: the first credit therefore arrives at a prompt's \emph{third}
+sighting, after two recurrence periods.
+
+Our M8 arms consequently train on a seeded $512$-row subset of the same decontaminated corpus,
+giving a $64$-step epoch --- confirmed in the run header (\texttt{Epoch 1/10 Step 1/64}) and in
+the ledger, whose \texttt{pending} count rises by exactly $8$ per step to $512$ at step $64$ with
+zero evictions and zero same-batch skips. The subset size is a \emph{consequence of
+Eq.~\ref{eq:recurrence}}, not a tuned hyper-parameter, and it is the arms' principal limitation:
+they say what a learned router does when credit is available, not what it does at A0's corpus
+size, where by Eq.~\ref{eq:recurrence} it is not.
+
+\subsection{What carries the routing claim, and the instrument checked against two controls}
+\label{sec:contrast}
+
+The mode mix is not evidence. In a controlled world where a right answer exists, a
+batch-credited router's $L_1$ distance from uniform \emph{rises} while its targeting stays at
+chance, because the router chooses its own assignment and the arms drift apart on that feedback
+alone. Results are therefore carried by \textbf{subset contrast} --- half the total variation
+distance between the mode distribution on one subset of groups and on another, which is $0$ for a
+router with a favourite mode however lopsided the mix becomes --- with direction checked by a
+\textbf{per-subset targeting fraction}, so an inverted preference cannot pass.
+
+Two subset labellings are reported and they answer different questions. \emph{Silence} is the
+fixed rule's own partition (solved-silent, unsolved-silent, informative); a router that separates
+these is doing what the hand-written rule already does, so this is the floor and not the finding,
+and its targeting fraction is reported as \emph{agreement with the rule}, never as correctness ---
+a live run has no ground truth about which mode helps a prompt. \emph{Covariate} is a median split
+on one covariate \emph{within} the informative stratum, which holds the pass count approximately
+fixed, so any contrast there is attributable to something the pass count does not carry. That is
+the axis our own feature audit records as untested rather than refuted.
+
+Every number is a difference against a control, bootstrapped over \emph{steps} rather than groups
+because within one step the decisions share a policy, a batch and a parameter vector. The two
+arms are resampled independently: rollout generation is not deterministic across inference
+servers, so two arms with the same seed and the same data order see different completions from
+step one and are independent draws from one configuration, not a matched pair.
+
+Before any arm was read, the statistic was driven through the real advantage path for $200$ steps
+against a router that reads one covariate and nothing else, and against a feature-blind router
+drawing modes from fixed proportions (Table~\ref{tab:instrument}). It fires at $0.99$ on the
+covariate a router actually used and reports $0.06$ for a router that used nothing, so a contrast
+reported below is not a property of the estimator. A covariate that is constant within a window
+is reported \emph{undefined}, never $0$.
+
+\begin{table}[t]
+\centering\small
+\caption{The measurement instrument against a positive and a null control, $200$ steps through
+the real \texttt{\_compute\_advantages}. Brackets are $95\%$ bootstrap intervals over steps.}
+\label{tab:instrument}
+\begin{tabular}{lccc}
+\toprule
+router & contrast on \texttt{mean\_logprob} & on \texttt{logprob\_dispersion} & silence contrast \\
+\midrule
+reads \texttt{mean\_logprob} only & $0.9882$ $[0.831, 1.000]$ & $0.2071$ & $0.0098$ \\
+feature-blind (null)              & $0.0616$ $[0.020, 0.228]$ & $0.0440$ & $0.0528$ \\
+\midrule
+difference                        & $\mathbf{+0.9266}$ $[+0.670, +0.954]$ & $+0.1632$ & $-0.0430$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{The credit study reproduces exactly with the config path in place}
+\label{sec:creditrepro}
+
+Making \texttt{credit="prompt\_self\_baseline"} selectable from configuration required editing
+the two lines in the actor and the config dataclass that the CPU study had deliberately left
+alone. Table~\ref{tab:creditrepro} re-runs that study on the edited tree: every figure it is
+cited by is recovered to three decimals, over the same eight paired seeds.
+
+\begin{table}[t]
+\centering\small
+\caption{\texttt{credit\_sim} re-run on the tree that now exposes the rule from configuration.
+Final-quarter subset contrast, mean over $8$ paired seeds, with the error bar on the
+\emph{difference} and the number of seeds in which it has the reported sign.}
+\label{tab:creditrepro}
+\begin{tabular}{lc c lc}
+\toprule
+arm & final contrast & \quad & difference & value \\
+\midrule
+\texttt{batch}                       & $0.098$ & & \texttt{prompt} $-$ \texttt{batch}    & $+0.682 \pm 0.021$ (8/8) \\
+\texttt{prompt}                      & $0.779$ & & \texttt{prompt} $-$ shuffled          & $+0.678 \pm 0.018$ (8/8) \\
+\texttt{prompt}, credit shuffled     & $0.102$ & & self-baseline $-$ shuffled           & $+0.685 \pm 0.024$ (8/8) \\
+\texttt{prompt\_self\_baseline}      & $\mathbf{0.828}$ & & self-baseline $-$ \texttt{prompt} & $+0.048 \pm 0.012$ (7/8) \\
+\ \ same, credit shuffled            & $0.143$ & & \texttt{prompt\_centered} $-$ \texttt{prompt} & $-0.027 \pm 0.010$ (1/8) \\
+\texttt{prompt\_centered}            & $0.752$ & & & \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The last row is a negative result and is reported as one. \texttt{prompt\_centered} subtracts the
+batch's mean delta, which is one number shared by every arm --- the same class of quantity
+per-prompt credit exists to escape --- and it measures \emph{below} plain per-prompt credit. It
+remains selectable because it is the rung of the ablation that shows the distinction matters, not
+because it is a candidate.
+
+\subsection{The learned router on a GPU: arms, and the pre-credit window as a null check}
+\label{sec:m8arms}
+
+Four arms train concurrently on $8\times$B200, two GPUs each (\texttt{fsdp:d1p1t1} actor +
+\texttt{sglang:d1p1t1} rollout; the fp32 $32$B actor fits one card unsharded at a measured
+$133.7$\,GB of $178.35$, so there is exactly one router per arm rather than one per data-parallel
+worker). Everything except the routing configuration is A0's: Qwen2.5-32B-Instruct, LoRA $r{=}32$
+on q/k/v/o, $8$ prompts $\times$ $8$ samples, cap $1024$, $\mathrm{lr}=10^{-4}$,
+$\texttt{kl\_ctl}=0$, $\texttt{adv\_norm}=\texttt{null}$.
+
+\begin{center}\small
+\begin{tabular}{llll}
+\toprule
+arm & router & credit & role \\
+\midrule
+\texttt{m8\_prompt}  & \texttt{contextual} & \texttt{prompt\_self\_baseline} & treatment \\
+\texttt{m8\_control} & \texttt{random}     & (inert: no \texttt{observe}) & \textbf{rate-matched control} \\
+\texttt{m8\_shuffle} & \texttt{contextual} & \texttt{prompt\_self\_baseline} $+$ shuffle & correspondence control \\
+\texttt{m8\_batch}   & \texttt{contextual} & \texttt{batch} & the recorded null, re-run \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The control replays the treatment's \emph{measured} proportions, taken from the treatment's own
+\texttt{route/\{mode\}\_groups} over its first $19$ steps
+($\mathtt{rl}=0.3882$, $\mathtt{sft}=0.2961$, $\mathtt{skip}=0.3158$) and supplied through two
+independent paths --- the environment the router reads and a file the preflight compares it
+against --- so the configuration cannot agree with the expectation by construction. Over the
+window below the control realised $0.325/0.306/0.369$ against the treatment's own
+$0.400/0.288/0.313$, inside three binomial standard errors at this sample size.
+
+\paragraph{A pre-registered null, and it holds.} By Eq.~\ref{eq:recurrence} no credit exists
+before a prompt's third sighting, i.e.\ step $\approx128$ here, and over the window reported in
+Table~\ref{tab:m8pre} the ledger's \texttt{credited} count is $0$ for every step of every arm
+while \texttt{pending} rises by exactly $8$ per step. The learned router has therefore received
+no feedback and its ridge models sit at initialisation for every mode, so it must \emph{not}
+separate itself from a router that reads nothing. It does not: every difference against the
+matched control contains zero. This window is reported because it is the check that says the
+instrument and the control are not manufacturing a result --- it is not the claim, and the
+window where the claim lives is stated below as still open.
+
+\begin{table}[t]
+\centering\small
+\caption{Pre-credit window, steps $[0,20)$ on every arm --- $160$ routing decisions per arm, $0$
+credits in either. Windows are matched on \emph{step index}, i.e.\ policy age, because the arms
+were launched at different times. Brackets are $95\%$ bootstrap intervals over steps; the two
+arms are resampled independently, since rollout generation is not deterministic across inference
+servers and the arms are independent draws from one configuration rather than a matched pair.}
+\label{tab:m8pre}
+\begin{tabular}{lccc}
+\toprule
+subset contrast & treatment & matched random & difference \\
+\midrule
+silence (solved vs unsolved)      & $0.3966$ & $0.2857$ & $+0.1108$ $[-0.072, +0.260]$ \\
+cov.\ \texttt{mean\_response\_len}   & $0.0864$ & $0.0732$ & $+0.0132$ $[-0.230, +0.229]$ \\
+cov.\ \texttt{len\_dispersion}       & $0.0682$ & $0.1463$ & $-0.0782$ $[-0.259, +0.163]$ \\
+cov.\ \texttt{mean\_logprob}         & $0.1397$ & $0.0976$ & $+0.0421$ $[-0.191, +0.291]$ \\
+cov.\ \texttt{logprob\_dispersion}   & $0.1383$ & $0.0976$ & $+0.0408$ $[-0.177, +0.243]$ \\
+cov.\ \texttt{truncated\_fraction}   & \multicolumn{3}{c}{undefined --- constant within the informative stratum} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{What is still open, stated as such.} These arms establish that the learned router is
+selectable, runs at $32$B beside its mandatory control, and does \emph{not} beat that control
+before it is taught anything. They do not yet say whether it beats it once credit flows: the
+post-credit window $[128,\cdot)$ opens only after two recurrence periods and is being written
+continuously to \texttt{gs://selfevo/runs/b200/\_analysis/}, together with the correspondence
+control that shuffles credits across the prompts that earned them and the batch-credited arm
+that the identity predicts cannot learn at all. A difference reported there, and only there,
+would be the first evidence that a learned router decides better than the fixed rule in training.
