@@ -154,8 +154,12 @@ def find_free_ports(
     attempts = 0
 
     while len(free_ports) < count and attempts < max_attempts:
-        # Generate random port within range
-        port = random.randint(min_port, max_port)
+        # Drawn from _PORT_RNG, NOT from the global `random`. `seeding.set_random_seed` has
+        # already seeded the global module from `config.seed` by the time any port is
+        # allocated, so two runs sharing a seed -- which is precisely what a paired
+        # treatment/control pair must do -- drew the IDENTICAL candidate sequence and the
+        # later one exhausted its ten attempts on ports the earlier one already held.
+        port = _PORT_RNG.randint(min_port, max_port)
 
         # Skip if port already attempted or excluded
         if port in attempted_ports or port in exclude_ports:
@@ -176,6 +180,15 @@ def find_free_ports(
         )
 
     return sorted(free_ports)
+
+
+# Port selection must NOT be reproducible. It is drawn from a private generator seeded from
+# the OS rather than from the global `random` module, which `areal.utils.seeding` binds to the
+# experiment seed: with a shared seed two concurrent runs on one host draw the same candidates,
+# and the second dies with "Could only find 0 free ports". A port is not part of a result, so
+# nothing is lost by making it unreproducible, and `random.SystemRandom` consumes no state that
+# any seeded draw elsewhere depends on.
+_PORT_RNG = random.SystemRandom()
 
 
 def is_port_free(port: int) -> bool:
