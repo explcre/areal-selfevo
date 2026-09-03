@@ -36,6 +36,13 @@ N_SAMPLES="${N_SAMPLES:-8}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1024}"
 MAX_TOKENS="${MAX_TOKENS:-2048}"
 MAX_TOK_PER_MB="${MAX_TOK_PER_MB:-2048}"
+# Prompt-token budget. 1024 is the A0 value and the default, so this file with no
+# environment set is still the baseline. It is settable because it is half of the sum
+# the preflight bounds: a sequence of MAX_PROMPT_LEN + MAX_NEW_TOKENS cannot be split
+# across microbatches, so raising the generation cap requires lowering this or raising
+# MAX_TOK_PER_MB, and only one of those is free. MEASURED over 8,656 sampled rollouts:
+# the longest prompt served is 676 tokens and p999 is 590, so 768 drops none of them.
+MAX_PROMPT_LEN="${MAX_PROMPT_LEN:-1024}"
 # What a rollout that hit MAX_NEW_TOKENS contributes to the advantage: keep (A0, the
 # historical behaviour -- it grades 0 and carries the same negative advantage as a
 # confident wrong answer), zero (no advantage of its own, group baseline untouched) or
@@ -91,7 +98,7 @@ OVERRIDES=(
 
   train_dataset.path=/home/ubuntu/data/deepmath_decontam
   train_dataset.batch_size="$BATCH_SIZE"
-  train_dataset.max_length=1024
+  train_dataset.max_length="$MAX_PROMPT_LEN"
   valid_dataset.path=DigitalLearningGmbH/MATH-lighteval
   valid_dataset.batch_size="$BATCH_SIZE"
 
