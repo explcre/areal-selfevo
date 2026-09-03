@@ -2298,3 +2298,130 @@ run proceeds --- the sweep costs about ten GPU-minutes per checkpoint and the ha
 merge and analysis are stored beside the scores in
 \texttt{gs://selfevo/evals/a0\_headline/}, so extending it is re-running one script rather
 than rebuilding the measurement.
+
+\subsection{The interference null survives a second run, a later checkpoint, and a swept
+random control}
+\label{sec:gate0late}
+
+Sec.~\ref{sec:gate0} closed the pre-registered gate on one checkpoint. Three objections
+survive that measurement and each of them, if right, would reopen the method: that the batch
+was favourable, that the effect appears only once the policy has specialised, and that a
+single draw of the size-matched random partition is not a null distribution. This subsection
+answers all three, and adds a provenance correction to Sec.~\ref{sec:gate0} that has to be
+recorded because the checkpoint it names no longer holds the weights it was measured on.
+
+\paragraph{Provenance correction to Sec.~\ref{sec:gate0}.} The dump behind Table~\ref{tab:gate0}
+read the adapter at \texttt{a0\_math/t1/default/\allowbreak epoch0epochstep199globalstep199} at
+09:41 on 2026-09-02. The file now at that path was written at 21:22 the same day by the
+currently live run, which reuses the same experiment and trial names and therefore the same
+directory. The tensor Table~\ref{tab:gate0} measured is consequently \emph{not} the tensor at
+that path, and that table cannot be re-derived from the checkpoint directory as it now stands.
+Nothing in the result changes --- the dump, its 496 exact gradient pairs and its metadata are
+all still on disk --- but the identity has to be carried by recorded checksums rather than by a
+path, and every measurement below records one.
+
+\paragraph{The batch is the most readable one available, not a favourable one.} A GRPO group
+whose rollouts all score alike carries an identically zero advantage and therefore an exactly
+zero gradient, so a batch of mostly unanimous groups drives every partition's mean cosine
+toward the same value for a reason that has nothing to do with clustering. That is the
+false-negative this gate was pre-registered to refuse, and the first dump taken on this project
+hit it: 90 of 128 groups were unanimous. The batch used here and in Sec.~\ref{sec:gate0}
+(\texttt{a0\_step199\_probe.jsonl}, md5 \texttt{078a2ba0541a2a19b9a9c95449062ad6}) carries 140
+groups at group size $8$ with $k$-histogram $\{1{:}20,\,2{:}19,\,3{:}20,\,4{:}14,\,5{:}15,\,
+6{:}17,\,7{:}35\}$: \textbf{140 of 140 groups are non-unanimous}, against a pre-registered
+requirement of $60\%$. The dumps confirm it downstream --- zero zero-valued GRPO sketches in
+every dump reported here. Whatever this null is, it is not the sparse-advantage artefact.
+
+\paragraph{A second run, never previously analysed.} A readable dump also exists at
+\texttt{globalstep49} of the \texttt{harnessT\_trunc} experiment --- a different run, same base
+(Qwen2.5-32B-Instruct), same adapter geometry (r$=32$, $\alpha=32$, on q/k/v/o) --- over 153
+groups, again $153/153$ non-unanimous, $k$-histogram $\{1{:}28,\,2{:}24,\,3{:}19,\,4{:}11,\,
+5{:}16,\,6{:}18,\,7{:}37\}$. It had been dumped but never analysed. Table~\ref{tab:gate0late49}
+gives it. The contrast changes sign across the three settings ($+0.0029$, $-0.0004$, $+0.0263$)
+and no setting resolves: the largest is still below the $0.0331$ sketch resolution floor. The
+$\texttt{mcs}=5$ row is reported for completeness but does not meet the pre-registered
+$K\ge 4$ requirement --- it finds three clusters, which is one pair per partition.
+
+\paragraph{What was run for the trajectory.} Three adapters from the \emph{live} A0 run were
+re-dumped on eight H200s, on the identical batch, with the identical sketch (\texttt{dim}
+$8192$, \texttt{seed} $0$) and the identical library versions as the H100 dump
+(torch 2.9.1+cu128, transformers 5.3.0, peft 0.18.1); the repository's own $175$ cluster-LoRA
+tests pass on that box, including the test that pins the \texttt{hidden\_states} layout the
+MEDS feature depends on. Identity is established the way Sec.~\ref{sec:a0headline} established
+it, because the path cannot carry it: md5 \texttt{b8319909729618a04f3f5a90faf9468b} at step
+$199$, \texttt{a876c1c068274251a4001f35e8c261c9} at step $449$ and
+\texttt{65aa994558e845bea9b3bf63b720ac70} at step $749$, each $134{,}287{,}464$ bytes with
+exactly $256$ merged tensors, and Frobenius norms of the merged LoRA delta of $1.2309$,
+$3.0912$ and $4.7495$ --- strictly increasing, so the three lie on one run's trajectory and the
+adapter is demonstrably not inert across the span being tested.
+
+\paragraph{One caveat, stated rather than buried.} The rollouts are held fixed across the three
+checkpoints, so at steps $449$ and $749$ they are off-policy and the stored rewards, and hence
+the advantages, are those of the earlier policy. That is deliberate: holding the batch fixed is
+what makes the comparison across checkpoints a statement about the \emph{parameters} rather
+than about two things moving at once. What it cannot rule out is an interference structure that
+only appears in a batch drawn from the later policy itself.
+
+\paragraph{Why the random control is swept.} Sec.~\ref{sec:gate0} compares the behavioural
+partition against \emph{one} draw of a size-matched random partition. A single draw is a point,
+not a null distribution, and the quantity that decides the gate is whether the behavioural
+partition sits outside the range that feature-blind labels of the same sizes produce. We
+therefore redraw the control at five seeds per setting and read the contrast against its own
+spread, which is the comparison the pre-registered rule was reaching for.
+
+\begin{table}[t]
+\centering\small
+\caption{A second run, never previously analysed: mean pairwise cosine between per-cluster
+gradients at \texttt{globalstep49} of \texttt{harnessT\_trunc}, $153$ groups, $153/153$
+non-unanimous. The hypothesis requires \emph{behavioural} to sit below \emph{random}. The
+contrast changes sign across settings and no row resolves against the $0.0331$ floor. The
+$\texttt{mcs}=5$ row finds three clusters and so does not meet the pre-registered $K\ge4$.}
+\label{tab:gate0late49}
+\begin{tabular}{lrrrrr}
+\toprule
+min.\ cluster size & clusters & behavioural & random & prompt-grad. & behav.\ $-$ random \\
+\midrule
+2 & 30 & $+0.00282$ & $-0.00007$ & $+0.00069$ & $+0.00289$ \\
+3 & 15 & $+0.00719$ & $+0.00759$ & $-0.00124$ & $-0.00040$ \\
+5 & \phantom{0}3 & $+0.01375$ & $-0.01253$ & $-0.02562$ & $+0.02628$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[t]
+\centering\small
+\caption{The interference null along one run's trajectory. Three checkpoints of the live A0 run
+(identity established by the strictly increasing merged-LoRA norms $1.2309$, $3.0912$,
+$4.7495$), the same $140$-group batch, the same sketch. \emph{behav.} and \emph{random} are mean
+pairwise cosines between per-cluster gradients; the random control is redrawn at five seeds and
+$z$ is the behavioural-minus-random contrast in units of that control's own spread. The
+hypothesis requires the contrast to be \emph{negative} and large. Nothing resolves against the
+$0.0331$ sketch floor at any checkpoint, the sign depends on the clustering setting rather than
+on the checkpoint, and the contrast does not grow as the policy specialises.}
+\label{tab:gate0traj}
+\begin{tabular}{rrrrrrr}
+\toprule
+step & min.\ clust. & $K$ & behav. & random & behav.\ $-$ random & $z$ \\
+\midrule
+199 & 2 & 25 & $-0.00151$ & $+0.00019$ & $-0.00170$ & $1.19$ \\
+199 & 3 & 17 & $-0.00110$ & $-0.00071$ & $-0.00039$ & $0.22$ \\
+199 & 5 & \phantom{0}8 & $+0.00423$ & $-0.00102$ & $+0.00526$ & $1.34$ \\
+449 & 2 & 26 & $-0.00090$ & $+0.00049$ & $-0.00139$ & $0.89$ \\
+449 & 3 & 18 & $-0.00079$ & $+0.00002$ & $-0.00081$ & $0.85$ \\
+749 & 2 & 24 & $-0.00169$ & $+0.00059$ & $-0.00228$ & $1.17$ \\
+749 & 3 & 18 & $-0.00054$ & $-0.00001$ & $-0.00053$ & $0.49$ \\
+749 & 5 & \phantom{0}7 & $+0.00742$ & $+0.00119$ & $+0.00624$ & $1.48$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{The verdict, and what it costs.} Across four checkpoints from two runs, three
+clustering settings and five control seeds, the behavioural partition never separates gradients
+from a size-matched random one by more than about $1.5$ standard deviations of the control's own
+spread, and every contrast sits an order of magnitude inside the sketch's resolution floor. At
+the settings that meet the pre-registered $K\ge4$ with the most clusters the sign is nominally
+favourable and never significant; at the coarsest setting it is unfavourable. \textbf{The
+pre-registered rule closes the gate: the clusters are not a gradient-separating structure, and
+no per-cluster adapters are built on this signal.} The one escape the plan had reserved --- that
+interference grows as the policy specialises --- is measured here across a $550$-step span and
+does not occur.
