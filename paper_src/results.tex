@@ -3160,8 +3160,9 @@ and scores $0$ --- the same $0$ a confidently wrong answer scores, and after
 \emph{additional} penalty; the implicit one, through the extractor, is unconditional. On A0's
 own rollout dumps ($154{,}856$ generations over $1{,}419$ steps; over the restart-free region
 from step $520$, $57{,}272$ rows in $7{,}159$ complete groups of eight) $\mathbf{11.4\%}$ of
-generations reach the cap and $10.6\%$ reach it and grade wrong. That is $\mathbf{26.8\%}$ of
-every wrong answer in the run. The rate is flat: per $100$-step block it moves between
+generations reach the cap and $10.6\%$ reach it and grade wrong, on either window. That is
+$\mathbf{26.3\%}$ of every wrong answer over the restart-free region and $26.8\%$ over the
+whole dump set; every figure below is the restart-free one. The rate is flat: per $100$-step block it moves between
 $10.2\%$ and $12.2\%$, sloping $-1.8$ points per thousand steps. The dumps reproduce the
 trainer's own accuracy to four decimals ($0.5982$ against $\texttt{task\_reward/avg}=0.5986$
 over the same steps), so they are the batch the actor trained on and not a sample of it.
