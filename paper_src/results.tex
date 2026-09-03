@@ -3146,8 +3146,8 @@ the resulting hazard that a minimal fix would score the wrong directory successf
 than erroring. It states that their suites still pass $119/119$ and that their published
 results predate the change.
 
-\subsection{Truncated rollouts are graded as wrong answers, which is a fifth of the
-gradient and is not the flat curve}
+\subsection{A fifth of A0's negative gradient pushes down on rollouts that were on
+their way to a correct answer}
 \label{sec:truncation}
 
 \paragraph{The mechanism, and it is not rare.} The reward is
@@ -3178,17 +3178,59 @@ truncated also weights them. Of that, $19.0$ points are negative advantage, whic
 $\mathbf{36.6\%}$ of all negative-advantage mass in the run. Better than a third of the
 downward push in A0 sits on rows whose label was never checked.
 
-\paragraph{They are unfinished, not degenerate, which is what makes the label suspect.} Of
-the $6{,}167$ truncated-and-wrong rollouts after step $520$, $92.8\%$ carry no
+\paragraph{They are unfinished, not degenerate, and $39.9\%$ of them would have been
+right.} Of the $6{,}167$ truncated-and-wrong rollouts after step $520$, $92.8\%$ carry no
 \verb|\boxed{}| at all, show no repeating block covering more than half their tail, and
-compress no better than $4\times$; they stop in the middle of a residue calculation or a
-sum. Only $3.6\%$ look degenerate by either measure. So the budget, not a loop, is what ends
-them. How many would be \emph{correct} with room is the number that separates a correctness
-bug from an inefficiency, and it needs regeneration on a GPU, which we have not run. The
-free upper bound from the dumps: the untruncated siblings of these rows solve the same prompt
-$46.1\%$ of the time, $36.6\%$ of truncated-wrong rows sit on prompts no sibling ever solves,
-and a rollout that ran past $1024$ tokens is on a slower path than the siblings it is being
-compared with. The recovery rate is therefore below $0.46$ and plausibly well below.
+compress no better than $4\times$: the budget ends them, not a loop. What that costs was then
+measured rather than argued. Every one of the $293$ truncated-and-wrong rollouts drawn in
+steps $1375$--$1424$ was re-fed to the policy as its prompt \emph{plus its own $1024$
+truncated tokens} and allowed to run on for up to $2{,}900$ more, four continuations each at
+the same temperature $1.0$ the rollouts were drawn at, on the LoRA checkpoint at
+\texttt{globalstep1399} (the adapter moves by at most $2.4\%$ in relative Frobenius norm
+across that window, so one checkpoint covers it). This is the exact counterfactual and not a
+resample: a fresh draw from the same prompt is a different trajectory, while a continuation is
+the same one with more room.
+
+\textbf{$99.9\%$ of the continuations terminated}, needing a median of $154$ and a mean of
+$209$ extra tokens --- these rollouts were a paragraph short, not a chapter. The recovery rate
+is $\mathbf{0.3985}$, $95\%$ CI $[0.3473, 0.4488]$ by a cluster bootstrap over
+the $293$ rows. The free upper bound stated in advance was $0.4610$, the rate at which these
+rows' \emph{untruncated} siblings solve the same prompt, and the interval lands inside it. Row
+by row, $49.5\%$ recover at least one continuation of four and $31.4\%$ recover all four.
+
+\paragraph{On the rows that carry gradient, recovery is higher, and that is the defect.} A row
+contributes nothing unless its group disagrees with itself, so the rows that matter are the
+$165$ truncated-wrong rows with a strictly negative advantage --- and those sit on prompts a
+sibling did solve, which are the recoverable ones. Weighting each row by the gradient mass it
+actually carries, the recovery probability on them is $\mathbf{0.6439}$, $95\%$ CI
+$[0.5628, 0.7174]$. Those rows hold $32.7\%$ of the negative-advantage mass in this window
+($36.6\%$ over the longer restart-free window). Multiplying through per row rather than
+multiplying two aggregates: $\mathbf{21.1\%}$ of A0's negative-advantage gradient mass, and
+$\mathbf{11.0\%}$ of its total gradient mass, is a push \emph{away} from a rollout that was
+on its way to a correct answer. That figure needs no assumption about learning. It is a defect
+in the training signal whether or not it explains anything about the curve.
+
+\paragraph{Raising the cap buys 2.8 accuracy points of training signal for
+1.4\% more generation time, and that is measured, not extrapolated.} The same $400$
+prompts the trainer drew in that window --- every question in it, not only the ones that
+truncated, because the cost of a bigger cap is a property of the whole mix --- were redrawn
+four times at a $1{,}024$-token cap and four times at $3{,}900$. The $1{,}024$ arm reproduces
+what the trainer saw, which is the check that this is the same policy on the same data:
+accuracy 0.6331 against the window's own $0.6422$, hit-cap 0.1113 against $0.1000$,
+mean 660.3 generated tokens against $653.3$. At $3{,}900$ the hit-cap rate is
+$\mathbf{0.0000}$ --- not one of $1{,}600$ draws reaches it --- accuracy rises by
+$\mathbf{+0.0275}$ $[+0.0031, +0.0519]$, and the mean response grows from
+660.3 to 669.7 tokens, a factor of $1.014$. On the prompts that truncate at
+all the gain is $+0.0938$ $[+0.0385, +0.1490]$ for $+7.6\%$ tokens.
+
+The parametric relation quoted earlier, that a mean length of $667$ grows by
+$0.114\cdot L$, was right; the guess at $L$ was not. Measured, the rollouts that exceed
+$1{,}024$ tokens need about $84$ more on average --- $0.114 \times 84 = 9.6$ tokens against
+the $9.4$ observed --- not the $250$ to $2{,}000$ the illustration spanned. The distribution
+does \emph{not} broadly lengthen when the cap is lifted: the $90$th percentile at a
+$3{,}900$-token cap is $1039$ tokens, so the $1{,}024$ cap was cutting at about the
+$89$th percentile of a distribution that essentially ends there. Nearly all of the cost of a
+bigger cap is paid on the tenth of rollouts that wanted it.
 
 \paragraph{Excluding is not free, and on this run's own dumps zeroing dominates it.} Two
 repairs are available: give the truncated row no advantage of its own but leave the group
@@ -3200,9 +3242,13 @@ on the same $7{,}159$ groups: $52.1\%$ are already unanimous and silent; excludi
 rows drives a further $\mathbf{7.8\%}$ of all groups to unanimity ($16.3\%$ of the groups that
 currently carry any signal) and empties $2.0\%$ outright, leaving $68.4\%$ of the gradient
 mass. Zeroing leaves $78.2\%$ and makes no group newly unanimous, because every surviving
-row's advantage is bit-identical to the baseline's. Neither is asserted better: exclude buys
-an unbiased baseline at the price of a sixth of the informative groups, and which price is
-worth paying depends on the recovery rate above.
+row's advantage is bit-identical to the baseline's. Neither is asserted better, and on the
+measurement above neither is the first thing to reach for: a $3{,}900$-token cap removes the
+truncation entirely for $1.4\%$ more generated tokens, which leaves these two policies
+governing a population that no longer exists. The ordering we would defend is raise the cap
+first and set \texttt{truncated\_advantage=zero} for whatever still truncates --- it
+preserves $78.2\%$ of the gradient mass against exclude's $68.4\%$ and kills no groups ---
+rather than re-weighting a defect that can simply be removed.
 
 \paragraph{No run in this project had a truncation instrument, and the ready-made flag rests
 on the same broken predicate.} \texttt{ppo\_actor/no\_eos\_ratios} compares a sequence's
@@ -3216,19 +3262,30 @@ predicate --- response length against the cap --- existed in the trainer as
 \texttt{\_truncated\_rows} but was computed only when group routing was enabled, which A0 is
 not.
 
-\paragraph{Correction: the train--test budget gap does not exist.} It had been recorded that
-the headline evaluation scores $0.43$--$0.47$ at $16{,}384$ tokens while the same checkpoints
-score $0.11$--$0.14$ at $2{,}048$, and that token budget is therefore worth some $32$
-accuracy points on this task. Checked against the two artefacts on the \emph{same problems},
-it is not. The periodic evaluation takes the first $64$ problems of the OlympiadBench search
-half; the headline run at \texttt{globalstep149} scores $\mathbf{0.125}$ on those same $64$
-indices at $16{,}384$ tokens, against $\mathbf{0.141}$ for the periodic evaluation at
-$2{,}048$. The $0.47$ is the mean over all $675$ problems and the $64$ are a hard prefix of
-them, not a budget effect. The budget does not bind at either setting: $1$ of $64$
+\paragraph{Two corrections to the record, both of them ours.} Both were stated in this
+project's own reporting before being checked, and the inflated versions have already been
+passed on, so they are retracted here explicitly rather than quietly superseded.
+
+\emph{First: token budget is not worth $32$ accuracy points, and we do not train at a
+sixteenth of the evaluation budget in any sense that costs accuracy.} The claim came from
+setting the headline OlympiadBench number at $16{,}384$ tokens, $0.43$--$0.47$, beside the
+in-training trend score at $2{,}048$, $0.11$--$0.14$. Those are different problem sets. The
+periodic evaluation takes the first $64$ problems of the OlympiadBench search half, and the
+headline run itself scores $\mathbf{0.125}$ on those same $64$ indices at $16{,}384$ tokens
+against $\mathbf{0.141}$ for the periodic evaluation at $2{,}048$ --- a one-problem
+difference in the other direction. The budget does not bind at either setting: $1$ of $64$
 generations stops on \texttt{finish\_reason=length} at $2{,}048$ and $7$ of $675$ at
-$16{,}384$, and greedy responses average about $2{,}230$ characters in both. Truncation in
-this project is a training-time phenomenon, produced by sampling at temperature $1.0$, and
-does not appear at evaluation.
+$16{,}384$, and greedy responses average about $2{,}230$ characters in both. The $0.47$ is
+the mean over all $675$ problems and the $64$ are a hard prefix of them. Nothing about the
+evaluation budget was ever the story.
+
+\emph{Second: the mean length of an incorrect answer is $870$ tokens, not $982$.} The
+$982$-versus-$802$ pair that motivated this investigation was a single step's reading of
+\texttt{ppo\_actor/\{correct,incorrect\}\_seq\_len}. Averaged over the run those are
+$\mathbf{869.9}$ and $\mathbf{719.2}$ tokens of \emph{sequence} --- $760$ and $607$ of
+generated response once the $109$-token mean prompt is removed. \texttt{incorrect\_seq\_len}
+does reach $982$, at $26\%$ of steps. The qualitative claim that wrong answers are much
+longer survives; the specific numbers were a snapshot quoted as an average.
 
 \paragraph{So the mechanism is real and we do not claim it is the null.} Three things argue
 against truncation explaining the flat curve. The truncation rate is constant across $1{,}419$
@@ -3236,10 +3293,25 @@ steps and so is response length ($870$ tokens of sequence for a wrong answer aga
 a correct one, both flat to within $2\%$ end to end), which is not what a run optimising
 against length looks like. $52.1\%$ of groups are unanimous and contribute exactly zero
 whatever is done about truncation. And a perfect repair moves at most the $21.8\%$ of gradient
-mass identified above. What can be said is that this is the largest identified source of
-label noise in A0, that better than a third of its negative gradient rests on it, and that the
-decisive measurement --- regenerating truncated-wrong rollouts at a larger budget from the
-same checkpoint and prompt --- has not been made.
+mass identified above. What can be said, and is now measured rather than argued, is that this is the
+largest identified source of label noise in A0, that about a third of its negative gradient
+rests on rows the verifier never checked, and that a fifth of that negative gradient has the
+\emph{wrong sign}. Whether repairing it moves the curve is a question for the arm, not for
+this measurement, and we do not pre-announce the answer.
+
+\paragraph{Three checks that had to pass before any of this counted.} The grader used
+throughout is the trainer's own \texttt{math\_reward\_fn}, and it reproduces \emph{all
+$3{,}200$} stored rewards in the window, so a recovery measured with it is measured with A0's
+own notion of correct. Decoding a dumped rollout back to text and re-tokenising it round-trips
+exactly on $293$ of $293$ truncated rows --- prompt length and response length both --- so a
+continuation resumes from the token state its rollout was actually in. And the adapter had to
+be shown live: sglang lists \texttt{a0\_v1399} in \texttt{/v1/models} and answers requests
+naming it with $200$ and fluent mathematics, but those completions are \textbf{bit-identical
+to the base model} over $144$ greedy tokens. The adapter is applied only when it is passed as
+the request's \texttt{lora\_path} field, where it moves the logprobs by up to $0.061$. A run
+that had trusted the model name would have regenerated with the base model and reported the
+result as A0's policy, with nothing in the response to say otherwise; the client now refuses
+to generate unless that difference is non-zero.
 
 \paragraph{What was built, and what it does by default.} \texttt{PPOActorConfig} gains
 \texttt{truncated\_advantage} $\in$ \{\texttt{keep}, \texttt{zero}, \texttt{exclude}\},
@@ -3252,8 +3324,13 @@ settings against hand-computed group statistics, and seven mutations of the seam
 killed; the first version of the harness found a guard that could not fire, which was
 removed, and a dry run found that the field is on the dataclass but not in the composed YAML,
 so the override needs hydra's append form. The preflight refuses a launch whose resolved
-config does not carry the arm the launcher asked for. Nothing was changed in the running
-baseline.
+config does not carry the arm the launcher asked for. Separately, \texttt{run\_a0.sh} and
+\texttt{preflight\_a0.py} --- which between them decide which arm runs --- lived in a
+directory that is not a git repository; they are now in the tree, and the preflight sha256s
+the live file against the committed one and refuses the launch when they differ, so an
+unversioned edit stops a run instead of quietly changing an experiment. Nothing was changed
+in the running baseline: no config, no restart, and its logs, dumps and checkpoints were read
+only.
 
 \subsection{The post-credit window: one covariate survives both controls}
 \label{sec:m8post}
