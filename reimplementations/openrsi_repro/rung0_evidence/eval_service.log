@@ -1,0 +1,5 @@
+2026-09-03 05:56:17,685 [EvalService] INFO --data-dir not specified, waiting for tasks to be registered via POST /register
+2026-09-03 05:56:17,686 [EvalService] INFO Evaluation Service ready: http://127.0.0.1:8321
+2026-09-03 05:56:17,686 [EvalService] INFO Starting Evaluation Service, press Ctrl+C to stop
+2026-09-03 05:56:17,885 [EvalService] INFO "GET /health HTTP/1.1" 200 -
+2026-09-03 05:56:46,194 [EvalService] INFO "POST /register HTTP/1.1" 404 -
