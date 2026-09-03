@@ -2164,6 +2164,22 @@ class PPOActorConfig(TrainEngineConfig):
             "help": "Mask truncated generations (no EOS token) and exclude from training"
         },
     )
+    truncated_advantage: str = field(
+        default="keep",
+        metadata={
+            "help": "What a rollout that hit the generation cap contributes to the "
+            "advantage. 'keep' is the historical behaviour and leaves the update "
+            "bit-identical: the verifier finds no answer in an unfinished response, "
+            "the rollout grades 0, and after bias and scaling it carries the same "
+            "negative advantage as a confidently wrong answer. 'zero' keeps the row "
+            "in the group baseline but gives the row itself no advantage. 'exclude' "
+            "additionally drops it from the group mean and std, so the baseline is "
+            "formed only from rollouts that actually terminated. Prefer this over "
+            "mask_no_eos_with_zero, whose predicate compares a sequence length to "
+            "the PADDED BATCH WIDTH and is not a truncation test.",
+            "choices": ["keep", "zero", "exclude"],
+        },
+    )
 
     # Advantage Estimation
     discount: float = field(
@@ -2344,6 +2360,15 @@ class PPOActorConfig(TrainEngineConfig):
             raise ValueError(
                 "gae_timestep_unit must be 'token' or 'turn', got "
                 f"{self.gae_timestep_unit!r}"
+            )
+
+        if self.truncated_advantage not in {"keep", "zero", "exclude"}:
+            # Refused rather than defaulted. A typo that silently fell back to 'keep'
+            # would produce an arm that reports the fix in its name, runs the baseline,
+            # and has no metric that disagrees.
+            raise ValueError(
+                "truncated_advantage must be 'keep', 'zero' or 'exclude', got "
+                f"{self.truncated_advantage!r}"
             )
 
         reward_norm = self.reward_norm

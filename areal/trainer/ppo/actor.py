@@ -294,6 +294,7 @@ class PPOActor:
         )
         self.gae_timestep_unit = config.gae_timestep_unit
         self.mask_no_eos_with_zero = config.mask_no_eos_with_zero
+        self.truncated_advantage = config.truncated_advantage
 
         self.temperature = config.temperature
 
@@ -881,8 +882,50 @@ class PPOActor:
         # across prompts. Direct calls without batched metadata keep the legacy
         # fixed-group-size behavior.
         group_sizes = meta.traj_group_sizes if meta is not None else None
+
+        # Which rows never terminated. Computed on EVERY step, routed or not, because
+        # until now no unrouted run emitted a training-time truncation rate at all:
+        # `no_eos_ratios` below compares a sequence length to the padded batch width,
+        # and on the A0 baseline it read 0.0835 against a true cap rate of 0.1138 with
+        # a per-step correlation of r=0.04. It is not a truncation instrument and is
+        # left alone; this is one.
+        truncated = _truncated_rows(data["loss_mask"], self.config.max_new_tokens)
+
+        # A truncated rollout carries no VERIFIED label. The verifier is handed a
+        # response that stops mid-derivation, finds no answer to parse, and returns 0 --
+        # the same 0 a confident wrong answer gets, which after reward_bias and
+        # reward_scaling is the same negative number. On the A0 baseline that is 11.4%
+        # of rollouts, 17.5% of response tokens and 21.8% of the batch's
+        # |advantage| x token gradient mass, of which 36.6% of ALL negative-advantage
+        # mass sits on rows whose label was never checked.
+        norm_mask = None
+        if self.truncated_advantage == "exclude":
+            # Form the group baseline from terminating rollouts only. `Normalization`
+            # masks the excluded rows out of the group mean and std AND zeroes their own
+            # centred reward, so one mask does both halves. Excluding is not free: it
+            # shrinks the group, and a group whose remaining rows agree contributes
+            # exactly zero. Measured on this run's own dumps, exclusion drives a further
+            # 7.8% of groups to unanimity and leaves 68.4% of the gradient mass, against
+            # 78.2% for 'zero'.
+            norm_mask = (~truncated).to(reward_score.dtype)
         if self.reward_norm:
-            reward_score = self.reward_norm(reward_score, group_sizes=group_sizes)
+            reward_score = self.reward_norm(
+                reward_score, loss_mask=norm_mask, group_sizes=group_sizes
+            )
+        if self.truncated_advantage in ("zero", "exclude"):
+            # The truncated row itself gets no advantage. Applied AFTER normalization
+            # rather than by editing the reward, so that under 'zero' the baseline its
+            # siblings are measured against is bit-identical to 'keep' and the two arms
+            # differ in exactly one thing.
+            #
+            # This multiply, not the mask above, is what makes the degenerate cases safe,
+            # which is why it is unconditional. `Normalization` returns its input
+            # UNNORMALISED when the mask sums to zero, so a batch in which every row hit
+            # the cap would otherwise put the raw scaled reward straight into the loss for
+            # rows nobody verified. A guard on `truncated.all()` was written for exactly
+            # that case and then removed: mutation testing showed it could not change any
+            # output, because this line already zeroes those rows.
+            reward_score = reward_score * (~truncated).to(reward_score.dtype)
 
         loss_mask = data["loss_mask"].float()
         loss_mask = torch.roll(loss_mask, shifts=-1, dims=-1)
@@ -1355,8 +1398,19 @@ class PPOActor:
         stats_tracker.stat(**stats, denominator="n_valid_tokens")
 
         prompt_lens = _infer_prompt_lens(data["attention_mask"], data["loss_mask"])
+        # Recomputed here rather than carried over from _compute_advantages: this is a
+        # different method with its own locals, and reading the name from there is the
+        # defect this line replaces -- it raised NameError on the first real step while
+        # every unit test that drove _compute_advantages passed. `_truncated_rows` reads
+        # a per-row SUM, which is invariant under the shifts=-1 roll that method applies,
+        # so the two calls agree by construction.
+        truncated = _truncated_rows(data["loss_mask"], self.config.max_new_tokens)
         seq_stats = dict(
             no_eos_ratios=(seqlens == attn_mask.shape[-1]).float(),
+            # The real one. Reported beside no_eos_ratios rather than instead of it, so
+            # that a reader of an old run and a reader of a new one are looking at two
+            # differently named quantities instead of one name that changed meaning.
+            truncated_ratios=truncated.float(),
             task_reward=task_reward,
             prompt_len=prompt_lens.float(),
             seq_len=seqlens.float(),
@@ -1365,6 +1419,11 @@ class PPOActor:
         scalars = dict(
             mask_no_eos_with_zero=self.config.mask_no_eos_with_zero,
             eps_clip=self.config.eps_clip,
+            # Arm identity, logged from the actor that acted on it rather than read back
+            # from the config file: keep=0, zero=1, exclude=2.
+            truncated_advantage=float(
+                {"keep": 0, "zero": 1, "exclude": 2}[self.truncated_advantage]
+            ),
         )
         if self.config.c_clip is not None:
             scalars["c_clip"] = self.config.c_clip
