@@ -107,6 +107,34 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
         "    if total > served_context_len * 100:",
         "the context guard effectively never fires",
     ),
+    (
+        "M13-nesting-collapses-to-flat",
+        "nested.py",
+        '        grpo_advantages(disc, epsilon=cfg.epsilon) if ncfg.sampling == "nested" else None',
+        "        None",
+        "the scaffold comparison level silently disappears; nested becomes flat",
+    ),
+    (
+        "M14-difficulty-from-one-scaffold-only",
+        "nested.py",
+        "    p_hat, n_valid, n_aborted = success_rate(all_rollouts, abort_policy=cfg.abort_policy)",
+        "    p_hat, n_valid, n_aborted = success_rate(per_scaffold_rollouts[0], abort_policy=cfg.abort_policy)",
+        "p_hat uses one scaffold's rollouts instead of the task's whole budget",
+    ),
+    (
+        "M15-degenerate-scaffold-group-allowed",
+        "nested.py",
+        "        if self.sampling == \"nested\" and self.n_scaffolds < 2:",
+        "        if self.sampling == \"nested\" and self.n_scaffolds < 0:",
+        "a one-scaffold 'nested' run forms a singleton group instead of being refused",
+    ),
+    (
+        "M16-malformed-nesting-silently-reshaped",
+        "nested.py",
+        "    if len(scaffolds) != len(rollout_texts_by_scaffold):",
+        "    if False:",
+        "a scaffold/rollout-block shape mismatch is zipped away instead of refused",
+    ),
 ]
 
 

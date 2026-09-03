@@ -1,0 +1,103 @@
+{
+  "config": {
+    "group_size": 8,
+    "k": 8,
+    "sigma": 0.15,
+    "pool": 4000,
+    "keep_frac": 0.1,
+    "horizon": 30,
+    "trials": 20000,
+    "seed": 20260903,
+    "out": "gate_outcome.json"
+  },
+  "A_energy_identity": {
+    "group_size": 8,
+    "mean_energy_nondegenerate": 7.9999616089703025,
+    "min_energy_nondegenerate": 7.999951620766884,
+    "max_energy_nondegenerate": 7.999968000096,
+    "identity_target_G": 8.0,
+    "max_abs_deviation_from_G": 4.83792331156252e-05,
+    "degenerate_energy_is_exactly_zero": true,
+    "degenerate_fraction": 0.2255
+  },
+  "A_budget_efficiency": {
+    "treatment_realised": {
+      "mean_theta": 0.3036259187257342,
+      "expected_degenerate_fraction": 0.12064291836054668,
+      "advantage_energy_per_rollout": 0.8793570816394534
+    },
+    "size_matched_random_control": {
+      "mean_theta": 0.4811854151296403,
+      "expected_degenerate_fraction": 0.24846209975863442,
+      "advantage_energy_per_rollout": 0.7515379002413656
+    },
+    "idealised_at_p_star_0.2": {
+      "mean_theta": 0.2,
+      "expected_degenerate_fraction": 0.1677747200000001,
+      "advantage_energy_per_rollout": 0.8322252799999998
+    },
+    "idealised_at_0.5": {
+      "mean_theta": 0.5,
+      "expected_degenerate_fraction": 0.0078125,
+      "advantage_energy_per_rollout": 0.9921875
+    }
+  },
+  "B_sign_flip": {
+    "learnability": {
+      "treatment": 0.17580961646820387,
+      "control_uniform": 0.14151822328643227,
+      "diff_vs_uniform": 0.0342913931817716,
+      "control_matched_difficulty": 0.1750163655861961,
+      "diff_vs_matched_difficulty": 0.0007932508820077677,
+      "control_matched_mean": 0.16749240844047575,
+      "diff_vs_matched_mean": 0.008317208027728118,
+      "control_band_wide": 0.18416698745567403,
+      "diff_vs_band_wide": -0.008357370987470164
+    },
+    "frontier": {
+      "treatment": 0.5973569030001827,
+      "control_uniform": 0.37842615154026227,
+      "diff_vs_uniform": 0.21893075145992047,
+      "control_matched_difficulty": 0.5946110014299006,
+      "diff_vs_matched_difficulty": 0.0027459015702820944,
+      "control_matched_mean": 0.5270314611370882,
+      "diff_vs_matched_mean": 0.07032544186309453,
+      "control_band_wide": 0.4621004494101923,
+      "diff_vs_band_wide": 0.13525645358999044
+    },
+    "zpd": {
+      "treatment": 0.5706892192429387,
+      "control_uniform": 0.26146678843835713,
+      "diff_vs_uniform": 0.30922243080458156,
+      "control_matched_difficulty": 0.5592002062667156,
+      "diff_vs_matched_difficulty": 0.011489012976223067,
+      "control_matched_mean": 0.4199685831879871,
+      "diff_vs_matched_mean": 0.15072063605495162,
+      "control_band_wide": 0.3445033466817631,
+      "diff_vs_band_wide": 0.22618587256117562
+    },
+    "lifetime": {
+      "treatment": 0.019799133438101742,
+      "control_uniform": 0.01230652665355069,
+      "diff_vs_uniform": 0.007492606784551053,
+      "control_matched_difficulty": 0.01970338168875808,
+      "diff_vs_matched_difficulty": 9.57517493436616e-05,
+      "control_matched_mean": 0.017235065707176894,
+      "diff_vs_matched_mean": 0.002564067730924848,
+      "control_band_wide": 0.015374939964504982,
+      "diff_vs_band_wide": 0.004424193473596761
+    },
+    "success_teaches": {
+      "treatment": 0.28200017863927024,
+      "control_uniform": 0.37311174870110286,
+      "diff_vs_uniform": -0.09111157006183263,
+      "control_matched_difficulty": 0.28246687967707124,
+      "diff_vs_matched_difficulty": -0.00046670103780099836,
+      "control_matched_mean": 0.29372437122850775,
+      "diff_vs_matched_mean": -0.011724192589237514,
+      "control_band_wide": 0.436702605174572,
+      "diff_vs_band_wide": -0.15470242653530175
+    }
+  },
+  "B_verdict": "The winner changes with the assumed learning rule, so this simulation cannot answer whether the gate improves self-improvement. Only Part A is reportable CPU-side."
+}

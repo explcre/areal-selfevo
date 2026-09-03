@@ -3005,3 +3005,143 @@ security hardening in the benchmark it depends on has not yet been mirrored in t
 test suites still pass $119/119$. We record this as a reproducibility observation about
 released systems, not as a criticism of the work: it is precisely the kind of quiet
 breakage that stops third parties reproducing a paper without anyone noticing.
+
+\subsection{The group structure was wrong, and it is the algorithm}
+\label{sec:ornithnested}
+
+Our first reimplementation sampled \emph{flat}: one scaffold per task, one rollout group,
+and --- worse --- it passed the rollout advantages to all three stages, so the scaffold and
+task stages formed no groups of their own. We record this plainly because GRPO's advantage
+is group-relative, so the group structure is not a detail of the algorithm, it \emph{is} the
+algorithm, and a flat implementation is a different estimator rather than a simplified one.
+
+\paragraph{The source contradicts itself, which is why this was missable.} Ornith's release
+figure shows each task producing several scaffolds and each scaffold producing several
+rollouts. The prose does not: it says the policy produces ``a solution rollout'', singular,
+while the difficulty term references a set $\{\tau_i\}$ for the success rate. So the nesting
+rests on the figure alone and the text is silent or arguably contradictory. We treat nested
+as faithful, because a figure showing structure is more specific evidence than prose that
+omits it, and keep flat as an ablation (\texttt{NestedConfig.sampling}). This is ambiguity
+A16; the two counts are A17 and neither is disclosed.
+
+\paragraph{Nested creates two comparison levels where flat creates one.} Rollouts compete
+within a scaffold on $R_{\mathrm{rollout}}$; scaffolds compete within a task on
+$R_{\mathrm{harness}}=CFH$, whose $F$ is an aggregate over that scaffold's own rollouts.
+Arms must therefore be matched on total rollouts, $n_{\mathrm{scaffolds}}\times
+n_{\mathrm{rollouts}}$, not on steps: nested at $3\times8$ spends $24$ rollouts per task
+where flat at $1\times8$ spends $8$. The implementation is $16$ mutations deep now, four of
+them new and specific to the nesting --- a silently collapsed scaffold level, a $\hat p$
+taken from one scaffold instead of the task's whole budget, a singleton scaffold group
+accepted, and a malformed nesting zipped away rather than refused. All $16$ are caught and
+the suite is $55$ tests.
+
+\paragraph{The winner's curse recurs one level up, by construction.} A scaffold is scored on
+the rollouts it happened to draw, so a scaffold with lucky rollouts scores well for reasons
+that have nothing to do with the scaffold. This is the identical hazard we measured for task
+selection, at the scaffold level, and it takes the identical remedy: score on one rollout
+block, re-score on an independent one, and report the fresh block. The nested runner takes a
+holdout block for exactly this, and a test asserts that discovery and holdout scaffold
+rewards actually differ --- if they did not, the scaffold score would not depend on drawn
+rollouts and there would be no curse to correct.
+
+\subsection{Does the gate improve learning? What is settled, and what a simulation cannot
+settle}
+\label{sec:gateoutcome}
+
+The outcome decomposes as
+$\text{improvement per unit budget} = (\text{task quality}) \times (\text{budget
+efficiency})$, and the two halves have different epistemic status.
+
+\paragraph{Budget efficiency is settled exactly, with no learning assumptions.} Under
+binary-reward GRPO every non-degenerate group carries advantage energy exactly $G$ and every
+degenerate group exactly $0$, so energy per rollout is precisely the non-degenerate
+fraction. We verified the identity rather than quoting it: mean energy $7.999962$ against
+$G=8$, maximum absolute deviation $4.8\times10^{-5}$ (our denominator is $s+\epsilon$, not
+$s$). On the gate's \emph{realised} difficulty distribution this gives
+Table~\ref{tab:gatebudget}.
+
+\begin{table}[t]
+\centering\small
+\caption{Advantage energy delivered per rollout, on realised distributions rather than at
+the nominal target. Synthetic, CPU-side, $G=8$, $k=8$, $\sigma=0.15$.}
+\label{tab:gatebudget}
+\begin{tabular}{lccc}
+\toprule
+selector & mean $\theta$ & dead-group fraction & energy / rollout \\
+\midrule
+gate, realised            & $0.304$ & $0.1206$ & $\mathbf{0.8794}$ \\
+size-matched uniform      & $0.481$ & $0.2485$ & $0.7515$ \\
+idealised at $p^*=0.2$    & $0.200$ & $0.1678$ & $0.8322$ \\
+idealised at $0.5$        & $0.500$ & $0.0078$ & $0.9922$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Two corrections to the waste figure, including to our own earlier statement of it. The
+realised dead-group fraction is $0.1206$, \textbf{not} $0.1678$: the $17\%$ number is the
+idealised value \emph{at} $p^*=0.2$ and the gate does not hit its target, its realised mean
+$\theta$ being $0.304$. Quoting $17\%$ overstates the waste by about $40\%$ relative. And
+against \emph{no selection at all} the gate is more efficient, $0.879$ against $0.752$,
+because an unselected pool is full of near-$0$ and near-$1$ tasks that are deader than
+anything near $0.2$. The waste claim is only ever a comparison between targets ($0.879$
+against $0.992$), never between gate and no gate.
+
+\paragraph{Task quality cannot be settled here, and we demonstrate that rather than assert
+it.} Running five defensible learning rules against four controls gives two results. First,
+\textbf{the control that was specified is vacuous in a difficulty-only simulation}: against
+a control resampled to the treatment's own realised $\theta$ distribution, the largest
+absolute difference across all five rules is $0.0115$, necessarily so, because $\theta$ is
+the entire task representation in simulation and matching it exhausts the task. In a real
+run it is not vacuous, because there the gate also selects on validity and novelty and the
+control does not. Second, \textbf{the sign flips with the assumed rule}: the gate beats a
+uniform control under learnability, frontier, zone-of-proximal-development and lifetime, but
+\emph{loses} under a rule where gain rises with success rate, by $-0.0911$ against uniform
+and $-0.1547$ against a crude band filter. Which rule holds is exactly what is unknown, so a
+cheap simulation returns the answer it was built to give. The outcome question must be run
+on a real model.
+
+\paragraph{One substantive hint the simulation does license.} A one-line filter keeping
+$0.1<\hat p<0.9$, with no target and no kernel, recovers much of the gate's advantage and
+beats it outright under two of the five rules. If that survives on a real model, the
+difficulty kernel and its target are unsupported complexity. That comparison is
+pre-registered as arm C2 in \texttt{PREREG\_gate\_outcome.md}, alongside the matched-difficulty
+control C1, with stop rules fixed in advance: if the gate does not separate from C1 beyond
+the noise band it works and does not matter, which given the router and the clustering is a
+third such component and is publishable as one.
+
+\subsection{OpenRSI: routes to their published numbers that avoid the broken endpoint}
+\label{sec:openrsiroutes}
+
+Asked to find a path to OpenRSI's published results that does not go through the failing
+\texttt{/evaluate}, we checked three and report all three outcomes.
+
+\begin{itemize}
+\item \textbf{A pre-skew tagged release: does not exist.} \texttt{git tag} on OpenRSI is
+empty; there are no releases. So there is no version predating the NatureBench hardening
+that we could run unmodified, and the pin option is closed on availability as well as on
+security.
+\item \textbf{Shipped reference outputs or expected scores: none.} No expected, reference,
+golden, or baseline result files exist anywhere in the tree, so there is nothing to compare
+a local run against short of rerunning their protocol.
+\item \textbf{An offline grader: yes, and it is the MLE-Bench path.} Their MLE-Bench
+evaluation runs through \texttt{dojo/tasks/mlebench/evaluate.py}, whose
+\texttt{evaluate\_submission(submission\_path, data\_dir, competition\_id, results\_output\_dir)}
+grades against the \texttt{mlebench} package's registry and leaderboard with no HTTP service
+at all. The NatureBench eval-service skew therefore does not touch their headline benchmark.
+\end{itemize}
+
+The catch is cost and comparability, not plumbing. \texttt{mlebench} is an external
+dependency needing prepared Kaggle competition data per task, and Ornith publishes only
+aggregate Medal Average over the full $22$-task Lite split at three runs, with no per-run or
+per-instance values, so a subset run is not comparable to anything they report. Verifying
+their published numbers by this route is the $1584$-sandbox-hour path in
+Sec.~\ref{sec:external} and needs a deliberate decision. For NatureBench specifically the
+token-plus-assertion route remains the only option.
+
+\paragraph{Reported upstream.} We opened
+\texttt{FrontisAI/OpenRSI} issue \#12 describing the skew: both commit hashes, the
+control-token gate on \texttt{/register}, the simultaneous change of \texttt{/evaluate} to
+require an opaque per-task token and to stop honouring a per-call \texttt{output\_dir}, and
+the resulting hazard that a minimal fix would score the wrong directory successfully rather
+than erroring. It states that their suites still pass $119/119$ and that their published
+results predate the change.
