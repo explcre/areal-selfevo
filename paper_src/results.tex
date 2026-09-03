@@ -3232,6 +3232,40 @@ $3{,}900$-token cap is $1039$ tokens, so the $1{,}024$ cap was cutting at about 
 $89$th percentile of a distribution that essentially ends there. Nearly all of the cost of a
 bigger cap is paid on the tenth of rollouts that wanted it.
 
+\paragraph{What is launchable is $1{,}536$, not $3{,}900$, and it is enough.} The cap
+cannot simply be raised on the box A0 runs on, and the preflight is right to refuse. A
+sequence longer than \texttt{actor.mb\_spec.max\_tokens\_per\_mb}$=2048$ cannot be split and
+forms its own oversized microbatch, against a measured $9.95$\,GB transient pool and a
+$3.37$\,GB margin, so \texttt{train\_dataset.max\_length}$+$\texttt{gconfig.max\_new\_tokens}
+must not exceed $2048$ --- which at \texttt{max\_length}$=1024$ pins the generation cap at
+exactly $1024$. Asked for $1536$, $2048$ or $3072$ it refuses all three, and it should.
+
+The slack is in the prompt half of that sum, which nothing was using. Over $8{,}656$ sampled
+rollouts the longest prompt the trainer has ever served is $676$ tokens and the $99.9$th
+percentile is $590$, so \texttt{max\_length} can come down to $512$ at the cost of $0.28\%$
+of prompts (to $768$ at the cost of none) and hand the difference to generation. Redrawing
+the same $400$ prompts four times at each of three caps:
+
+\begin{center}\small
+\begin{tabular}{rccccc}
+\toprule
+cap & accuracy & paired $\Delta$ vs $1024$ & hit-cap & mean gen.\ tokens & $\times1024$ \\
+\midrule
+$1024$ & $0.6306$ & --- & $0.1081$ & $657.6$ & $1.000$ \\
+$1280$ & $0.6538$ & $+0.0231\ [+0.0006,+0.0456]$ & $0.0319$ & $672.7$ & $1.023$ \\
+$1536$ & $0.6825$ & $+0.0519\ [+0.0275,+0.0769]$ & $0.0100$ & $673.4$ & $1.024$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent Both intervals exclude zero, and the two caps cost the same $2.4\%$ in tokens
+because the extra budget is only ever spent by the tenth of rollouts that wanted it. So
+\texttt{MAX\_PROMPT\_LEN=512 MAX\_NEW\_TOKENS=1536} removes $91\%$ of the truncation, buys
+$5.2$ points of training-signal accuracy, costs $2.4\%$ more generated tokens and $0.28\%$ of
+prompts, and passes the preflight at exactly $2048$. That configuration is the arm we would
+run; it was verified to start and was not started, because launching it is a decision about
+days of GPU rather than about this measurement.
+
 \paragraph{Excluding is not free, and on this run's own dumps zeroing dominates it.} Two
 repairs are available: give the truncated row no advantage of its own but leave the group
 baseline alone (\emph{zero}), or additionally drop it from the group mean and standard
@@ -3243,9 +3277,8 @@ rows drives a further $\mathbf{7.8\%}$ of all groups to unanimity ($16.3\%$ of t
 currently carry any signal) and empties $2.0\%$ outright, leaving $68.4\%$ of the gradient
 mass. Zeroing leaves $78.2\%$ and makes no group newly unanimous, because every surviving
 row's advantage is bit-identical to the baseline's. Neither is asserted better, and on the
-measurement above neither is the first thing to reach for: a $3{,}900$-token cap removes the
-truncation entirely for $1.4\%$ more generated tokens, which leaves these two policies
-governing a population that no longer exists. The ordering we would defend is raise the cap
+measurement above neither is the first thing to reach for: a bigger cap removes most of the
+population these two policies govern, for a couple of percent in tokens. The ordering we would defend is raise the cap
 first and set \texttt{truncated\_advantage=zero} for whatever still truncates --- it
 preserves $78.2\%$ of the gradient mass against exclude's $68.4\%$ and kills no groups ---
 rather than re-weighting a defect that can simply be removed.
