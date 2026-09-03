@@ -180,3 +180,40 @@ Consequences applied to the analysis: the two arms are resampled INDEPENDENTLY i
 (a two-sample difference, not a paired one), and every comparison is made over the same STEP
 WINDOW rather than the same wall-clock window, because a router's contexts come from the policy
 at that step and the arms were launched at different times. `m8_analysis.py --window LO:HI`.
+
+### 9. A COMPLETED run reads as a stall, and that cost 45 idle minutes at $39.63/h
+
+2026-09-03 08:07. Reported symptom: "all four arms stalled at Step 64, last writes 07:19-07:39,
+only one trainer survives, GPUs at zero." Every one of those observations was accurate and the
+conclusion was wrong.
+
+**What actually happened: all four arms FINISHED.** Each ends with
+
+    Epoch 10/10 Step 64/64 Train step 640/640 done.    R_EXIT=0
+
+`Step 64/64` is the **per-epoch** counter, and $64$ is the epoch length on the 512-row subset;
+`Train step 640/640` is the global one. A completed run's last line therefore ALWAYS reads
+`Step 64`, which is why it collided with the credit-period number and looked like a smoking gun.
+`total_train_steps=1024` was never binding -- the dataset's 10-epoch cap (10 x 64 = 640) was.
+
+The remaining observations resolve the same way. Zero OOM kills in the kernel ring buffer, and
+memory could not have been it in any case: peak is reached in the FIRST PPO update, not at step
+64. The four "died" 20 minutes apart because they were LAUNCHED 20 minutes apart and each ran
+the same number of equal-cost steps. The "one surviving trainer" was not a trainer at all: the
+two survivors were this session's own `sync_gcs.sh` and `analyse_loop.sh`.
+
+**The credit path was the leading suspect and it is exonerated by its own output.** Both
+per-prompt arms recorded exactly **4096 credits** = 512 steps x 8 groups, i.e. every step from
+128 to 639 inclusive, and 5120 decisions = 640 x 8. A path that broke at the period boundary
+cannot emit 512 consecutive steps of credits after it.
+
+**The real defect was that nothing said the box had gone idle.** A stall detector would have
+stayed silent through all 45 minutes, because nothing stalled. `liveness.sh` therefore reports
+four states -- RUNNING, DONE, STALLED, FAILED -- of which only the last two alert per-run, and
+adds a BOX-LEVEL alert when fewer than `MIN_BUSY` of the 8 cards are busy. That box alert is the
+one that fires on this failure. Per-run liveness stays log growth, never utilisation (a dead run
+once held four cards at 100% for 46 minutes); the box check uses `utilisation > 5% OR
+memory > 2 GiB`, so it does not cry wolf through the minutes a 32B actor takes to load.
+
+**Operational lesson for anyone reading these logs:** quote `Train step N/M`, never `Step n/m`.
+The two counters differ by the epoch length and only one of them is monotone across a run.
