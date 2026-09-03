@@ -1776,9 +1776,61 @@ class GroupRoutingConfig:
             common component, leaving only how a decision fared RELATIVE to the rest of the
             batch, which is the quantity the router is supposed to be choosing on.
 
-            The default is ``"batch"`` so this changes nothing unless asked for, and the three
+            ``"prompt_self_baseline"`` is ``"prompt"`` with THAT PROMPT'S OWN earlier deltas
+            subtracted -- ``PromptCreditLedger(baseline="self_mean")``. It is the same
+            within-group centring GRPO applies across a rollout group, applied instead across
+            one prompt's appearances in time, so the quantity removed is per-prompt and never
+            an aggregate shared by every arm. Measured on ``selfevo.routing.credit_sim`` over
+            8 paired seeds: final subset contrast 0.828 against 0.098 for ``"batch"``, a paired
+            difference of +0.682 +- 0.021 for plain ``"prompt"`` and a further +0.048 +- 0.012
+            for this baseline over it. A prompt's FIRST delta is withheld rather than credited
+            against a zero baseline -- a zero baseline hands the first-credited mode the whole
+            common training trend -- and the withheld pairings are counted in
+            ``prompt_credit/cold_baseline_skips``.
+
+            ``"prompt_centered"`` is recorded as a NEGATIVE result and should not be the arm
+            that gets a GPU: the batch mean it subtracts is one number shared by every arm,
+            the same class of quantity per-prompt credit exists to escape, and it measures at
+            or below plain ``"prompt"`` in both regimes tested (-0.027 +- 0.010 here;
+            -0.064 +- 0.016 and -0.007 +- 0.017 over 20 seeds in an earlier sweep). It is kept
+            selectable because it is the rung of the ablation that shows the distinction
+            matters, not because it is a candidate.
+
+            The default is ``"batch"`` so this changes nothing unless asked for, and the four
             form an ablation ladder on exactly one axis: what the router is told about its own
             decisions.
+        credit_shuffle_seed: The CORRESPONDENCE control, and the only thing that separates
+            "the router found the structure" from "the credit signal got noisier".
+
+            When set, the credits computed for a batch are permuted across the prior decisions
+            that earned them before they reach the router: the same ledger, the same pairings,
+            the same multiset of values, with only the prompt-to-credit correspondence
+            destroyed. Measured in simulation, this collapses the per-prompt arm from 0.779 to
+            0.102 subset contrast -- back to the batch arm's level -- so a treatment arm that
+            does NOT beat its own shuffle has not shown targeting.
+
+            ``None`` (default) means no shuffle, which is every run before this field existed.
+            It is REFUSED on ``credit="batch"``: every unit there already holds the identical
+            scalar, so permuting them changes nothing and the arm would report a control that
+            could not have failed.
+        decision_trace_path: Where to append one JSON record per routed group per step --
+            mode, solve rate, group size and the seven observability features -- plus one per
+            credited decision.
+
+            Required because the number that decides this axis is not an aggregate. Subset
+            contrast is half the total variation distance between the mode distribution on one
+            subset of units and on another, so it needs each unit's mode BESIDE the features
+            that define the subsets; the stats stream carries only ``route/{mode}_groups``, and
+            a run logged that way cannot be re-read for it afterwards. That is why the
+            batch-credited arm's null had to be re-derived in simulation instead of measured
+            from its own logs.
+
+            One file per process, suffixed with the pid: at ``fsdp:d2`` the actor path runs in
+            two workers, each holding its own router and seeing half of every batch, and
+            merging them into one file would hide that the arm ran two independent routers.
+            ``None`` (default) writes nothing. Requires a ``router``: the fixed solved/unsolved
+            rule never reaches this code path, so a trace configured without one would produce
+            an empty file and report a routing arm that never routed.
         decision: What is done with the WEIGHTS a router returns.
 
             ``"argmax"`` (default, and what every run before this flag existed did) keeps the
@@ -1949,6 +2001,8 @@ class GroupRoutingConfig:
     unsolved_advantage: float = 0.0
     router: str | None = None
     credit: str = "batch"
+    credit_shuffle_seed: int | None = None
+    decision_trace_path: str | None = None
     decision: str = "argmax"
     zero_mean: bool = False
     exclude_truncated_from_sft: bool = False
@@ -1956,11 +2010,29 @@ class GroupRoutingConfig:
     router_source_file: str | None = None
 
     def __post_init__(self):
-        if self.credit not in ("batch", "prompt", "prompt_centered"):
+        if self.credit not in (
+            "batch",
+            "prompt",
+            "prompt_centered",
+            "prompt_self_baseline",
+        ):
             raise ValueError(
-                f"credit must be 'batch', 'prompt' or 'prompt_centered', got "
-                f"{self.credit!r}. An unknown value silently falling back to 'batch' would "
-                f"report a per-prompt-credit arm that never ran."
+                f"credit must be 'batch', 'prompt', 'prompt_centered' or "
+                f"'prompt_self_baseline', got {self.credit!r}. An unknown value silently "
+                f"falling back to 'batch' would report a per-prompt-credit arm that never ran."
+            )
+        if self.credit_shuffle_seed is not None and self.credit == "batch":
+            raise ValueError(
+                "credit_shuffle_seed is the correspondence control and it cannot be run on "
+                "credit='batch': every unit of a batch already holds the identical scalar, so "
+                "permuting them across units changes nothing. A control that cannot fail is "
+                "not a control, so this is refused rather than run as a no-op."
+            )
+        if self.decision_trace_path is not None and not self.router:
+            raise ValueError(
+                "decision_trace_path requires a router: the fixed solved/unsolved rule never "
+                "reaches the routing path, so the trace would stay empty and the run would "
+                "report a routing arm that never routed."
             )
         if self.decision not in ("argmax", "mixture"):
             raise ValueError(

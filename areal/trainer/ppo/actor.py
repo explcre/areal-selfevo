@@ -515,6 +515,8 @@ class PPOActor:
         from selfevo.integration.group_apply import apply_decisions, apply_mixtures
         from selfevo.observability import group_features
         from selfevo.routing.base import RoutingContext
+        from selfevo.routing.decision_trace import shuffle_correspondence
+        from selfevo.routing.decision_trace import trace_records as _trace
 
         router = getattr(self, "_selfevo_router", None)
         if router is None:
@@ -564,7 +566,11 @@ class PPOActor:
         # prompt's change in solve rate. They differ on exactly one axis, so they are an
         # ablation pair rather than two features.
         _credit = getattr(gr, "credit", "batch")
-        use_prompt_credit = _credit in ("prompt", "prompt_centered")
+        use_prompt_credit = _credit in (
+            "prompt",
+            "prompt_centered",
+            "prompt_self_baseline",
+        )
 
         # Close the loop on the PREVIOUS batch before deciding this one. The outcome of a
         # decision is not observable until after the update it took part in, so the earliest
@@ -680,6 +686,25 @@ class PPOActor:
             # say how attributable an update was errs OPTIMISTICALLY.
             modes.append(decision.argmax())
 
+        # One record per routed group. Written BEFORE the credit block so a step that dies in
+        # crediting still leaves its decisions on disk, and written on every arm -- treatment,
+        # matched random control and shuffle alike -- so the three are read by one analysis.
+        _trace(
+            gr,
+            (
+                {
+                    "kind": "decision",
+                    "step": step,
+                    "unit_id": ctx.unit_id,
+                    "mode": mode,
+                    "solve_rate": float(ctx.solve_rate),
+                    "group_size": int(ctx.group_size),
+                    "features": {k: float(v) for k, v in ctx.extra.items()},
+                }
+                for ctx, mode in zip(contexts, modes)
+            ),
+        )
+
         if use_prompt_credit and hasattr(router, "observe"):
             # Credit each PRIOR decision with the change in ITS OWN prompt's solve rate,
             # then record the decision just made. Same task, different point in training,
@@ -692,7 +717,16 @@ class PPOActor:
 
             ledger = getattr(self, "_selfevo_ledger", None)
             if ledger is None:
-                ledger = PromptCreditLedger()
+                # The baseline is chosen HERE, from the config value, so that the arm has one
+                # name. "self_mean" measures a decision against that prompt's own earlier
+                # deltas -- a per-prompt quantity -- where "last" leaves the common training
+                # trend in every credit and rewards whichever mode was used during an
+                # improving window.
+                ledger = PromptCreditLedger(
+                    baseline="self_mean"
+                    if _credit == "prompt_self_baseline"
+                    else "last"
+                )
                 self._selfevo_ledger = ledger
 
             ids_cpu = data["input_ids"].detach().cpu().tolist()
@@ -724,10 +758,36 @@ class PPOActor:
             shift = 0.0
             if _credit == "prompt_centered" and pairs:
                 shift = sum(d for _, d in pairs) / len(pairs)
+            # The correspondence control. Permuting the credits across the prior decisions
+            # that earned them keeps the ledger, the pairings and the multiset of values and
+            # destroys only the prompt-to-credit correspondence, so an arm that does not beat
+            # its own shuffle has shown a noisier signal rather than targeting. Counted when
+            # it is inert, because a step with one pairing cannot be permuted and a control
+            # that could not have failed must not be reported as one.
+            _shuffle_seed = getattr(gr, "credit_shuffle_seed", None)
+            if _shuffle_seed is not None:
+                pairs, inert = shuffle_correspondence(pairs, _shuffle_seed, step)
+                stats_tracker.scalar(
+                    **{"prompt_credit/shuffle_inert_steps": float(inert)}
+                )
             for prior, delta in pairs:
                 outcomes[prior.unit_id] = DecisionOutcome(
                     mode=prior.mode, value=delta - shift, batch_id=str(prior.step)
                 )
+            _trace(
+                gr,
+                (
+                    {
+                        "kind": "credit",
+                        "step": step,
+                        "credited_step": prior.step,
+                        "unit_id": prior.unit_id,
+                        "mode": prior.mode,
+                        "value": delta - shift,
+                    }
+                    for prior, delta in pairs
+                ),
+            )
             # The size of the common trend that centring removes. If this is large relative
             # to the spread of deltas, the raw "prompt" signal was mostly measuring training
             # progress rather than the decision.

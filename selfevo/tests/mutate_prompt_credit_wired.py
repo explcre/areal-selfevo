@@ -3,18 +3,33 @@ import hashlib, pathlib, subprocess, sys
 
 REPO = pathlib.Path(sys.argv[1])
 TARGET = REPO / "areal/trainer/ppo/actor.py"
-TESTS = "selfevo/tests/test_prompt_credit_wired.py"
+TESTS = [
+    "selfevo/tests/test_prompt_credit_wired.py",
+    "selfevo/tests/test_m8_config_gap.py",
+]
 
 MUTATIONS = [
     ("prompt credit never runs, so credit='prompt' silently means 'batch'",
      '        if use_prompt_credit and hasattr(router, "observe"):',
      '        if False and hasattr(router, "observe"):'),
     ("credit mode ignored, so both arms take the prompt path",
-     '        use_prompt_credit = _credit in ("prompt", "prompt_centered")',
+     '        use_prompt_credit = _credit in (\n            "prompt",\n            "prompt_centered",\n            "prompt_self_baseline",\n        )',
      '        use_prompt_credit = True'),
     ("credit mode ignored the other way, so the arm never exists",
-     '        use_prompt_credit = _credit in ("prompt", "prompt_centered")',
+     '        use_prompt_credit = _credit in (\n            "prompt",\n            "prompt_centered",\n            "prompt_self_baseline",\n        )',
      '        use_prompt_credit = False'),
+    ("the self-baseline arm silently runs the 'last' baseline, i.e. plain per-prompt credit",
+     '                    baseline="self_mean"\n                    if _credit == "prompt_self_baseline"\n                    else "last"',
+     '                    baseline="last"'),
+    ("every per-prompt arm gets the self baseline, erasing the ablation rung",
+     '                    baseline="self_mean"\n                    if _credit == "prompt_self_baseline"\n                    else "last"',
+     '                    baseline="self_mean"'),
+    ("the correspondence control never permutes, so it is the treatment run twice",
+     '            if _shuffle_seed is not None:',
+     '            if False:'),
+    ("the shuffle fires on every arm, so the treatment is its own control",
+     '            if _shuffle_seed is not None:',
+     '            if True:'),
     ("ledger rebuilt every batch, so no prompt ever pairs",
      '            ledger = getattr(self, "_selfevo_ledger", None)',
      '            ledger = None'),
@@ -40,7 +55,7 @@ MUTATIONS = [
 
 
 def run_tests() -> bool:
-    r = subprocess.run([sys.executable, "-m", "pytest", TESTS, "-q", "--no-header", "-x"],
+    r = subprocess.run([sys.executable, "-m", "pytest", *TESTS, "-q", "--no-header", "-x"],
                        cwd=REPO, capture_output=True, text=True, timeout=1800)
     return r.returncode == 0
 
