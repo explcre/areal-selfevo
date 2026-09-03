@@ -1,0 +1,45 @@
+{
+  "config": {
+    "pool": 4000,
+    "keep": 400,
+    "k": 8,
+    "sigma": 0.15,
+    "p_star": 0.2,
+    "group_size": 8,
+    "seed": 20260902,
+    "out": "sw_k8.json"
+  },
+  "matched_family_proportions": {
+    "combinatorics": 0.2875,
+    "geometry": 0.2475,
+    "algebra": 0.225,
+    "number_theory": 0.24
+  },
+  "control_family_proportions": {
+    "number_theory": 0.24,
+    "combinatorics": 0.2875,
+    "algebra": 0.225,
+    "geometry": 0.2475
+  },
+  "winners_curse": {
+    "treatment_D_discovery": 0.9459594689067656,
+    "treatment_D_holdout": 0.5512665646367053,
+    "shrinkage": 0.3946929042700603,
+    "control_D_holdout": 0.2991832102445533
+  },
+  "true_difficulty_enrichment": {
+    "treatment_mean_abs_theta_minus_pstar": 0.14008002611380674,
+    "treatment_sem": 0.0050839269947132466,
+    "control_mean_abs_theta_minus_pstar": 0.3513785297777296,
+    "control_sem": 0.01205329953685996,
+    "difference_control_minus_treatment": 0.21129850366392286,
+    "se_on_difference": 0.013081603243213065,
+    "z": 16.152340025565884
+  },
+  "degeneracy": {
+    "treatment_measured": 0.11221249999999999,
+    "control_measured": 0.21234999999999998,
+    "closed_form_at_p_star_0.2": 0.1677747200000001,
+    "closed_form_at_0.5": 0.0078125
+  }
+}

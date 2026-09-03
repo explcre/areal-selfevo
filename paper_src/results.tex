@@ -2630,3 +2630,168 @@ the epoch length but scatters around it ($45$ steps for the first), because prom
 reshuffled within an epoch. This is the first time a learned router in this project has been
 credited with anything that varies by unit, and it is the precondition every result in the
 post-credit window rests on.
+
+\subsection{Two external self-improvement systems: one reproducible, one only reimplementable}
+\label{sec:external}
+
+This subsection records what we were able to recover from two published self-improvement
+systems, because the paper needs both a baseline we can actually run and an honest
+statement of what could not be reconstructed. No GPU was used for anything below; every
+number is CPU-side and was produced on 2026-09-02.
+
+\paragraph{Ornith-1.5 can be reimplemented but not reproduced, and the distinction is
+not cosmetic.} Its method page publishes explicit formulas, so the \emph{method} is
+implementable: three sequential stages per iteration (task generation, scaffold
+generation, rollout), each optimised with GRPO, with
+$R_{\mathrm{task}}=V(q,s)\,D(q,s,\{\tau_i\})\,N(q)$,
+$D=\exp[-(p-p^*)^2/2\sigma^2]$,
+$N(q)=1-\max_{q_j\in\mathcal{B}}\mathrm{sim}(q,q_j)$,
+$R_{\mathrm{harness}}=C(q,h)F(h,\{\tau_i\})H(h)$ and
+$R_{\mathrm{rollout}}(\tau_i)=h(q,\tau_i)$. What is \emph{not} available is everything
+needed to reproduce a run. The advertised repository holds a README, a licence, a
+\texttt{.gitignore} and four images across its entire history; there is no source file,
+configuration, log or training loop in any commit, and no task buffer, per-task outcome,
+harness, rollout trace, reward, advantage, ablation or compute ledger was released. Of
+the loop's hyperparameters only $p^*=0.2$ is disclosed: $\sigma$, the rollout count $k$,
+the similarity function behind $N$, and the operational definitions of $V$, $C$, $F$ and
+$H$ are all absent. We therefore report a \emph{reimplementation}, and every one of those
+gaps is an explicitly numbered choice of ours in
+\texttt{reimplementations/ornith\_repro/AMBIGUITIES.md} rather than an inherited fact.
+
+\paragraph{There is no head-to-head with Ornith and we do not construct one.} Everything
+Ornith reports is agentic or repository-scale coding --- Terminal-Bench 2.1, SWE-Bench
+Verified/Pro/Multilingual, DeepSWE, NL2Repo --- at $128$K--$400$K context with four-hour
+timeouts, two of the benchmarks judged by a proprietary model and the headline figures
+self-reported five-run averages with no per-run values or intervals. It reports no
+competition mathematics, no LiveCodeBench and no SQL, which are exactly what we report.
+The benchmark intersection is \emph{empty}. Their released weights are $9$B, $35$B-A3B
+and $397$B, with no $32$B model, so scale matching was never possible either, and their
+bases were Qwen3.5 and Gemma~4 rather than ours. Any table putting our numbers beside
+theirs would be one we invented, so we do not build one.
+
+\paragraph{What the reimplementation is, and how it is checked.} The loop runs end-to-end
+on CPU against a deterministic stub client: one generated task, one scaffold, one rollout
+batch, one reward per stage, one update per stage, artifacts written to JSONL and read
+back with each stage's provenance digest recomputed on read. Every assertion is on
+observable state --- a field in a record or a value read off disk --- never on a function
+returning true. The suite is $48$ tests and runs in under a second, unchanged, on both a
+Python $3.12$ workstation and the H100 box's Python $3.10$ with
+\texttt{CUDA\_VISIBLE\_DEVICES} empty, so none of it depends on any GPU or on which base
+model turns out to be trainable in our stack. The base model is a constructor parameter,
+not a constant.
+
+\paragraph{The guards are mutation-tested, and the harness found a real hole.} A guard
+that has never been observed to fail is not evidence, so
+\texttt{reimplementations/mutate.py} applies twelve deliberate defects to fresh copies of
+the package and requires the suite to go red for each: empty-buffer novelty returning
+$0$, the product $VDN$ replaced by a mean, the published $p^*$ altered, a singleton GRPO
+group scored as zeros rather than refused, the task inserted into the buffer before it is
+scored, the control-matching guard short-circuited, the degeneracy formula truncated,
+provenance made input-independent, and the all-degenerate-batch and context-length guards
+disabled. On its first run \textbf{one mutation survived}: flipping the default abort
+policy from ``exclude'' to ``failure'' --- that is, silently grading aborted generations
+as wrong answers, the exact silent-zero path this project has been bitten by --- changed
+nothing observable, because every test passed \texttt{abort\_policy} explicitly and so
+never exercised the value that ships. Two regression tests now assert the defaults
+directly and all twelve mutations are caught. This is recorded because the hole was in
+the test suite, not in the code, and it would have been invisible to a green run.
+
+\paragraph{The difficulty gate beats its size-matched control, which is not what this
+project's other learned components did.} On a synthetic pool of $4000$ tasks with known
+true success probability $\theta$ and an observable family label independent of $\theta$,
+we score every task on a discovery block of $k$ rollouts, keep the top $400$ by $D$
+exactly as $R_{\mathrm{task}}$ would rank them at $V=N=1$, and compare against $400$ tasks
+drawn at the treatment's \emph{own measured} family proportions. A fresh independent
+rollout block then re-evaluates both arms. Table~\ref{tab:ornithgate} reports the result.
+Selection genuinely enriches tasks whose true difficulty is near $p^*$: the mean
+$|\theta-p^*|$ is $0.140$ for the treatment against $0.351$ for the matched control at
+$k=8$, a difference of $+0.211 \pm 0.013$ on the difference ($z=16.2$). Unlike the learned
+router and the MEDS clustering, both retired for tying with a control of this shape, this
+component does not tie.
+
+\paragraph{But the score it reports is badly optimistic, and $\sigma$ is inert for
+ranking.} The same table shows a large winner's curse: at $k=8$ the selected tasks score
+$D=0.946$ on the block that selected them and $0.551$ on a fresh one, a shrinkage of
+$0.395$, so the difficulty a run would report for its own curriculum is inflated by
+roughly $72\%$. The curse is a pure function of $k$ and closes only slowly, needing
+$k\gtrsim149$ to fall under $0.05$. Separately, the enrichment column is \emph{identical}
+across $\sigma\in\{0.05,0.10,0.15,0.30\}$, which is not a numerical accident: with $V$ and
+$N$ held constant, ranking by $D$ is ranking by $|\hat{p}-p^*|$, and that ordering does not
+depend on $\sigma$ at all. The undisclosed $\sigma$ therefore cannot change which tasks a
+run selects, only how the reward is scaled --- and GRPO's group normalisation absorbs a
+common positive scale. One of the two most conspicuous missing hyperparameters is thus
+nearly inert for selection, which materially reduces the reconstruction risk. It regains
+influence only through the product with a varying $V$ and $N$.
+
+\paragraph{The published $p^*=0.2$ maximises the fraction of wasted groups.} A binary
+reward makes a GRPO group constant, and therefore exactly zero-gradient, with probability
+$\theta^G+(1-\theta)^G$; we verify this closed form against simulation to $\pm0.01$. At
+$G=8$ it is $0.0078$ at $\theta=0.5$ but $0.1678$ at $\theta=0.2$, a factor of $21.5$. The
+tension this creates is visible in Table~\ref{tab:ornithgate}: as $k$ rises the gate
+selects true difficulty better, and the degenerate-group fraction it produces rises
+\emph{with} it, from $0.126$ at $k=4$ to $0.187$ at $k=32$, converging on the closed-form
+value at $p^*$. The better Ornith's difficulty gate works, the more of its rollout budget
+carries no reward-directed gradient. This is a property of the published constant, derived
+from the published equations and measured here; it is not a claim about their weights.
+
+\begin{table}[t]
+\centering\small
+\caption{Ornith-1.5's difficulty gate, reimplemented, on a synthetic pool of $4000$ tasks
+with known true $\theta$, keeping the top $400$ by $D$ against a size-matched random
+control at the treatment's own measured family proportions ($\sigma=0.15$, $p^*=0.2$,
+$G=8$, seed $20260902$). $D_{\mathrm{disc}}$ and $D_{\mathrm{hold}}$ are the mean
+difficulty reward on the selecting block and on a fresh independent block. The enrichment
+column is $|\theta-p^*|$ for the control minus the treatment, so positive means the gate
+selected genuinely-harder-to-target tasks; its uncertainty is the standard error on the
+\emph{difference}. This is a synthetic instantiation of the published reward design, not a
+measurement of Ornith's models.}
+\label{tab:ornithgate}
+\begin{tabular}{rccccc}
+\toprule
+$k$ & $D_{\mathrm{disc}}$ & $D_{\mathrm{hold}}$ & shrinkage & enrichment (ctrl$-$treat) & degenerate frac. \\
+\midrule
+$4$   & $0.9460$ & $0.4078$ & $+0.5381$ & $+0.1605$ \ ($z=11.0$) & $0.1259$ \\
+$8$   & $0.9460$ & $0.5513$ & $+0.3947$ & $+0.2113$ \ ($z=16.2$) & $0.1122$ \\
+$16$  & $0.9762$ & $0.7058$ & $+0.2703$ & $+0.2435$ \ ($z=19.3$) & $0.1548$ \\
+$32$  & $0.9790$ & $0.8151$ & $+0.1640$ & $+0.2871$ \ ($z=23.5$) & $0.1875$ \\
+$64$  & $0.9829$ & $0.8963$ & $+0.0866$ & $+0.2887$ \ ($z=24.6$) & $0.1860$ \\
+$149$ & $0.9830$ & $0.9406$ & $+0.0425$ & $+0.3085$ \ ($z=25.7$) & $0.1746$ \\
+\midrule
+\multicolumn{6}{l}{\footnotesize closed-form degenerate fraction at $G=8$: $0.1678$ at $\theta=0.2$, $0.0078$ at $\theta=0.5$.} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{OpenRSI, by contrast, is genuinely reproducible, and we verified that rather
+than assuming it.} OpenRSI (\texttt{FrontisAI/OpenRSI}, commit \texttt{1f477c48},
+CC~BY-NC~4.0 with a \texttt{NOTICE}; arXiv:2607.28568) ships the search harness
+(\texttt{OpenMLE-Evo}), the SFT and RL stages (\texttt{OpenMLE-ERL}), and a real execution
+sandbox (\texttt{OpenMLE-Gym}, with controller, router, workers and
+\texttt{docker-compose}). It installs and imports cleanly under Python $3.12$, and
+\textbf{its own test suites pass $119/119$} --- $66$ in \texttt{OpenMLE-Evo/tests} and
+$53$ in the vendored \texttt{aira-evo} tests. Both \texttt{Frontis-MA1-35B} and its base
+\texttt{Qwen3.6-35B-A3B} are on the Hub, and the NatureBench task data is public and
+ungated; a single task package downloads at $2.9$\,MB and contains the problem data, the
+evaluator \emph{and} the ground truth, so a one-task end-to-end run needs nothing but a
+served model. Their declared \texttt{requires-python} is \texttt{>=3.11,<3.13}, and the
+suite indeed does not collect under $3.13$. We note one near-miss in our own procedure:
+invoking their tests through a relative interpreter path fails $2$ of $66$, because
+\texttt{sys.executable} then carries \texttt{..} segments that their code correctly
+resolves and their assertion does not; with an absolute path it is $66/66$. Their release
+is clean and we nearly reported a defect that was ours.
+
+\paragraph{Two corrections to how that target is usually described, and what it costs.}
+First, the headline $39.39\% \rightarrow 60.61\%$ Medal Average is a \emph{model} swap
+with the harness held fixed --- both rows run OpenMLE-Evo --- and their own table says so
+explicitly; it is not a scaffold-versus-no-scaffold delta, and recovering it means serving
+two models and running the search twice. Second, the NatureBench hidden evaluation data,
+task packages, evaluation service and container images are \emph{not} redistributed inside
+OpenRSI; they come from the separate public NatureBench repository and Hub dataset. On
+cost, their protocol fixes a \emph{wall-clock} budget per task, so a faster GPU cannot buy
+it down --- it only changes how much search fits inside the budget, which would itself
+deviate from the protocol. MLE-Bench Lite at their stated protocol ($22$ tasks, three
+independent runs, $12$\,h per task) is $792$ sandbox-hours per model--harness cell and
+$1584$ for the base-versus-MA1 pair, plus a served $35$B-A3B model throughout, plus Docker
+and Kaggle data. NatureBench Lite ($10$ tasks, four-hour budget) is about $40$ hours per
+cell, roughly twenty times cheaper for the same claim shape, which is why the ladder we
+propose starts there and starts with a single-candidate smoke run.
