@@ -1,0 +1,106 @@
+{
+  "config": {
+    "group_size": 8,
+    "k": 8,
+    "sigma": 0.15,
+    "keep_frac": 0.1,
+    "reps": 20000,
+    "seed": 20260903,
+    "out": "pstar_robustness.json"
+  },
+  "assumptions": {
+    "A-binary-rollout-reward": "The solver-stage reward R_rollout = h(q,tau) is BINARY. This is the load-bearing assumption. The release defines p via a binary success test s, but never states that h itself is binary. If h returns a graded score, constant groups become rare and the criticism largely dissolves for that stage. Tested in check_continuous_h().",
+    "B-iid-rollouts-within-group": "Rollouts in a group are independent given the task. Real rollouts share a prompt and a policy and are positively correlated, which makes degeneracy HIGHER, so the closed form is a lower bound and the criticism is conservative here. Tested in check_correlated_rollouts().",
+    "C-group-is-one-task": "A GRPO group is k rollouts of a single task. If groups mix tasks, the reward spread comes from task difficulty as well and degeneracy falls. The release does not state group construction.",
+    "D-gate-actually-hits-its-target": "The realised theta of trained-on tasks concentrates near p*. This is exactly what our gate experiment measured, and it is why the tension is real rather than hypothetical: accuracy of the gate and waste move together.",
+    "E-no-resampling": "Degenerate groups are not detected and resampled. DAPO-style dynamic sampling would convert the waste from lost gradient into extra compute. The release states no such mechanism, but absence of a statement is not absence of the mechanism."
+  },
+  "A_continuous_harness": {
+    "w=0.0,theta=0.2": 0.162,
+    "w=0.0,theta=0.5": 0.0084,
+    "w=0.01,theta=0.2": 0.0,
+    "w=0.01,theta=0.5": 0.0,
+    "w=0.05,theta=0.2": 0.0,
+    "w=0.05,theta=0.5": 0.0,
+    "w=0.25,theta=0.2": 0.0,
+    "w=0.25,theta=0.5": 0.0
+  },
+  "B_correlated_rollouts": {
+    "spread=0.0,theta=0.2": 0.17565,
+    "spread=0.0,theta=0.5": 0.0078,
+    "spread=0.1,theta=0.2": 0.19145,
+    "spread=0.1,theta=0.5": 0.01075,
+    "spread=0.2,theta=0.2": 0.27335,
+    "spread=0.2,theta=0.5": 0.02225
+  },
+  "C1_pool_shape": {
+    "uniform": {
+      "kept_mean_theta": 0.2932515161192432,
+      "kept_degeneracy": 0.12755241229875222,
+      "unselected_pool_degeneracy": 0.23134639763763448,
+      "ratio_kept_over_pool": 0.5513481670829463
+    },
+    "beta(2,5)-easy-skewed": {
+      "kept_mean_theta": 0.2733282987604713,
+      "kept_degeneracy": 0.13376310069619418,
+      "unselected_pool_degeneracy": 0.1653590342838565,
+      "ratio_kept_over_pool": 0.8089252654111143
+    },
+    "beta(5,2)-hard-skewed": {
+      "kept_mean_theta": 0.5012536904846149,
+      "kept_degeneracy": 0.0316030302630346,
+      "unselected_pool_degeneracy": 0.16745366820509416,
+      "ratio_kept_over_pool": 0.18872701089072466
+    },
+    "bimodal-0.05/0.95": {
+      "kept_mean_theta": 0.05,
+      "kept_degeneracy": 0.6634204313281248,
+      "unselected_pool_degeneracy": 0.6634204313281248,
+      "ratio_kept_over_pool": 1.0
+    }
+  },
+  "C2_multiplicative": {
+    "D only (V=N=1)": {
+      "kept_mean_theta": 0.29030000657535293,
+      "kept_mean_abs_theta_minus_pstar": 0.12211284812282702,
+      "kept_degeneracy": 0.13073262147074158
+    },
+    "mild V,N variation": {
+      "kept_mean_theta": 0.2600342470017098,
+      "kept_mean_abs_theta_minus_pstar": 0.11857032236866205,
+      "kept_degeneracy": 0.1841688615231768
+    },
+    "strong V,N variation": {
+      "kept_mean_theta": 0.25854867184117125,
+      "kept_mean_abs_theta_minus_pstar": 0.11936447249661604,
+      "kept_degeneracy": 0.18761049467630098
+    }
+  },
+  "D_pstar_curve": {
+    "0.05": 0.6634204313281248,
+    "0.10": 0.4304672200000001,
+    "0.15": 0.27249078132812493,
+    "0.20": 0.1677747200000001,
+    "0.25": 0.100128173828125,
+    "0.30": 0.05771361999999997,
+    "0.40": 0.017451519999999995,
+    "0.50": 0.0078125
+  },
+  "E_lifetime_defence": {
+    "theta=0.2": {
+      "informative_fraction_per_step": 0.8322252799999998,
+      "relative_lifetime": 0.8,
+      "lifetime_informative_product": 0.6657802239999999
+    },
+    "theta=0.3": {
+      "informative_fraction_per_step": 0.94228638,
+      "relative_lifetime": 0.7,
+      "lifetime_informative_product": 0.659600466
+    },
+    "theta=0.5": {
+      "informative_fraction_per_step": 0.9921875,
+      "relative_lifetime": 0.5,
+      "lifetime_informative_product": 0.49609375
+    }
+  }
+}

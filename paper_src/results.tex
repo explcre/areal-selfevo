@@ -2795,3 +2795,153 @@ $1584$ for the base-versus-MA1 pair, plus a served $35$B-A3B model throughout, p
 and Kaggle data. NatureBench Lite ($10$ tasks, four-hour budget) is about $40$ hours per
 cell, roughly twenty times cheaper for the same claim shape, which is why the ladder we
 propose starts there and starts with a single-candidate smoke run.
+
+\subsection{OpenRSI rung 0: the released quickstart does not complete against its own
+benchmark's current HEAD}
+\label{sec:openrsirung0}
+
+We attempted the smallest end-to-end run OpenRSI documents: its NatureBench local
+quickstart with \texttt{--smoke}, which generates and evaluates a single candidate on a
+single task. It was run on one idle H200 serving \texttt{Frontis-MA1-30B} (their released
+$30$B post-trained checkpoint, \texttt{Qwen3MoeForCausalLM}, $48$ layers, $128$ experts,
+$8$ routed per token) through SGLang at a $131072$-token served context, with the
+candidate runtime built from \texttt{conda-forge} to their published environment spec. We
+used the $30$B rather than the $35$B because it fits one card comfortably. The GPUs
+running other work were not touched.
+
+\paragraph{Four of five stages fired; the fifth could not.} Task construction, prompt and
+scaffold construction, generation, and candidate materialisation all succeeded: the model
+returned a $5338$-byte \texttt{run.py} for the counterfactual-estimation task, which is a
+real generation and not a template. The run then failed at the reward stage. The
+NatureBench evaluation service answered \texttt{POST /register} with HTTP $404$,
+\texttt{unknown endpoint}, and the search aborted before any candidate was scored.
+
+\paragraph{The cause is a version skew between two first-party repositories.} It is not a
+misconfiguration on our side and not a missing credential. NatureBench commit
+\texttt{d38eb9c} (2026-08-28), ``protect control endpoints with service token'', put
+\texttt{/register}, \texttt{/start\_timer}, \texttt{/resume\_timer} and
+\texttt{/pause\_timer} behind a \texttt{\_has\_control\_access()} check that returns $404$
+--- deliberately masking the endpoint's existence --- unless the caller presents a service
+control token. The check is absent at \texttt{d38eb9c\^{}}. OpenRSI at its own HEAD
+(\texttt{1f477c48}) has no notion of that token: its
+\texttt{base\_task.\_post\_json} sends only \texttt{Content-Type: application/json}, and
+the strings \texttt{control\_token} and \texttt{eval\_control\_token} do not occur anywhere
+in \texttt{OpenMLE-Evo}. So a user following OpenRSI's documented quickstart against
+NatureBench HEAD, three days newer than the commit that broke it, cannot complete a single
+task. This does not touch the validity of their published results, which were produced
+before the skew; it is a statement about what the released instructions do today.
+
+\paragraph{Their failure handling is correct, which we checked rather than assumed.} The
+run's \texttt{summary.csv} reports \texttt{grade\_avg@k} $=1.0$ beside
+\texttt{success\_rate} $=0.0$ and \texttt{unknown} $=1$. Read carelessly that looks like a
+harness reporting a perfect score for a run that never evaluated, which is the failure mode
+Secs.~\ref{sec:harnessvalid} and following document repeatedly in our own tooling. It is
+not. In their \texttt{build\_submit\_grade\_and\_medal}, grade is a normalised leaderboard
+rank in which \emph{lower is better} --- \texttt{submit\_grade\_best} is a \texttt{min} ---
+and $1.0$ with medal \texttt{N/A} is the explicit fallback returned when
+\texttt{submit\_score is None}. The failure is recorded conservatively and flagged in three
+separate columns. We report this because we were one careless reading away from filing a
+false defect against them, for the second time in this audit: their test suite also appears
+to fail $2$ of $66$ until one notices that the failure is caused by invoking the
+interpreter through a relative path.
+
+\paragraph{Stopped here by pre-agreement.} Rung 0 was defined to require a read-back
+artifact carrying a per-stage reward, and it did not produce one, so rung 1 was not
+started. Two ways forward exist and they are not equivalent: pinning NatureBench to
+\texttt{d38eb9c\^{}} reproduces the stack OpenRSI was written against but re-opens control
+endpoints to model-generated code, which is the exact exposure their fix closed and is a
+poor idea on a shared box; alternatively OpenRSI's client can be taught to send the token,
+which is a one-header change but means we are no longer running their code unmodified. The
+choice belongs to the PI, not to us.
+
+\subsection{Correction and hardening of the $p^*$ claim in
+Sec.~\ref{sec:external}}
+\label{sec:pstarcorrection}
+
+Sec.~\ref{sec:external} stated that Ornith's published $p^*=0.2$ ``maximises the fraction
+of budget that carries zero gradient'' and that ``the better the gate works the more it
+wastes''. Both statements are too strong, and this subsection corrects them. The
+underlying arithmetic is unchanged and exact; the interpretation was not.
+
+\paragraph{What survives exactly.} For a binary reward and group size $G$, a GRPO group is
+constant with probability $\theta^G+(1-\theta)^G$, verified against simulation to
+$\pm0.01$. This is monotone \emph{decreasing} on $[0,\tfrac12]$, so $p^*=0.2$ is in no
+sense a maximiser: at $G=8$ the rate is $0.6634$ at $\theta=0.05$, $0.1678$ at $0.20$, and
+$0.0078$ at $0.50$. The defensible claim is the pairwise one --- targeting $0.2$ rather
+than $0.5$ costs a factor of $21.5$ in constant groups --- and, more generally, that any
+target below one half pays a monotone penalty.
+
+\paragraph{The claim needs $R_{\mathrm{rollout}}$ to be exactly binary, and the release
+never says it is.} This is the load-bearing assumption and it is fragile. Modelling the
+harness as a binary verdict plus a continuous quality term of weight $w$, the constant-group
+rate at $\theta=0.2$ collapses from $0.1620$ at $w=0$ to $0.0000$ at $w=0.01$: a harness
+that returns any graded component at all essentially never produces an exactly constant
+group. Ornith defines $p$ through a binary success test $s$, but $R_{\mathrm{rollout}}=h$
+is never stated to be binary, and the release does not resolve whether $s=h$. We therefore
+downgrade this from a defect of the published method to a defect \emph{conditional on a
+binary harness}. One caveat cuts the other way and is a derivation rather than a
+measurement: in an all-failure group with small $w$, the normalised advantages are
+determined entirely by the jitter, so the gradient is non-zero but uncorrelated with
+anything about the task. Exactly-zero gradient and pure-noise gradient are not obviously
+ranked.
+
+\paragraph{Selection usually reduces degeneracy relative to no selection, which is the
+opposite of what we implied.} Repeating the selection under four priors on $\theta$, the
+kept set's mean constant-group rate against the unselected pool's is $0.128$ vs $0.231$
+(uniform), $0.134$ vs $0.165$ (Beta$(2,5)$), $0.032$ vs $0.168$ (Beta$(5,2)$), and $0.663$
+vs $0.663$ (bimodal at $0.05/0.95$). In three of four the gate \emph{improves} matters,
+because an unselected pool is full of tasks near $\theta=0$ or $1$ that are far more
+degenerate than anything near $0.2$. The rising degeneracy with $k$ in
+Table~\ref{tab:ornithgate} is convergence from below onto the closed-form value at $p^*$,
+not evidence that the gate destroys signal a no-gate baseline would have kept. The correct
+comparison is between choices of $p^*$, never between gate and no gate.
+
+\paragraph{The multiplicative structure does not rescue it; it mildly worsens it.} Asked
+whether $V\!\cdot\!D\!\cdot\!N$ blunts the effect by admitting tasks away from $p^*$, we
+find the kept set's constant-group rate \emph{rises} with factor variation, $0.1307$ at
+$V=N=1$, $0.1842$ under mild variation and $0.1876$ under strong variation, while
+$|\theta-p^*|$ barely moves. The product admits some candidates whose $\theta$ is more
+extreme, which costs rather than saves.
+
+\paragraph{Correlated rollouts make the penalty larger, so the arithmetic is conservative.}
+With a shared per-group shift of half-width $0.2$ --- the effect of sharing one prompt and
+one policy --- the rate at $\theta=0.2$ rises from $0.176$ to $0.273$, and at $\theta=0.5$
+from $0.008$ to $0.022$. The independence assumption understates the cost.
+
+\paragraph{And there is a real defence of $p^*<\tfrac12$, which we state because it nearly
+wins.} A task at $\theta=0.5$ yields the most informative groups now but is closer to being
+solved and leaves the useful band sooner. Scoring the informative fraction per step against
+a lifetime proportional to $1-\theta$ gives $0.666$ at $\theta=0.2$, $0.660$ at $0.3$ and
+$0.496$ at $0.5$: on this model $0.2$ and $0.3$ are effectively tied and both beat $0.5$.
+The model is ours, invented to steelman their choice, and Ornith publishes neither a task
+lifetime nor the staleness dynamics that would settle it. \textbf{Net verdict:} the
+per-step signal cost of $p^*=0.2$ is exact, large, and worsened by both correlation and the
+product form; whether it is the \emph{wrong} target is not established, because it turns on
+a task-lifetime quantity the release does not disclose. Stated that narrowly, the criticism
+holds. Stated as ``$0.2$ maximises waste'', it does not.
+
+\paragraph{Everything in both subsections remains CPU-side and, for the $p^*$ work,
+synthetic.} No claim here has been reproduced on a real model, and the label stays until
+one is.
+
+\paragraph{Reporting convention adopted for the gate result.} Wherever the difficulty gate
+is reported from here on, the \emph{fresh-block} figure is the headline and the
+selecting-block figure is labelled an artefact of selection. At $k=8$ that means the gate's
+difficulty is $0.551$, not $0.946$. The two differ by $0.395$, and quoting the selecting
+block is precisely how a curriculum is made to look like it works. Both numbers stay in
+Table~\ref{tab:ornithgate} so the gap is visible rather than quietly resolved.
+
+\paragraph{The $\sigma$-inertness result, stated as a finding with its proof.} Among the
+loop's undisclosed hyperparameters, $\sigma$ cannot affect which tasks a run selects.
+Proof: with $V$ and $N$ constant across candidates,
+$R_{\mathrm{task}} \propto D = \exp[-(\hat p-p^*)^2/2\sigma^2]$, which is a strictly
+decreasing function of $(\hat p-p^*)^2$ for every $\sigma>0$. Ranking candidates by $D$ is
+therefore ranking them by $|\hat p-p^*|$, an order independent of $\sigma$; ties are
+resolved identically because $\hat p$ takes only $k+1$ values. Selection is thus invariant
+to $\sigma$, and GRPO's group normalisation additionally absorbs the common positive scale
+$\sigma$ induces in the reward. This is confirmed empirically: the enrichment column is
+identical across $\sigma\in\{0.05,0.10,0.15,0.30\}$. $\sigma$ regains influence only
+through the product with a \emph{varying} $V$ and $N$, where it sets the exchange rate
+between difficulty and the other two factors. The practical consequence for anyone
+reimplementing Ornith is that one of the two most conspicuous missing constants carries far
+less reconstruction risk than it appears to.

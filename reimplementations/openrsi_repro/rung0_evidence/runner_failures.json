@@ -1,0 +1,10 @@
+[
+  {
+    "success": false,
+    "task_name": "s42256-023-00611-x",
+    "epoch_index": 0,
+    "output_dir": "/home/ubuntu/rung0_out/program_ep_0/s42256-023-00611-x",
+    "return_code": 1,
+    "error": "AIRA Dojo task failed: s42256-023-00611-x (return_code=1)"
+  }
+]
