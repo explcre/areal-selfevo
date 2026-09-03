@@ -9,6 +9,12 @@ The configuration mirrors the live runs (``examples/math/gsm8k_grpo.yaml`` with 
 overrides): ``reward_norm`` group-level, ``adv_norm`` disabled. Group-level reward
 normalisation is what makes a unanimous group's advantages identically zero, so a test
 without it would not exercise the silence this feature exists for.
+
+The fixtures this file used to define now live in ``selfevo/tests/conftest.py``. Nine other
+test files imported them from here, which made this module a conftest that also ran thirteen
+tests: importing one fixture pulled in every constant below it and coupled file ordering
+under ``pytest -x``. The names are re-imported here, so this file and anything still
+importing them from it both behave exactly as before.
 """
 
 from __future__ import annotations
@@ -18,84 +24,22 @@ import logging
 import pytest
 import torch
 
-from areal.api.cli_args import GroupRoutingConfig, NormConfig, PPOActorConfig
-from areal.trainer.ppo.actor import PPOActor
-from areal.utils.data import TrajBatchMeta
+from selfevo.tests.conftest import (  # noqa: F401  (re-exported for older importers)
+    MIXED,
+    PROMPT,
+    SOLVED_AND_UNSOLVED,
+    B,
+    G,
+    T,
+    advantages,
+    make_actor,
+    make_batch,
+    meta,
+)
+
+from areal.api.cli_args import GroupRoutingConfig
 
 logging.disable(logging.INFO)
-
-B, T, G = 8, 6, 4          # two groups of four
-PROMPT = 2                 # first PROMPT columns are prompt, loss_mask == 0 there
-
-# group 0: every sample correct  -> silent because SOLVED
-# group 1: two of four correct   -> informative, RL has signal
-MIXED = [1, 1, 1, 1, 0, 1, 0, 1]
-# group 0 solved, group 1 all wrong -> silent because UNSOLVED
-SOLVED_AND_UNSOLVED = [1, 1, 1, 1, 0, 0, 0, 0]
-
-
-def make_actor(
-    group_routing: GroupRoutingConfig | None = None,
-    *,
-    group_reward_norm: bool = True,
-    reward_bias: float = 0.0,
-) -> PPOActor:
-    """A CPU actor configured like the live runs.
-
-    Args:
-        group_routing: Value for ``config.group_routing``. ``None`` is the shipped default
-            and must leave the update untouched.
-        group_reward_norm: Whether to centre rewards within the group, as the live configs
-            do. Set False to get AReaL's own default (``reward_norm=None``), under which a
-            unanimous SOLVED group's advantages are NOT zero -- the configuration that
-            separates "silent" from "solved".
-        reward_bias: Added to every reward before scaling. A non-zero bias is what separates
-            "silent" from "unsolved": an all-wrong group scores zero, and zero rewards give
-            zero advantages with or without centring, so only a bias makes such a group
-            carry gradient while still being unsolved by raw reward.
-
-    Returns:
-        A ``PPOActor`` whose ``_compute_advantages`` can be called directly.
-    """
-    cfg = PPOActorConfig(
-        path="unused-for-advantage-computation",
-        kl_ctl=0.0,
-        adv_norm=None,
-        reward_bias=reward_bias,
-        reward_norm=(
-            NormConfig(mean_level="group", std_level="group", group_size=G)
-            if group_reward_norm
-            else None
-        ),
-    )
-    cfg.group_routing = group_routing
-    return PPOActor(cfg, engine=None)
-
-
-def make_batch(rewards: list[float]) -> dict[str, torch.Tensor]:
-    """A minimal batch with a prompt region that must never receive a routed constant."""
-    loss_mask = torch.zeros(B, T)
-    loss_mask[:, PROMPT:] = 1.0
-    return {
-        "input_ids": torch.randint(0, 100, (B, T)),
-        "loss_mask": loss_mask,
-        "rewards": torch.tensor(rewards, dtype=torch.float32),
-        "old_logp": torch.zeros(B, T),
-        "ref_logp": torch.zeros(B, T),
-        "logprobs": torch.zeros(B, T),
-        "attention_mask": torch.ones(B, T),
-    }
-
-
-def meta() -> TrajBatchMeta:
-    """Group structure matching ``make_batch``: two groups of ``G`` rows."""
-    return TrajBatchMeta(n_trajs=B, traj_group_sizes=[G, G], traj_seqlens=[T] * B)
-
-
-def advantages(actor: PPOActor, rewards: list[float]) -> torch.Tensor:
-    """Run the real advantage computation and return the advantage tensor."""
-    return actor._compute_advantages(make_batch(rewards), meta())["advantages"]
-
 
 # --------------------------------------------------------------------------- silence ---
 

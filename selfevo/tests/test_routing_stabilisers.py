@@ -32,9 +32,9 @@ torch = pytest.importorskip("torch")
 from areal.api.cli_args import GroupRoutingConfig, NormConfig, PPOActorConfig
 from areal.trainer.ppo.actor import PPOActor, _recentre_advantages, _truncated_rows
 from areal.utils.data import TrajBatchMeta
-from selfevo import compose
 from selfevo.integration.group_apply import apply_decisions, apply_mixtures
 from selfevo.routing.base import RoutingDecision, TrainingMode
+from selfevo.tests.conftest import registered_router
 
 logging.disable(logging.INFO)
 
@@ -156,19 +156,13 @@ class AllSFTRouter:
 def stub_router():
     """Register the all-SFT router and restore the registry afterwards.
 
-    The registry is module-level state shared with every other test in the process, so a
-    test that mutates it without restoring makes an unrelated test fail later, in a
-    different file, with no visible connection.
+    The restore is ``conftest.registered_router``: the registry is module-level state
+    shared with every other test in the process, so a test that mutates it without
+    restoring makes an unrelated test fail later, in a different file, with no visible
+    connection.
     """
-    previous = compose.ROUTERS.get(STUB, KeyError)
-    compose.ROUTERS[STUB] = lambda *a, **kw: AllSFTRouter()
-    try:
+    with registered_router(STUB, lambda *a, **kw: AllSFTRouter()):
         yield
-    finally:
-        if previous is KeyError:
-            compose.ROUTERS.pop(STUB, None)
-        else:
-            compose.ROUTERS[STUB] = previous
 
 
 # --------------------------------------------------------------- the fixture is honest ---

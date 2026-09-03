@@ -29,6 +29,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import code_bench as cb  # noqa: E402
 from code_sandbox import SandboxLimits  # noqa: E402
+# The stub endpoint lives beside the shared plumbing it stands in for; a second copy here
+# would drift from the one the math suite tests.
+from test_math_bench import _StubSession  # noqa: E402
 
 FAST = SandboxLimits(wall_seconds=8.0, memory_bytes=512 * 1024 ** 2)
 
@@ -75,6 +78,52 @@ def test_prose_without_a_fence_is_not_code():
     assert cb.extract_code("I cannot solve this problem.") is None
     assert cb.extract_code("") is None
     assert cb.extract_code("```python\n\n```") is None
+
+
+# The live 32B run, on abc390_e: a 1102-character program that compiled, followed by an
+# EMPTY python fence. Taking the last python block and refusing it for being empty threw
+# the submission away and scored it no_code -- 1 of 20 problems on that slice.
+_TRAILING_EMPTY_FENCE = (
+    "Here is my solution.\n\n"
+    "```python\nimport sys\nprint(sum(map(int, sys.stdin.read().split())))\n```\n"
+    "```python\n```\n"
+)
+
+
+def test_an_empty_trailing_fence_does_not_discard_the_submission():
+    got = cb.extract_code(_TRAILING_EMPTY_FENCE)
+    assert got == "import sys\nprint(sum(map(int, sys.stdin.read().split())))\n"
+    compile(got, "<submission>", "exec")  # it really was a program
+
+
+def test_a_completion_whose_only_block_is_empty_is_still_no_code():
+    """The empty-block guard is right; only the discard-the-submission half was wrong."""
+    assert cb.extract_code("```python\n```") is None
+    assert cb.extract_code("```python\n   \n```") is None
+    assert cb.extract_code("```\n\n```") is None
+    assert cb.extract_code("```python\n\n```\nnothing here\n```python\n\n```") is None
+
+
+def test_precedence_level_1_is_the_last_non_empty_python_block():
+    text = ("```python\nfirst()\n```\n```python\nsecond()\n```\n"
+            "```python\n\n```\n```\nuntagged()\n```")
+    assert cb.extract_code(text) == "second()\n"
+
+
+def test_precedence_level_2_is_any_fence_once_no_python_block_has_content():
+    """Only reached when level 1 yields nothing: an all-empty python level is not an answer."""
+    assert cb.extract_code("```python\n\n```\n```\nuntagged()\n```") == "untagged()\n"
+    assert cb.extract_code("```text\nnotes\n```\n```\nlast()\n```") == "last()\n"
+
+
+def test_precedence_level_3_the_python_tag_form_is_refused_not_extracted():
+    """Documented as a refusal and UNEXERCISED: 0/35 live completions used this form."""
+    assert cb.extract_code("[PYTHON]\nprint(1)\n[/PYTHON]") is None
+
+
+def test_precedence_level_4_an_unfenced_program_is_refused_not_extracted():
+    """Also a documented refusal: executing unfenced text would execute prose."""
+    assert cb.extract_code("import sys\nprint(sum(map(int, sys.stdin.read().split())))") is None
 
 
 # ------------------------------------------------------------------ compare_stdout
@@ -536,6 +585,10 @@ def test_main_grades_recorded_completions_and_writes_an_auditable_artifact(
     assert row["n_truncated"] == 1
     assert row["params"]["dataset_md5"]
     assert row["params"]["sandbox_tier"] in ("bwrap", "netns", "subprocess")
+    # A regrade calls no endpoint, and must say so rather than inherit a model id.
+    assert row["params"]["model"] is None
+    assert row["params"]["endpoint"] is None and row["params"]["served_models"] is None
+    assert row["params"]["generations_source"] == str(gens)
 
     records = [json.loads(x) for x in
                (tmp_path / "res.records.jsonl").read_text().splitlines()]
@@ -599,3 +652,145 @@ def test_every_problem_has_private_tests():
 def test_the_suite_names_a_release_that_exists():
     for bench in cb.SUITE:
         assert cb.require_dataset(bench).exists()
+
+
+# ------------------------------------------------------ which model actually answered
+#
+# Same exposure as the math suite, through the same shared plumbing: the payload names a
+# MODEL ID, an unregistered id is answered HTTP 200 by the BASE model, and a results row
+# that does not record the id cannot be attributed afterwards. Driven through the REAL
+# main() with a stub session, so the wiring is what is under test, not a helper.
+
+
+@pytest.fixture()
+def stub_endpoint(monkeypatch):
+    """Swap aiohttp's session for a stub, so main() runs its real loop with no server.
+
+    Args:
+        monkeypatch: pytest's patcher.
+
+    Returns:
+        A factory ``(models, completion) -> _StubSession`` that installs the stub.
+    """
+    import aiohttp
+
+    def install(models=("harnessT49",), completion=""):
+        stub = _StubSession(models=models, completion=completion)
+
+        def _open(**kw):
+            stub.opened += 1
+            return stub
+
+        monkeypatch.setattr(aiohttp, "TCPConnector", lambda **kw: None)
+        monkeypatch.setattr(aiohttp, "ClientSession", _open)
+        return stub
+
+    return install
+
+
+def _argv(tmp_path, *extra):
+    return ["code_bench.py", "--base-url", "http://stub.invalid/v1",
+            "--out", str(tmp_path / "res.json"), "--workers", "2",
+            "--wall-seconds", "8", *extra]
+
+
+def _solution(payload):
+    """A submission that solves whichever synthetic problem was asked."""
+    prompt = payload["messages"][0]["content"]
+    if "class Solution" in prompt:
+        return "```python\nclass Solution:\n    def add(self, a, b):\n        return a + b\n```"
+    return ("```python\nimport sys\n"
+            "print(sum(map(int, sys.stdin.read().split())))\n```")
+
+
+def test_generating_against_an_unserved_model_id_is_refused(
+        synthetic, tmp_path, monkeypatch, stub_endpoint):
+    """The severe case: sglang would have answered 200 and served the BASE model."""
+    stub = stub_endpoint(models=("base-32b", "evalmodel"))
+    monkeypatch.setattr(sys, "argv", _argv(tmp_path, "--model", "harnessT49"))
+    with pytest.raises(SystemExit) as e:
+        cb.main()
+    assert "harnessT49" in str(e.value) and "base-32b" in str(e.value)
+    assert stub.post_calls == [], "refused BEFORE generating, not after"
+    assert not (tmp_path / "res.json").exists(), "a refused run writes no score"
+
+
+def test_the_results_row_records_which_model_answered(
+        synthetic, tmp_path, monkeypatch, stub_endpoint):
+    stub = stub_endpoint(models=("harnessT49", "base-32b"), completion=_solution)
+    monkeypatch.setattr(sys, "argv", _argv(tmp_path, "--model", "harnessT49"))
+    assert cb.main() == 0
+    row = json.loads((tmp_path / "res.json").read_text())[0]
+    assert row["params"]["model"] == "harnessT49"
+    assert row["params"]["endpoint"] == "http://stub.invalid/v1/chat/completions"
+    assert row["params"]["served_models"] == ["harnessT49", "base-32b"]
+    assert row["params"]["generations_source"] is None
+    assert stub.get_calls == ["http://stub.invalid/v1/models"]
+    assert row["n_pass"] == 3, "the stub solved all three synthetic problems"
+
+
+def test_the_model_flag_has_no_default_that_could_silently_resolve():
+    assert cb.build_parser().parse_args([]).model is None
+
+
+def test_generating_without_a_model_refuses_before_touching_the_endpoint(
+        synthetic, tmp_path, monkeypatch, stub_endpoint):
+    stub = stub_endpoint(models=("evalmodel",))
+    monkeypatch.setattr(sys, "argv", _argv(tmp_path))
+    with pytest.raises(SystemExit) as e:
+        cb.main()
+    # The message names the flag AND the offline alternative -- which is what distinguishes
+    # this refusal from the endpoint's own "that id is not served".
+    assert "--model" in str(e.value) and "--from-generations" in str(e.value)
+    assert stub.opened == 0, "refused before a session was even opened"
+    assert stub.get_calls == [] and stub.post_calls == []
+
+
+# ------------------------------------------------------------- where the data lives
+
+
+def test_the_snapshot_search_follows_hf_home(tmp_path, monkeypatch):
+    """HF_HOME=~/hf_cache on the eval box sent this looking in a directory that is not there."""
+    monkeypatch.delenv(cb.DATA_ENV, raising=False)
+    snap = tmp_path / "hf" / cb._HF_SUBPATH / "abc123"
+    snap.mkdir(parents=True)
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    assert cb.snapshot_dir() == snap
+
+
+def test_the_old_default_cache_stays_a_second_candidate(tmp_path, monkeypatch):
+    monkeypatch.delenv(cb.DATA_ENV, raising=False)
+    default = tmp_path / "dot_cache"
+    monkeypatch.setattr(cb, "_HF_DEFAULT_HOME", str(default))
+    snap = default / cb._HF_SUBPATH / "zzz"
+    snap.mkdir(parents=True)
+    # HF_HOME is set and its cache directory EXISTS but holds no snapshot: the old path
+    # must still be tried, and the empty root must not be taken as an answer.
+    (tmp_path / "empty_hf" / cb._HF_SUBPATH).mkdir(parents=True)
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "empty_hf"))
+    assert cb.snapshot_dir() == snap
+    # And HF_HOME outranks it when both hold a snapshot.
+    theirs = tmp_path / "empty_hf" / cb._HF_SUBPATH / "aaa"
+    theirs.mkdir(parents=True)
+
+    assert cb.snapshot_dir() == theirs
+
+
+def test_hf_home_is_first_and_the_default_is_always_present(tmp_path, monkeypatch):
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    roots = [str(r) for r in cb.hf_snapshot_roots()]
+    assert len(roots) == 2 and roots[0].startswith(str(tmp_path / "hf"))
+    assert roots[1].endswith(cb._HF_SUBPATH) and roots[0].endswith(cb._HF_SUBPATH)
+    monkeypatch.delenv("HF_HOME", raising=False)
+    assert [str(r) for r in cb.hf_snapshot_roots()] == [roots[1]]
+
+
+def test_a_missing_snapshot_names_every_root_it_tried(tmp_path, monkeypatch):
+    """A dataset that cannot be found must say where it looked, or LCB_DATA gets set by hand."""
+    monkeypatch.delenv(cb.DATA_ENV, raising=False)
+    monkeypatch.setattr(cb, "_HF_DEFAULT_HOME", str(tmp_path / "dot_cache"))
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+    with pytest.raises(FileNotFoundError) as e:
+        cb.snapshot_dir()
+    assert str(tmp_path / "hf") in str(e.value)
+    assert str(tmp_path / "dot_cache") in str(e.value)

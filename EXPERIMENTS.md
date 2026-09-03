@@ -4295,3 +4295,766 @@ lost, but this is the third time today a `pkill`-family pattern has matched the 
 The bracket-class trick (`proxy_rollout_serve[r]`) does not help when the pattern appears inside a
 longer command string that also contains it; the fix is to exclude `bash -c` and the caller's own
 pid explicitly, which `reap_a0.sh` already does and my ad-hoc loop did not.
+
+### A second blocker, found after the fix and measured: the training rollout server cannot accept text at all
+
+A0 was restarted into tmux at 13:39 by another agent, 28 minutes after this change was deployed at
+13:11, with `SELFEVO_PERIODIC_EVAL=1` — so the running trainer has the new resolver. Probing the
+server it points at showed the curve still cannot be produced, for a reason that has nothing to do
+with adapter ids.
+
+**A0's rollout sglang server is launched with `--skip-tokenizer-init`.** It therefore has no
+tokenizer, and it refuses text on both OpenAI paths:
+
+| request | result |
+|---|---|
+| `/v1/chat/completions`, model `a0_math-v31` (currently served) | **HTTP 500** `'NoneType' object has no attribute 'apply_chat_template'` |
+| `/v1/chat/completions`, model = the BASE snapshot path | **HTTP 500**, identical message |
+| `/v1/completions`, text prompt | **HTTP 400** `The engine initialized with skip_tokenizer_init=True cannot accept text prompts. Please provide input_ids...` |
+| `/v1/chat/completions`, `max_tokens=16384` | **HTTP 400** `max_completion_tokens is too large: 16384. This model supports at most 4096` |
+
+`math_bench` posts text to `/v1/chat/completions`, and so does the liveness probe, so every request
+of every evaluation point fails. The trainer itself is unaffected: it talks to this server through
+AReaL's own bridge in `input_ids`, which is exactly why the flag is set.
+
+**This retracts an inference in the section above.** That entry recorded "asking the server for an
+evicted id (`a0_math-v0`) returns HTTP 500 ... so this particular case does not reproduce the
+'unregistered id serves BASE silently' trap." A **currently served** id returns the same HTTP 500,
+and so does the base snapshot, so that probe could not distinguish an evicted id from the missing
+tokenizer. The reassuring half of that finding is withdrawn; the "fails loudly" property was never
+measured. Nothing else in that entry depends on it.
+
+**What step 50 will actually do, and it is the designed behaviour.** Every generation fails, so
+`n_graded` is 0, `assert_scored_something` raises `EmptyEvaluation`, and the point is emitted as
+`status_code=3` with a NaN accuracy and no best-val update. Loud, attributable, and not a zero —
+which is what the guards are for. It is still not a curve.
+
+**What it needs.** A server that owns a tokenizer. The eval cannot borrow the training rollout
+server as it is currently launched, so either a separate sglang instance is stood up with the same
+`--lora-paths` and WITHOUT `--skip-tokenizer-init` (and `SELFEVO_PERIODIC_EVAL_BASE_URL` pointed at
+it), or `math_bench` learns to send `input_ids`. The first is a GPU decision and is not taken here;
+the second changes the harness that produced every number this project reports, which this module
+exists specifically not to do.
+
+**Two smaller things for whoever makes that call.** The server runs `--context-length 4096`, so
+`SELFEVO_PERIODIC_EVAL_MAX_TOKENS` must be set well below it — the default 16384 is rejected
+outright, measured above, and `model_context_limit` cannot catch this because it reads the MODEL's
+config (32768) rather than the server's flag. And `~/harness4/run_a0_pe.sh:22` pins
+`SELFEVO_PERIODIC_EVAL_BASE_URL`, which by the precedence documented above suppresses the engine
+lookup entirely; it happens to be correct today only because the launcher re-allocated the same
+port 32735. Dropping that line is what makes the address survive the next restart.
+
+### A wart in the fix, found by watching the real run, and closed
+
+The step-50 line above reads `model=UNRESOLVED` — and that was wrong. `status=3` is
+`empty_evaluation`, not `adapter_unresolved` (7), so the adapter HAD resolved; every generation
+then failed on the tokenizer. The pin travelled out of `_evaluate_async` only in its return value,
+which the exception destroyed, so a point that knew exactly which weights it was probing reported
+that it did not. The failure points are precisely the ones whose weights a reader needs named.
+
+Closed by writing the pin into a caller-supplied mapping the moment it is resolved, and recovering
+it in `run_periodic_eval` on every path out. A failed point now carries
+`periodic_eval/adapter/version` and a `resolved_adapter` in its artifact; `status_code` still says
+whether resolution itself was the thing that failed, so this is not conflated with a genuine
+`adapter_unresolved`, where nothing was ever pinned and the version is honestly NaN. The two cases
+are a discriminating pair of tests.
+
+`test_periodic_eval.py` **80 passed**. `mutate_periodic_eval.py` is 31 mutations, the new one being
+"a failed evaluation forgets the adapter it was pinned to": **killed 31, survived 0, skipped 0, of 31.** The full `selfevo/tests` suite
+was re-run against a snapshot of the live tree carrying both commits: **54 failed, 1948 passed,
+4 skipped, 5 deselected, 4 xfailed** in 290.2 s, and the failure set is again identical to the
+delta-reverted baseline in the table above — nothing unique to either side, +24 passed, +0 failed.
+
+This is worth recording as a shape rather than a one-off. The guard was tested, the mutation suite
+was green at 30 of 30, and the defect still only became visible when the code met the real server —
+because every test that exercised a failure path asserted on the status code and the NaN, which
+were right, and none asserted on the field that was wrong.
+
+## The periodic evaluation can now talk to the training rollout server, and cannot be mistaken for the headline evaluation when it does
+
+### The blocker, measured rather than inferred
+
+A0's rollout server is launched by AReaL with `--skip-tokenizer-init`, which is correct for the
+trainer because the trainer speaks token ids. The consequence for the evaluation is total: the
+server holds no tokenizer, so **every** text request fails, for every model id it serves, base
+snapshot included. Measured against the live server on 2026-09-02:
+
+    POST /v1/chat/completions {"messages": [...]}  -> HTTP 500
+        "Internal server error: 'NoneType' object has no attribute 'apply_chat_template'"
+    POST /v1/completions      {"prompt": "hello"}  -> HTTP 400
+        "The engine initialized with skip_tokenizer_init=True cannot accept text prompts.
+         Please provide input_ids or re-initialize the engine with skip_tokenizer_init=False."
+
+That is why every point emitted `empty_evaluation` with a non-numeric accuracy — loudly, and
+correctly — and why the run had no validation signal at all.
+
+**The third measurement is the one that decided the design.** Sending token ids to
+`/v1/completions` does not work either:
+
+    POST /v1/completions      {"prompt": [ids...]} -> HTTP 500 "Internal server error: 'text'"
+
+The ids ARE accepted — the request gets as far as the length check, which is what produces the
+HTTP 400 for an over-budget cap — but the OpenAI *response* serialiser reads `ret["text"]`
+unconditionally and a tokenizer-less engine never produces it, so the reply cannot be built.
+`stream`, `echo` and `logprobs` were each tried and none of them changes it. The OpenAI surface of
+this server is unusable in **both** directions.
+
+sglang's native `/generate` is not. It takes `input_ids`, returns `output_ids`, routes a LoRA
+adapter by `lora_path` and returns per-token logprobs — and it is the endpoint AReaL's own bridge
+uses (`areal/v2/inference_service/sglang/bridge.py`), so this is the interface the training run is
+itself generating through rather than a second path invented for the evaluation.
+
+### The fix
+
+`math_bench.py` gains a token-id path: `server_capabilities` asks `/get_server_info` how the server
+was launched, `TokenIO` loads the tokenizer from the model snapshot on disk, applies the chat
+template locally and decodes the reply, and `generate_ids` speaks `/generate`. `build_generator` is
+the single seam that chooses, and the decoded **text** is handed to the existing extraction,
+comparison and counters unchanged — there is no second grader. `periodic_eval.py` routes its
+liveness probe the same way, which matters because liveness runs after the benchmark and a
+`LivenessUnavailable` makes the whole point NaN however well the benchmark went.
+
+The additive guarantee is proved rather than asserted. A golden recorded from the **pre-change**
+`math_bench.py` (`selfevo/tests/baselines/standalone_row_pre_token_id.json`, written by
+`make_standalone_golden.py`, which refuses to run against a tree that already has the change) holds
+the whole results row and every generation for a fixed input against a tokenising stub;
+`test_the_standalone_row_is_byte_identical_to_the_pre_change_baseline` regenerates and compares,
+for both shapes of tokenising server — one that publishes its launch flags and one that 404s.
+
+### The model-context guard could not catch this, and now there is one that can
+
+`resolve_params` clamps `max_tokens` against `model_context_limit`, which reads the model's own
+`config.json`. A `config.json` cannot see `--context-length`, because that is a **server** flag.
+A0's Qwen2.5-32B declares `max_position_embeddings: 32768` while its rollout server was launched
+with `--context-length 4096`, so the guard passes and every request is then rejected:
+
+    max_tokens=16384 -> HTTP 400 "Requested token count exceeds the model's maximum context
+    length of 4096 tokens. You requested a total of 16428 tokens: 44 from the input messages
+    and 16384 for the completion."
+
+`apply_server_context_limit` clamps against the limit the **server publishes about itself**:
+`context_length` in `/get_server_info`, which is where the launch flags are readable.
+(`/v1/models` reports the same 4096 as `max_model_len`, and is deliberately NOT read — that list
+moves between requests on a training server, and three tests pin the exact number of times it is
+fetched.) The row records `max_tokens_requested` and `server_context_limit` when the clamp fires. The budget is also now set explicitly in
+`~/harness4/run_a0_pe.sh` (`SELFEVO_PERIODIC_EVAL_MAX_TOKENS=2048`) rather than left on a default
+the server rejects. 2048 is chosen against the split rather than picked: the longest prompt in
+olympiadbench's search half is 1304 tokens, so 1304 + 2048 = 3352 fits inside 4096 for every
+problem in it.
+
+### A number from this server is not the headline number, and that is now structural
+
+The training server caps at 4096 against a headline OlympiadBench budget of 16384, and this project
+has already measured what a budget change does to a benchmark score. So:
+
+* the score series is **`trend_score`**, not `accuracy`. There is no `accuracy` series in the
+  `periodic_eval/` namespace at all, so there is nothing a reader can line up against a headline
+  accuracy by name. `test_this_namespace_publishes_no_accuracy_series_at_all` pins that.
+* every point carries `max_tokens` (the budget that **ran**, read from the row's own `params`
+  after every override and clamp, not from the configuration that asked for it),
+  `headline_max_tokens` (read from `math_bench.BENCH_OVERRIDES`, i.e. from the same table the
+  headline runs read, so it cannot drift) and `budget_matches_headline`, which is 0 whenever they
+  differ.
+* `assert_row_records_budget` refuses a results row with no budget and `assert_points_record_budget`
+  refuses the emitted mapping — a pre-condition and a post-condition, neither derived from the
+  other, both landing as `status_code=9` (`budget_unrecorded`) and NaN rather than killing a run of
+  many days.
+* the artifact carries a `token_budget` block next to the score, and the human-readable line reads
+  `trend=0.0000@max_tokens=2048 NOT-COMPARABLE-WITH-HEADLINE(16384)`.
+
+The module docstring says what the series is for: detecting a run that is not learning, and
+tracking trend against the run's own first point. It is not an estimate of the model's accuracy.
+
+### An abort is not a wrong answer, and this was scoring six of eight as one
+
+The one-sample dry run passed and the eight-sample run then produced a *plausible* 0.125. Opening
+the generations showed **six of the eight came back `finish_reason: "abort"`**, cut off after as
+little as 75 characters, and every one of them was graded as a wrong answer. `pause_generation`,
+which AReaL sends around every weight update (`fsdp_engine.py:1610`, on the trainer's own rank-0
+thread), drops the requests in flight and waits until they are gone. A curve built from that reads
+"the model gets everything wrong" when what happened is that the run interrupted its own
+evaluation.
+
+An abort is now a **failed** request: excluded from the denominator, counted in `n_failed`, and
+refused outright by `assert_scored_something` once it happens to more than half the problems. The
+same eight problems then produced `status=3 empty_evaluation` and NaN instead of 0.125.
+
+Worth stating precisely, because it changes what to expect in the real run. **Outside** the hook's
+window the evaluation is barely usable: **twelve** one-sample dry runs against the live server
+produced **one** `status=0`; the other eleven were `status=3` (`empty_evaluation`, eight) or
+`status=5` (`liveness_unavailable`, three), every one of them abort-driven. A0 steps about every
+28 s (step 50 at 14:09, step 100 at 14:32) and issues a `pause_generation` per weight update, so
+even a 32-token liveness probe straddles one more often than not.
+
+**Inside** the window it should not happen, and the argument is code-reading rather than
+measurement: every `pause_generation` call site in the tree — `fsdp_engine.py:1610` and `:1699`
+in `_update_weights_*`, `rl_trainer.py:594` in `_offload_rollout`, `rl_trainer.py:825` for AWEX —
+is synchronous on the trainer's own rank-0 thread, and that thread is blocked inside
+`maybe_run` for the whole evaluation, so it cannot be issuing one. That is the same argument the
+hook's docstring already makes about the adapter window holding still, which has been borne out:
+`assert_still_served` has never fired. If it is wrong, the evaluation now reports
+`empty_evaluation` and NaN rather than publishing a flat curve of zeros, which is the property
+that actually matters.
+
+One consequence of the budget to weigh before restarting: at `LIMIT=64` and 2048 tokens the
+evaluation blocks the trainer for minutes rather than the 12.1 s the all-failing points cost, and
+at `FREQ_STEPS=50` (about 23 minutes of training) that is single-digit percent of throughput.
+
+### Dry run against the live server
+
+One sample, full pipeline, CPU only on our side, `limit=1`, `max_tokens=2048`:
+
+    model_path resolved to .../snapshots/5ede1c97...
+    periodic eval step=50 status=0 diagnosis=1 model=a0_math-v155
+      trend=0.0000@max_tokens=2048 NOT-COMPARABLE-WITH-HEADLINE(16384)
+      live=1 maxdlogp=1.04914 best=0.0@50 13.0s (2.6% of throughput)
+
+Adapter resolved and pinned from the moving window, liveness measured through token-id logprobs,
+one problem graded, budget recorded, artifact written with its `token_budget` block. `params` in
+the row records `token_id_path: true`, the tokenizer it used, `lora_path: a0_math-v155` and
+`server_context_limit: 4096`.
+
+### Tests
+
+`selfevo/tests/test_token_id_eval.py` is 42 tests against fake sglang servers covering a
+tokenising server, a server with no tokenizer, a server that rejects the budget, and a reply that
+decodes to text the grader then scores. The tokenizer in them is real — a byte-level one built in
+`tmp_path` that round-trips arbitrary text exactly and carries a real chat template — so the encode
+and the decode under test are the library's and not a stub's.
+
+`selfevo/tests/mutate_token_id_eval.py` is 22 mutations: **killed 22, survived
+0, skipped 0 of 22.** The five the brief named are all in it and all killed:
+a decoder that drops the final token, a budget that goes unrecorded, the token-id path engaging
+against a tokenising server, a comparability flag stuck at "not comparable", and a decode failure
+that returns an empty string the grader then scores as wrong. So are the two that matter most in
+the other direction: a flag stuck at "comparable", and an abort graded as a wrong answer.
+
+`test_periodic_eval.py` **80 passed**, unchanged except that ten assertions on
+`periodic_eval/olympiadbench/accuracy` now name `trend_score` — the rename is the point, so the
+assertions moved with it and none was weakened.
+
+Full suite `pytest selfevo/tests experiments/bench` on the live tree: **75 failed, 2254 passed, 7 skipped, 4 xfailed** in 353.1 s. The
+delta-reverted baseline on the same tree at the same moment: **75 failed, 2213 passed, 7 skipped, 4 xfailed** in 326.5 s. The failure **sets** are
+**identical** — nothing unique to either side; +41 passed, +0 failed.
+
+### What the running job needs to pick this up
+
+`PeriodicEvalHook` is constructed once, at trainer start (`rl_trainer.py:485`), and
+`PeriodicEvalConfig.from_env` reads the environment once there. A0 (pid 482965, tmux `a0`) is
+therefore holding both the old module and the old environment in memory, and **cannot** pick up
+either the code change or `SELFEVO_PERIODIC_EVAL_MAX_TOKENS` without a restart. Nothing here
+restarts it; the decision is the operator's.
+
+### Correction (17:43 UTC): a healthy run at step 509 was reaped in error
+
+**I killed a working run.** The supervised reap issued at 17:42 was reasoned about a box state
+observed at 13:29. **Four hours elapsed between observing that state and acting on it**, and in
+that window the box had entirely changed: the 13:24 misconfigured run was gone, and a correctly
+configured one, launched 13:39:19 (pid 482965) via `harness4/run_a0_pe.sh`, had reached
+**step 509** and logged it at 17:42:20. `reap_a0.sh` SIGINTed it eleven seconds later; the run
+died with `KeyboardInterrupt` and `A0_EXIT=1` at 17:42:35. The reap script did nothing wrong --
+it stopped exactly what it was aimed at. The error is entirely mine: **elapsed time was never
+re-checked before a destructive action, and a stale observation was treated as current.**
+
+What survives and what does not. Saver checkpoints are intact through `globalstep499`. But that
+run carried `recover.mode=disabled` and, as established above, `recover_info` has never existed,
+so **a relaunch begins at step 1**; there is no automatic path back to 499. All ten periodic-eval
+result directories are intact.
+
+**The rule this needs:** re-read the clock and re-observe process state immediately before any
+stop, in the same command, and refuse to act on an observation older than a few minutes. A stale
+`ps` is more dangerous than no `ps`, because it reads as certainty.
+
+### The ten eval points: every one a refusal, and why
+
+The run produced a periodic-eval point at each of steps 50 through 500. **All ten refused; none
+scored.** Identical across every point:
+
+```
+status=3 (empty_evaluation)   diagnosis=-1 (unknown)   model=UNRESOLVED
+resolved_adapter=null   acc=nan   live=na   0.9% of throughput
+"periodic eval graded nothing at step N: olympiadbench: graded 0 of 64 problems (64 failed).
+ This is a broken evaluation, not a score."
+```
+
+Split was `search` at every point, as intended. Cost held at 0.0088-0.0094 of throughput (~12.1 s),
+**well under the 4% measured on CPU**, so the cadence is not the problem.
+
+**Root cause: the pinned base URL.** `run_a0_pe.sh:22` exported
+`SELFEVO_PERIODIC_EVAL_BASE_URL=http://172.28.127.18:32735/v1`. That run's rollout server actually
+served on `http://172.28.127.18:11717` and `:20475` -- **:32735 was never one of its addresses.**
+Setting the variable suppresses the engine lookup, so the eval spent four hours asking an address
+nothing was listening on, which is why the adapter never resolved and all 64 generations failed at
+every point. The pin was not "right by coincidence"; it was wrong from the first point onward.
+
+Two things this vindicates. The module **refused rather than scoring**: `status=3` with NaN, never
+a zero that would read as "the adapter is inert" and never a silent fall-through to the base model.
+A genuine zero and a broken evaluation stayed distinguishable, which is exactly what that series
+was designed for. And the port really is allocated per launch -- 17727, 21698, 17762, 18284, 11717,
+20475 and 32735 have all been it today -- so a hardcoded address is correct only for the launch
+that produced it.
+
+**Fix applied:** the pinned export is removed from `harness4/run_a0_pe.sh` and replaced with a
+comment recording why it must stay unset. `bash -n` passes. Nothing else in that launcher changed,
+and no relaunch was issued.
+
+*Still uncommitted, deliberately; this file carries another agent's uncommitted work.*
+
+---
+
+## A0 relaunch 2026-09-02 17:51Z: removing the pinned base URL made the eval WORSE, and the pin was never the bug
+
+**Run**: relaunched FRESH from step 1 at `17:51:24Z` (tmux session `a0`, `harness4/run_a0_pe.sh`),
+gated on a GPU/process observation taken in the same second. No warm start from `globalstep499`:
+`recover_checkpoint/` was empty, so a warm start would have restored LoRA weights without Adam
+moments or dataloader position -- a discontinuity the other arms will not have.
+
+### What was verified, and what refused
+
+Read from the trainer's OWN `runs/a0_math/process_env.json` (pid 650208), not the launcher text:
+`SELFEVO_PERIODIC_EVAL_BASE_URL` **absent**, and all nine other eval variables present
+(`EVAL=1, FREQ_STEPS=50, LIMIT=64, MODEL=a0_math, BASE_MODEL, STATE, OUT_DIR, MAX_TOKENS=2048,
+MODEL_PATH`), no stray `SELFEVO_*`. The line-continuation drop did not happen.
+
+The step-50 point **REFUSED. It did not score.** `status_code=6` (`endpoint_error`), `diagnosis=-1`,
+`trend_score=null`, `resolved_adapter=null`, 0 problems graded:
+
+```
+periodic eval cannot read the rollout endpoint at step 50: RuntimeError: RolloutController
+exposes no inference server address, so there is no endpoint to evaluate against.
+periodic eval failed at step 50: ValueError: no /v1 endpoint: neither the trainer's rollout
+engine nor SELFEVO_PERIODIC_EVAL_BASE_URL supplied one, and there is no default to guess.
+```
+
+`base_url_from_rollout()` reads `rollout.addresses` or `rollout._engine.addresses`. `.addresses`
+lives on `RemoteInfEngine` (`areal/infra/remote_inf_engine.py:439`), which runs in scheduler-created
+engine workers. A0's trainer holds a **`RolloutController`**
+(`areal/infra/controller/rollout_controller.py:75`), which owns `inf_engine` as a *class* and reaches
+engines by RPC. It has neither attribute. **The discovery path has never worked in this deployment**,
+so removing the pin removed the only working source of the address.
+
+### The previous diagnosis was wrong: the pin was CORRECT
+
+`run_a0_pe.sh` asserts the run "never served on" `:32735` and that the port "is allocated afresh on
+every launch". Both are false, and the evidence is in that run's own log:
+
+* the reaped 13:39 run's trainer was itself generating against `172.28.127.18:32735/generate`
+  (108 occurrences in `train.log.1788371484`), so `:32735` WAS its live sglang server;
+* today's relaunch landed on `:32735` again -- `/proc/<sglang pid>/cmdline` reads
+  `--host 172.28.127.18 --port 32735`, and `curl http://172.28.127.18:32735/v1/models` returns the
+  base snapshot plus `a0_math-v53`, `-v54`, `-v55`. The ports quoted in the comment as rival values
+  for it (`17727` etc.) are **worker RPC ports**, published at
+  `/tmp/areal/name_resolve/ubuntu/a0_math/t1/workers/<role>/<rank>/ENTRY`; `17727` is currently
+  `proxy-rollout`. Two different things were compared as if they were one.
+
+The ten refusals of the 13:39 run were `status=3 empty_evaluation` -- *connected, graded 0 of 64* --
+not `status=6`. A dead address gives 6. That run's `process_env.json` carries
+`SELFEVO_PERIODIC_EVAL_BASE_URL` but **no `MAX_TOKENS` and no `MODEL_PATH`**; both were added to the
+launcher afterwards. Without `MAX_TOKENS` the module default 16384 exceeds the server's
+`--context-length 4096` and every request is rejected -> 0 graded -> status 3. That, not the URL,
+explains the ten refusals, and the fix for it was already in place before this relaunch.
+
+### Consequences
+
+* Items "trend score / budget / adapter version / liveness / diagnosis / budget counters" are
+  **unanswerable** for this run: nothing generated. `n_graded=null`, `adapter/version=null`.
+* The **throughput cost of a real point is still unmeasured.** This point cost 0.00099 s
+  (`throughput_frac=7.4e-07`), even less informative than the 0.9% on record; both failed instantly.
+  The `0.87%` on the old points reproduces exactly as `12.09 s / (50 x 27.8 s)`.
+* **Adapter-version advance is untestable** while the endpoint is unresolved, though `/v1/models`
+  shows versions advancing (v53 -> v55) on the live server, so weights are being republished.
+
+### Two things that are healthy
+
+* **Step 24 did not wedge**, judged on utilisation: GPUs ran 100/100/~80/~70% through steps 23-24,
+  dropped to 0% for a single 20 s sample at `18:09:16Z` (the step-25 saver write, memory still held --
+  the exact shape that read as a deadlock before), and were back to 100/100/77/85% by `18:09:36Z`.
+  Step 26 completed `18:09:57Z`. Cadence 27.4 s/step vs 27.8 s/step for the reaped run.
+* Preflight passed 0-failed; `Model creation and loading time: 230.90s` vs `231.20s` previously.
+
+### New, unrelated: W&B is discarding this run's first 509 steps
+
+The fresh run reuses the W&B run id `a0_math_t1_train` and logs `wandb: Resuming run t1`, so W&B
+holds `current step 509` from the reaped run and answers every commit with
+`Tried to log to step N that is less than the current step 509 ... this data will be ignored`.
+**Every metric of the fresh run below step 509 -- including the eval points -- is dropped by W&B**,
+though `runs/a0_periodic/step*/results.json` on disk is unaffected. A fresh arm needs a fresh run id.
+
+*Appended by the relaunch agent; left uncommitted deliberately -- this tree holds ~78 uncommitted
+paths from other agents, several already staged, so a bare `git commit` would sweep them in.*
+
+## 2026-09-02, later: the endpoint was never discoverable, and the tracker id was never fresh
+
+Two defects, both fixed before A0 was restarted, both proved against fakes and mutation-tested.
+
+### 1. `base_url_from_rollout` read an attribute that is not on the object it is given
+
+`RemoteInfEngine` has `.addresses`. A0's trainer holds a **`RolloutController`**, which does not,
+so the automatic path had **never once** produced an address on this stack -- every periodic
+evaluation this feature ever ran either used a pinned `SELFEVO_PERIODIC_EVAL_BASE_URL` or
+refused with `endpoint_error`. What the controller does hold is `server_infos`, the
+`LocalInfServerInfo(host, port, process)` list its own `launch_server` returned:
+`host = gethostip()` -> `172.28.127.18`, `port = find_free_ports(1)[0]` -> the port in use.
+
+**The pin was not wrong.** Correcting the earlier diagnosis: the ports quoted against it
+(16866, 17672, 17909) come from `/tmp/areal/name_resolve/<user>/<exp>/<trial>/workers/`, which
+holds the RPC ports of the worker PROCESSES. The sglang HTTP port is a different thing; it is
+not recorded in name-resolve at all on this stack (`gen_servers` is written only by the v1
+launcher, and the v2 inference service launches from the controller). Verified on the live
+run at 18:46Z: `endpoint_from_name_resolve(...)` -> ``, `endpoint_from_process_table(...)` ->
+`172.28.127.18:32735`, which `/v1/models` confirms is serving `a0_math-v76`.
+
+`resolve_endpoint()` replaces it and walks four sources, recording which one answered:
+
+| code | source | authority |
+|---|---|---|
+| 1 | `configured` | `SELFEVO_PERIODIC_EVAL_BASE_URL`, still wins outright |
+| 2 | `engine` | `.addresses` / `._engine.addresses` |
+| 3 | `server_infos` | the controller's own launcher return value (the one that answers here) |
+| 4 | `name_resolve` | this trial's `gen_servers` record -- **never** `workers/` |
+| 5 | `process_cmdline` | the serving process' `--host/--port`, fenced by trial ownership |
+
+The two scanning sources are skipped entirely when the process cannot name its experiment and
+trial, because an unscoped scan of a box that runs several trials is a guess. The process scan
+attributes a server through its ancestry (launch_server -> rpc_server(rollout) -> bash ->
+trainer) and **refuses** when one trial owns two servers at different addresses. Nothing falls
+back to localhost; a total failure is `status_code=10` (`endpoint_undiscovered`), which is a
+different code from `endpoint_error=6` so "I don't know where the server is" cannot hide
+behind "the server didn't answer". Every point now carries
+`periodic_eval/endpoint/port` and `periodic_eval/endpoint/source`, and the artifact carries
+`{"base_url": ..., "source": ...}`.
+
+### 2. every metric of the fresh run was being discarded
+
+`StatsLoggerConfig.wandb.id_suffix` defaults to the constant `"train"`, so the run id is
+`<exp>_<trial>_train` for **every** launch; with `resume="allow"` the fresh run resumed the old
+one and W&B answered 70 of 70 commits with `Tried to log to step N that is less than the
+current step M ... this data will be ignored`. `selfevo/run_identity.py` appends a
+launch-unique token unless `SELFEVO_WANDB_RUN_ID` names an id to resume, and two independent
+checks fire when that has not worked: `assert_id_is_fresh` at startup (a launch that did not
+ask to resume must come back at step 0) and `assert_step_advances` on the first commit (the
+first write must not land below the tracker's step -- which catches an *intended* resume that
+rewound, the case intent alone cannot cover).
+
+### Proof
+
+* `test_periodic_eval.py` + `test_run_identity.py`: **114 passed** (33 of them new).
+* Full `selfevo/tests`: patched **54 failed / 2028 passed / 4 skipped / 4 xfailed**; pristine
+  **54 failed / 1995 passed / 4 skipped / 4 xfailed**. The failure SETS are identical
+  (`comm` of the sorted `FAILED` lines: empty both ways), so the 54 are pre-existing and this
+  delta adds 33 passes and no regressions.
+* `mutate_periodic_eval.py`: **44 killed / 1 survived / 0 skipped of 45**, including every
+  candidate in the brief -- localhost fallback, an unchecked address on failure, the recorded
+  address always reporting the configured value, the collision check passing on a past step.
+* `mutate_run_identity.py`: **11 killed / 0 survived / 0 skipped of 11**.
+
+### One pre-existing hole, newly VISIBLE rather than newly created
+
+`mutate_periodic_eval.py` had a row whose anchor became ambiguous when the token-id liveness
+path was added beside the chat one, so it had been reported as `SKIP` -- i.e. that mutation had
+never run. Split into two rows: the chat path is killed, and **the token-id path SURVIVES**.
+Nothing in the suite constrains `measure_liveness`' token-id branch against returning "no
+difference" instead of raising `LivenessUnavailable` when the endpoint sends no logprobs. That
+is the branch A0 actually uses (`--skip-tokenizer-init`). Not fixed here -- it is outside these
+two defects -- but it is now a SURVIVOR in the harness rather than a hidden SKIP.
+
+*Appended by the endpoint/tracker-id agent; left uncommitted deliberately, for the same reason
+the section above it was: this tree holds ~78 uncommitted paths from other agents.*
+
+## The adapter-liveness guard could not fail: the base model, compared with itself, was reported LIVE (2026-09-02 20:40--21:13 UTC)
+
+**The two control numbers first.** Production `measure_liveness`, unmodified, against A0's own
+rollout server (`http://172.28.127.18:32735/v1`), while `a0_math/t1` was training:
+
+| control | what is compared | `max_abs_dlogprob` | `is_live` |
+|---|---|---|---|
+| **NEGATIVE** | base vs base -- **identical weights, no adapter** | **0.978284** | **1 (LIVE)** |
+| **POSITIVE** | `a0_math-v116` vs base | **1.007238** | 1 (LIVE) |
+
+The guard was **broken**. It called the base model live against itself, at a value that does
+not separate from a real adapter. Every liveness verdict this project had recorded was
+uninformative, including the pair that was said to resolve the base-model concern.
+
+### What the metric actually was, and what 1.04 was the maximum of
+
+Six probe prompts. For each, one greedy completion (`temperature=0`, `max_tokens=32`) from the
+adapter id and one from the base id, both through the same sglang endpoint. Per-token logprobs
+of each side's OWN chosen tokens were then `zip`-ed and subtracted: `max |a_lp[i] - b_lp[i]|`
+over 6x32 = 192 positions.
+
+The two streams are independent generations. Once greedy diverges, index *i* holds **different
+tokens on the two sides**, so the metric subtracts the logprob of one token under one model
+from the logprob of a *different* token under the other. That is not a distribution difference.
+
+The negative control caught it happening. On *"Prove that the sum of the first n odd positive
+integers equals n^2"*, base-vs-base produced `\(n\)` on one call and `\( n \)` on the other; at
+position 26 the metric differenced `a = -0.9837` against `b = -0.0028`, giving `0.9808`.
+
+**The ceiling.** There is no mathematical bound on `|dlogprob|`, but there is a strong practical
+one, and the value was sitting on it. Divergence only happens at *near-ties*: the losing branch
+sits near `log(0.5) = -0.693` and the winning branch near `0`. So the maximum clusters around
+0.7--1.1 whatever the adapter is doing, which is why it moved by 1e-5 across fifty steps.
+
+### A0's own record already showed the metric following a coin flip, not the weights
+
+From `~/runs/a0_periodic/step*/results.json`:
+
+| step | adapter | `greedy_differ_frac` | `max_abs_dlogprob` | `is_live` |
+|---|---|---|---|---|
+| 50  | `a0_math-v51`  | 0.1667 | 1.041274 | 1 |
+| 100 | `a0_math-v101` | 0.1667 | 1.041258 | 1 |
+| 150 | `a0_math-v151` | 0.0000 | **0.116725** | 1 |
+
+`greedy_differ_frac = 0.1667` is exactly 1 of 6 prompts -- the same base-vs-base nondeterminism
+reproduced above, not an adapter effect. When the flip did not happen (step 150) the
+"difference" fell **nine fold**, on an adapter that had only trained *further*. The metric was
+reporting whether a coin came up heads.
+
+### A second, independent defect: the server is bimodal
+
+Scoring one fixed 61-token sequence on the base route 24 times returned **exactly two distinct
+logprob vectors** (22/24 and 2/24) differing by **0.605382** nats at a single position. It is
+not LoRA leakage: the deviant vector is equidistant from the adapter (0.606) and from the modal
+base (0.605). Consequence: `live_eps = 1e-4` was never usable, because the same-weights noise is
+the same size as the adapter signal (0.40--1.53 across versions).
+
+### Forced scoring is the sound primitive
+
+sglang `/generate` with `max_new_tokens=0, return_logprob=True, logprob_start_len=0` scores a
+FIXED sequence and returns `meta_info.input_token_logprobs`. Same tokens, same contexts, both
+sides. Measured on A0's server, pooled over 6 prompts / 465 positions:
+
+* base vs base: **exactly 0.0** on 7 independent sweeps (0/465 positions above 1e-4);
+* adapter vs base: pooled mean **0.05251**, max 0.586688, **378/465** positions above 1e-4.
+
+### The repaired guard passes both controls
+
+`measure_liveness` was rewritten (by the agent holding that file) to generate nothing: it scores
+each side twice per prompt, takes the **minimum** cross-pair difference as signal and the
+**maximum** within-side difference as an in-band negative control, and decides on the **mean**
+over positions rather than the maximum. Verified against A0's live server:
+
+| control | `mean_abs_dlogprob` | `noise_mean` | `is_live` |
+|---|---|---|---|
+| NEGATIVE base vs base, 6 repeats | **0.00000000** (all 6) | 0.0--0.00626 | **0/6 live** |
+| POSITIVE `a0_math-v151`, 6 repeats | 0.04456--0.05342 | 0.0--0.00626 | **6/6 live** |
+
+Flake hunt, 39 negative controls on the intermediate 3-scoring version: **1 FALSE LIVE**
+(`signal_mean = 0.0095187`). On the final 4-scoring min-cross version: **0 FALSE LIVE in 27**,
+with same-weights `signal_mean` pinned at exactly 0.0 because the minimum always finds a clean
+pairing. The min-cross construction is what neutralises the bimodality.
+
+### OPEN, and the one actionable item: `DEFAULT_LIVE_EPS` is still 1e-4
+
+The worst same-weights pooled mean measured is **0.00952**; the weakest real adapter signal is
+**0.0446**. `1e-4` is 95x below the floor. The residual failure mode is both scorings of one
+side landing on the deviant path (p ~ 0.083^2 ~ 0.7% per prompt), which yields `signal_mean`
+~0.0095 with `noise_mean` 0 -- a false LIVE. Over a 2000-step run that is order one to two
+false verdicts. **Recommend `DEFAULT_LIVE_EPS = 0.02`** (2.1x above the measured floor, 2.2x
+below the weakest signal). Not applied here: `selfevo/periodic_eval.py` was being edited by
+another agent throughout this session (four distinct revisions observed between 20:54 and
+20:59 UTC), and a concurrent whole-file write would have been a lost update.
+
+### Tests and mutation testing
+
+`selfevo/tests/test_liveness_negative_control.py` -- 13 pass, **1 red on purpose**
+(`test_the_default_epsilon_clears_the_measured_same_weights_noise_floor`, which stays red until
+the constant above is raised). The negative control is now a test, not something an agent has
+to remember to run.
+
+`selfevo/tests/mutate_liveness_negative_control.py` -- **8/8 mutations caught**, run against a
+private copy of the package in scratch so the shared checkout is never mutated: comparing a
+distribution against itself; defaulting the verdict when nothing was compared; routing on the
+CONFIGURED adapter name rather than the served one; deciding on a maximum one position can
+carry; dropping the in-band control; reporting live unconditionally; reporting the noise as
+zero without measuring it; going back to generating.
+
+### Evaluation cost: rising, and NOT for the reason expected
+
+| step | benchmark s | total eval s | throughput | mean gen chars | finish mix | implied step s |
+|---|---|---|---|---|---|---|
+| 50  | 88.7  | 104.2 | 7.8%  | 2289 | 61 stop / 3 length | 26.7 |
+| 100 | 123.9 | 139.5 | 10.3% | 2336 | 61 stop / 3 length | 27.1 |
+| 150 | 155.4 | 177.4 | 12.9% | 2287 | 61 stop / 3 length | 27.5 |
+
+**The "longer generations" hypothesis is falsified.** Generation length is flat, the
+finish-reason mix is identical, `n_graded = 64` and `n_failed = 0` at all three points, and
+there are **zero** aborts in the log. Training is not slowing either (implied step time
+26.7 -> 27.5 s). The growth is entirely in the benchmark generation phase: +35.2 s then +31.5 s
+per 50 steps. The liveness probe is not the driver (15.5 / 15.6 / 22.0 s) and after the rewrite
+it is prefill-only and cannot grow with completion length at all.
+
+Three points cannot distinguish linear from saturating, and step count and wall-clock are
+collinear here (step time is flat), so this does **not** identify the mechanism. What it does
+say is that nothing observed so far bounds it: on the observed slope the cadence reaches 100%
+of throughput near step ~1900.
+
+**Recommended cap (cadence and `limit` deliberately untouched):** bound the cost rather than the
+work. Before each evaluation, project its duration from the previous point's measured seconds
+and the run's measured step time; if the projected `throughput_frac` exceeds a configured
+ceiling (0.15 is the natural first value, just above the current 0.129), skip that point and
+emit a distinct status code so the gap is visible on the curve rather than silent. That bounds
+the cost without changing what an evaluation measures, and it degrades to today's behaviour
+while the projection stays under the ceiling.
+
+*Appended by the liveness-control agent. `EXPERIMENTS.md` left UNCOMMITTED deliberately: it
+already carries 465 uncommitted lines from other agents, and committing it would take their
+work with mine. The two test files and `paper_src/results.tex` are committed with an explicit
+pathspec.*
+
+---
+
+## 2026-09-02 -- the liveness guard REPAIRED, and the cost extrapolation refuted by its next point
+
+A second agent worked this guard concurrently; the section above is theirs. The diagnosis was
+reached independently and the two agree in every number. What is new below is (a) the repaired
+implementation, which the section above did not have -- it shipped the broken probe with a
+deliberately red test -- (b) a second failure mode the first repair design still had, and
+(c) a **fourth** cost point that refutes the extrapolation recorded above.
+
+### The two controls, before and after the repair
+
+Both measured against A0's live rollout server (`http://172.28.127.18:32735/v1`,
+Qwen2.5-32B-Instruct + LoRA r32) while A0 was training.
+
+| control | shipped probe | repaired probe |
+|---|---|---|
+| **NEGATIVE** -- base model vs ITSELF, no adapter anywhere | `is_live=1`, max 0.9783, mean 0.01329, `greedy_differ_frac` 0.167 | `is_live=0`, mean **0.0**, max **0.0**, noise 0.0 |
+| **POSITIVE** -- newest served adapter vs base | `is_live=1`, max 1.0072, mean 0.03735 | `is_live=1`, mean **0.0488**, max 0.767, noise 0.0 |
+
+The shipped probe's two controls do not separate: 0.978 against 1.007. Every liveness verdict
+this project recorded before today was that non-separation, not a measurement.
+
+Repeated 10x each, alternating, across weight syncs: **negative 8/8 inert** (2 aborted by
+`pause_generation`, correctly refused as `LivenessUnavailable` rather than defaulted);
+**positive 10/10 live**, signal mean 0.0427-0.0535 against noise 0.0-0.0058, a margin of ~8x.
+
+### The run's own record shows the old metric tracking a coin flip, not the weights
+
+Read back from `runs/a0_periodic/step*/results.json`:
+
+| step | `greedy_differ_frac` | `max_abs_dlogprob` |
+|---|---|---|
+| 50  | 0.167 | 1.04127 |
+| 100 | 0.167 | 1.04126 |
+| 150 | 0.0   | 0.11673 |
+| 200 | 0.0   | 0.10187 |
+| 250 | 0.167 | 1.04128 |
+
+Five points, two values, and a perfect correspondence: the metric is 1.0413 on every point
+where greedy diverged on 1 of 6 probes and 0.10-0.12 on every point where it did not. Step 250
+is the decisive one -- it comes AFTER two points at 0.10 and jumps back to 1.04128, so the
+series is not even monotone in training progress. It is a two-state indicator of whether an
+argmax flipped at a near-tie.
+
+The "difference" is 1.041 exactly when greedy text diverged on 1 of 6 probes and 0.10-0.12
+when it did not -- a ten-fold move in the metric driven by whether the argmax flipped at a
+near-tie, while the adapter only ever trained further. The 1.04127/1.04126 agreement to five
+decimals that prompted this investigation is two coin flips landing the same way on the same
+probe, not two measurements of two sets of weights.
+
+### The server has a second numerical path, so no fixed threshold could have worked
+
+Scoring one fixed 61-token sequence on the base route 24 times returned **exactly two
+distinct** logprob vectors: 22 identical, 2 differing by 0.605 nats at a single position. The
+deviant vector is not the adapter's (0.606 from it, 0.605 from the modal base), so this is a
+kernel/batch-shape path, not LoRA leakage. 0.605 is **larger** than the 0.397 a 130-version
+adapter produced on the same sequence. A threshold on an absolute logprob difference is
+therefore measuring the server.
+
+### What the repaired probe does
+
+`selfevo/periodic_eval.py`: `measure_liveness` **generates nothing**. It scores the fixed
+probe prompts through sglang's `/generate` with `max_new_tokens=0, return_logprob=True,
+logprob_start_len=0` and reads `input_token_logprobs`, so every compared position is the same
+token in the same context on both sides. Each side is scored **twice**; the signal is the
+smallest of the four adapter-vs-base pairings and the control is the largest of the two
+same-weights pairings, and `is_live = mean_signal > mean_noise + live_eps`.
+
+Two samples per side is not decoration. With one sample per side the deviant scoring lands on
+the signal side about one time in ten: **1 of 10 negative controls came back `is_live=1` with
+mean 0.0140** against a noise of 0.0. Two samples put that deviation into the control, where
+it belongs.
+
+New metric keys `periodic_eval/liveness/noise_max_abs_dlogprob` and `.../noise_mean_abs_dlogprob`
+carry the control beside the signal. `greedy_differ_frac` is **removed** and replaced by
+`prompts_live_frac`: the negative control measured `greedy_differ_frac` at 0.167 on identical
+weights, so it was reading the server's batching nondeterminism. `DEFAULT_LIVE_EPS` 1e-4 ->
+0.01, above the 0.00952 same-weights floor measured above and below the 0.0427 weakest adapter
+signal measured here.
+
+### Mutation test: 10/10 caught (and 8/8 on the other agent's independent harness)
+
+`/home/ubuntu/liveness_control/mutate_run.py`, run against a private mirror of the package so
+the shared checkout is never mutated. Baseline green at 159 tests.
+
+| # | mutation | caught by |
+|---|---|---|
+| M1 | compare the adapter with ITSELF | 9 tests |
+| M2 | max over an empty set returns a default instead of refusing | `test_a_probe_that_compared_nothing_refuses` |
+| M3 | route the CONFIGURED adapter name, not the served one | `test_generation_uses_the_resolved_id_and_never_the_configured_one` |
+| M4 | verdict from a fixed threshold, ignoring the in-band control | 2 tests |
+| M5 | one sample per side | 6 tests |
+| M6 | truncate to the shorter vector instead of refusing (THE ORIGINAL BUG) | `test_liveness_refuses_to_compare_positions_that_are_not_the_same_positions` |
+| M7 | send a `lora_path` for the base model too | 10 tests |
+| M8 | generate tokens instead of scoring | 3 tests |
+| M9 | control is the SMALLEST same-weights pairing | 5 tests |
+| M10 | signal is the LARGEST cross pairing | `test_two_deviant_scorings_pulling_opposite_ways_are_still_not_an_adapter` |
+
+**M10 survived the first pass.** Two deviant scorings pulling in opposite directions make the
+widest cross pairing wider than either side's own spread, so a probe reporting its widest
+pairing calls identical weights live even with the control measured correctly. Nothing in
+either agent's suite caught it; the test above was written for it and it is now caught. The
+first mutation pass is the only reason that hole is closed.
+
+The other agent's committed `selfevo/tests/mutate_liveness_negative_control.py` also reports
+**8/8 caught** against this implementation, and 13 of its 14 tests passed unmodified -- the
+14th pinned `DEFAULT_LIVE_EPS`, now satisfied.
+
+### Evaluation cost: the extrapolation above is refuted by the very next point
+
+| step | benchmark s | liveness s | total s | throughput | mean gen chars | finish mix | implied step s |
+|---|---|---|---|---|---|---|---|
+| 50  | 88.7  | 15.5 | 104.2 | 7.8%  | 2289 | 61 stop / 3 length | 26.7 |
+| 100 | 123.9 | 15.6 | 139.5 | 10.3% | 2336 | 61 stop / 3 length | 27.1 |
+| 150 | 155.4 | 22.0 | **177.4** | **12.9%** | 2287 | 61 stop / 3 length | 27.5 |
+| **200** | **122.9** | **15.7** | **138.6** | **10.1%** | **2323** | **62 stop / 2 length** | **27.4** |
+| **250** | **117.4** | **15.7** | **133.1** | **9.8%**  | **2397** | **60 stop / 4 length** | **27.2** |
+
+**The cost is not climbing. It peaked at step 150 and has fallen at each of the two points
+since.** The section above projected "100% of throughput near step ~1900" from the first three
+points; points four and five refute that projection outright -- the benchmark phase went
+88.7 -> 123.9 -> 155.4 -> 122.9 -> 117.4 s and the throughput share 7.8 -> 10.3 -> 12.9 -> 10.1
+-> 9.8%. Three points of a rise were not a trend.
+
+**The "longer generations" hypothesis is falsified** and now on five points: generation length
+is flat and, if anything, slightly LONGER at the cheapest point (2289 / 2336 / 2287 / 2323 /
+2397 mean chars against 104 / 140 / 177 / 139 / 133 s), the finish-reason mix is unchanged, all
+five points graded 64 of 64 with `n_failed=0`, there are zero aborts in any graded set, and step
+time is flat (26.7 -> 27.2 s). The workload is identical at every point; only wall clock moves.
+What moves it is contention with A0's own rollout traffic on the shared sglang server, which is
+not a function of training progress.
+
+**No cap is warranted on this evidence, and none was added.** Cadence and `limit` untouched, as
+instructed. The cost is bounded by a workload that does not change: 64 problems at a
+server-clamped 2048 tokens, which is a fixed amount of decoding whatever the policy has learned.
+If a bound is wanted anyway, the right one is a wall-clock ceiling per point rather than a
+cadence change -- **300 s**, roughly 1.7x the observed maximum of 177.4 s and 2.2x the five-point
+mean of 138.6 s -- emitted as a distinct status code and a NaN so a skipped point is visible on
+the curve rather than silent. That bounds the tail without changing what an evaluation measures.
+
+The repaired probe additionally makes the liveness half of that cost **fall and stop varying**:
+15.5 / 15.6 / 22.0 / 15.7 s of generation becomes a measured **4.13 s** of prefill-only scoring
+(5 runs on the live server: 6.84, 3.46, 3.43, 3.46, 3.45 s), and being decode-free it cannot
+grow with completion length at all.
+
+### Files
+
+`selfevo/periodic_eval.py`, `selfevo/tests/test_periodic_eval.py`,
+`selfevo/tests/test_token_id_eval.py`. Full suite for the three liveness files: 159 passed.
+A0 (`a0_math/t1`, PID 736523) was not touched; it holds its own already-imported copy of the
+module, and its step-200 point at 21:25 UTC still ran the old probe.
+
+*Appended by the second liveness agent. `EXPERIMENTS.md` left UNCOMMITTED deliberately: it
+carries 600+ uncommitted lines from other agents and committing it would take their work with
+mine.*

@@ -50,6 +50,7 @@ from selfevo.routing.feedback import (
     DecisionOutcome,
     LearningRouter,
 )
+from selfevo.tests.conftest import mode_of
 
 GRANS = tuple(Granularity)
 RATES = (0.0, 0.25, 0.5, 0.75, 1.0)
@@ -69,12 +70,6 @@ def ctx(p=0.5, *, teacher=False, uid=None, gran=Granularity.SAMPLE, g=4, extra=N
         solve_rate=p, group_size=g, granularity=gran, has_teacher=teacher,
         unit_id=uid, extra=feats(**kw) if extra is None else extra,
     )
-
-
-def mode_of(d):
-    """The single mode a hard routing decision selected."""
-    assert len(d.weights) == 1, f"expected a one-hot decision, got {d.weights}"
-    return next(iter(d.weights))
 
 
 def outcome(mode, value, unit_id, *, batch_id="b0", cost=1.0):

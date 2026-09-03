@@ -1,0 +1,1528 @@
+#!/usr/bin/env python3
+"""Dump per-GROUP LoRA gradient sketches from a checkpoint and a batch of rollouts.
+
+This is the GPU half of the interference probe, and it deliberately knows nothing about
+clusters. It computes, for each GRPO group in one batch:
+
+* a linear sketch of the gradient of that group's GRPO loss w.r.t. the LoRA parameters;
+* a linear sketch of the gradient of the NEGATIVE LOG-LIKELIHOOD of the PROMPT tokens only,
+  which is the ELREA (arXiv 2502.00089) feature -- ELREA clusters instructions on
+  prompt-token gradients and already does cluster -> per-cluster LoRA -> merge in SFT, so
+  "are behavioural clusters different from prompt-gradient clusters?" is the ablation that
+  decides whether the rollouts are needed at all;
+* the MEDS behavioural vector (latter-half layer-wise logits at the answer token);
+* the group's task label, size and mean reward;
+* and, for the first few groups, the FULL unprojected gradient, so the sketch can be
+  validated instead of assumed.
+
+Clustering happens in ``interference_analyze.py``, on CPU, from this file alone. The split
+is not organisational: a cluster's gradient is the SUM of its members' gradients when every
+group's loss carries the same denominator, and the sketch is linear, so **every partition is
+free once the dump exists**. Four partitions, one pass over the batch. It also puts the
+scikit-learn and hdbscan dependency on the analysis side, which matters because the venv that
+runs training has neither and must not acquire them.
+
+WHY THE PROMPT-TOKEN MASKING IS DONE HERE. The trainer's loss path cannot produce it: the
+GRPO loss is masked to RESPONSE tokens, so its gradient restricted to prompt positions is
+identically zero and clustering on it would cluster noise. The ELREA feature is a different
+loss -- plain next-token NLL on the prompt -- so it is built in this script rather than by
+touching the trainer. Cost: one extra backward per group, i.e. the dump does two backward
+passes per group instead of one.
+
+Usage::
+
+    python -m selfevo.cluster_lora.interference_dump \
+        --model /path/to/hf/checkpoint --rollouts batch.jsonl --out dump.npz \
+        [--adapter /path/to/trained/lora] [--sketch-dim 8192] [--full-grad-groups 8]
+
+Runs under the TRAINING venv (torch, transformers, peft). It needs neither scikit-learn nor
+hdbscan, by design.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import time
+from dataclasses import dataclass, field
+from typing import Any, Sequence
+
+import numpy as np
+
+from .features import LayerLogitExtractor, answer_token_index, meds_feature
+from .sketch import SketchPlan, sketch_torch
+
+__all__ = [
+    "DumpConfig",
+    "Group",
+    "LOGIT_PEAK_BYTES_PER_ELEMENT",
+    "LogitsBudgetExceeded",
+    "assert_logits_fit",
+    "chunk_tokens_for_budget",
+    "group_backward",
+    "group_losses",
+    "load_rollouts",
+    "logits_peak_bytes",
+    "run_dump",
+]
+
+#: Transient bytes per (token, vocab-entry) inside the chunked unembedding, DERIVED not
+#: measured, and deliberately an upper bound.
+#:
+#: Per chunk the head holds the bf16 matmul output (2), the fp32 log-softmax output (4), and
+#: during the recomputed backward the gradient of that output (4) and of the logits (2):
+#: 12 bytes per element. It is exposed as ``--logit-peak-bytes`` so a box that measures
+#: something different can say so rather than work around the constant.
+#:
+#: The ORIGINAL unchunked path cost 10 bytes per element over the WHOLE group at once
+#: (bf16 logits 2, the ``.float()`` copy 4 with the bf16 node still alive, and the
+#: log-softmax output 4), which is 14.20 GB for the largest group of the probe batch at
+#: vocab 152,064 -- against 61.02 GB of resident weights on an 80 GiB card. That is the OOM
+#: this constant exists to make predictable.
+LOGIT_PEAK_BYTES_PER_ELEMENT = 12
+
+#: Default ceiling on the TRUNK's retained activations for one forward.
+#:
+#: Under gradient checkpointing the decoder keeps one hidden-state tensor per layer, so the
+#: cost is ``layers x tokens x hidden x 2`` bytes -- for a 64-layer 5120-wide model that is
+#: 655 KB per token, and the probe batch's worst group of 16,712 padded tokens would retain
+#: 10.95 GB on top of 61.02 GB of weights. Fixing the unembedding alone leaves that as the new
+#: binding constraint, which is why the trunk is sub-batched over SEQUENCES as well.
+DEFAULT_ACTIVATION_BUDGET_BYTES = 6 * 1024**3
+
+#: CEILING on the chunked head's transient memory when no budget is given. It is a ceiling
+#: and not the value used: the actual budget is derived from MEASURED free memory (see
+#: :func:`resolve_logits_budget`), because a fixed default is wrong on any card whose free
+#: memory differs from the one it was chosen for.
+#:
+#: MEASURED 2026-09-02, and this is why the derivation exists. At 4 GiB the chunk is ~2,190
+#: tokens at vocab 152,064 -- inside the 2,048-4,096 band the length distribution calls for --
+#: but on an 80 GB card already holding 61 GB of weights only ~4.60 GB is free at check time
+#: against a 6.44 GB requirement, so the guard refused group 2 of 128. Group 2 has 8,824
+#: padded tokens, which is p75 of the batch (p75 = 8,856) and NOT the 16,712-token outlier:
+#: because the per-chunk requirement is near-constant across groups, a fixed 4 GiB would have
+#: refused the majority of the batch. That is a systematic misconfiguration, not a tail case.
+#:
+#: The derived budget also turns out to be the better operating point for a different reason:
+#: a smaller chunk fits in the headroom a concurrent training run leaves, so the probe does
+#: not need the card to itself.
+DEFAULT_LOGITS_BUDGET_BYTES = 4 * 1024**3
+
+
+#: Multiple of the head's estimate that must be free before a forward is allowed.
+#:
+#: Above 1 because the estimate covers the HEAD only and the decoder's activations share the
+#: same pool. Defined once because the guard and the derived default must agree: a default
+#: computed at one headroom and checked at another would refuse the very plan it just chose.
+DEFAULT_HEADROOM = 1.5
+
+
+def satisfying_plan(
+    free_bytes: int,
+    *,
+    vocab: int,
+    headroom: float = DEFAULT_HEADROOM,
+    peak_bytes: int = LOGIT_PEAK_BYTES_PER_ELEMENT,
+) -> tuple[int, int]:
+    """The largest budget and chunk that would pass the free-memory check.
+
+    Exists so the refusal can print the value that FIXES it rather than leaving the reader to
+    derive it. Every number needed is already in hand -- free memory, the headroom factor, the
+    vocabulary and the per-element cost -- and the run that first hit this guard had to work
+    out 2.5 by hand from the message.
+
+    Args:
+        free_bytes: Free device memory at the moment of the check.
+        vocab: Vocabulary size.
+        headroom: Multiple of the estimate that must be free.
+        peak_bytes: Bytes per (token, vocab-entry).
+
+    Returns:
+        ``(budget_bytes, chunk_tokens)``. ``chunk_tokens`` is 0 when not even one token fits,
+        which no setting can repair and which the caller must say rather than suggest.
+
+    Raises:
+        ValueError: On a non-positive argument.
+    """
+    if free_bytes < 0 or vocab <= 0 or headroom <= 0 or peak_bytes <= 0:
+        raise ValueError(
+            f"free_bytes must be >= 0 and the rest positive; got {free_bytes}, {vocab}, "
+            f"{headroom}, {peak_bytes}"
+        )
+    max_peak = int(free_bytes / headroom)
+    return max_peak, int(max_peak // (int(vocab) * int(peak_bytes)))
+
+
+def _gib(n: float) -> float:
+    """Bytes as GiB, floored to one decimal so a printed suggestion is never rounded UP.
+
+    The flag is interpreted in GiB (``logits_budget_gb * 1024**3``), so a suggestion printed
+    in decimal GB would not be directly usable and a value rounded up would not satisfy the
+    check it was offered to satisfy.
+    """
+    import math
+
+    return math.floor(n / 1024**3 * 10) / 10
+
+
+def resolve_logits_budget(
+    requested_gb: float | None,
+    free_bytes: int | None,
+    *,
+    vocab: int,
+    ceiling_bytes: int = DEFAULT_LOGITS_BUDGET_BYTES,
+    headroom: float = DEFAULT_HEADROOM,
+    peak_bytes: int = LOGIT_PEAK_BYTES_PER_ELEMENT,
+) -> tuple[int, str]:
+    """Decide the logits budget, from measured free memory unless one was asked for.
+
+    An explicit ``--logits-budget-gb`` is honoured exactly, including one that will not fit:
+    a flag the caller set is a statement of intent, and silently overriding it would make the
+    refusal that follows unattributable to anything the caller did.
+
+    Otherwise the budget is what the card can actually take -- ``free / headroom`` -- capped
+    at ``ceiling_bytes``. A fixed default was measured refusing the majority of a 128-group
+    batch on an 80 GB card holding 61 GB of weights, and it would have been equally wrong in
+    the other direction on an emptier card.
+
+    Args:
+        requested_gb: The flag, in GiB, or ``None`` to derive.
+        free_bytes: Measured free device memory, or ``None`` where it cannot be asked.
+        vocab: Vocabulary size, for reporting the resulting chunk.
+        ceiling_bytes: Never derive a budget above this.
+        headroom: Multiple of the estimate that must be free.
+        peak_bytes: Bytes per (token, vocab-entry).
+
+    Returns:
+        ``(budget_bytes, why)``. ``why`` is recorded in the dump's metadata so a completed run
+        says which branch it took rather than leaving it to be inferred from the value.
+
+    Raises:
+        ValueError: If an explicit budget is not positive.
+    """
+    if requested_gb is not None:
+        if requested_gb <= 0:
+            raise ValueError(f"--logits-budget-gb must be positive, got {requested_gb}")
+        return int(requested_gb * 1024**3), f"explicit --logits-budget-gb {requested_gb}"
+    if free_bytes is None:
+        return int(ceiling_bytes), (
+            f"ceiling {_gib(ceiling_bytes):.1f} GiB; free memory could not be measured"
+        )
+    fit, chunk = satisfying_plan(
+        free_bytes, vocab=vocab, headroom=headroom, peak_bytes=peak_bytes
+    )
+    budget = min(int(ceiling_bytes), max(0, fit))
+    return budget, (
+        f"derived from {_gib(free_bytes):.1f} GiB free / {headroom}x headroom "
+        f"= {_gib(fit):.1f} GiB, capped at the {_gib(ceiling_bytes):.1f} GiB ceiling "
+        f"-> {_gib(budget):.1f} GiB (~{chunk} tokens per chunk at vocab {vocab})"
+    )
+
+
+class LogitsBudgetExceeded(RuntimeError):
+    """One group's unembedding would not fit, refused BEFORE the forward runs.
+
+    ``--max-full-grad-gb`` already guards the full-gradient STORE, but the store was never
+    the binding constraint: at 32B the per-group LOGITS are an order of magnitude larger,
+    and the process died inside the LM head where no guard could see it. This is the same
+    discipline applied where it actually binds, and it names the group so a refusal is
+    actionable rather than a stack trace.
+    """
+
+
+def logits_peak_bytes(
+    chunk_tokens: int, vocab: int, *, peak_bytes: int = LOGIT_PEAK_BYTES_PER_ELEMENT
+) -> int:
+    """Transient bytes the chunked unembedding needs for one chunk.
+
+    Args:
+        chunk_tokens: Positions evaluated per chunk. This is a count of TOKENS, never of
+            sequences: the probe batch's worst group is one 1,330-token prompt repeated
+            across all eight samples, so a sequence-count chunk of 1 still allocates
+            2,089 tokens' worth while a token-count chunk is uniform across groups.
+        vocab: Vocabulary size.
+        peak_bytes: Bytes per (token, vocab-entry); see
+            :data:`LOGIT_PEAK_BYTES_PER_ELEMENT`.
+
+    Returns:
+        Estimated peak bytes.
+
+    Raises:
+        ValueError: On a non-positive argument.
+    """
+    if chunk_tokens <= 0 or vocab <= 0 or peak_bytes <= 0:
+        raise ValueError(
+            f"chunk_tokens, vocab and peak_bytes must all be positive; got "
+            f"{chunk_tokens}, {vocab}, {peak_bytes}"
+        )
+    return int(chunk_tokens) * int(vocab) * int(peak_bytes)
+
+
+def chunk_tokens_for_budget(
+    vocab: int,
+    budget_bytes: int = DEFAULT_LOGITS_BUDGET_BYTES,
+    *,
+    peak_bytes: int = LOGIT_PEAK_BYTES_PER_ELEMENT,
+    cap: int | None = None,
+) -> int:
+    """Largest chunk whose unembedding fits the budget, capped at the work available.
+
+    Derived from the budget rather than fixed, so the same setting means the same MEMORY on
+    a model of a different vocabulary -- a token count that is comfortable at vocab 32k is
+    five times the intended footprint at 152k.
+
+    Args:
+        vocab: Vocabulary size.
+        budget_bytes: Ceiling on the chunked head's transient memory.
+        peak_bytes: Bytes per (token, vocab-entry).
+        cap: Never return more than this; pass the group's token count so a small group is
+            done in one chunk instead of padding the plan.
+
+    Returns:
+        A chunk size of at least 1.
+
+    Raises:
+        LogitsBudgetExceeded: If even a single token exceeds the budget, which no chunking
+            can fix and which therefore has to be said rather than silently rounded up to 1.
+    """
+    per_token = int(vocab) * int(peak_bytes)
+    n = int(budget_bytes) // per_token
+    if n < 1:
+        raise LogitsBudgetExceeded(
+            f"a single token needs {per_token / 1e9:.2f} GB at vocab {vocab}, over the "
+            f"{budget_bytes / 1e9:.2f} GB logits budget; raise --logits-budget-gb, because "
+            "no chunk size can bring this under the limit"
+        )
+    if cap is not None:
+        n = min(n, max(1, int(cap)))
+    return int(n)
+
+
+def forward_tokens_for_budget(
+    n_layers: int, hidden: int, budget_bytes: int = DEFAULT_ACTIVATION_BUDGET_BYTES
+) -> int:
+    """Tokens one trunk forward may carry before its retained activations exceed the budget.
+
+    Args:
+        n_layers: Decoder layers.
+        hidden: Model width.
+        budget_bytes: Ceiling on retained activations.
+
+    Returns:
+        A token count of at least 1. Sequences are independent under causal attention with
+        right padding, so splitting a group across several forwards changes nothing about
+        the gradient -- the loss is a sum over sequences and the sum is reassociated.
+
+    Raises:
+        ValueError: On a non-positive argument.
+    """
+    if n_layers <= 0 or hidden <= 0 or budget_bytes <= 0:
+        raise ValueError(
+            f"n_layers, hidden and budget_bytes must be positive; got {n_layers}, "
+            f"{hidden}, {budget_bytes}"
+        )
+    per_token = int(n_layers) * int(hidden) * 2
+    return max(1, int(budget_bytes) // per_token)
+
+
+def assert_logits_fit(
+    *,
+    group_id: str,
+    n_tokens: int,
+    vocab: int,
+    chunk_tokens: int,
+    budget_bytes: int = DEFAULT_LOGITS_BUDGET_BYTES,
+    free_bytes: int | None = None,
+    headroom: float = DEFAULT_HEADROOM,
+    peak_bytes: int = LOGIT_PEAK_BYTES_PER_ELEMENT,
+) -> dict:
+    """Refuse a group whose unembedding will not fit, BEFORE any forward runs.
+
+    Args:
+        group_id: Named in the refusal, so the offending group is identified rather than
+            inferred from how far the run got. The probe batch's worst group is id 11 of
+            128 in file order, so a guard that fires does so in the first minute.
+        n_tokens: Padded tokens in this group, i.e. ``B * T``.
+        vocab: Vocabulary size.
+        chunk_tokens: Planned chunk.
+        budget_bytes: Ceiling on the chunked head's transient memory.
+        free_bytes: Free device memory, or ``None`` to skip the device check (CPU, or a
+            backend that cannot report it). The budget check still runs.
+        headroom: Multiple of the estimate that must be free. Above 1 because the estimate
+            covers the head only: the decoder's own activations share the same pool, and a
+            guard that let the head fit exactly would pass and then die one layer later.
+
+    Returns:
+        The budget record, which the dump writes into its metadata so a completed run can be
+        read against the plan it ran under.
+
+    Raises:
+        LogitsBudgetExceeded: If the chunk exceeds the budget, or the estimate plus headroom
+            exceeds free device memory.
+    """
+    peak = logits_peak_bytes(chunk_tokens, vocab, peak_bytes=peak_bytes)
+    record = {
+        "group_id": group_id,
+        "n_tokens": int(n_tokens),
+        "vocab": int(vocab),
+        "chunk_tokens": int(chunk_tokens),
+        "chunk_peak_bytes": int(peak),
+        "unchunked_peak_bytes": int(
+            logits_peak_bytes(max(1, n_tokens), vocab, peak_bytes=peak_bytes)
+        ),
+        "budget_bytes": int(budget_bytes),
+        "free_bytes": None if free_bytes is None else int(free_bytes),
+    }
+    if peak > budget_bytes:
+        # Here the budget is the binding limit, so raising it IS a fix.
+        raise LogitsBudgetExceeded(
+            f"group {group_id!r}: a chunk of {chunk_tokens} tokens at vocab {vocab} needs "
+            f"{_gib(peak):.1f} GiB, over the {_gib(budget_bytes):.1f} GiB logits budget. "
+            f"Lower --chunk-tokens, or raise --logits-budget-gb to at least "
+            f"{peak / 1024**3:.1f}"
+        )
+    if free_bytes is not None and peak * headroom > free_bytes:
+        # Here it is NOT. The chunk is DERIVED from the budget, so a larger budget makes a
+        # larger chunk and a larger peak -- the very quantity being compared against free
+        # memory. Advising "raise --logits-budget-gb" in this branch, as an earlier version
+        # did by reusing the clause above, sends the reader in exactly the wrong direction at
+        # the moment they are stuck. Only a SMALLER chunk, or more free memory, can satisfy it.
+        fit_budget, fit_chunk = satisfying_plan(
+            free_bytes, vocab=vocab, headroom=headroom, peak_bytes=peak_bytes
+        )
+        if fit_chunk < 1:
+            advice = (
+                "not even a single token fits in the free memory, so no setting can repair "
+                "this: free memory on the card or give the probe another one"
+            )
+        else:
+            advice = (
+                f"LOWER the budget: set --logits-budget-gb {_gib(fit_budget):.1f} or less "
+                f"(equivalently --chunk-tokens {fit_chunk} or less), or free memory on the "
+                f"card. Do NOT raise --logits-budget-gb: the chunk is derived from it, so a "
+                f"larger budget means a larger chunk and a larger requirement"
+            )
+        raise LogitsBudgetExceeded(
+            f"group {group_id!r} has {n_tokens} padded tokens at vocab {vocab}; the chunked "
+            f"unembedding needs {_gib(peak):.1f} GiB and {headroom}x that must be free for "
+            f"the decoder's own activations, but only {_gib(free_bytes):.1f} GiB is. "
+            f"Unchunked this group would have needed "
+            f"{_gib(record['unchunked_peak_bytes']):.1f} GiB. {advice}"
+        )
+    return record
+
+
+class RolloutSchemaError(ValueError):
+    """A rollout record is missing something the probe cannot invent.
+
+    Raised per record with the offending key named. Silently skipping malformed rollouts
+    would shrink the batch, and a batch that quietly lost its hard groups is exactly the
+    batch on which conflict looks small.
+    """
+
+
+@dataclass
+class DumpConfig:
+    """Everything the dump needs, in one object so a run can be recorded verbatim.
+
+    Args:
+        model: HF checkpoint path or hub id.
+        rollouts: JSONL of rollout samples.
+        out: Output ``.npz``.
+        adapter: Optional trained LoRA to load. **Strongly recommended.** At a fresh LoRA
+            init ``B = 0``, so ``dL/dA = B^T (...) = 0`` exactly and half of every gradient
+            vanishes; the cosines are then taken over the ``B`` blocks alone. That is still
+            a real gradient, but it is not the gradient of a model mid-training, and the
+            dump records ``zero_block_fraction`` so the degenerate case cannot be mistaken
+            for a measurement.
+        sketch_dim: CountSketch dimension. The resolution floor is about ``3/sqrt(dim)``;
+            at 8192 that is 0.033, so a published cross-task cosine of ~1e-5 cannot be
+            confirmed from sketches at this width and is reported as "below the floor"
+            instead.
+        sketch_seed: Shared across every group, necessarily -- two groups sketched under
+            different hashes have cosine ~0 whatever their gradients did.
+        full_grad_groups: Groups whose FULL gradient is stored, for validating the sketch.
+        max_full_grad_gb: Refuse rather than write a dump larger than this in full
+            gradients. The refusal names the size, so the caller lowers the count on
+            purpose instead of discovering it after an hour on eight GPUs.
+        answer_strategy: ``boxed`` (MEDS' own) or ``last``.
+        group_feature_agg: How per-sample behaviour becomes one vector per group. ``mean``
+            averages the samples. Recorded because a group with mixed correctness has two
+            behaviours in it and their mean is neither -- a limitation of routing at group
+            granularity, not of the feature.
+        lora_rank / lora_alpha / target_modules: Used only when ``adapter`` is absent.
+        dtype: Compute dtype.
+        max_len: Truncate sequences to this many tokens.
+        device: Torch device.
+    """
+
+    model: str
+    rollouts: str
+    out: str
+    adapter: str | None = None
+    sketch_dim: int = 8192
+    sketch_seed: int = 0
+    full_grad_groups: int = 8
+    max_full_grad_gb: float = 8.0
+    answer_strategy: str = "boxed"
+    group_feature_agg: str = "mean"
+    lora_rank: int = 16
+    lora_alpha: int = 16
+    target_modules: tuple[str, ...] = ("all-linear",)
+    dtype: str = "bfloat16"
+    max_len: int = 4096
+    device: str = "cuda"
+    use_layer_diff: bool = False
+    last_n_layers: int | None = None
+    extractor_mode: str = "hooks"
+    group_key: str | None = None
+    task_key: str | None = None
+    reward_key: str | None = None
+    chunk_tokens: int | None = None
+    seq_chunk: int | None = None
+    activation_budget_gb: float = 6.0
+    logits_budget_gb: float | None = None
+    logit_peak_bytes: int = LOGIT_PEAK_BYTES_PER_ELEMENT
+    use_checkpoint: bool = True
+    gradient_checkpointing: bool = True
+
+
+@dataclass
+class Group:
+    """One GRPO group: a prompt and the samples drawn for it.
+
+    Args:
+        group_id: Stable prompt identity. Used as the row key in the dump and as the churn
+            key in training, so it must be the PROMPT's id and never a batch position.
+        task: Task label, for the cross-task calibration partition.
+        prompt_ids: The prompt's token ids, shared by every sample.
+        response_ids: One response per sample.
+        rewards: One scalar per sample.
+    """
+
+    group_id: str
+    task: str
+    prompt_ids: list[int]
+    response_ids: list[list[int]]
+    rewards: list[float]
+
+    @property
+    def size(self) -> int:
+        """Samples in this group."""
+        return len(self.response_ids)
+
+    @property
+    def is_silent(self) -> bool:
+        """True when every sample scored alike, so the GRPO gradient is exactly zero.
+
+        Tested on the reward standard deviation rather than on a k threshold, because that is
+        the actual condition: group-level normalisation centres the rewards, so a unanimous
+        group has advantages identically zero whatever the rewards were.
+
+        MEASURED on the probe batch: 90 of 128 groups are unanimous (k=0 or k=8), so 70% of
+        the batch contributes no gradient at all. That is a property of the batch, not a
+        defect, but anything that samples groups WITHOUT consulting this ends up sampling
+        mostly zeros.
+        """
+        r = np.asarray(self.rewards, dtype=np.float64)
+        return bool(r.std() == 0.0)
+
+    def advantages(self) -> np.ndarray:
+        """GRPO advantages: rewards centred and scaled within the group.
+
+        Matches the live configuration (``reward_norm`` with ``mean_level`` and
+        ``std_level`` both ``group``). A group whose samples all score alike therefore has
+        advantages identically zero and contributes NO gradient -- which is not a defect to
+        paper over here, it is the measured 29-44% of groups this project already tracks,
+        and such a group must show up in the dump as a zero-gradient group rather than be
+        rescued by a different normalisation.
+        """
+        r = np.asarray(self.rewards, dtype=np.float64)
+        centred = r - r.mean()
+        sd = r.std()
+        return centred / sd if sd > 0 else centred
+
+
+def _first_key(rec: dict, names: Sequence[str]):
+    """First of ``names`` present in ``rec``, or ``None``.
+
+    Rollout dumps in this project have appeared under several field names, and a loader that
+    insisted on one would mean a conversion step -- which is another place rows can be
+    dropped silently. Unknown extra fields (lengths, truncation flags) are ignored rather
+    than rejected.
+    """
+    for n in names:
+        if n in rec and rec[n] is not None:
+            return n
+    return None
+
+
+#: Field names accepted for each role, in priority order.
+GROUP_KEYS = ("group_id", "prompt_id", "uid", "qid", "index", "idx")
+TASK_KEYS = ("task", "task_name", "dataset", "source", "data_source")
+PROMPT_TEXT_KEYS = ("prompt", "question", "query")
+PROMPT_ID_KEYS = ("prompt_ids", "prompt_token_ids")
+RESPONSES_KEYS = ("responses", "completions", "outputs", "generations")
+RESPONSE_ID_LIST_KEYS = ("responses_ids", "response_token_ids", "responses_token_ids")
+RESPONSE_TEXT_KEYS = ("response", "completion", "output", "generation")
+RESPONSE_ID_KEYS = ("response_ids", "response_token_ids")
+REWARDS_KEYS = ("rewards", "scores", "accs", "acc")
+REWARD_KEYS = ("reward", "score", "correct")
+
+
+def load_rollouts(
+    path: str,
+    *,
+    tokenizer,
+    max_len: int = 4096,
+    group_key: str | None = None,
+    task_key: str | None = None,
+    reward_key: str | None = None,
+) -> list[Group]:
+    """Read a JSONL of rollouts into groups, accepting either record shape.
+
+    Two shapes occur, and both are supported because requiring one means a conversion step
+    that can itself drop rows:
+
+    * **per sample** -- one line per rollout, with ``response``/``response_ids`` and a scalar
+      ``reward``. Lines sharing a group id are gathered into one group.
+    * **per group** -- one line per prompt, with ``responses``/``response_ids`` as a LIST and
+      ``rewards`` as a list of the same length. This is the shape the harness writes.
+
+    Token ids are accepted in place of text in both. Extra fields -- lengths, truncation
+    flags -- are ignored rather than rejected.
+
+    Args:
+        path: JSONL file.
+        tokenizer: Used only where text has to be encoded.
+        max_len: Truncation budget for prompt + response.
+        group_key: Field holding prompt identity. ``None`` searches
+            :data:`GROUP_KEYS` and falls back to a hash of the prompt tokens. The fallback
+            is the one place two genuinely different prompts could merge, so it is used only
+            when no id field exists at all.
+        task_key: Field holding the task label. ``None`` searches :data:`TASK_KEYS`; absent
+            means ``"unknown"``, which makes the cross-task partition REFUSE rather than
+            invent a split.
+        reward_key: Field holding the reward. ``None`` searches the known names.
+
+    Returns:
+        Groups in first-appearance order.
+
+    Raises:
+        RolloutSchemaError: On a record missing a prompt, a response or a reward, naming the
+            file, the line and the names that were looked for. Skipping malformed rollouts
+            would shrink the batch, and a batch that quietly lost its hard groups is exactly
+            the batch on which conflict looks small.
+    """
+    import hashlib
+
+    buckets: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    with open(path, "r", encoding="utf-8") as fh:
+        for lineno, line in enumerate(fh, 1):
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            where = f"{path}:{lineno}"
+
+            k = _first_key(rec, PROMPT_ID_KEYS)
+            if k is not None:
+                p_ids = list(rec[k])
+            else:
+                k = _first_key(rec, PROMPT_TEXT_KEYS)
+                if k is None:
+                    raise RolloutSchemaError(
+                        f"{where}: no prompt field. Looked for {list(PROMPT_ID_KEYS)} and "
+                        f"{list(PROMPT_TEXT_KEYS)}; the record has {sorted(rec)}"
+                    )
+                p_ids = tokenizer.encode(rec[k], add_special_tokens=False)
+
+            # Group-shaped first: a list of responses on one line.
+            resp_list: list[list[int]] | None = None
+            k = _first_key(rec, RESPONSE_ID_LIST_KEYS)
+            if k is not None:
+                resp_list = [list(r) for r in rec[k]]
+            else:
+                k = _first_key(rec, RESPONSES_KEYS)
+                if k is not None:
+                    resp_list = [
+                        list(r) if isinstance(r, (list, tuple))
+                        else tokenizer.encode(
+                            r if isinstance(r, str) else r.get("text", ""),
+                            add_special_tokens=False,
+                        )
+                        for r in rec[k]
+                    ]
+            if resp_list is None:
+                k = _first_key(rec, RESPONSE_ID_KEYS)
+                if k is not None:
+                    resp_list = [list(rec[k])]
+                else:
+                    k = _first_key(rec, RESPONSE_TEXT_KEYS)
+                    if k is None:
+                        raise RolloutSchemaError(
+                            f"{where}: no response field. Looked for "
+                            f"{list(RESPONSES_KEYS)}, {list(RESPONSE_ID_LIST_KEYS)}, "
+                            f"{list(RESPONSE_TEXT_KEYS)} and {list(RESPONSE_ID_KEYS)}; the "
+                            f"record has {sorted(rec)}"
+                        )
+                    resp_list = [tokenizer.encode(rec[k], add_special_tokens=False)]
+
+            rk = reward_key or _first_key(rec, REWARDS_KEYS) or _first_key(rec, REWARD_KEYS)
+            if rk is None or rk not in rec:
+                raise RolloutSchemaError(
+                    f"{where}: no reward field. Looked for {list(REWARDS_KEYS)} and "
+                    f"{list(REWARD_KEYS)}; the record has {sorted(rec)}. GRPO advantages "
+                    "cannot be formed without one, and a default would fabricate the very "
+                    "signal under test"
+                )
+            raw_reward = rec[rk]
+            rewards = (
+                [float(x) for x in raw_reward]
+                if isinstance(raw_reward, (list, tuple))
+                else [float(raw_reward)] * len(resp_list)
+            )
+            if len(rewards) != len(resp_list):
+                raise RolloutSchemaError(
+                    f"{where}: {len(rewards)} rewards for {len(resp_list)} responses; a "
+                    "mismatch would score one rollout with another rollout's reward"
+                )
+
+            gk = group_key or _first_key(rec, GROUP_KEYS)
+            gid = (
+                str(rec[gk]) if gk is not None and gk in rec
+                else hashlib.blake2b(json.dumps(p_ids).encode(), digest_size=8).hexdigest()
+            )
+            tk = task_key or _first_key(rec, TASK_KEYS)
+            task = str(rec[tk]) if tk is not None and tk in rec else "unknown"
+
+            if gid not in buckets:
+                buckets[gid] = {"task": task, "prompt": p_ids, "resp": [], "rew": []}
+                order.append(gid)
+            budget = max(1, max_len - len(p_ids))
+            for r, w in zip(resp_list, rewards):
+                buckets[gid]["resp"].append(list(r)[:budget])
+                buckets[gid]["rew"].append(float(w))
+
+    groups = [
+        Group(
+            group_id=gid,
+            task=buckets[gid]["task"],
+            prompt_ids=buckets[gid]["prompt"],
+            response_ids=buckets[gid]["resp"],
+            rewards=buckets[gid]["rew"],
+        )
+        for gid in order
+    ]
+    if not groups:
+        raise RolloutSchemaError(f"{path} yielded no groups")
+    return groups
+
+
+def _decoder_and_unembedding(model):
+    """The transformer trunk and the unembedding weight, through any wrapper.
+
+    The trunk is called DIRECTLY rather than through the causal-LM wrapper, and that is the
+    whole fix: the wrapper's forward ends in a full-vocabulary ``lm_head`` over every
+    position at once, which at 32B and vocab 152,064 is 4.73 GB in bf16 for the probe
+    batch's worst group and 14.20 GB once the fp32 copy the old code took is counted --
+    against 61.02 GB of resident weights on an 80 GiB card. Calling the trunk yields hidden
+    states of ``B x T x 5120`` instead, 171 MB for the same group, and the unembedding is
+    then applied in chunks that are freed as they go.
+
+    LoRA still applies. PEFT replaces the Linear MODULES in place, so the adapters are
+    inside the trunk and are reached whichever forward calls them; only prompt-learning
+    methods live on the wrapper, and this method is LoRA. Asserted rather than assumed by
+    ``test_the_chunked_path_still_reaches_every_lora_parameter``.
+
+    Args:
+        model: A causal LM, possibly PEFT-wrapped.
+
+    Returns:
+        ``(decoder_module, unembedding_weight)``.
+
+    Raises:
+        RuntimeError: If either cannot be located. Falling back to the wrapper's forward
+            would silently restore the allocation this exists to avoid.
+    """
+    decoder = None
+    getter = getattr(model, "get_decoder", None)
+    if callable(getter):
+        try:
+            decoder = getter()
+        except Exception:  # pragma: no cover - only on exotic wrappers
+            decoder = None
+    if decoder is None:
+        base = model
+        for _ in range(6):
+            if hasattr(base, "layers") and hasattr(base, "norm"):
+                decoder = base
+                break
+            nxt = getattr(base, "model", None) or getattr(base, "base_model", None)
+            if nxt is None or nxt is base:
+                break
+            base = nxt
+    head = None
+    get_out = getattr(model, "get_output_embeddings", None)
+    if callable(get_out):
+        head = get_out()
+    unembed = getattr(head, "weight", None)
+    if decoder is None or unembed is None:
+        raise RuntimeError(
+            f"could not locate the decoder trunk and unembedding on "
+            f"{type(model).__name__} (decoder={decoder is not None}, "
+            f"unembed={unembed is not None}); the chunked head needs both, and falling back "
+            "to the wrapper's forward would restore the full-vocabulary allocation that "
+            "OOMs at 32B"
+        )
+    return decoder, unembed
+
+
+def _chunk_weighted_logp(hidden, targets, weights, unembed):
+    """Weighted sums of the sampled tokens' log-probabilities, for ONE chunk.
+
+    The full-vocabulary tensor exists only inside this function and only for ``chunk`` rows.
+    ``log_softmax(..., dtype=torch.float32)`` performs the reduction in fp32 WITHOUT first
+    materialising an fp32 copy of the logits, which is what the previous ``.float()`` did --
+    that copy kept the bf16 node alive alongside it and was half the peak.
+
+    Args:
+        hidden: ``(chunk, H)`` residual stream at the emitting positions.
+        targets: ``(chunk,)`` token actually emitted at each position.
+        weights: Sequence of ``(chunk,)`` weight vectors, one per loss. Both losses share
+            this pass because they read the same log-probabilities; only the weights differ.
+        unembed: ``(V, H)`` unembedding.
+
+    Returns:
+        A ``(len(weights),)`` tensor of weighted sums.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    logits = F.linear(hidden, unembed)
+    logp = torch.log_softmax(logits, dim=-1, dtype=torch.float32)
+    sel = logp.gather(1, targets.unsqueeze(1)).squeeze(1)
+    return torch.stack([(w * sel).sum() for w in weights])
+
+
+def _weighted_logp_sums(hidden, targets, weights, unembed, *, chunk_tokens, use_checkpoint):
+    """Sum :func:`_chunk_weighted_logp` over chunks of POSITIONS.
+
+    Chunked on tokens rather than on sequences because the probe batch's spread is entirely
+    in sequence LENGTH: every group has eight samples, and the worst group is a single
+    1,330-token prompt that is prepended to all eight, so a chunk of one SEQUENCE still
+    allocates 2,089 tokens' worth there while being three times smaller than the median
+    group elsewhere. A token chunk is uniform across groups; a sequence chunk is not.
+
+    The sum over chunks is exactly the sum over positions -- the loss is linear in the
+    per-token terms -- so the gradient is unchanged. ``use_checkpoint`` recomputes each
+    chunk's logits during the backward instead of retaining them, which trades one extra
+    unembedding matmul per chunk for keeping only ONE chunk's logits alive at a time. That
+    is exact for a deterministic forward, which :func:`_assert_deterministic_forward`
+    establishes rather than assumes.
+
+    Args:
+        hidden: ``(N, H)`` flattened emitting positions.
+        targets: ``(N,)`` emitted tokens.
+        weights: Sequence of ``(N,)`` weight vectors.
+        unembed: ``(V, H)`` unembedding.
+        chunk_tokens: Positions per chunk.
+        use_checkpoint: Recompute chunk logits in the backward pass.
+
+    Returns:
+        A ``(len(weights),)`` tensor of weighted sums over every position.
+    """
+    import torch
+    import torch.utils.checkpoint as ckpt
+
+    n = hidden.shape[0]
+    chunk = max(1, min(int(chunk_tokens), n))
+    # Checkpointing a chunk whose input does not require grad produces no gradient and only a
+    # warning, so the flag is honoured only where it can mean something.
+    do_ckpt = bool(use_checkpoint) and bool(hidden.requires_grad)
+    total = None
+    for start in range(0, n, chunk):
+        stop = min(start + chunk, n)
+        h, t = hidden[start:stop], targets[start:stop]
+        w = [x[start:stop] for x in weights]
+
+        def run(hc, tc, *wc):
+            """Bound so ``unembed`` -- which is frozen and needs no grad -- is not a checkpoint input."""
+            return _chunk_weighted_logp(hc, tc, wc, unembed)
+
+        out = ckpt.checkpoint(run, h, t, *w, use_reentrant=False) if do_ckpt else run(h, t, *w)
+        total = out if total is None else total + out
+    if total is None:  # pragma: no cover - an empty group is refused upstream
+        raise ValueError("no positions to score; the group has no tokens")
+    return total
+
+
+def group_losses(
+    model,
+    group: Group,
+    *,
+    device,
+    token_denominator: int,
+    prompt_denominator: int,
+    chunk_tokens: int | None = None,
+    logits_budget_bytes: int = DEFAULT_LOGITS_BUDGET_BYTES,
+    peak_bytes_per_element: int = LOGIT_PEAK_BYTES_PER_ELEMENT,
+    use_checkpoint: bool = True,
+    free_bytes: int | None = None,
+    _advantages=None,
+):
+    """The two per-group losses whose gradients the dump sketches.
+
+    **The denominators are global, not per-group, and that is the correctness condition for
+    everything downstream.** With a shared denominator the batch loss is exactly the sum of
+    the per-group losses, so the batch gradient is exactly the sum of the per-group
+    gradients, so a cluster's gradient is exactly the sum of its members' -- which is what
+    lets the analysis form any partition from this dump. Normalising per group would make
+    every group's loss carry a different scale and the sums would describe nothing.
+
+    The GRPO surrogate is evaluated ON-POLICY, where the importance ratio is exactly 1 and
+    the clip is inert. That is not a simplification of this project's runs; it is what they
+    measured -- ``importance_weight`` avg=min=max=1.0 and ``clip_ratio`` 0.0 at every step
+    of four runs -- so the surrogate's gradient here is ``-sum_t A_t * dlogp_t``, the same
+    one the trainer produces.
+
+    **The unembedding is applied in chunks and the trunk is called directly.** The value and
+    the gradient are unchanged -- the loss is a sum over positions and the sum is
+    reassociated, nothing more -- but the full-vocabulary tensor now exists for one chunk at
+    a time instead of for the whole group. The equivalence is a test
+    (``test_the_chunked_path_is_numerically_identical_to_the_unchunked_one``), not a claim,
+    because "same maths, less memory" is exactly the sort of refactor that silently is not.
+
+    Args:
+        model: The (PEFT-wrapped) causal LM.
+        group: The group.
+        device: Torch device.
+        token_denominator: Total RESPONSE tokens in the batch.
+        prompt_denominator: Total PROMPT tokens in the batch.
+        chunk_tokens: Positions per unembedding chunk. ``None`` derives it from
+            ``logits_budget_bytes`` and the model's vocabulary.
+        logits_budget_bytes: Ceiling on the chunked head's transient memory.
+        peak_bytes_per_element: Bytes per (token, vocab-entry) for the estimate.
+        use_checkpoint: Recompute chunk logits in the backward pass.
+        free_bytes: Free device memory for the pre-forward guard, or ``None`` to skip it.
+
+    Returns:
+        ``(grpo_loss, prompt_nll_loss)``, both scalars with grad.
+
+    Raises:
+        ValueError: If a denominator is zero, which would divide the whole measurement by
+            nothing rather than by the batch.
+        LogitsBudgetExceeded: If this group will not fit. Raised BEFORE the forward, naming
+            the group and the estimate, rather than dying inside the LM head.
+    """
+    import torch
+
+    if token_denominator <= 0 or prompt_denominator <= 0:
+        raise ValueError(
+            f"denominators must be positive, got response={token_denominator} "
+            f"prompt={prompt_denominator}"
+        )
+    decoder, unembed = _decoder_and_unembedding(model)
+    vocab = int(unembed.shape[0])
+
+    # ``_advantages`` is how :func:`group_backward` hands a sub-batch the advantages its
+    # PARENT group defines. Recomputing them from the slice would centre the rewards within
+    # the slice, which is a different measurement -- and one that would still run.
+    adv = group.advantages() if _advantages is None else _advantages
+    n_prompt = len(group.prompt_ids)
+    seqs = [group.prompt_ids + r for r in group.response_ids]
+    width = max(len(s) for s in seqs)
+
+    # BEFORE the forward, which is the whole point: the old code died inside the LM head,
+    # where no guard could see it and no message could name the group.
+    plan = chunk_tokens if chunk_tokens is not None else chunk_tokens_for_budget(
+        vocab, logits_budget_bytes, peak_bytes=peak_bytes_per_element,
+        cap=len(seqs) * max(1, width - 1),
+    )
+    assert_logits_fit(
+        group_id=group.group_id, n_tokens=len(seqs) * width, vocab=vocab,
+        chunk_tokens=plan, budget_bytes=logits_budget_bytes, free_bytes=free_bytes,
+        peak_bytes=peak_bytes_per_element,
+    )
+
+    ids = torch.full((len(seqs), width), 0, dtype=torch.long)
+    attn = torch.zeros((len(seqs), width), dtype=torch.long)
+    for i, s in enumerate(seqs):
+        ids[i, : len(s)] = torch.tensor(s, dtype=torch.long)
+        attn[i, : len(s)] = 1
+    ids, attn = ids.to(device), attn.to(device)
+
+    hidden = decoder(input_ids=ids, attention_mask=attn, use_cache=False).last_hidden_state
+    target = ids[:, 1:]
+    valid = attn[:, 1:].bool()
+
+    pos = torch.arange(width - 1, device=device).unsqueeze(0)
+    # Position t predicts token t+1, so the RESPONSE region in emitter coordinates starts at
+    # n_prompt - 1: that position emits the response's first token. Off by one here would
+    # put the prompt's last token into the RL loss and drop the response's first, which is
+    # the same off-by-one this project has already recorded once in its token router.
+    resp_mask = valid & (pos >= n_prompt - 1)
+    prompt_mask = valid & (pos < n_prompt - 1)
+
+    a = torch.tensor(adv, dtype=torch.float32, device=device).unsqueeze(1)
+    w_grpo = (a * resp_mask).reshape(-1)
+    w_nll = prompt_mask.to(torch.float32).reshape(-1)
+
+    sums = _weighted_logp_sums(
+        hidden[:, :-1, :].reshape(-1, hidden.shape[-1]),
+        target.reshape(-1),
+        (w_grpo, w_nll),
+        unembed,
+        chunk_tokens=plan,
+        use_checkpoint=use_checkpoint,
+    )
+    grpo = -sums[0] / token_denominator
+    prompt_nll = -sums[1] / prompt_denominator
+    return grpo, prompt_nll
+
+
+def group_backward(
+    model,
+    group: Group,
+    *,
+    which: str,
+    device,
+    token_denominator: int,
+    prompt_denominator: int,
+    seq_chunk: int | None = None,
+    activation_budget_bytes: int = DEFAULT_ACTIVATION_BUDGET_BYTES,
+    **loss_kw,
+) -> float:
+    """Backward one group's loss, sub-batching the trunk over SEQUENCES.
+
+    The sequences of a GRPO group are independent -- causal attention with right padding
+    gives no path between them -- and the loss is a sum over them under a denominator that
+    does not depend on the split. So ``sum_s L_s`` has gradient ``sum_s grad L_s``, and
+    backwarding each sub-batch immediately accumulates exactly the same ``.grad`` as one
+    backward over the whole group while freeing each sub-batch's activations first.
+
+    That is the second half of the OOM fix and it is needed for the same reason as the first.
+    Chunking the unembedding removes 14.20 GB, but the trunk still retains one hidden-state
+    tensor per layer under gradient checkpointing: 64 x 16,712 x 5120 x 2 = 10.95 GB for the
+    probe batch's worst group, on top of 61.02 GB of weights on an 80 GiB card. Sub-batching
+    that group into two forwards brings it to about 6.8 GB.
+
+    Args:
+        model: The (PEFT-wrapped) causal LM.
+        group: The group.
+        which: ``"grpo"`` or ``"nll"``; which of the two losses to backward.
+        device: Torch device.
+        token_denominator: Total RESPONSE tokens in the batch.
+        prompt_denominator: Total PROMPT tokens in the batch.
+        seq_chunk: Sequences per forward. ``None`` derives it from
+            ``activation_budget_bytes`` and the model's depth and width.
+        activation_budget_bytes: Ceiling on the trunk's retained activations per forward.
+        **loss_kw: Forwarded to :func:`group_losses` (chunking and the logits budget).
+
+    Returns:
+        The loss value, summed over sub-batches -- identical to the single-forward value.
+
+    Raises:
+        ValueError: On an unknown ``which``.
+    """
+    if which not in ("grpo", "nll"):
+        raise ValueError(f"unknown loss {which!r}; expected 'grpo' or 'nll'")
+    width = len(group.prompt_ids) + max(len(r) for r in group.response_ids)
+    if seq_chunk is None:
+        cfgobj = getattr(model, "config", None)
+        n_layers = int(getattr(cfgobj, "num_hidden_layers", 0) or 0)
+        hidden = int(getattr(cfgobj, "hidden_size", 0) or 0)
+        if n_layers > 0 and hidden > 0:
+            per_forward = forward_tokens_for_budget(n_layers, hidden, activation_budget_bytes)
+            seq_chunk = max(1, per_forward // max(1, width))
+        else:
+            seq_chunk = group.size
+    seq_chunk = max(1, min(int(seq_chunk), group.size))
+
+    total = 0.0
+    for start in range(0, group.size, seq_chunk):
+        stop = min(start + seq_chunk, group.size)
+        # A sub-batch is a Group in its own right, but its ADVANTAGES must stay the ones the
+        # whole group defines: recomputing them from a slice would centre the rewards within
+        # the slice and change the measurement. So the slice carries the parent's rewards and
+        # the advantages are taken from the parent.
+        part = Group(
+            group_id=group.group_id, task=group.task, prompt_ids=group.prompt_ids,
+            response_ids=group.response_ids[start:stop], rewards=group.rewards[start:stop],
+        )
+        part_adv = group.advantages()[start:stop]
+        grpo, nll = group_losses(
+            model, part, device=device, token_denominator=token_denominator,
+            prompt_denominator=prompt_denominator, _advantages=part_adv, **loss_kw,
+        )
+        loss = grpo if which == "grpo" else nll
+        loss.backward()
+        total += float(loss.detach())
+    return total
+
+
+def _assert_deterministic_forward(model) -> None:
+    """Refuse to run if any dropout is active, because two things here recompute the forward.
+
+    Both the per-chunk checkpointing and whole-model gradient checkpointing evaluate the
+    forward twice and differentiate the SECOND evaluation. With dropout active the two draw
+    different masks, and the resulting gradient is not the gradient of the loss that was
+    reported -- it is a plausible number with no error anywhere, which is the failure class
+    this project distrusts most and has already recorded once for checkpointing.
+
+    Args:
+        model: The model about to be probed.
+
+    Raises:
+        RuntimeError: Naming the modules with a non-zero rate, so the fix is to disable them
+            rather than to guess.
+    """
+    import torch.nn as nn
+
+    active = [
+        name for name, mod in model.named_modules()
+        if isinstance(mod, nn.Dropout) and float(getattr(mod, "p", 0.0)) > 0.0
+    ]
+    if active:
+        raise RuntimeError(
+            f"dropout is active on {len(active)} module(s), e.g. {active[:3]}. The probe "
+            "recomputes the forward for both chunk and model checkpointing and would "
+            "differentiate a different dropout mask than it reported. Disable dropout "
+            "(the live configs set disable_dropout and lora_dropout 0) or pass "
+            "--no-checkpoint and --no-gradient-checkpointing, which will need far more memory"
+        )
+
+
+def _free_bytes(device, *, release_cache: bool = True) -> int | None:
+    """Genuinely available memory on ``device``, or ``None`` where it cannot be asked.
+
+    **The cache is released FIRST, and that is the whole point of this function.**
+    ``mem_get_info`` reports what the DRIVER has free, and PyTorch's caching allocator keeps
+    freed blocks RESERVED rather than returning them. So driver-free shrinks monotonically as
+    a run proceeds even though nothing leaks, and a guard fed that number is comparing its
+    estimate against a figure that describes the allocator's history rather than what is
+    actually available.
+
+    MEASURED 2026-09-02, and it is the reason the fourth projection attempt failed. On a
+    clear card the pool grows steadily; at a 4.0 GiB budget the guard refused at group 5 of
+    153 with 2.7 GiB reported free, and at 1.5 GiB it refused at group 25 with 1.4 GiB.
+    **A smaller chunk does not fix this** -- it only buys more groups before the window
+    closes, so no fixed budget finishes the batch. The defect was in what the guard was fed,
+    not in when it fired, which is the same shape as the inverted-advice bug: the guard was
+    right and its surroundings were not.
+
+    Releasing the cache costs re-allocation on the next group, which against a run of many
+    minutes is noise. ``release_cache=False`` reproduces the old, drifting reading and exists
+    so a test can show the drift is real rather than assumed.
+
+    Args:
+        device: The device to ask about.
+        release_cache: Return cached blocks to the driver before reading.
+
+    Returns:
+        Free bytes, or ``None`` on a CPU or a backend without the query -- returned rather
+        than raised so the budget check still runs and only the device check is skipped.
+    """
+    import torch
+
+    try:
+        if torch.device(device).type == "cuda" and torch.cuda.is_available():
+            if release_cache:
+                torch.cuda.empty_cache()
+            return int(torch.cuda.mem_get_info(torch.device(device))[0])
+    except Exception:  # pragma: no cover - backend-specific
+        return None
+    return None
+
+
+def _lora_blocks(model):
+    """``(name, parameter)`` for every trainable LoRA parameter, in a fixed order.
+
+    Order is fixed by ``named_parameters`` and the NAME is what the sketch hashes on, so the
+    projection is stable across groups and across processes even if the iteration order ever
+    changed.
+    """
+    for name, param in model.named_parameters():
+        if param.requires_grad and "lora_" in name:
+            yield name, param
+
+
+def run_dump(cfg: DumpConfig) -> dict[str, Any]:
+    """Load, compute and write the dump.
+
+    Returns:
+        A summary dict, also written into the ``.npz`` as ``meta``.
+
+    Raises:
+        RuntimeError: If the requested full-gradient storage would exceed
+            ``max_full_grad_gb``, or if the model carries no LoRA parameters at all.
+    """
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    t0 = time.time()
+    tok = AutoTokenizer.from_pretrained(cfg.model)
+    dtype = getattr(torch, cfg.dtype)
+    model = AutoModelForCausalLM.from_pretrained(cfg.model, dtype=dtype)
+    if cfg.adapter:
+        from peft import PeftModel
+
+        model = PeftModel.from_pretrained(model, cfg.adapter, is_trainable=True)
+    else:
+        from peft import LoraConfig, TaskType, get_peft_model
+
+        tm = list(cfg.target_modules)
+        model = get_peft_model(
+            model,
+            LoraConfig(
+                task_type=TaskType.CAUSAL_LM,
+                r=cfg.lora_rank,
+                lora_alpha=cfg.lora_alpha,
+                target_modules="all-linear" if tm == ["all-linear"] else tm,
+                bias="none",
+            ),
+            autocast_adapter_dtype=False,
+        )
+    model.to(cfg.device)
+    model.train()
+    # Both the chunked head and whole-model checkpointing differentiate a RECOMPUTED
+    # forward, so a live dropout would make the measured gradient not the gradient of the
+    # reported loss. Checked before anything runs.
+    if cfg.use_checkpoint or cfg.gradient_checkpointing:
+        _assert_deterministic_forward(model)
+    if cfg.gradient_checkpointing:
+        # Not optional at 32B. Fixing the unembedding leaves the decoder's own retained
+        # activations as the binding constraint -- 64 layers over the worst group's 16,712
+        # padded tokens -- and they do not fit either. Exact for a deterministic forward,
+        # which the assertion above establishes.
+        enable_inputs = getattr(model, "enable_input_require_grads", None)
+        if callable(enable_inputs):
+            # Without this the trunk's input does not require grad, every layer's
+            # checkpoint is a no-op boundary, and no gradient reaches the LoRA parameters.
+            enable_inputs()
+        enable_ckpt = getattr(model, "gradient_checkpointing_enable", None)
+        if callable(enable_ckpt):
+            enable_ckpt(gradient_checkpointing_kwargs={"use_reentrant": False})
+
+    blocks = list(_lora_blocks(model))
+    if not blocks:
+        raise RuntimeError(
+            "the model carries no trainable LoRA parameters; the probe would sketch an "
+            "empty gradient and report cosines over nothing"
+        )
+    n_params = sum(int(p.numel()) for _n, p in blocks)
+
+    groups = load_rollouts(
+        cfg.rollouts, tokenizer=tok, max_len=cfg.max_len, group_key=cfg.group_key,
+        task_key=cfg.task_key, reward_key=cfg.reward_key,
+    )
+    # WHICH groups get their full gradient stored, and it must not be "the first N".
+    #
+    # MEASURED on the real batch: 90 of 128 groups are unanimous, so taking the first 8 in
+    # file order stored k = [8, 0, 0, 4, 8, 8, 8, 0] -- seven groups with an exactly zero
+    # gradient and one with a norm of 1.28e-4. ``_sketch_validation`` needs TWO non-zero
+    # gradients to form a single pair, found one, and correctly reported that every stored
+    # gradient was zero. The sketch therefore went unvalidated, and no rerun of that
+    # selection could have validated it: drawing 8 arbitrary groups from a 70%-silent batch
+    # yields two non-zero about 0.5% of the time.
+    #
+    # Selecting from the informative groups makes two enough, which is also why the store
+    # stopped being a memory decision.
+    informative = [i for i, g in enumerate(groups) if not g.is_silent]
+    n_full = min(int(cfg.full_grad_groups), len(informative))
+    full_idx = {i: k for k, i in enumerate(informative[:n_full])}
+    gb = n_full * n_params * 4 / 1e9
+    if gb > cfg.max_full_grad_gb:
+        raise RuntimeError(
+            f"storing full gradients for {n_full} groups of {n_params:,} LoRA parameters "
+            f"needs {gb:.1f} GB, over the {cfg.max_full_grad_gb} GB limit. Lower "
+            "--full-grad-groups (the sketch validation needs only a handful of pairs) or "
+            "raise --max-full-grad-gb deliberately"
+        )
+
+    resp_tokens = sum(len(r) for g in groups for r in g.response_ids)
+    prompt_tokens = sum(len(g.prompt_ids) * g.size for g in groups)
+    plan = SketchPlan(dim=cfg.sketch_dim, seed=cfg.sketch_seed)
+    extractor = LayerLogitExtractor(mode=cfg.extractor_mode)
+    boxed = tok.encode("\\boxed{", add_special_tokens=False)
+
+    _decoder, _unembed = _decoder_and_unembedding(model)
+    vocab = int(_unembed.shape[0])
+    budget_bytes, budget_why = resolve_logits_budget(
+        cfg.logits_budget_gb, _free_bytes(cfg.device), vocab=vocab,
+        peak_bytes=cfg.logit_peak_bytes,
+    )
+    logger_line = f"cluster_lora probe: logits budget {budget_why}"
+    print(logger_line, flush=True)
+
+    # The whole batch's worst group, priced BEFORE any of it runs. The probe batch's tail is
+    # one 1,330-token prompt repeated across eight samples, and that group is 11th of 128 in
+    # file order -- so pricing it up front turns a refusal from an hour of wasted work into a
+    # message before the first forward.
+    def _padded_tokens(g):
+        """Tokens one forward materialises for this group: B x T, T padded to its longest."""
+        return g.size * (len(g.prompt_ids) + max(len(r) for r in g.response_ids))
+
+    widest = max(groups, key=_padded_tokens)
+    widest_tokens = _padded_tokens(widest)
+    # Positions, not tokens: chunking iterates over the emitting positions, which is one
+    # fewer per sequence. Capping here makes the RECORDED plan the plan that actually runs --
+    # without the cap a tiny-vocabulary model records a chunk of millions of tokens and
+    # prices it at the full budget while doing kilobytes of work.
+    widest_positions = widest.size * max(1, _padded_tokens(widest) // widest.size - 1)
+    plan_chunk = cfg.chunk_tokens if cfg.chunk_tokens is not None else chunk_tokens_for_budget(
+        vocab, budget_bytes, peak_bytes=cfg.logit_peak_bytes, cap=widest_positions
+    )
+    loss_kw = dict(
+        chunk_tokens=cfg.chunk_tokens, logits_budget_bytes=budget_bytes,
+        peak_bytes_per_element=cfg.logit_peak_bytes, use_checkpoint=cfg.use_checkpoint,
+    )
+    backward_kw = dict(
+        seq_chunk=cfg.seq_chunk,
+        activation_budget_bytes=int(cfg.activation_budget_gb * 1024**3),
+        **loss_kw,
+    )
+    # Every free-memory reading the guard is given, so DRIFT is visible in a finished run
+    # rather than inferred from where it stopped. A healthy run's readings oscillate around a
+    # level; readings that fall monotonically to the refusal are the signature of a guard
+    # being fed the allocator's history, which is what the fourth projection attempt hit.
+    free_seen: list[int] = []
+
+    def guard_free() -> int | None:
+        """Read genuinely-available memory, releasing the cache first, and record it."""
+        v = _free_bytes(cfg.device)
+        if v is not None:
+            free_seen.append(int(v))
+        return v
+
+    budget_record = assert_logits_fit(
+        group_id=widest.group_id, n_tokens=widest_tokens, vocab=vocab,
+        chunk_tokens=plan_chunk, budget_bytes=budget_bytes,
+        free_bytes=guard_free(), peak_bytes=cfg.logit_peak_bytes,
+    )
+
+    sketches, prompt_sketches, feats = [], [], []
+    full_grads: list[np.ndarray] = []
+    gids, tasks, sizes, rewards, zero_frac, feat_ok = [], [], [], [], [], []
+    t_grad = t_feat = 0.0
+
+    for gi, g in enumerate(groups):
+        # --- the two gradients -------------------------------------------------------
+        s = time.time()
+        model.zero_grad(set_to_none=True)
+        group_backward(
+            model, g, which="grpo", device=cfg.device,
+            token_denominator=resp_tokens, prompt_denominator=prompt_tokens,
+            **backward_kw, free_bytes=guard_free(),
+        )
+        grads = [(n, p.grad if p.grad is not None else torch.zeros_like(p)) for n, p in blocks]
+        zero_frac.append(
+            sum(1 for _n, gr in grads if not bool(gr.any())) / max(1, len(grads))
+        )
+        sketches.append(sketch_torch(grads, plan))
+        if gi in full_idx:
+            # Moved to the host in the gradient's OWN dtype and upcast there. The previous
+            # order -- ``.float().cpu()`` -- built a full fp32 copy ON THE CARD first, which
+            # is twice the transfer and, at 33.5M LoRA parameters, 134 MB of device memory
+            # per stored group that the run needed for its chunk. Free memory was measured
+            # falling 4.60 -> 3.44 -> 2.44 GB across budget attempts, almost exactly
+            # 8 x 268 MB, which is what forced the budget down to 1.5 GiB and the chunk to
+            # 882 tokens. The store is only read at the very end, so it has no business
+            # living on the accelerator at all.
+            full_grads.append(
+                torch.cat([gr.detach().reshape(-1).cpu().float() for _n, gr in grads]).numpy()
+            )
+            if torch.cuda.is_available():
+                # Return the transient blocks to the driver rather than to torch's cache, so
+                # the freed memory is visible to the guard's next free-memory check. Called
+                # only on the few groups that store, so it costs nothing per batch.
+                torch.cuda.empty_cache()
+        model.zero_grad(set_to_none=True)
+        group_backward(
+            model, g, which="nll", device=cfg.device,
+            token_denominator=resp_tokens, prompt_denominator=prompt_tokens,
+            **backward_kw, free_bytes=guard_free(),
+        )
+        pgrads = [(n, p.grad if p.grad is not None else torch.zeros_like(p)) for n, p in blocks]
+        prompt_sketches.append(sketch_torch(pgrads, plan))
+        model.zero_grad(set_to_none=True)
+        t_grad += time.time() - s
+
+        # --- the behavioural feature -------------------------------------------------
+        s = time.time()
+        vecs = []
+        for r in g.response_ids:
+            seq = g.prompt_ids + r
+            try:
+                pos = answer_token_index(
+                    seq, boxed_ids=boxed, strategy=cfg.answer_strategy,
+                    response_start=len(g.prompt_ids),
+                )
+            except Exception:
+                # Fall back to the final position and RECORD it. A group whose answer token
+                # could not be located has a feature from a different place than its peers,
+                # and a comparison that did not know would be between two things.
+                pos = len(seq) - 2
+            ids = torch.tensor(seq, dtype=torch.long, device=cfg.device).unsqueeze(0)
+            trace = extractor.trace(model, ids, pos, int(seq[pos + 1]))
+            vecs.append(
+                meds_feature(
+                    trace, use_layer_diff=cfg.use_layer_diff,
+                    last_n_layers=cfg.last_n_layers,
+                )
+            )
+        feats.append(np.mean(np.stack(vecs, 0), axis=0))
+        feat_ok.append(1.0)
+        t_feat += time.time() - s
+
+        gids.append(g.group_id)
+        tasks.append(g.task)
+        sizes.append(g.size)
+        rewards.append(float(np.mean(g.rewards)))
+
+    # The condition that silently disabled the validation last time, computed and NAMED.
+    # Reporting it only as a note inside the analysis meant a reader had to notice a sentence;
+    # a status string in the metadata is something a script can refuse on.
+    n_nonzero_full = sum(1 for v in full_grads if float(np.abs(v).max()) > 0.0)
+    n_zero_sketch = sum(1 for v in sketches if float(np.abs(v).max()) == 0.0)
+    if n_nonzero_full >= 2:
+        validation_status = f"ok: {n_nonzero_full} non-zero stored gradients"
+    else:
+        validation_status = (
+            f"IMPOSSIBLE: only {n_nonzero_full} of {len(full_grads)} stored gradients are "
+            f"non-zero, and a pair needs two. The sketch is UNVALIDATED for this run. "
+            f"{len(informative)} of {len(groups)} groups are informative; raise "
+            f"--full-grad-groups, or use a batch with more non-unanimous groups"
+        )
+    print(f"cluster_lora probe: sketch validation {validation_status}", flush=True)
+    if n_zero_sketch:
+        print(
+            f"cluster_lora probe: {n_zero_sketch} of {len(sketches)} GRPO sketches are "
+            f"exactly zero (unanimous groups); the MEDS side of the comparison rests on "
+            f"{len(sketches) - n_zero_sketch} groups",
+            flush=True,
+        )
+
+    meta = {
+        "model": cfg.model,
+        "adapter": cfg.adapter or "",
+        "n_groups": len(groups),
+        "n_lora_params": n_params,
+        "sketch_dim": cfg.sketch_dim,
+        "sketch_seed": cfg.sketch_seed,
+        "response_tokens": resp_tokens,
+        "prompt_tokens": prompt_tokens,
+        "answer_strategy": cfg.answer_strategy,
+        "group_feature_agg": cfg.group_feature_agg,
+        "seconds_gradients": round(t_grad, 3),
+        "seconds_features": round(t_feat, 3),
+        "seconds_total": round(time.time() - t0, 3),
+        "full_grad_groups": n_full,
+        # Which groups, and why those. A store selected without consulting silence is a
+        # store of zeros on any batch like this one.
+        "full_grad_selection": "informative groups only (reward std > 0), in file order",
+        "full_grad_group_ids": [groups[i].group_id for i in full_idx],
+        "full_grad_nonzero": n_nonzero_full,
+        "sketch_validation_status": validation_status,
+        "n_groups_informative": len(informative),
+        "n_zero_grpo_sketches": n_zero_sketch,
+        "denominator": "global: batch response tokens for GRPO, batch prompt tokens for NLL",
+        "vocab": vocab,
+        "chunk_tokens": plan_chunk,
+        "seq_chunk": cfg.seq_chunk,
+        "activation_budget_gb": cfg.activation_budget_gb,
+        "logits_budget_gb": cfg.logits_budget_gb,
+        "logits_budget_bytes": int(budget_bytes),
+        "logits_budget_why": budget_why,
+        "logit_peak_bytes": cfg.logit_peak_bytes,
+        "use_checkpoint": cfg.use_checkpoint,
+        "gradient_checkpointing": cfg.gradient_checkpointing,
+        # The worst group priced before the run, so a completed dump can be read against the
+        # plan it ran under rather than against the defaults someone assumes it used.
+        "logits_budget": budget_record,
+        # The guard's INPUT over the run. first and last far apart with min == last is a pool
+        # that was never released; oscillation around a level is health.
+        "free_bytes_readings": len(free_seen),
+        "free_bytes_first": free_seen[0] if free_seen else None,
+        "free_bytes_last": free_seen[-1] if free_seen else None,
+        "free_bytes_min": min(free_seen) if free_seen else None,
+        "free_bytes_max": max(free_seen) if free_seen else None,
+    }
+    np.savez_compressed(
+        cfg.out,
+        sketch=np.stack(sketches, 0),
+        prompt_sketch=np.stack(prompt_sketches, 0),
+        meds_feature=np.stack(feats, 0),
+        group_id=np.array(gids, dtype=object),
+        task=np.array(tasks, dtype=object),
+        group_size=np.array(sizes, dtype=np.int64),
+        reward_mean=np.array(rewards, dtype=np.float64),
+        zero_block_fraction=np.array(zero_frac, dtype=np.float64),
+        full_grad=(np.stack(full_grads, 0) if full_grads else np.zeros((0, 0), dtype=np.float32)),
+        meta=np.array(json.dumps(meta), dtype=object),
+    )
+    return meta
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Command-line entry point."""
+    p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    p.add_argument("--model", required=True)
+    p.add_argument("--rollouts", required=True)
+    p.add_argument("--out", required=True)
+    p.add_argument("--adapter", default=None)
+    p.add_argument("--sketch-dim", type=int, default=8192)
+    p.add_argument("--sketch-seed", type=int, default=0)
+    p.add_argument("--full-grad-groups", type=int, default=8)
+    p.add_argument("--max-full-grad-gb", type=float, default=8.0)
+    p.add_argument("--answer-strategy", default="boxed", choices=["boxed", "last"])
+    p.add_argument("--lora-rank", type=int, default=16)
+    p.add_argument("--lora-alpha", type=int, default=16)
+    p.add_argument("--dtype", default="bfloat16")
+    p.add_argument("--max-len", type=int, default=4096)
+    p.add_argument("--device", default="cuda")
+    p.add_argument("--last-n-layers", type=int, default=None)
+    p.add_argument("--extractor-mode", default="hooks", choices=["hooks", "hidden_states"])
+    p.add_argument("--group-key", default=None, help="jsonl field holding prompt identity")
+    p.add_argument("--task-key", default=None, help="jsonl field holding the task label")
+    p.add_argument("--reward-key", default=None, help="jsonl field holding the reward")
+    p.add_argument("--chunk-tokens", type=int, default=None,
+                   help="positions per unembedding chunk; default derives from the budget")
+    p.add_argument("--seq-chunk", type=int, default=None,
+                   help="sequences per trunk forward; default derives from the budget")
+    p.add_argument("--activation-budget-gb", type=float, default=6.0,
+                   help="ceiling on the trunk's retained activations per forward")
+    p.add_argument("--logits-budget-gb", type=float, default=None,
+                   help="chunked head budget in GiB; OMIT IT to derive from measured free "
+                        "memory, capped at 4 GiB. A value here is honoured exactly")
+    p.add_argument("--logit-peak-bytes", type=int, default=LOGIT_PEAK_BYTES_PER_ELEMENT,
+                   help="bytes per (token, vocab-entry) used by the estimate")
+    p.add_argument("--no-checkpoint", action="store_true",
+                   help="retain every chunk's logits instead of recomputing them")
+    p.add_argument("--no-gradient-checkpointing", action="store_true",
+                   help="retain the decoder's activations; needs far more memory at 32B")
+    a = p.parse_args(argv)
+    meta = run_dump(
+        DumpConfig(
+            model=a.model, rollouts=a.rollouts, out=a.out, adapter=a.adapter,
+            sketch_dim=a.sketch_dim, sketch_seed=a.sketch_seed,
+            full_grad_groups=a.full_grad_groups, max_full_grad_gb=a.max_full_grad_gb,
+            answer_strategy=a.answer_strategy, lora_rank=a.lora_rank,
+            lora_alpha=a.lora_alpha, dtype=a.dtype, max_len=a.max_len, device=a.device,
+            last_n_layers=a.last_n_layers, extractor_mode=a.extractor_mode,
+            group_key=a.group_key, task_key=a.task_key, reward_key=a.reward_key,
+            chunk_tokens=a.chunk_tokens, seq_chunk=a.seq_chunk,
+            activation_budget_gb=a.activation_budget_gb,
+            logits_budget_gb=a.logits_budget_gb,
+            logit_peak_bytes=a.logit_peak_bytes,
+            use_checkpoint=not a.no_checkpoint,
+            gradient_checkpointing=not a.no_gradient_checkpointing,
+        )
+    )
+    print(json.dumps(meta, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

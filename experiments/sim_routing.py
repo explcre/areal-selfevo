@@ -126,6 +126,18 @@ def run(
             u.p, _ = _grpo_update(u.p, group_size, lr_rl, rng)
         elif mode == TrainingMode.SFT:
             u.p = _sft_update(u, lr_sft)
+        elif mode != TrainingMode.SKIP:
+            # The cost was already charged above. A mode with no branch here would therefore
+            # spend a full rollout plus a full update and move `p` by exactly nothing, and
+            # the arm would report the spend of a mode that never ran. `distill` is registered
+            # and costs 1.0 and matched neither branch: an audit measured 400 of 1000 units in
+            # that state. Silence in a simulator does not crash a run, it publishes a number.
+            raise ValueError(
+                f"router emitted {mode!r}, which this simulator charges "
+                f"{UPDATE_COSTS[mode]} for and has no update branch for: the unit would pay "
+                "full cost and never move. Implement the update or stop the router emitting "
+                "it -- do not let it be counted as spend."
+            )
         if spent >= budget:
             break
     if i >= max_iters:

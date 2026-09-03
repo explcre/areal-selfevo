@@ -28,16 +28,14 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-import areal.trainer.ppo.actor as actor_mod
-
 from areal.api.cli_args import GroupRoutingConfig
-from selfevo import compose
 from selfevo.routing.base import HarnessAction, RoutingDecision, TrainingMode
 
-from selfevo.tests.test_group_routing import (  # noqa: E402
+from selfevo.tests.conftest import (  # noqa: E402
     MIXED,
     advantages,
     make_actor,
+    registered_router,
 )
 
 STUB = "_harness_seam_stub"
@@ -101,34 +99,8 @@ def router_factory():
         kwargs.update(kw)
         return made
 
-    previous = compose.ROUTERS.get(STUB, KeyError)
-    compose.ROUTERS[STUB] = factory
-    try:
+    with registered_router(STUB, factory):
         yield configure
-    finally:
-        if previous is KeyError:
-            compose.ROUTERS.pop(STUB, None)
-        else:
-            compose.ROUTERS[STUB] = previous
-
-
-class Recorder:
-    """Captures ``stats_tracker.scalar`` kwargs so the LOGGED values can be asserted."""
-
-    def __init__(self) -> None:
-        self.seen: dict = {}
-
-    def scalar(self, **kw) -> None:
-        """Accumulate every logged key, last write winning."""
-        self.seen.update(kw)
-
-
-@pytest.fixture
-def recorder(monkeypatch):
-    """Swap the actor's module-level stats tracker for one that records."""
-    r = Recorder()
-    monkeypatch.setattr(actor_mod, "stats_tracker", r)
-    return r
 
 
 def actor_with(variants, **kw):
@@ -182,39 +154,17 @@ def test_a_one_name_variant_set_is_still_a_legal_config():
     assert cfg.harness_variants == ["plain"]
 
 
-def test_a_harness_arm_with_neither_a_router_nor_a_selector_is_refused():
-    """A variant set needs SOMETHING that will consume it, or it dispatches nothing.
+def test_a_harness_arm_without_a_router_is_refused():
+    """The fixed solved/unsolved rule emits no decision, so it can emit no harness action.
 
-    Updated when the harness axis gained its second consumer. The original rule was "a
-    harness arm requires a router", which was right while ``_route_groups`` was the only
-    place a dispatcher was built: without a router that method never runs, so the run would
-    carry a ``harness_variants`` line in its config and dispatch nothing -- an arm reporting
-    itself as something it is not, and one the refusal guard cannot catch, because a router
-    that never runs emits no action to refuse.
-
-    ``RLTrainer._harness_route`` is now a second consumer, on the driver rather than in the
-    actor, and it is driven by ``harness_selector`` rather than by a router. So the
-    requirement is the disjunction: a variant set with NEITHER still dispatches nothing and
-    is still refused, which is what this asserts. What is no longer refused -- and must not
-    be, or the arm this validation protects could not be configured -- is a selector arm with
-    no router, covered below.
+    Without a router ``_route_groups`` never runs, no dispatcher is ever built, and the run
+    would carry a ``harness_variants`` line in its config while dispatching nothing. That is
+    an arm reporting itself as something it is not, which is the exact failure the refusal
+    guard exists to make loud -- and the guard cannot catch it, because a router that never
+    runs emits no action to refuse.
     """
-    with pytest.raises(ValueError, match="either a router or a harness_selector"):
+    with pytest.raises(ValueError, match="requires a router"):
         GroupRoutingConfig(enabled=True, harness_variants=["plain", "long"])
-
-
-def test_a_selector_is_a_sufficient_consumer_without_a_router():
-    """The driver-side consumer needs no router, and requiring one would confound the arm.
-
-    A router rewrites advantages. Forcing a harness arm to carry one would make the two arms
-    of a harness experiment differ in the harness AND in the advantage path, so a difference
-    between them could not be attributed to either.
-    """
-    cfg = GroupRoutingConfig(
-        harness_variants=["gen96", "gen160", "gen256"],
-        harness_selector="truncation_step_limit",
-    )
-    assert cfg.router is None and cfg.harness_selector == "truncation_step_limit"
 
 
 # ------------------------------------------------ can_evolve_harness, in production ------

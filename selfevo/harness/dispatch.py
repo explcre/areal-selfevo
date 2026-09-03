@@ -318,19 +318,6 @@ class HarnessDispatcher:
         return self._variants
 
     @property
-    def selector(self):
-        """The rule that picks the next variant on PROPOSE.
-
-        Exposed because a feature-driven selector carries the counters an arm is REPORTED on
-        -- how many decisions it took, how many it declined -- and because the matched control
-        is constructed from the treatment's realised ``moves`` and ``decisions``. Reading them
-        off the object that made the decisions is the alternative to recomputing them from a
-        log, which is how a control comes to be matched to a number the treatment never
-        produced.
-        """
-        return self._selector
-
-    @property
     def active(self) -> HarnessVariant | None:
         """The variant a rollout would run under now, or ``None`` for an empty set."""
         return self._active
@@ -512,11 +499,7 @@ class HarnessDispatcher:
         return self.adapter.run(task_id, self._active)
 
 
-def build_dispatcher(
-    names: Sequence[str] | None,
-    selector: str | None = None,
-    selector_args: dict | None = None,
-) -> HarnessDispatcher | None:
+def build_dispatcher(names: Sequence[str] | None) -> HarnessDispatcher | None:
     """Resolve configured variant names into a dispatcher, or ``None`` for no harness arm.
 
     The single production entry point, so that "is there a harness consumer?" has one answer
@@ -528,13 +511,6 @@ def build_dispatcher(
     Args:
         names: Variant names from config, resolved against
             :data:`selfevo.harness.base.VARIANTS`. ``None`` or empty means no harness arm.
-        selector: Name of a rule in :data:`selfevo.harness.selectors.SELECTORS`, or ``None``
-            for :func:`round_robin`. Resolved HERE rather than by the caller so that "which
-            selectors exist?" has one answer, the same way variant names do; a trainer doing
-            its own lookup would be a second place for an unknown name to be dropped.
-        selector_args: Keyword arguments for the selector factory. This is how the matched
-            CONTROL is configured from the treatment's measured ``moves`` and ``decisions``,
-            so it carries counts rather than a mode name.
 
     Returns:
         A :class:`HarnessDispatcher`, or ``None`` when no variant set was configured.
@@ -553,9 +529,4 @@ def build_dispatcher(
             f"Dropping an unknown name would shrink the variant set and silently turn a "
             f"harness-evolving arm into its own control"
         )
-    rule = None
-    if selector is not None:
-        from selfevo.harness.selectors import build_selector
-
-        rule = build_selector(selector, selector_args)
-    return HarnessDispatcher([VARIANTS[n] for n in names], selector=rule)
+    return HarnessDispatcher([VARIANTS[n] for n in names])

@@ -6,8 +6,13 @@ passing tests that let five real defects through. So each guard that matters is 
 purpose and the suite must go red. The mutants are chosen to be the plausible ways this
 grader could silently lie: a failure quietly leaving the denominator, a crash or a hang
 being graded as a wrong answer instead of as itself, private tests not being run, a
-comparator loose enough to accept a wrong number, and a sandbox that stops bounding what
-it claims to bound.
+comparator loose enough to accept a wrong number, a sandbox that stops bounding what it
+claims to bound, a VALID submission thrown away because a later block was empty (a live
+32B run scored one that way), and a dataset the harness cannot find on a box that has it.
+
+The model-identity guards -- refusing to score a model id the endpoint does not serve, and
+recording which one answered -- are mutated separately in mutate_model_attribution.py,
+because they live half in math_bench.py and need the math suite to judge them.
 
 A mutant that leaves the file byte-identical, or that does not compile, proves nothing.
 Both are detected and reported as SKIP rather than counted, because "the tests still
@@ -114,8 +119,48 @@ MUTANTS = [
      '    if not blocks:\n        return text'),
     ("E02", "code_bench.py",
      "the FIRST code block wins, grading exploration rather than the answer",
-     '    body = (py or [b for _, b in blocks])[-1]',
-     '    body = (py or [b for _, b in blocks])[0]'),
+     "        for body in reversed(level):",
+     "        for body in level:"),
+    ("E03", "code_bench.py",
+     "an empty chosen block ends the search, discarding a valid earlier submission",
+     "        for body in reversed(level):",
+     "        for body in level[-1:]:"),
+    ("E04", "code_bench.py",
+     "an empty block is submitted for execution instead of refused",
+     "            if body.strip():",
+     "            if True:"),
+    ("E05", "code_bench.py",
+     "an untagged block outranks a python-tagged one, so sample output displaces the answer",
+     "    for level in (py, [b for _, b in blocks]):",
+     "    for level in ([b for _, b in blocks], py):"),
+
+    # ------------------------------------------------------------------- the data path
+    ("H01", "code_bench.py",
+     "HF_HOME is ignored, so a box that has the dataset still needs LCB_DATA by hand",
+     "        roots.append(Path(os.path.expanduser(home)) / _HF_SUBPATH)",
+     "        pass"),
+    ("H02", "code_bench.py",
+     "the default cache outranks HF_HOME, so the wrong snapshot can be scored",
+     '''    roots = []
+    home = os.environ.get("HF_HOME")
+    if home:
+        roots.append(Path(os.path.expanduser(home)) / _HF_SUBPATH)
+    default = Path(os.path.expanduser(_HF_DEFAULT_HOME)) / _HF_SUBPATH
+    if default not in roots:
+        roots.append(default)
+    return roots''',
+     '''    roots = [Path(os.path.expanduser(_HF_DEFAULT_HOME)) / _HF_SUBPATH]
+    home = os.environ.get("HF_HOME")
+    if home:
+        roots.append(Path(os.path.expanduser(home)) / _HF_SUBPATH)
+    return roots'''),
+    ("H03", "code_bench.py",
+     "the first cache root wins even when it holds no snapshot at all",
+     '''        snaps = sorted(d for d in root.iterdir() if d.is_dir())
+        if snaps:
+            return snaps[-1]''',
+     '''        snaps = sorted(d for d in root.iterdir() if d.is_dir())
+        return snaps[-1]'''),
 
     # ---------------------------------------------------------------------- the sandbox
     ("S01", "code_sandbox.py",

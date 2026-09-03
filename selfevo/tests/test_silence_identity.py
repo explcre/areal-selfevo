@@ -27,34 +27,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-import areal.trainer.ppo.actor as actor_mod
-
-from selfevo.tests.test_group_routing import G, make_actor, make_batch, meta  # noqa: E402
-
-
-class Recorder:
-    """Captures stats_tracker.scalar kwargs so the LOGGED values can be asserted."""
-
-    def __init__(self) -> None:
-        self.calls: list[dict] = []
-
-    def scalar(self, **kw) -> None:
-        self.calls.append(kw)
-
-    def get(self, key: str):
-        """Last logged value for `key`, or None."""
-        for c in reversed(self.calls):
-            if key in c:
-                return c[key]
-        return None
-
-
-@pytest.fixture
-def recorder(monkeypatch):
-    """Swap the module-level stats tracker for one that records."""
-    r = Recorder()
-    monkeypatch.setattr(actor_mod, "stats_tracker", r)
-    return r
+from selfevo.tests.conftest import G, make_actor, make_batch, meta  # noqa: E402
 
 
 def run(rewards, recorder, *, blank_mask_rows=()):

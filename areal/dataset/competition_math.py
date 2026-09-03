@@ -10,6 +10,21 @@ The reward function is unchanged: ``math_reward_fn`` is ``math_verify.parse`` + 
 against ``data["answer"]``, which is answer-format agnostic. So the only job here is to hand
 it the same two fields GSM8K does -- ``messages`` and ``answer`` -- with the gold in a form
 ``parse`` can read.
+
+``keep_solution`` adds a third field, ``gold_ids``: the gold DERIVATION, tokenised. It is off
+by default and every existing run reproduces bit for bit with it off, which is asserted by
+``selfevo/tests/test_gold_batch_path.py`` against a recorded digest of the adapter's output.
+It exists because the bare ``\\boxed{}`` answer is not a supervision target -- training
+toward ``\\boxed{7}`` teaches the model to emit the token 7, not to derive it -- and an
+UNSOLVED group has no self-target of any kind, so the derivation is the only correct target
+available without a teacher model or a second rollout.
+
+TOKENISED HERE, not in the workflow, and the reason is cost measured on this box: all 7500
+training solutions tokenise in 3.29s once and are then cached by ``datasets`` fingerprinting,
+whereas the workflow encodes per ROLLOUT -- 80 times per prompt at the live ``n_samples=8``
+over 10 epochs -- inside the async rollout loop of every rollout worker. Tokenising once also
+means the length distribution is knowable before a GPU is booked: median 162 tokens, p90 482,
+max 2494, and 99.15% under 1024.
 """
 
 from __future__ import annotations
@@ -69,6 +84,9 @@ def get_math_rl_dataset(
     split: str,
     tokenizer,
     max_length: int | None = None,
+    keep_solution: bool = False,
+    gold_template: str = "{solution}",
+    append_eos: bool = True,
     **kwargs,
 ):
     """Competition MATH, shaped exactly like the GSM8K RL dataset.
@@ -76,17 +94,45 @@ def get_math_rl_dataset(
     Args:
         path: HF dataset id, e.g. ``DigitalLearningGmbH/MATH-lighteval``.
         split: ``train`` or ``test``.
-        tokenizer: Used only for the length filter.
+        tokenizer: Used for the length filter, and required when ``keep_solution`` is set.
         max_length: Drop prompts longer than this many tokens.
+        keep_solution: Keep the gold DERIVATION as a tokenised ``gold_ids`` column. Default
+            False, which is the shipped behaviour and the only one any prior run has seen.
+        gold_template: How the gold text is assembled before tokenising, with ``{solution}``
+            substituted. Default ``"{solution}"`` -- the raw derivation. It is a parameter
+            rather than a constant because a gold row is spliced in after a PROMPT, and the
+            prompt's chat template decides what a valid continuation looks like: the live 30B
+            model's template ends the prompt at ``<|im_start|>assistant\\n<think>\\n``, so a
+            gold that does not close that block with ``\\n</think>\\n\\n`` first would train
+            the model to answer inside a thinking block it never leaves. Set it per model;
+            there is no default that is right for every template, and guessing one silently
+            is how a gold arm trains a shape the model never emits.
+        append_eos: Append the tokenizer's EOS. Default True. A rollout's ``output_tokens``
+            end with the stop token (``ModelResponse.output_tokens_without_stop`` strips it,
+            and ``multi_turn.py:115`` re-adds it when it is absent), so a gold row without one
+            would be the only row in the batch that never terminates, and training on it
+            teaches the model not to stop after a derivation.
 
     Returns:
-        A dataset with ``messages`` and ``answer``, matching what ``MathAgent`` reads.
+        A dataset with ``messages`` and ``answer``, matching what ``MathAgent`` reads, plus
+        ``gold_ids`` when ``keep_solution`` is set. ``gold_ids`` is an empty list for a row
+        whose solution is missing or empty; the column is present for EVERY row either way,
+        because ``concat_padded_tensors`` refuses a batch whose trajectory dicts disagree on
+        their key set, so an absent-for-some column would break collation rather than degrade.
 
     Raises:
         ValueError: If no example yields a boxed answer -- that means the schema is not what
             this adapter expects, and training would proceed with every reward zero, which is
-            indistinguishable from a model that cannot solve anything.
+            indistinguishable from a model that cannot solve anything. Also if
+            ``keep_solution`` is set without a tokenizer, which would otherwise produce a
+            gold column of empty lists and a gold arm that trains on nothing.
     """
+    if keep_solution and tokenizer is None:
+        raise ValueError(
+            "keep_solution=True needs a tokenizer: the gold is tokenised here, once, rather "
+            "than per rollout. Without one every gold_ids would be empty and the gold arm "
+            "would train on nothing while still reporting itself as a gold arm."
+        )
     dataset = load_dataset(path=path, split=split)
 
     def process(sample):
@@ -97,8 +143,9 @@ def get_math_rl_dataset(
         # exactly the harder answer types -- so training on bare golds would have silently
         # zeroed the reward on the structured half of MATH and biased the task toward simple
         # scalars. See _boxed_gold below.
-        gold = _boxed_gold(extract_boxed_answer(sample.get("solution", "")))
-        return {
+        solution = sample.get("solution", "")
+        gold = _boxed_gold(extract_boxed_answer(solution))
+        out = {
             "messages": [
                 {
                     "role": "user",
@@ -108,8 +155,20 @@ def get_math_rl_dataset(
             ],
             "answer": gold,
         }
+        if keep_solution:
+            # add_special_tokens=False: this is a CONTINUATION of a prompt that has already
+            # been through the chat template, so a second BOS or a second turn header would
+            # be spliced into the middle of an assistant turn. Measured on the live
+            # tokenizer, add_special_tokens=True prepends nothing for this model, but that
+            # is a property of one tokenizer and not a guarantee.
+            text = gold_template.format(solution=solution) if solution else ""
+            ids = tokenizer.encode(text, add_special_tokens=False) if text else []
+            if ids and append_eos and tokenizer.eos_token_id is not None:
+                ids = list(ids) + [int(tokenizer.eos_token_id)]
+            out["gold_ids"] = ids
+        return out
 
-    keep = {"messages", "answer"}
+    keep = {"messages", "answer"} | ({"gold_ids"} if keep_solution else set())
     dataset = dataset.map(process)
     dataset = dataset.remove_columns([c for c in dataset.column_names if c not in keep])
 

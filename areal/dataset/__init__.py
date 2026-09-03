@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 
 VALID_DATASETS = [
     "gsm8k",
+    "deepmath",
     "clevr_count_70k",
     "geometry3k",
     "virl39k",
@@ -37,6 +38,22 @@ def _get_custom_dataset(
         from .gsm8k import get_gsm8k_sft_dataset
 
         return get_gsm8k_sft_dataset(
+            path=path,
+            split=split,
+            tokenizer=tokenizer,
+            max_length=max_length,
+            **kwargs,
+        )
+    elif "deepmath" in path.lower() and type == "rl":
+        # Matched BEFORE the MATH branch, and that ordering is the whole point: the id
+        # "zwhe99/DeepMath-103K" satisfies `"math" in path.lower()`, so without this clause
+        # ahead of it DeepMath would be handed to the MATH adapter, which reads `problem` and
+        # `solution` -- neither of which this corpus ships. That failure is not silent (the
+        # MATH adapter would KeyError on `problem`), but the ordering is still load-bearing and
+        # is asserted by selfevo/tests/test_deepmath_dataset.py rather than left to reading.
+        from .deepmath import get_deepmath_rl_dataset
+
+        return get_deepmath_rl_dataset(
             path=path,
             split=split,
             tokenizer=tokenizer,

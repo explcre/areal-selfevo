@@ -12,11 +12,16 @@ else
 fi
 ulimit -n 131072 || true
 MODEL="${1:?model path or hf id}"; TAG="${2:?tag}"; GPUS="${3:-0,1}"; PORT="${4:-8404}"
+# The id the server REGISTERS and the id the scorer ASKS FOR, from one variable. They
+# must match: an unregistered id is answered HTTP 200 by the BASE model, so two
+# literals that drift apart would silently score the wrong weights. math_bench.py now
+# refuses an id that is not in /v1/models, which turns that drift into a stop.
+SERVED_NAME="${SERVED_NAME:-evalmodel}"
 # Follows OUTROOT/BENCH_ROOT so every caller writes to the same volume; $HOME is only the
 # fallback, and on a container it is often the wrong (small) one.
 OUT="${OUTROOT:-${BENCH_ROOT:-$HOME}/runs/math}/$TAG"; mkdir -p "$OUT"
 CUDA_VISIBLE_DEVICES="$GPUS" python3 -m sglang.launch_server \
-  --model-path "$MODEL" --served-model-name evalmodel \
+  --model-path "$MODEL" --served-model-name "$SERVED_NAME" \
   --host 127.0.0.1 --port "$PORT" --tp $(echo "$GPUS" | tr ',' '\n' | wc -l) \
   --mem-fraction-static "${MEMFRAC:-0.85}" ${SGL_EXTRA:-} > "$OUT/server.log" 2>&1 &
 SRV=$!
@@ -51,6 +56,7 @@ printf '{"tag":"%s","benches":"%s","max_tokens":%s,"concurrency":%s,"started":%s
 echo "RUN_META benches=${BENCHES:-aime24,aime25,amc23,math500} max_tokens=${MAXTOK:-3072} conc=${CONC:-64}"
 # Repo copy, never a stale $HOME copy: numbers must come from audited code.
 python3 "$(dirname "$0")/math_bench.py" --base-url "http://127.0.0.1:$PORT/v1" \
+  --model "$SERVED_NAME" \
   --benchmarks "${BENCHES:-aime24,aime25,amc23,math500}" \
   --max-tokens "${MAXTOK:-3072}" --concurrency "${CONC:-64}" --limit "${LIMIT:-0}" \
   --split "${SPLIT:-all}" \

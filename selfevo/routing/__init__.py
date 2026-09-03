@@ -7,6 +7,7 @@ from .base import (
     RoutingContext,
     RoutingDecision,
     TrainingMode,
+    applicable_modes,
     known_modes,
     register_mode,
 )
@@ -28,6 +29,7 @@ __all__ = [
     "RoutingDecision",
     "TrainingMode",
     "known_modes",
+    "applicable_modes",
     "register_mode",
     "SilenceSide",
     "expected_nonsilent_groups",
