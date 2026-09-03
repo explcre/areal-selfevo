@@ -2615,3 +2615,18 @@ continuously to \texttt{gs://selfevo/runs/b200/\_analysis/}, together with the c
 control that shuffles credits across the prompts that earned them and the batch-credited arm
 that the identity predicts cannot learn at all. A difference reported there, and only there,
 would be the first evidence that a learned router decides better than the fixed rule in training.
+
+\paragraph{Eq.~\ref{eq:recurrence} verified live, step for step.} The treatment arm's ledger
+behaves exactly as the arithmetic requires on the running $32$B job.
+\texttt{prompt\_credit/pending} rises by precisely $8$ per step and saturates at $512$, the
+corpus size, with zero evictions and zero same-batch skips.
+\texttt{prompt\_credit/cold\_baseline\_skips} becomes non-zero at \emph{exactly} step $64$ ---
+one recurrence period --- which is the first delta being withheld because a prompt has no
+earlier delta to centre against. The \emph{first credit} lands at \emph{exactly} step $128$,
+two recurrence periods, and the credited values are genuinely per-unit rather than a shared
+scalar: over the first $32$ they span $[-0.625, +0.750]$ with standard deviation $0.250$
+around a mean of $-0.020$. The interval between a decision and the credit that closes it is not
+the epoch length but scatters around it ($45$ steps for the first), because prompts are
+reshuffled within an epoch. This is the first time a learned router in this project has been
+credited with anything that varies by unit, and it is the precondition every result in the
+post-credit window rests on.
