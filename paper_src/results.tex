@@ -2149,3 +2149,152 @@ and its step $424$ at 23:17:26. Both of those stale checkpoints would already ha
 destroyed had they been left in place, and the remaining three were inside the following hour.
 That is what makes the separation a rescue rather than a tidy-up --- and it is also why the
 race in the preceding paragraph happened at all.
+
+\subsection{The A0 baseline is flat at the headline budget too, and the cheap probe was
+wrong about the level but right about the shape}
+\label{sec:a0headline}
+
+Sec.~\ref{sec:pereval} and Sec.~\ref{sec:perevalfix} leave one question open, and it is the
+question that decides what to do next: the periodic series is flat around $0.11$, but every
+point in it was taken at $2048$ new tokens on $64$ problems, so the flatness could be the run
+failing to learn or it could be an instrument too blunt to see learning. Those two readings
+imply opposite next moves. This subsection settles it by scoring the saved checkpoints at the
+\emph{headline} budget on a problem set large enough to resolve a difference worth acting on,
+with the un-adapted base model included as the control. \textbf{The answer is that both halves
+of the worry are partly right, and they do not cancel: the cheap probe understates the
+accuracy by about $32$ points, and its flatness is nonetheless real.}
+
+\paragraph{What was run.} Every arm scores all $338$ problems of the committed OlympiadBench
+\texttt{search} half at $16{,}384$ new tokens, greedy, one sample --- the headline protocol
+exactly, with \texttt{max\_tokens} taken from \texttt{BENCH\_OVERRIDES} rather than passed on
+the command line, so it is the same constant the periodic evaluation reads. Thirty-two
+evaluations were run on eight B200s: six replicates of the base model, the $22$ checkpoints
+from step $24$ to step $549$, and four repeat measurements described below. All $32$ graded
+$338$ of $338$ with \emph{zero} request failures, and truncation never exceeded $5$ of $338$,
+so no score here is budget-bound --- unlike the periodic series, the cap is not what is being
+measured. The \texttt{report} half was deliberately not touched: it is the reserved half that
+makes the headline claim meaningful, and spending it on a diagnostic sweep would have
+destroyed the search/report discipline for a question that $338$ problems can answer.
+
+\paragraph{Every arm is served by an identical code path, on purpose.} Each LoRA was merged
+into the base weights and served as a standalone model, so the base control and the
+checkpoints differ only in the weights and not in whether an adapter kernel ran at all. A
+base scored without \texttt{--lora-paths} against checkpoints scored with it would confound
+the one comparison this subsection exists to make.
+
+\paragraph{The checkpoints are provably from the live run.} That directory held a killed
+run's checkpoints until they were separated by hand, so identity was re-established from the
+weights rather than from the path. The Frobenius norm of the merged LoRA delta rises strictly
+monotonically across all $22$ checkpoints, $0.0758$ at step $24$ to $3.4858$ at step $549$
+with no break and exactly $256$ merged tensors every time; file modification times are
+strictly increasing and all fall after the live launch at 19:43; every adapter file is
+$134{,}287{,}464$ bytes. A checkpoint from a different run does not lie on another run's
+trajectory, so the monotone series is the check that the size and the path cannot provide.
+The same trajectory answers a second question at no extra cost: the adapter is not inert.
+It grows by a factor of $46$ over the run, reaching a relative perturbation of
+$2.46\times10^{-3}$, so whatever is wrong is not that the optimiser failed to move the weights.
+
+\paragraph{The instrument's own noise band, measured rather than assumed.} The base model was
+scored six times from six separate servers. At temperature $0$ on fixed weights the only
+remaining source of variation is batching nondeterminism, so the spread across those six is
+what this harness returns when \emph{nothing} is different. It is not small:
+$0.4083$, $0.4320$, $0.4379$, $0.4379$, $0.4231$, $0.4290$ --- mean $0.4280$, standard
+deviation $0.0112$, range $3.0$ points, with $14$ to $22$ of $338$ problems changing answer
+between two runs of identical weights. \textbf{Three of the six same-weights pairs differ
+significantly by McNemar}: $\texttt{base\_b}-\texttt{base\_a}=+0.0237$ with $95\%$ CI
+$[+0.0020,+0.0454]$, and both $\texttt{base\_c}$ and $\texttt{base\_d}$ against
+$\texttt{base\_a}$ give $+0.0296$ with $95\%$ CI $[+0.0024,+0.0568]$. This is a sixth entry
+for the catalogue of Sec.~\ref{sec:harness}: McNemar's interval models sampling error only,
+and greedy decoding on a batching server carries a second source it does not model, so a
+single paired comparison against a single base measurement will report a significant gain
+between two copies of the same weights at a rate far above $5\%$. A base control has to be
+\emph{replicated}, not merely present.
+
+\paragraph{The curve.} Table~\ref{tab:a0headline} gives it. The $22$ checkpoints span
+$0.4142$ to $0.4615$, a range of $4.7$ points, against a same-weights band of $3.0$ points.
+Pooled over all $22$, the checkpoints average $0.4369$ against the base's $0.4280$, a
+difference of $+0.89$ points with a bootstrap $95\%$ CI of $[-0.56,+2.39]$ --- consistent with
+zero, and tight enough to have resolved a true effect of $2.4$ points. Fitting accuracy
+against step gives a slope of $+0.13$ points per $100$ steps, $95\%$ CI
+$[-0.21,+0.49]$; over the $525$ steps measured that is $+0.68$ points with $95\%$ CI
+$[-1.09,+2.56]$. Both intervals are computed by resampling \emph{problems}, which is what the
+arms share, rather than resampling arms.
+
+\begin{table}[t]
+\centering\small
+\caption{A0 at the headline budget: OlympiadBench \texttt{search} half, all $338$ problems,
+$16{,}384$ new tokens, greedy, one sample. \texttt{base} is the mean of six replicates of the
+un-adapted model, whose own range is $3.0$ points. $\Delta$ is against that mean and $z$ is
+$\Delta$ over its bootstrap standard error. Every row graded $338$ of $338$ with no request
+failures. \textbf{Unlike Table~\ref{tab:pereval} these are accuracies at the headline budget
+and are directly comparable with the rest of this paper.}}
+\label{tab:a0headline}
+\begin{tabular}{rcccc}
+\toprule
+step & accuracy & Wilson 95\% & $\Delta$ vs base & $z$ \\
+\midrule
+base ($n=6$) & $0.4280$ & --- & --- & --- \\
+\midrule
+$24$  & $0.4142$ & $[0.363,0.467]$ & $-0.0138$ & $-1.03$ \\
+$49$  & $0.4467$ & $[0.395,0.500]$ & $+0.0187$ & $+1.41$ \\
+$74$  & $0.4231$ & $[0.372,0.476]$ & $-0.0049$ & $-0.35$ \\
+$99$  & $0.4497$ & $[0.398,0.503]$ & $+0.0217$ & $+1.75$ \\
+$124$ & $0.4379$ & $[0.386,0.491]$ & $+0.0099$ & $+0.77$ \\
+$149$ & $0.4349$ & $[0.383,0.488]$ & $+0.0069$ & $+0.46$ \\
+$174$ & $0.4527$ & $[0.400,0.506]$ & $+0.0247$ & $+1.74$ \\
+$199$ & $0.4615$ & $[0.409,0.515]$ & $+0.0335$ & $+2.48$ \\
+$224$ & $0.4290$ & $[0.377,0.482]$ & $+0.0010$ & $+0.07$ \\
+$249$ & $0.4408$ & $[0.389,0.494]$ & $+0.0128$ & $+0.91$ \\
+$274$ & $0.4290$ & $[0.377,0.482]$ & $+0.0010$ & $+0.08$ \\
+$299$ & $0.4260$ & $[0.374,0.479]$ & $-0.0020$ & $-0.15$ \\
+$324$ & $0.4172$ & $[0.366,0.470]$ & $-0.0108$ & $-0.85$ \\
+$349$ & $0.4349$ & $[0.383,0.488]$ & $+0.0069$ & $+0.48$ \\
+$374$ & $0.4379$ & $[0.386,0.491]$ & $+0.0099$ & $+0.83$ \\
+$399$ & $0.4231$ & $[0.372,0.476]$ & $-0.0049$ & $-0.41$ \\
+$424$ & $0.4349$ & $[0.383,0.488]$ & $+0.0069$ & $+0.49$ \\
+$449$ & $0.4290$ & $[0.377,0.482]$ & $+0.0010$ & $+0.08$ \\
+$474$ & $0.4349$ & $[0.383,0.488]$ & $+0.0069$ & $+0.51$ \\
+$499$ & $0.4527$ & $[0.400,0.506]$ & $+0.0247$ & $+2.10$ \\
+$524$ & $0.4408$ & $[0.389,0.494]$ & $+0.0128$ & $+0.87$ \\
+$549$ & $0.4615$ & $[0.409,0.515]$ & $+0.0335$ & $+2.46$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{The three points that looked significant do not replicate.} Three checkpoints
+cleared $|z|>2$ against the base mean --- steps $199$, $499$ and $549$. At $22$ comparisons
+that is close to what $\alpha=0.05$ produces by chance, and none survives a Bonferroni
+threshold of $|z|>2.86$, but the decisive test is to measure them again rather than to argue
+about multiplicity. Each was re-scored on a fresh server, together with the lowest checkpoint
+as a control on the direction of the effect. Every one moved back toward the base: step $199$
+fell from $0.4615$ to $0.4320$, step $549$ from $0.4615$ to $0.4438$, step $499$ from $0.4527$
+to $0.4467$, while step $24$ rose from $0.4142$ to $0.4231$. Averaged over both measurements
+no checkpoint sits more than $2.5$ points above the base mean, which is inside the
+same-weights band. \textbf{The apparent significance was the batching noise of the preceding
+paragraph, caught by the control it predicts.}
+
+\paragraph{What this supports, stated plainly.} At the headline budget, across $525$ training
+steps, the A0 baseline is statistically indistinguishable from the un-adapted base model. The
+design would have resolved a pooled effect of $2.4$ points or a drift of $2.6$ points over the
+run and it found $+0.89$ and $+0.68$ respectively, both with intervals containing zero. So
+the reading is \emph{not} that the cheap probe was too blunt to see a real gain: at seven
+times the sensitivity and eight times the budget there is still no gain to see. What the
+cheap probe did get badly wrong is the level --- $0.11$ against $0.43$, a $32$-point
+understatement --- which is exactly the distortion Sec.~\ref{sec:pereval} built its naming
+convention to prevent, now measured on this run rather than argued from the general case.
+Combined with the weight-space trajectory, which shows the adapter growing by $46\times$
+throughout, the diagnosis is the ``learning but not helping'' branch of
+\texttt{periodic\_eval.diagnose}, not the ``not learning'' branch: the optimiser is moving
+the weights steadily and none of that movement reaches OlympiadBench accuracy.
+
+\paragraph{What this does not support, and what would settle it.} This is $549$ steps of a
+run configured for $12{,}853$, so it bounds the gain \emph{so far} and not the gain the run
+can eventually produce; a null at $4\%$ of a schedule is not a null at the end of one. It is
+also one benchmark, and a reward that is teaching something OlympiadBench does not test would
+look exactly like this. Two things would separate those cases. First, the same sweep on the
+training reward itself: if the reward is rising while accuracy is flat, the gap is the claim
+and it is measurable with the artifacts already saved. Second, continuing this curve as the
+run proceeds --- the sweep costs about ten GPU-minutes per checkpoint and the harness,
+merge and analysis are stored beside the scores in
+\texttt{gs://selfevo/evals/a0\_headline/}, so extending it is re-running one script rather
+than rebuilding the measurement.
