@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Rung 0 as run on 2026-09-03. Serves Frontis-MA1-30B on ONE GPU and runs the
 # OpenRSI NatureBench local quickstart with --smoke (one task, one candidate).
-# Currently BLOCKED at the reward stage; see RUNG0.md.
+# Requires patches/0001-send-naturebench-control-token.patch applied to OpenRSI 1f477c48.
+# STILL BLOCKED at /evaluate (API changed shape, not just auth); see RUNG0.md.
 set -euo pipefail
 GPU="${GPU:-3}"
 PORT="${PORT:-30010}"
@@ -19,6 +20,8 @@ until curl -fsS "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1; do sleep 5; 
 curl -fsS "http://127.0.0.1:$PORT/v1/models"   # record which model actually answers
 
 cd ~/OpenRSI/OpenMLE-Evo
+# LOCAL MODIFICATION: supply the NatureBench control token (NatureBench >= d38eb9c).
+export NATUREBENCH_CONTROL_TOKEN_PATH="$HOME/NatureBench/eval_logs/eval_control_token"
 PRIMARY_KEY=EMPTY ~/py312/bin/python scripts/run_naturebench_local.py \
   --naturebench-repo ~/NatureBench \
   --local-python ~/nbenv/bin/python \

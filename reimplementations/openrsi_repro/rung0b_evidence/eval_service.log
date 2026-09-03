@@ -1,0 +1,9 @@
+2026-09-03 06:12:02,511 [EvalService] INFO --data-dir not specified, waiting for tasks to be registered via POST /register
+2026-09-03 06:12:02,512 [EvalService] INFO Evaluation Service ready: http://127.0.0.1:8321
+2026-09-03 06:12:02,512 [EvalService] INFO Starting Evaluation Service, press Ctrl+C to stop
+2026-09-03 06:12:02,712 [EvalService] INFO "GET /health HTTP/1.1" 200 -
+2026-09-03 06:12:49,462 [EvalService] INFO [s42256-023-00611-x] task registered dynamically: data_dir=/home/ubuntu/OpenRSI/OpenMLE-Evo/.naturebench/data/tasks/s42256-023-00611-x, timeout=1800, out_dir=/home/ubuntu/rung0b_out/workspaces/_eval_service/rung0_smoke_patched/s42256-023-00611-x, instances=4
+2026-09-03 06:12:49,462 [EvalService] INFO "POST /register HTTP/1.1" 200 -
+2026-09-03 06:12:49,463 [EvalService] INFO [s42256-023-00611-x] timer started
+2026-09-03 06:12:49,464 [EvalService] INFO "POST /start_timer HTTP/1.1" 200 -
+2026-09-03 06:12:49,464 [EvalService] INFO "POST /evaluate HTTP/1.1" 400 -

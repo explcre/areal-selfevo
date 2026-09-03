@@ -1,0 +1,60 @@
+diff --git a/OpenMLE-Evo/third_party/aira-evo/examples/nature_bench/base_task.py b/OpenMLE-Evo/third_party/aira-evo/examples/nature_bench/base_task.py
+index 541ec46..034e01a 100644
+--- a/OpenMLE-Evo/third_party/aira-evo/examples/nature_bench/base_task.py
++++ b/OpenMLE-Evo/third_party/aira-evo/examples/nature_bench/base_task.py
+@@ -32,6 +32,37 @@ from dojo.core.tasks.constants import (
+ )
+ 
+ 
++# --- LOCAL MODIFICATION, NOT UPSTREAM -------------------------------------------------
++# NatureBench commit d38eb9c (2026-08-28, "protect control endpoints with service token")
++# gates POST /register, /start_timer, /resume_timer and /pause_timer behind the header
++# X-NatureBench-Control-Token, answering 404 "unknown endpoint" when it is absent so the
++# endpoints stay hidden from model-generated code. OpenRSI at commit 1f477c48 never sends
++# that header, so its documented NatureBench quickstart cannot register a task against
++# NatureBench at or after d38eb9c. This helper supplies the token. It is our change, not
++# the authors'; see reimplementations/openrsi_repro/RUNG0.md.
++NATUREBENCH_CONTROL_TOKEN_HEADER = "X-NatureBench-Control-Token"
++
++
++def _load_naturebench_control_token() -> str:
++    """Return the NatureBench eval-service control token, or an empty string.
++
++    Reads NATUREBENCH_CONTROL_TOKEN, else the file named by
++    NATUREBENCH_CONTROL_TOKEN_PATH. Returns "" rather than raising, so a deployment whose
++    service does not gate control endpoints behaves exactly as before this patch.
++    """
++    token = os.environ.get("NATUREBENCH_CONTROL_TOKEN", "").strip()
++    if token:
++        return token
++    path = os.environ.get("NATUREBENCH_CONTROL_TOKEN_PATH", "").strip()
++    if not path:
++        return ""
++    try:
++        return Path(path).read_text(encoding="utf-8").strip()
++    except OSError:
++        return ""
++# --- END LOCAL MODIFICATION -----------------------------------------------------------
++
++
+ class _RawShell(str):
+     pass
+ 
+@@ -1465,10 +1496,16 @@ done
+     ) -> dict[str, Any]:
+         if self._uses_scm():
+             return self._remote_json_request(endpoint, payload, timeout=timeout)
++        # LOCAL MODIFICATION, NOT UPSTREAM: attach the NatureBench control token so
++        # that /register and the timer endpoints are reachable at NatureBench >= d38eb9c.
++        headers = {"Content-Type": "application/json"}
++        _control_token = _load_naturebench_control_token()
++        if _control_token:
++            headers[NATUREBENCH_CONTROL_TOKEN_HEADER] = _control_token
+         request = urllib.request.Request(
+             f"{self.eval_service_url}/{endpoint.lstrip('/')}",
+             data=json.dumps(payload).encode("utf-8"),
+-            headers={"Content-Type": "application/json"},
++            headers=headers,
+             method="POST",
+         )
+         try:

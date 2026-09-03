@@ -2945,3 +2945,63 @@ through the product with a \emph{varying} $V$ and $N$, where it sets the exchang
 between difficulty and the other two factors. The practical consequence for anyone
 reimplementing Ornith is that one of the two most conspicuous missing constants carries far
 less reconstruction risk than it appears to.
+
+\subsection{Rung 0, second attempt: the skew is authentication \emph{and} an API change}
+\label{sec:openrsirung0b}
+
+Following Sec.~\ref{sec:openrsirung0} we took the patch route rather than pinning
+NatureBench to its pre-fix commit, because pinning re-opens the control endpoints to
+model-generated code and the box in question also runs other people's jobs. The security
+argument is unchanged and we still endorse it. What changed is the size of the patch.
+
+\paragraph{The modification we made, declared.} Against OpenRSI commit \texttt{1f477c48}
+and NatureBench commit \texttt{cd9de65}, we add to
+\texttt{examples/nature\_bench/base\_task.py} a helper
+\texttt{\_load\_naturebench\_control\_token()} and make \texttt{\_post\_json} attach the
+header
+\begin{center}
+\texttt{X-NatureBench-Control-Token: <token>}
+\end{center}
+read from \texttt{NATUREBENCH\_CONTROL\_TOKEN} or the file named by
+\texttt{NATUREBENCH\_CONTROL\_TOKEN\_PATH}, which the service auto-creates at
+\texttt{NatureBench/eval\_logs/eval\_control\_token}. It is $60$ diff lines, verified to
+apply cleanly to a pristine \texttt{1f477c48}, bracketed in the source by
+\texttt{LOCAL MODIFICATION, NOT UPSTREAM}, and a no-op when no token is configured. It is
+kept as a patch file, not a vendored fork, because OpenRSI is CC~BY-NC~4.0.
+
+\paragraph{It closes the authentication half and no more.} After the patch the service logs
+\texttt{POST /register} $200$ and \texttt{POST /start\_timer} $200$, where both were $404$
+before. \texttt{POST /evaluate} then returns $400$, \texttt{missing eval\_token}:
+NatureBench's \texttt{/evaluate} now takes an opaque per-task \texttt{eval\_token} bound at
+registration, while OpenRSI still posts the pre-hardening body
+\texttt{\{task\_name, batch\_name, output\_dir\}}. A \texttt{git log -S eval\_token} places
+that API change in the same two commits as the gate (\texttt{d38eb9c}, \texttt{5304604}).
+
+\paragraph{We stopped rather than widen the patch, and the reason is a silent-wrong-number
+risk.} Under the new API the service evaluates
+\texttt{<registered out\_dir>/workspace/output} from state bound at registration, and no
+longer honours a per-call \texttt{output\_dir}. In our run those are different paths: the
+registered directory was
+\texttt{.../workspaces/\_eval\_service/rung0\_smoke\_patched/s42256-023-00611-x} while the
+attempt actually wrote to
+\texttt{.../workspaces/s42256-023-00611-x\_validation\_1/output}. OpenRSI registers once per
+task but evaluates once per attempt. Adding an \texttt{eval\_token} and dropping
+\texttt{output\_dir} would therefore score a fixed directory the candidate never wrote to,
+and it would do so \emph{successfully}: a returned number, of the wrong directory. Making
+it correct needs per-attempt re-registration with a constructed \texttt{out\_dir} and a
+token threaded through the attempt lifecycle, roughly $30$--$50$ lines of semantics we
+would be inferring rather than reading. That is where a wrong number would enter, so the
+scope decision goes back to the PI rather than being taken here.
+
+\paragraph{The reproducibility observation, stated as such.} At current HEADs of two
+first-party repositories --- OpenRSI \texttt{1f477c48} and NatureBench \texttt{cd9de65},
+three days after the commit that broke compatibility --- OpenRSI's documented NatureBench
+quickstart cannot evaluate a single task. It fails first at \texttt{/register} on a missing
+control-token header and then, once that is supplied, at \texttt{/evaluate} on a changed
+request contract. Ornith's absent code cannot be run at all; this is the milder but more
+insidious case, where a genuinely complete and well-tested release stops working because a
+security hardening in the benchmark it depends on has not yet been mirrored in the client.
+\textbf{Their published results predate the skew and are untouched by it}, and their own
+test suites still pass $119/119$. We record this as a reproducibility observation about
+released systems, not as a criticism of the work: it is precisely the kind of quiet
+breakage that stops third parties reproducing a paper without anyone noticing.

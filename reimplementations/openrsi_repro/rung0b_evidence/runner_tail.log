@@ -1,0 +1,30 @@
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/ubuntu/OpenRSI/OpenMLE-Evo/third_party/aira-evo/examples/mle_bench/single_task_runner.py", line 1785, in <module>
+    main()
+  File "/home/ubuntu/OpenRSI/OpenMLE-Evo/third_party/aira-evo/examples/mle_bench/single_task_runner.py", line 1677, in main
+    _, _, best_node = solver(task, state)
+                      ^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/OpenRSI/OpenMLE-Evo/third_party/aira-evo/src/dojo/solvers/evo/evo.py", line 2080, in __call__
+    state, solution = self.search(task, state)
+                      ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/OpenRSI/OpenMLE-Evo/third_party/aira-evo/src/dojo/solvers/evo/evo.py", line 1991, in search
+    state, eval_result = task.step_task(state, extract_code(child_node.code))
+                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/OpenRSI/OpenMLE-Evo/third_party/aira-evo/examples/nature_bench/base_task.py", line 1751, in step_task
+    eval_payload = self.evaluate_code(str(action), phase="validation")
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/OpenRSI/OpenMLE-Evo/third_party/aira-evo/examples/nature_bench/base_task.py", line 1711, in evaluate_code
+    eval_payload = self._post_evaluate(eval_output_dir)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/OpenRSI/OpenMLE-Evo/third_party/aira-evo/examples/nature_bench/base_task.py", line 1565, in _post_evaluate
+    return self._post_json("evaluate", payload, timeout=self.eval_timeout)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/OpenRSI/OpenMLE-Evo/third_party/aira-evo/examples/nature_bench/base_task.py", line 1516, in _post_json
+    raise RuntimeError(
+RuntimeError: NatureBench eval service /evaluate failed with HTTP 400: {
+  "error": "missing eval_token"
+}
+[2026-09-03 06:12:49,959][root][ERROR] - AIRA Dojo task failed: s42256-023-00611-x (return_code=1)
+[2026-09-03 06:12:50,004][root][WARNING] - AIRA Dojo runner completed with 1 failed tasks.
