@@ -4181,3 +4181,180 @@ be watched while letting T run into its own late collapse unremarked. The guard 
 held-out capability, or on tokens \emph{and} accuracy jointly, not on length alone. It is the
 reason the common budget sits at $6.95$M rather than somewhere chosen in advance, and therefore
 a contributing cause of the unresolved comparison above.
+
+\subsection{Ornith's three-stage loop, executed: the optimiser it never had, and what the
+loop costs before it can learn anything}
+\label{sec:ornithloop}
+
+Everything this paper has measured of Ornith-1.5 so far is its \emph{task-selection
+criterion}. The reproduction in \texttt{reimplementations/ornith\_repro} has sixteen modules
+and \textbf{nothing in it trains}: there is no optimiser, no backward pass and no parameter
+update anywhere in the package, and \texttt{loop.apply\_update} is a seam that records what
+would be updated. The central claim --- that a model improves itself by co-evolving tasks,
+scaffolds and weights --- had therefore never been executed. This section adds the missing
+half and runs it.
+
+\paragraph{What was added, and what was reused unchanged.} Group-relative optimisation on all
+three stages, each against its own published reward:
+$R_{\mathrm{task}} = V(q,s)\,D(q,s,\{\tau\})\,N(q)$ with
+$D=\exp(-(\hat p-p^\star)^2/2\sigma^2)$ and $p^\star=0.2$;
+$R_{\mathrm{harness}} = C(q,h)\,F(h,\{\tau\})\,H(h)$; and
+$R_{\mathrm{rollout}} = h(q,\tau)$, the scaffold being the rollout's reward function.
+Every one of those, the reward propagation between them and both within-task comparison
+levels are computed by \texttt{nested.run\_iteration\_nested}, which is imported rather than
+rewritten; the one group it cannot form is the \emph{task} group, because it scores a single
+task per call, so that is formed across the tasks of an iteration and is the only new GRPO
+group here. Three optimiser steps per iteration on one shared adapter, in the package's own
+\texttt{stage\_order} (solver, harness, proposer): one policy improving itself, not three
+policies. The scaffold constructors and the proposal parser are the package's, called through
+a replay client so that batched asynchronous generation does not fork their logic.
+
+\paragraph{Three configuration traps, all of which report as something else.}
+\begin{enumerate}
+\item \textbf{Dynamic adapter loading forbids data parallelism.} sglang refuses
+  \texttt{load\_lora\_adapter} with \texttt{dp\_size must be 1 or dp attention must be
+  enabled}, as an HTTP 500. Serving the arms in Sec.~\ref{sec:gatearms} never hit this because
+  those adapters were loaded once at boot; a loop that rewrites its adapter every iteration
+  cannot use data parallelism at all and must run tensor-parallel.
+\item \textbf{The server's context length reports as the generation cap.} With a
+  $6144$-token context every proposer completion stopped between $5359$ and $5520$ tokens and
+  the server returned \texttt{finish\_reason: length} --- indistinguishable from hitting a
+  generation cap of $16384$ that was nowhere near reached. Read at face value it says the
+  proposer rambles to any budget; it actually says the window was $6144$.
+\item \textbf{The stage prompts are not chat-templated by the package.} Sent as raw strings to
+  an instruction-tuned model the proposer does free-form continuation rather than
+  instruction-following. Every stage here is rendered through the model's chat template at the
+  same \texttt{reasoning\_effort=low} the rest of this paper uses.
+\end{enumerate}
+
+\paragraph{The loop's cost, measured before its budget was fixed, and it is the finding that
+constrains everything else.}
+
+\begin{table}[t]
+\centering\small
+\caption{What one turn of the published loop costs on \texttt{Qwen3.8-27B}, measured on the
+B200 before any budget was chosen. The benchmark row is the same model, same thinking budget,
+solving OlympiadBench (Table~\ref{tab:b200cap}) and is the comparison.}
+\label{tab:ornithcost}
+\begin{tabular}{lrrrr}
+\toprule
+stage & cap & median tokens & never terminated & usable output \\
+\midrule
+proposer            & $16{,}384$ & at the cap & $8/12$  & $4/12$ parse as a task \\
+proposer            & $22{,}528$ & at the cap & $9/12$  & $3/12$ parse as a task \\
+scaffold            & $16{,}384$ & $3{,}649$  & $0/8$   & --- \\
+solver, \emph{generated} task & $16{,}384$ & $\mathbf{15{,}325}$ & $7/16$ & $12/16$ boxed \\
+\addlinespace
+solver, OlympiadBench (Sec.~\ref{sec:gatearms}) & $16{,}384$ & $1{,}277$ & $0.317$ & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{The proposer does not terminate.} At a $16{,}384$-token cap two thirds of attempts
+never close their reasoning block; raising the cap to $22{,}528$, essentially the whole
+context window, leaves three quarters unterminated and the share that parses as a well-formed
+task unchanged at a quarter to a third. The extra budget buys nothing: the completions simply
+fill whatever cap is set. In the first live iteration this cost $383{,}722$ generated tokens
+across $24$ attempts to obtain \textbf{two} usable tasks, a yield of $0.083$.
+
+\textbf{And its output is expensive to use.} A task the model proposes takes a median of
+$\mathbf{15{,}325}$ tokens to attempt --- \emph{twelve times} the $1{,}277$-token median of an
+OlympiadBench problem for the same model at the same thinking budget --- with $7$ of $16$
+attempts never finishing at $16{,}384$. At the $4096$ cap the loop was first configured with,
+$15$ of $16$ rollouts are cut off, and the package's own guard G1 correctly refused the task
+for carrying $1$ gradeable rollout of $18$. That refusal is the loop working, not failing; but
+it means a faithful iteration cannot be run at a rollout budget an RL loop would normally use.
+
+\paragraph{What the loop did, against conditions fixed before it ran.}
+\texttt{PREREG\_ornith\_loop.md} states the primary quantity (informative rollout groups
+sustained across iterations), the secondary ones, and five degeneration conditions, and was
+written before any iteration statistic was read; its budget was amended once, before the run,
+because the measurement above showed the loop costs twelve times what the benchmark does.
+Ten iterations were run across three runs. No update ever fired between iterations that
+produced none, so the policy was unchanged and the iterations are independent draws.
+
+\textbf{One of ten iterations produced a gradient step at all.} The other nine could not
+assemble a task group of two. Table~\ref{tab:ornithloop} decomposes where they were lost.
+
+\begin{table}[t]
+\centering\small
+\caption{Ten iterations of the three-stage loop, pooled (\texttt{runs/ornith\_v2},
+\texttt{ornith\_run}, \texttt{ornith\_smoke}). ``never terminated'' is a proposer attempt that
+filled the 16{,}384-token cap without closing its reasoning block. The refusals are the
+package's own guards firing, correctly, on tasks it had accepted as valid.}
+\label{tab:ornithloop}
+\begin{tabular}{lr}
+\toprule
+quantity & value \\
+\midrule
+iterations run                                     & $10$ \\
+iterations that formed a task group and trained    & $\mathbf{1}$ \\
+proposer attempts                                  & $168$ \\
+\quad never terminated                             & $126$ \ $(0.750)$ \\
+\quad accepted as a well-formed task               & $27$ \ (yield $0.161$) \\
+proposer tokens generated                          & $2{,}442{,}356$ \\
+\quad per accepted task                            & $90$k \\
+\quad \textbf{per task that survived to be scored} & $\mathbf{407}$\textbf{k} \\
+\addlinespace
+accepted tasks refused: all rollout groups degenerate (guard G4) & $20$ \\
+accepted tasks refused: too few gradeable rollouts (guard G1)    & $1$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Which degeneration, and the k-vectors say it unambiguously.}
+``All groups degenerate'' can mean the proposer made a task the solver always solves or one it
+never solves, and those are opposite failures with opposite repairs, so the refusal path records
+the success count of every scaffold group it refuses. Across the $30$ scaffold groups of the
+refused tasks, $\mathbf{27}$ were unanimously \emph{correct} ($k=4$ of $4$), $2$ unanimously
+wrong, and $1$ mixed. The two tasks that survived to be scored had $\hat p = 0.9167$.
+
+\textbf{The proposer, instructed in Ornith's own prompt to aim at a problem the model solves
+``about one time in five'', produces tasks it solves essentially every time.} That is
+degeneration condition~1 of the five declared in advance, and it is the one that matters
+because the difficulty kernel is built to punish it: at $\hat p = 0.9167$,
+$D=\exp(-(0.9167-0.2)^2/2\cdot0.15^2) = 1.1\times10^{-5}$, so $R_{\mathrm{task}}=V D N$ is
+$1.07\times10^{-5}$ and the task reward is numerically dead. The gate is doing its job; there
+is simply nothing in its support to select.
+
+This is not an artefact of our group size. The package's own
+\texttt{predicted\_binary\_degeneracy} gives $0.706$ degenerate groups at $\hat p=0.9167$ with
+$G=4$ and $0.499$ at $G=8$: a larger group would have halved the loss, not removed it, and the
+observed all-correct rate of $27/30$ is higher than even the $G=4$ prediction because many of
+these tasks are at $\hat p=1$ exactly. At Ornith's published $p^\star=0.2$ the same formula
+gives $0.411$, so the target itself concedes a substantial degenerate fraction; the proposer
+is nowhere near it.
+
+\paragraph{The one iteration that trained, reported in full because it is the only one.}
+All three stages fired and all three took a real gradient step on one shared adapter:
+solver $8$ rows / $111{,}999$ tokens / grad-norm $0.0260$; harness $6$ rows / $61{,}668$ /
+$0.0395$; proposer $2$ rows / $26{,}152$ / $0.0146$. Both nested comparison levels formed ---
+$2$ of $6$ rollout groups informative, $2$ of $2$ scaffold groups informative, task group
+informative --- the adapter's LoRA-B moved from exactly $0$ to $16{,}156$, and the served
+adapter was verified against a null adapter on the same server at $2.33\times$ the
+null-routing numerical floor. The iteration took $868$ seconds and generated $734{,}658$
+tokens. Novelty was healthy ($N=0.966$) and validity perfect ($V=1.0$); neither the novelty
+buffer nor the validity gate is what stopped this loop.
+
+\paragraph{What this establishes, and what it does not.}
+It establishes that the loop \emph{runs}: the optimiser this reproduction never had is now
+attached to all three stages, the nested group structure is exercised rather than merely
+present, and every stage takes a measurable gradient step. It also establishes the process
+answer this run was for, and the answer is negative in a specific and diagnosable way.
+\textbf{On this base, the loop does not sustain a supply of informative groups because it
+cannot manufacture a task at the difficulty its own reward demands.} Nine iterations in ten
+produced no gradient at all, and $407$k generated tokens were spent per task that reached
+scoring.
+
+It does not establish that Ornith-1.5's method fails. Three limits bound the claim, and all
+three are ours. The proposer is a \emph{prompted} stage of an untrained policy: the loop is
+supposed to train it, and it never got the chance because the task group needed two survivors
+to form. A group size of $4$ costs signal that a group of $8$ would partly recover. And ten
+iterations is a small number, forced by a per-iteration cost we measured rather than chose.
+What the run does show is that the first turn of the loop is the hard one, and that the
+published design has no mechanism to get through it: the difficulty reward can only rank tasks
+a proposer already produces, and on a strong base an untrained proposer produces tasks at
+$\hat p \approx 1$. That is the same shape as this paper's other three counts of training
+signal that does no work, arriving one level up --- and it is an argument for seeding the loop
+from measured difficulty, which is exactly what the mixed subset of Sec.~\ref{sec:gatearms}
+provides and what the arms there used.
