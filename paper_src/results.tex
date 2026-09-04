@@ -3758,3 +3758,426 @@ for any real model: every problem in the committed search half sampled sixteen t
 terminating budget, split into an independent selecting block and fresh block of $k=8$, so
 that the control can be matched to fresh-block difficulty rather than to the inflated
 selecting-block value.
+\subsection{Running the pre-registered arms on eight B200s: the mixed subset, four silent
+traps, and what moved}
+\label{sec:gatearms}
+
+Sec.~\ref{sec:gatefeasibility} declined to start T, C1 and C2, on the grounds that a run at
+the default operating point would return a difference smaller than the instrument. This
+section reports the run, on a machine that removes the constraint that had been mistaken for
+an engineering one. Two things changed.
+
+\textbf{The hardware.} Eight B200s at $183$\,GB each. A $27$B policy in bf16 is $52$\,GB, so a
+LoRA trainer needs no sharding at all and a rollout server on a second device still has
+$\sim\!100$\,GB of KV cache. The four arms therefore run \emph{concurrently}, one trainer and
+one server each, on eight identical devices --- rather than in sequence on $80$\,GB boxes
+where the same experiment needs FSDP and the arms cannot share a hardware generation. Every
+number below comes from that one machine in one session.
+
+\textbf{The pool.} The arms train on the \textbf{mixed subset}, not on the search half. A
+group contributes gradient only when its members disagree, and an always-solved problem cannot
+disagree with itself at any group size; training on a pool that is mostly always-solved is the
+condition under which ``the method does not work'' and ``there was no room left'' produce the
+same table. The subset is established below from this box's own rollouts. We did not inherit a
+list.
+
+\paragraph{The rollout cap is measured, not assumed, and the measurement is the finding.}
+Four budget failures in this programme have the same shape: a cap chosen for the length of the
+visible answer while the model emits its reasoning first, so the answer never arrives and the
+failure reads as a refusal. So the whole committed search half was sampled sixteen times at
+\texttt{reasoning\_effort=low}, temperature $1.0$, top-$p$ $0.95$, at a deliberately generous
+$16{,}384$-token cap: $5408$ generations, zero harness errors.
+The distribution is not long-tailed, it is \emph{bimodal in termination}
+(Table~\ref{tab:b200cap}). Half the generations finish inside $1277$ tokens; and $31.7\%$ never
+finish at all. Doubling the cap from $8192$ to $16{,}384$ buys $7$ points of truncation for
+$66\%$ more tokens per rollout.
+
+\begin{table}[t]
+\centering\small
+\caption{Completion length at the rollout sampling distribution, from 5408 generations over
+the 338 committed search-half problems. Quantiles are over the 3695 \emph{resolved}
+generations only: a truncated one's length is the cap, not its length, and mixing them in
+makes every upper quantile equal the cap. The right two columns are what each candidate cap
+would have cost, computed from the same samples.}
+\label{tab:b200cap}
+\begin{tabular}{lrr@{\qquad}crr}
+\toprule
+statistic & tokens & & cap & truncated & mean tokens/rollout \\
+\midrule
+median             & $1{,}277$  & & $4{,}096$  & $0.4601$ & $2{,}580$ \\
+p90                & $8{,}301$  & & $8{,}192$  & $0.3874$ & $4{,}293$ \\
+p95                & $11{,}912$ & & $12{,}288$ & $0.3482$ & $5{,}792$ \\
+p99                & $15{,}360$ & & $16{,}384$ & $0.3168$ & $7{,}147$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{The model does not get these problems wrong; it fails to stop.} Accuracy over the
+resolved generations is $\mathbf{0.9480}$, against $0.6477$ once truncated generations are
+scored as the benchmark scores them. The gap is the whole story: at this thinking budget the
+binding constraint on OlympiadBench for \texttt{Qwen3.8-27B} is termination inside the token
+budget, not mathematics. That single measurement decides the pool, the reward and the outcome
+measure, and it is why both truncation conventions are reported everywhere below.
+
+\paragraph{The mixed subset, established here, and how large it is depends on one convention.}
+A problem is in the pool when at least one of its sixteen samples is scored correct and at
+least one is not. Whether a truncated sample counts as \emph{wrong} or as \emph{unknown}
+changes that count by a factor of two and a half (Table~\ref{tab:b200pool}).
+
+\begin{table}[t]
+\centering\small
+\caption{The mixed subset of the 338-problem search half, under both truncation conventions,
+from the same 5408 samples. ``informative'' is the exact hypergeometric probability that a
+group of $G$ drawn from a problem's own sixteen outcomes disagrees, averaged over the half ---
+which by the energy identity is also the advantage energy delivered per rollout.}
+\label{tab:b200pool}
+\begin{tabular}{lccc@{\qquad}cccc}
+\toprule
+ & always & never & \textbf{mixed} & \multicolumn{4}{c}{informative at $G=$} \\
+convention & solved & solved & (pool) & $2$ & $4$ & $8$ & $16$ \\
+\midrule
+truncated $=$ wrong, cap $16384$   & $180$ & $94$  & $\mathbf{64}$ & $0.0533$ & $0.0981$ & $0.1416$ & $0.1893$ \\
+truncated $=$ wrong, cap $8192$    & $159$ & $120$ & $\mathbf{59}$ & $0.0453$ & $0.0842$ & $0.1265$ & $0.1746$ \\
+truncated $=$ unknown, cap $16384$ & $201$ & $8$   & $\mathbf{25}$ & $0.0184$ & $0.0357$ & $0.0640$ & $0.1106$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{The arms train under \emph{truncated $=$ wrong}, and the reason is not a preference.}
+Under \emph{unknown} the gate's effective pool --- the inverse participation ratio of its own
+sampling weights --- is $\mathbf{2.7}$ \emph{problems}, and its matched control C1 lands on the
+same $2.7$; there is no experiment there, only three problems memorised four hundred times.
+Under \emph{wrong} at the training cap the effective pools are $14.4$ (T), $17.9$ (C1) and
+$42.0$ (C2) out of $59$. The convention also aligns the reward with the outcome the arms are
+judged on, and with the measurement above: what this model has to learn here is to finish.
+Its cost is stated rather than hidden --- $\hat p$ then carries the token budget as well as
+the mathematics, which is exactly the contamination that made the \emph{default} thinking
+budget unusable in Sec.~\ref{sec:gatefeasibility}. The mixed-subset filter removes the worst
+of it, because a problem that never terminates is never mixed and is excluded by construction.
+
+\textbf{Restricting to the mixed subset is the whole headroom, and it is a factor of five.}
+At the training cap and $G=8$, $\mathbf{0.8735}$ of groups drawn from the unrestricted search
+half carry exactly zero advantage. Measured over the run itself, the fraction of groups that
+carried advantage inside the mixed subset was $\mathbf{0.80}$ over the first ten steps of both
+T and C1 --- a factor of $\mathbf{6.3}$ --- falling to $0.40$ (T) and $0.65$ (C1) averaged over
+the whole run as the arms exhaust a $59$-problem pool. That ratio is the difference between an
+experiment with headroom and one without, and it is available for free: it costs one pass of
+rollout statistics over the pool, which every one of these systems already produces and
+discards. The decay is the other half of the same fact --- a pool this small is spent in a few
+dozen steps, which is an argument for \emph{generating} tasks rather than selecting them, and
+is exactly what Sec.~\ref{sec:gatescope} says Ornith's design does.
+
+\textbf{One agreement worth recording.} The split-half reliability of a $k=8$ difficulty
+estimate on this pool is $\mathbf{0.878}$, against the $0.871$ measured independently on other
+hardware in Sec.~\ref{sec:gatefeasibility}. The two runs share no machine, no server process
+and no sampling seed, so this is a genuine replication of the claim that $\hat p$ on a real
+model is scarce rather than noisy.
+
+\paragraph{Four silent traps, all of which fire and none of which is visible in a loss.}
+Each was found by a check written to be able to fail, and each would have produced a complete,
+well-formed, gate-passing run.
+
+\begin{enumerate}
+\item \textbf{The adapter reaches 16 of 64 layers.} \texttt{Qwen3.8-27B} sets
+  \texttt{full\_attention\_interval} $=4$: $16$ layers carry
+  \texttt{self\_attn.\{q,k,v,o\}\_proj} and the other $48$ carry a gated-delta-net
+  \texttt{linear\_attn} block with different module names. The \texttt{target\_modules}
+  inherited from the older Qwen match $64$ modules on $16$ layers --- and additionally the
+  multi-token-prediction head, giving $17$ distinct layer indices in the checkpoint's own
+  naming. Adding the MLP triple reaches all $64$ layers but still $0$ of $48$
+  linear-attention modules. Adding \texttt{linear\_attn.out\_proj} gives $304$ modules,
+  $16/16$ full-attention, $48/48$ linear-attention, $64/64$ layers. The coverage assertion
+  counts \emph{layers reached per family} and fires on both inherited configurations; it is
+  reported firing, not merely passing.
+\item \textbf{Naming the adapter in the \texttt{model} field is inert.} On the same prompt
+  string, \texttt{/v1/completions} with \texttt{model=}\,\emph{adapter} returns HTTP $200$ and
+  text byte-identical to the base route, while \texttt{/generate} with
+  \texttt{lora\_path=}\,\emph{adapter} differs. Every arm here routes through
+  \texttt{lora\_path}.
+\item \textbf{A ``does the adapter change the output'' probe is scale-dependent, in both
+  directions.} At LoRA-B magnitude $0.02$ only the MLP family moved a greedy completion; the
+  full-attention family needed $0.05$ and the linear-attention family $0.2$. A fixed small
+  probe therefore reports \emph{not applied} for a family that is applied --- our first run of
+  it accused two of three families. The check now sweeps magnitude and reports the smallest
+  one at which each family responds. In the other direction, comparing logprobs for
+  \emph{equality} is too fine: routing through the LoRA path adds $BAx$ that is exactly zero
+  for a null adapter, but the extra GEMM changes the bf16 reduction order, so a provably null
+  adapter still shifts logprobs. The usable form is a live adapter measured against a null
+  adapter on the same server.
+\item \textbf{Gradient checkpointing was silently inert.} \texttt{from\_pretrained} returns a
+  model in \texttt{eval} mode and transformers skips checkpointing entirely unless
+  \texttt{self.training}; the enabling call is accepted with no warning. Measured at the same
+  micro-batch: $175.9$\,GiB allocated and an out-of-memory error, against $\mathbf{82.5}$\,GiB
+  after \texttt{model.train()}. The trainer now runs one worst-case forward and backward
+  \emph{before} the first rollout is paid for and refuses to start without headroom.
+\end{enumerate}
+
+\textbf{A fifth, which is ours rather than the stack's, and which the one-sample run caught.}
+The pool was built with \emph{truncated $=$ wrong} while the advantage was computed by
+dropping truncated rollouts. On the first smoke step that combination reported accuracy
+$1.000$ and an informative fraction of $0.00$ --- on a pool every member of which is mixed by
+construction --- because a task selected precisely because it sometimes fails to terminate had
+its failures deleted and its survivors all agreed. The trainer now refuses to start when the
+convention it is given differs from the one recorded in the pool file.
+
+\textbf{And a sixth, in the serving stack.} \texttt{/unload\_lora\_adapter} deadlocks on a
+server still holding requests whose client was killed mid-generation: it logs ``Start unload
+Lora adapter'', never returns, and sits at $0\%$ GPU, which is indistinguishable from a slow
+step. On a clean server the unload/load pair takes $0.0$\,s and $0.2$\,s. Both calls are now
+bounded, so the failure aborts the arm instead of stalling it silently.
+
+\paragraph{Micro-batching is a rewrite of the measured quantity, so it is shown to be a
+no-op.} Right padding lets several rollouts share one forward, which is what makes a $27$B
+on-policy loop affordable; on a model whose 48 recurrent layers could consume padding it is
+also a way to change every logprob the gradient is built from. A fixed tolerance cannot decide
+this and trying one first is what showed why: two identical calls agree \emph{exactly}
+($0.0$), but scoring a sequence alone versus in a batch of two \emph{copies} of itself --- equal
+lengths, no padding at all --- already moves a token's logprob by $0.1032$. The drift is a
+shape-dependent bf16 reduction, and any absolute tolerance rejects it whatever padding does.
+Padding is therefore measured against that control: padding alone to length $64$ gives
+$0.1023$ and to $256$ gives $0.0469$. It does not exceed the no-padding control and it does not
+grow with the amount of padding, which is what a recurrence consuming pad tokens would do.
+
+\paragraph{The arms, and what each one actually selected.}
+All four read the same $59$-problem pool file and differ only in the rule
+(Table~\ref{tab:b200arms}). T weights each task by Ornith's kernel
+$D(\hat p)=\exp(-(\hat p-p^\star)^2/2\sigma^2)$ with $p^\star=0.2$, $\sigma=0.15$, read on the
+\emph{selecting} block. C1 is uniform-random resampled to T's realised \emph{fresh}-block
+difficulty histogram, which is pre-registration matching rule~2 and is also why the control is
+not vacuous here: it reaches the same true difficulty by a different rule, so it agrees with T
+on $\hat p_B$ and disagrees on $\hat p_A$. C2 keeps $0.1\le\hat p\le0.9$, no target and no
+kernel. C3 selects \emph{exactly} as T --- the same seed, the same draws --- and replaces the
+reward with an independent fair coin, so that the only difference between T and C3 is what the
+optimiser is told.
+
+\begin{table}[t]
+\centering\small
+\caption{What each selector actually draws from the $59$-problem mixed subset. ``effective
+pool'' is the inverse participation ratio of the selector's own weights, i.e.\ the number of
+problems it behaves as though it had. The C1 row is the control working: it matches T on the
+independent block ($\hat p_B$) and differs on the block the gate reads ($\hat p_A$), so it is
+a different rule that lands on the same difficulty rather than a relabelling of T.}
+\label{tab:b200arms}
+\begin{tabular}{llccc}
+\toprule
+arm & rule & mean $\hat p_A$ & mean $\hat p_B$ & effective pool \\
+\midrule
+T  & kernel at $p^\star=0.2$, $\sigma=0.15$ & $0.175$ & $0.219$ & $14.4$ \\
+C1 & matched to T's $\hat p_B$ histogram    & $0.221$ & $0.220$ & $17.9$ \\
+C2 & band $0.1\le\hat p\le0.9$              & $0.637$ & $0.688$ & $42.0$ \\
+C3 & T's draws, reward $\sim$ fair coin     & $0.175$ & $0.219$ & $14.4$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{And under the other convention the comparison does not exist.} With truncated samples
+dropped as unknown, T's effective pool is $\mathbf{2.7}$ problems and C1's is the same $2.7$;
+the two arms would then be the same three problems seen four hundred times each, and any
+difference between them would be memorisation. That is the sharpest statement of the scarcity
+this paper has: at a strong model's operating point, the difficulty gate applied to a curated
+frontier-mathematics pool has essentially nothing to select.
+
+
+\paragraph{A first attempt collapsed, and the control that identified why was C3.}
+The arms were first run with a \emph{token-level} loss normaliser (DAPO's, dividing by the
+batch's total completion tokens) at $\eta=2\times10^{-4}$. Three of the four arms destroyed
+themselves within a dozen steps (Table~\ref{tab:b200collapse}): rollout accuracy went to zero
+and stayed there. \textbf{The random-reward arm did not.} C3 sees the same tasks, the same
+group structure, the same optimiser and the same normaliser, and differs only in that its
+reward is a fair coin --- and it was still generating and still solving at the last step.
+
+\begin{table}[t]
+\centering\small
+\caption{The aborted first attempt, token-level normalisation at $\eta=2\times10^{-4}$
+(\texttt{runs/*\_lr2e4\_tokennorm\_collapsed}). ``first''/``last'' are means over the first and
+last three steps of each arm. The three arms with a real reward collapse; the one with a
+random reward does not, which is what locates the cause.}
+\label{tab:b200collapse}
+\begin{tabular}{lcccccc}
+\toprule
+ & \multicolumn{2}{c}{rollout accuracy} & \multicolumn{2}{c}{truncation} &
+   \multicolumn{2}{c}{generated tokens/step} \\
+arm & first & last & first & last & first & last \\
+\midrule
+T  & $0.243$ & $\mathbf{0.014}$ & $0.702$ & $0.271$ & $343$k & $202$k \\
+C1 & $0.250$ & $\mathbf{0.063}$ & $0.674$ & $0.062$ & $349$k & $112$k \\
+C2 & $0.743$ & $\mathbf{0.007}$ & $0.243$ & $0.222$ & $238$k & $185$k \\
+C3 (random reward) & $0.174$ & $0.292$ & $0.764$ & $0.604$ & $353$k & $320$k \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{The mechanism, and it is arithmetic rather than a tuning accident.} Under
+\emph{truncated $=$ wrong}, a rollout that hits the cap carries a negative advantage and
+$8192$ tokens, while a correct one carries a positive advantage and a median of about $1{,}200$.
+A token-level normaliser weights each rollout by its length, so the negative mass outweighs
+the positive by roughly seven to one, \emph{systematically}, on every group. The policy is
+pushed away from long continuations until it stops producing them, and on a benchmark where
+the model is right $94.8\%$ of the time \emph{when it finishes}, that is fatal. Under a random
+reward the same length weighting has no systematic direction --- long rollouts draw positive
+advantage as often as negative --- so C3 drifts and does not collapse. This is the same defect
+Sec.~\ref{sec:truncation} measured as ``$21.1\%$ of A0's negative-advantage gradient mass
+pushes away from rollouts on their way to a correct answer'', at the operating point where
+truncation is $0.39$ rather than a fifth of that, and it is therefore the dominant term rather
+than a correction.
+
+The arms were restarted with the vanilla GRPO normaliser --- average within a rollout, then
+across rollouts, so every rollout counts once whatever its length --- at $\eta=10^{-4}$, and a
+guard was added that halts an arm when its mean generated tokens per step falls below a
+quarter of its opening window, so a collapse is dated and cheap rather than a flat tail nobody
+reads. \textbf{We report the collapsed run rather than discarding it}: it is the sharpest
+evidence in this paper that a loss-normalisation choice, not a reward or a selector, can be
+the whole difference between a run that learns and a run that dies, and it was identified by a
+control included for an unrelated reason.
+
+\paragraph{The held-out outcome, and a correction to how we first scored it.}
+Every checkpoint was scored on the \emph{report} half --- $337$ problems no arm trained on ---
+at the training operating point (\texttt{reasoning\_effort=low}, temperature $1.0$, top-$p$
+$0.95$, cap $8192$), eight samples per item, adapters served by one process in one session so
+the pairing is exact. Intervals are on the paired per-item DIFFERENCE, never per arm.
+
+\textbf{We first scored these files with a convention that was ours rather than this paper's,
+and it inflated every treatment effect. It is withdrawn here.} Our analysis forced any
+generation that hit the token cap to zero. The grader this paper uses does not: it takes the
+last \emph{balanced} \verb|\boxed{}|, so a generation cut off after committing an answer is
+still scored on that answer --- a rule Sec.~\ref{sec:harnessvalid} adopted after measuring
+that discarding those flips $0$ items for the base model and $21$ of $23$ for the two most
+degraded checkpoints, i.e.\ that it penalises precisely the checkpoints under argument.
+
+The two readings differ by the share of generations cut off after committing, and that share
+is a property of the arm: $0.055$ for the base model, which truncates $41\%$ of the time,
+against $0.000$ for C1, which truncates $0.1\%$ of the time. \textbf{So the discarded
+convention charges the most to whichever arm truncates most, and the base model truncates most
+of all.} It moved T's endpoint gain from $+3.1$ to $+7.9$ points and C2's from $+8.0$ to
+$+13.2$, in each case by penalising the baseline rather than by crediting the arm.
+Table~\ref{tab:b200outcome} is on the paper's own grader.
+
+\begin{table}[t]
+\centering\small
+\caption{Held-out report half, avg@8, $337$ paired items, runs \texttt{eval\_final\_*},
+\texttt{eval\_matched\_*} and \texttt{eval\_extra\_*}, scored with the same grader as every
+other number in this paper. ``matched'' is each arm's last checkpoint at or below $6.95$M
+generated tokens --- the largest budget every arm reached, set by C1's halt; ``final'' is each
+arm's last checkpoint. ``trunc'' is the truncation rate at evaluation. C1's two columns are
+one measurement, not two: it halted \emph{at} the common budget, so its final adapter is its
+matched checkpoint and the file is byte-identical (md5 \texttt{7a1dcf26}\ldots).}
+\label{tab:b200outcome}
+\begin{tabular}{lccc@{\qquad}cccc}
+\toprule
+ & \multicolumn{3}{c}{matched ($\le 6.95$M tokens)} & \multicolumn{4}{c}{final} \\
+arm & avg@8 & $\Delta$ base & 95\% CI & avg@8 & $\Delta$ base & 95\% CI & trunc \\
+\midrule
+base & $0.6205$ & --- & --- & $0.6205$ & --- & --- & $0.410$ \\
+T    & $0.7226$ & $\mathbf{+0.102}$ & $[+0.075,+0.129]$
+     & $0.6513$ & $+0.031$ & $[+0.011,+0.050]$ & $0.216$ \\
+C1   & $0.5593$ & $\mathbf{-0.061}$ & $[-0.084,-0.038]$
+     & $0.5593$ & $-0.061$ & $[-0.084,-0.038]$ & $0.001$ \\
+C2   & $0.6558$ & $+0.035$ & $[+0.021,+0.050]$
+     & $0.7007$ & $\mathbf{+0.080}$ & $[+0.053,+0.108]$ & $0.039$ \\
+C3   & $0.6295$ & $+0.009$ & $[-0.001,+0.019]$
+     & $0.5909$ & $-0.030$ & $[-0.043,-0.017]$ & $0.405$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{C3: the reward was independent, and the arm did not gain.}
+Two questions, both answerable from the artifacts. \emph{Was the reward actually random?} The
+trainer computes the reward as \texttt{float(rng.random() < 0.5)} for C3 and
+\texttt{float(correct)} otherwise, so the C3 expression never reads correctness; the measurable
+consequence is that C3's distribution of rewarded-members-per-group must centre on $4$ rather
+than on $8\times$ its accuracy. It does. Over $234$ groups C3's mean rewarded count is
+$\mathbf{4.21}$ while $8\times$ its measured accuracy is $2.56$, and its histogram fits a fair
+coin ($\chi^2=14.8$ on $8$ d.o.f.) far better than it fits its own accuracy ($\chi^2=656$).
+The same statistic on T, whose reward \emph{is} correctness, gives a mean rewarded count of
+$6.612$ against $8\times$ accuracy of $6.612$ --- equal to three decimals. The reward was
+independent of correctness.
+
+\emph{Did C3 nonetheless move the benchmark?} $+0.9$ points at the matched checkpoint, with a
+$95\%$ interval $[-0.1,+1.9]$ that crosses zero, and $-3.0$ points $[-4.3,-1.7]$ at its own
+endpoint, where it is significantly \emph{below} the untrained base. An arm that is a point
+above baseline at one checkpoint and three points below at another, with the largest token
+budget of the four ($12.3$M against T's $10.6$M), is oscillating around zero rather than
+gaining. \textbf{The $+3.0$-point C3 lift in our first analysis was an artefact of the
+withdrawn convention}, which credited C3 for truncating as often as the base model while
+charging the base model for it.
+
+Charging C3 as a floor anyway --- subtracting its gain wherever that gain is positive --- every
+treatment effect survives: T $+0.093$ net at the matched budget ($6.6$ standard errors above
+the floor) and $+0.031$ at the endpoint ($3.1$), C2 $+0.026$ ($3.6$) and $+0.080$ ($5.7$).
+\textbf{The pre-stated failure condition does not obtain.} We would have reported it if it had:
+it is stated in \texttt{PREREG\_gate\_outcome.md} and in the operating-point finding that added
+C3 to the control set, precisely because spurious rewards are known to lift Qwen-family maths
+scores and this base is in that family.
+
+\paragraph{The two evaluations disagree because both arms' held-out curves are non-monotone,
+and they cross.} This is not two instruments measuring different things: it is one instrument
+applied to different checkpoints of the same arms. Neither is contaminated by the selection
+that produced it --- the report half was never trained on and was never used to choose a
+checkpoint --- but the arms do not improve monotonically, so \emph{which} checkpoint is
+scored moves the answer by more than the difference being tested.
+
+\begin{table}[t]
+\centering\small
+\caption{The same arm at several checkpoints, same grader, same $337$ items. T loses $11.8$
+points between step $50$ and step $61$; C2 dips and recovers. T is ahead of C2 at every budget
+we measured except the last.}
+\label{tab:b200traj}
+\begin{tabular}{lrrcc}
+\toprule
+arm & step & generated tokens & avg@8 & $\Delta$ base \\
+\midrule
+T  & $30$ & $6{,}487{,}508$  & $0.7226$ & $+0.102$ \\
+T  & $50$ & $8{,}958{,}062$  & $\mathbf{0.7697}$ & $\mathbf{+0.149}$ \\
+T  & $61$ & $10{,}618{,}909$ & $0.6513$ & $+0.031$ \\
+\addlinespace
+C2 & $20$ & $3{,}998{,}567$  & $0.6792$ & $+0.059$ \\
+C2 & $40$ & $6{,}810{,}872$  & $0.6558$ & $+0.035$ \\
+C2 & $60$ & $10{,}555{,}169$ & $0.7007$ & $+0.080$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The pre-registration nominates the \textbf{matched} evaluation: rule~3 says to match total
+token budget, not step count, because the arms differ in generation cost. On that reading T
+leads C2 by $6.7$ points. But the budget it is matched \emph{at} was not pre-registered --- it
+is $6.95$M because that is where C1's length guard halted, a threshold we chose, and the guard
+misfired (below). At the endpoint, where T and C2 are matched to within $0.6\%$ on tokens
+without any correction, C2 leads by $4.9$. T is ahead at $6.5$M and at $9.0$M and behind at
+$10.6$M, having lost $11.8$ points in its last eleven steps.
+
+\textbf{So we do not fire stop rule 2, in either direction, and we do not nominate a winner
+between T and C2.} An endpoint comparison between arms with crossing trajectories reports the
+wall clock; a best-checkpoint comparison reports whoever we looked at hardest --- and we
+evaluated T's step $50$ only \emph{after} seeing that its step $30$ beat its step $61$, so
+quoting $+0.149$ as T's result would be selection on the outcome. What this run can support is
+that both arms move held-out capability by far more than the instrument resolves, and that
+deciding between them needs a stopping criterion fixed in advance on a held-out signal. Ours
+was a wall clock. That is a design defect in this run, not a finding about the gate.
+
+\paragraph{What does survive.}
+\textbf{Stop rule 1 fires against the null: T beats C1 at every budget}, $+0.163$ at the
+matched budget and $+0.092$ at the endpoint, and C1 is the one arm here that was actively
+\emph{damaged} --- $-6.1$ points below the untrained base, with truncation driven to $0.001$
+and accuracy among finished generations to $0.560$. That is not a broken evaluation: it is the
+same terse-and-wrong endpoint its training curve reaches, and the identical numbers in both
+columns are one measurement copied, which we should have labelled and now have. A control
+matched to the gate's own realised fresh-block difficulty does not merely fail to keep up; on
+this pool it destroys capability while the gate builds it. This is the first learned selection
+component in this programme to beat its matched control rather than tie with it.
+
+\textbf{And the headroom claim is established, which was the point of the exercise.} At the
+matched budget alone the arms span $\mathbf{16.3}$ points ($0.7226$ for T against $0.5593$ for
+C1), against a $2.4$-point instrument and against this programme's previous full-pipeline result of $+0.89$
+points with a $95\%$ interval of $[-0.56,+2.39]$. The change that bought it was not the
+hardware and not the selector: it was training on the mixed subset, where $0.80$ of groups
+carry gradient against $0.13$ on the pool these systems normally draw from.
+
+\paragraph{A guard that fired on the wrong thing.} C1 was halted at step $36$ by a watchdog
+that stops an arm when its mean generated tokens per step falls below a quarter of its opening
+window. C1's fell to $0.24$. But on this task \emph{learning to terminate is} a fourfold
+reduction in tokens --- it is the mechanism by which T and C2 gained --- so the threshold
+cannot separate the improvement from the pathology, and it stopped the arm that most needed to
+be watched while letting T run into its own late collapse unremarked. The guard should key on
+held-out capability, or on tokens \emph{and} accuracy jointly, not on length alone. It is the
+reason the common budget sits at $6.95$M rather than somewhere chosen in advance, and therefore
+a contributing cause of the unresolved comparison above.
