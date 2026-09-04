@@ -3431,3 +3431,330 @@ and the correspondence shuffle is running, together with the hand-written rule a
 first round never launched. One covariate out of five surviving in one seed is a result to
 replicate before it is leaned on, and the comparison that must replicate is the
 \texttt{mean\_logprob} column against the shuffle.
+
+\subsection{Running the gate's outcome experiment: two feasibility tests, and the operating
+point that passes them}
+\label{sec:gatefeasibility}
+
+Sec.~\ref{sec:gateoutcome} left the outcome question to a real model and
+\texttt{PREREG\_gate\_outcome.md} fixed the design in advance. This section reports what
+happened when we took it to \texttt{Qwen3.8-27B} on eight H200s: why the arms were not started
+at the default operating point, and the measurement that identifies one where they can be.
+\textbf{Nothing here is an outcome for arm T, C1 or C2, and no stop rule has fired.} The
+pre-registration stands unamended. \textbf{And nothing here is a test of Ornith-1.5's loop:}
+what we measured is their difficulty criterion applied to a \emph{fixed} benchmark pool,
+whereas their published method \emph{generates} its tasks. \S\ref{sec:gatescope} states that
+scoping in full, and it matters most exactly where our numbers look worst for them.
+
+\paragraph{First, a correction that binds the design: C1 ties on every secondary outcome as
+arithmetic, not as a simulation artefact.} The pre-registration records that the
+matched-difficulty control is vacuous ``in a difficulty-only simulation'', because there
+$\theta$ is the whole task. That is true and weaker than the situation warrants. Advantage
+energy per rollout is exactly $1-\Pr(\text{unanimous})$, a function of the selected tasks'
+$\hat p$ distribution and of nothing else, so a control resampled to the treatment's own
+$\hat p$ histogram matches it identically --- on a real model as much as in simulation. We
+re-derived Part~A's arithmetic independently before reading it and recover its idealised rows
+exactly ($0.8322$ at $p^\star=0.2$, $0.9922$ at $0.5$, $G=8$); the tie is then exact in a
+$400{,}000$-task draw (Table~\ref{tab:c1tie}).
+
+\begin{table}[t]
+\centering\small
+\caption{Any statistic that is a function of $\hat p$ alone cannot separate the gate from a
+control matched to its own $\hat p$ histogram. $\mathrm{Beta}(1.5,3.5)$ pool, $k=8$,
+$N=400{,}000$, top decile by $D$.}
+\label{tab:c1tie}
+\begin{tabular}{lccc}
+\toprule
+selector & mean $\hat p$ & energy / rollout & gradient norm $\sqrt{\hat p(1-\hat p)}$ \\
+\midrule
+gate, top decile by $D$              & $0.2500$ & $1.0000$ & $0.4330$ \\
+C1, matched to the gate's histogram  & $0.2500$ & $1.0000$ & $0.4330$ \\
+C2, band $0.1\le\hat p\le0.9$        & $0.3595$ & $1.0000$ & $0.4281$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The consequence is procedural. The pre-registration's \emph{secondary} outcome --- ``advantage
+energy actually delivered per token in each arm'' --- cannot separate T from C1 even in
+principle, so a flat primary outcome must not be read as partially rescued by it. Only
+held-out capability can carry the comparison. Two smaller corrections belong with it. Under
+the gradient-norm measure this programme adopted in place of energy, C2 does \emph{not}
+dominate the gate ($0.4281$ against $0.4330$), so the case against the difficulty kernel also
+has to be made on held-out capability. And \texttt{gate\_outcome.py} draws
+$\theta\sim\mathrm{Uniform}(0,1)$, so Table~\ref{tab:gatebudget}'s ``size-matched uniform''
+row describes that synthetic pool rather than a benchmark: a real pool at a strong model's
+operating point is skewed toward $\theta=1$, where almost every group is unanimous, so the
+true no-selection row is \emph{worse} than $0.7515$ and the gate's margin over no selection is
+understated by the synthetic table. That correction favours the gate, and we record it for the
+same reason we recorded the ones that did not.
+
+\paragraph{Second: the held-out venue offers $25$ movable items, and the pipeline's own
+demonstrated effect is $+0.89$ points.} Counting from the committed greedy baseline rows
+rather than from a percentage, and separating the failures no policy could win
+(Table~\ref{tab:movable}), the report half offers $25$ items --- $7.42$ points of total
+possible movement, and that is the ceiling on the \emph{whole treatment}, not on the
+difference between two selection rules. Set against it,
+Sec.~\ref{sec:a0headline} measured this programme's full pipeline on this same benchmark at
+$+0.89$ points, $95\%$ CI $[-0.56,+2.39]$, with the instrument able to resolve a true effect
+of $2.4$ points, over $549$ steps across which the adapter grew $46\times$. That null was
+obtained at a base scoring $0.43$, with more than fifty points of headroom available. Moving
+to a base with seven cannot improve the situation, and a T-versus-C1 contrast is a
+second-order difference on top of a first-order effect that is already indistinguishable from
+zero.
+
+\begin{table}[t]
+\centering\small
+\caption{OlympiadBench decomposed by the committed split, from a greedy baseline at a
+$57{,}344$-token cap (\texttt{olymp\_qwen38\_20260903T170519Z}, $675/675$ graded, dataset md5
+\texttt{77315ce5}\ldots\ verified on load). Its pooled accuracy $0.8148$ sits between the
+$32{,}768$ and $65{,}536$ rows of Table~\ref{tab:frontier65k}, as the cap series predicts. A
+truncated generation is a budget artefact and an unextractable one a formatting artefact;
+neither is capability.}
+\label{tab:movable}
+\begin{tabular}{lrrrrr}
+\toprule
+half & $n$ & solved & wrong, truncated & wrong, no box & \textbf{improvable} \\
+\midrule
+search            & $338$ & $272$ & $36$ & $2$  & $28$ \ ($0.0828$) \\
+report (held out) & $337$ & $278$ & $25$ & $9$  & $\mathbf{25}$ \ ($\mathbf{0.0742}$) \\
+all               & $675$ & $550$ & $61$ & $11$ & $53$ \ ($0.0785$) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Third, and not anticipated by the pre-registration: at the rollout sampling
+distribution most generations never terminate.} Every OlympiadBench figure in this paper is
+\emph{greedy}. A GRPO rollout is not. Measured at the rollout distribution --- temperature
+$1.0$, top-$p$ $0.95$, the same $57{,}344$-token cap, sixteen samples --- the truncation rate
+is $\mathbf{0.625}$ and the harness declares the run \texttt{cap\_limited}. One problem
+resolved six of eight samples; the other resolved \emph{none}, its eight completions running
+$163$k--$192$k characters without ever closing the reasoning block.
+
+This is not only a cost problem, it changes what the gate selects. A task whose rollouts all
+truncate scores $\hat p=0$ and is assigned
+$D=\exp\!\big(-(0-0.2)^2/(2\cdot 0.15^2)\big)=0.411$, a substantial weight. \textbf{At the
+default thinking budget Ornith's difficulty gate preferentially selects tasks that fail to
+terminate}, not tasks of the intended difficulty, and shortening the rollout budget toward
+anything an RL loop could afford makes that worse rather than better. The gate's input is a
+budget measurement before it is a difficulty measurement --- a defect of the published
+mechanism as applied, not of our reimplementation of it.
+
+\paragraph{A silent zero that would have looked like a difficulty distribution.} The harness
+sends a fixed \texttt{--seed 0} unchanged on every request. Had the server honoured it
+per-request, all sixteen samples of a problem would have been identical and every $\hat p$
+would have been exactly $0$ or $1$ --- a plausible-looking, entirely artefactual difficulty
+distribution in which every group is unanimous. It does not: all sixteen completions per
+problem are textually distinct, confirmed separately by two identically seeded requests
+returning different text. We record the check because its failure mode is invisible in the
+output.
+
+\paragraph{The operating point that passes both tests, and it is the thinking budget rather
+than the benchmark.} \texttt{Qwen3.8-27B}'s chat template exposes
+\texttt{reasoning\_effort} $\in\{$\texttt{xhigh} (default)$,$ \texttt{medium}$,$
+\texttt{low}$\}$. Re-running the same problems and the same sampling distribution at
+\texttt{low} (Table~\ref{tab:opoint}) improves both at once without fixing either
+completely: truncation falls from $0.625$ to $0.210$, median rollout length falls by more
+than an order of magnitude to a budget an RL loop can afford, and accuracy falls away from
+ceiling, which \emph{enlarges} the improvable set the first test was short of. The two requirements looked opposed --- the benchmarks this base does
+not saturate are the ones on which it does not terminate --- and the thinking budget separates
+them.
+
+\begin{table}[t]
+\centering\small
+\caption{The same benchmark and the same sampling distribution (temperature $1.0$,
+top-$p$ $0.95$) at two thinking budgets. The \texttt{xhigh} row is $16$ generations over two
+problems, enough to establish that the median rollout \emph{is} the cap and not enough for a
+difficulty distribution; the \texttt{low} row is 5408 generations over 338 problems of the
+committed search half. \texttt{tokens} are counted with the model's own tokenizer.}
+\label{tab:opoint}
+\begin{tabular}{lcccc}
+\toprule
+\texttt{reasoning\_effort} & cap & truncated & median tokens & min tokens \\
+\midrule
+\texttt{xhigh} (default) & $57{,}344$ & $0.625$ & $57{,}344$ \ (the cap) & $35{,}035$ \\
+\texttt{low}             & $16{,}384$ & $0.210$ & $1{,}955$ & $236$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+At the default budget the \emph{median} rollout is the cap itself and even the shortest of the
+sixteen ran to $35{,}035$ tokens, so the model does not finish its reasoning on these problems
+at all; at \texttt{low} the median falls to 1{,}955 tokens, a factor of $29\times$, and
+truncation falls from $0.625$ to $0.210$. That is a real improvement and not a cure: it
+remains more than twice the $0.093$ the \emph{greedy} baseline shows at a cap three and a half
+times larger, so a fifth of rollouts still end at the cap and every figure below is computed on
+resolved samples only, with the truncated ones treated as unknown rather than wrong. Accuracy
+falls too, which is the point: it moves the base off the ceiling that left the held-out half
+with $25$ movable items.
+
+\begin{table}[t]
+\centering\small
+\caption{The two-block difficulty measurement at the terminating budget, on the committed
+search half. Each problem is sampled $16$ times and split into an independent selecting block
+and fresh block of $k=8$; \texttt{dead} is the fraction of groups that are unanimous and
+therefore carry exactly zero GRPO advantage. This is the real-model counterpart of
+Table~\ref{tab:gatebudget}, whose pool was $\theta\sim\mathrm{Uniform}(0,1)$.}
+\label{tab:realpool}
+\begin{tabular}{lcccc}
+\toprule
+ & mean $\hat p$ & dead-group fraction & energy / rollout & $\hat p\in[0.10,0.35]$ \\
+\midrule
+real pool, no selection (block A) & $0.8622$ & $0.8095$ & $0.1905$ & $$3.7\%$$ \\
+synthetic uniform pool (Table~\ref{tab:gatebudget}) & $0.481$ & $0.2485$ & $0.7515$ & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The prediction made above is confirmed and its size is larger than expected: an unselected
+real pool is far deader than the synthetic uniform one, $0.8095$ against $0.2485$, because a
+strong model's difficulty distribution piles up at $\hat p=1$ rather than spreading over
+$(0,1)$. Two consequences follow for the pre-registered arms, both of which change how they
+must be run rather than what they will find. The gate's budget-efficiency margin over no
+selection is much larger on a real pool than Table~\ref{tab:gatebudget} suggested. And the
+pool the gate actually selects from is small: only $3.7\%$ of the search half sits in the
+kernel's effective support $\hat p\in[0.10,0.35]$, so the arms must be sized against that
+handful rather than against the $338$-problem half. \textbf{The gate's difficulty on a real
+model is scarcity, not noise.} The simulation diagnosed the gate as a fine kernel applied to a
+statistic too coarse to resolve it, and predicted that selecting-block difficulty would
+regress hard on a fresh block ($0.946\to0.551$ at $k=8$). On this pool the opposite holds:
+difficulty is close to bimodal, so $\hat p$ carries little binomial noise, the split-half
+reliability of a $k=8$ measurement is $0.871$, and the realised selecting-to-fresh shift on
+the gate-selected tasks is $-0.0123$ rather than the large positive regression the simulation
+predicted --- and that same bimodality is exactly why there is
+almost nothing at the target difficulty to select. \textbf{The gate's problem on a real model
+is scarcity, not noise}, and the two call for different repairs: shrinkage fixes noise and
+does nothing for scarcity.
+
+\paragraph{Retracting the repair we proposed.} The companion analysis of the gate's estimator
+recommended one change to Ornith's gate and predicted it would help: replace $D(\hat p)$ with
+$D(\tilde p)$, where $\tilde p$ shrinks $\hat p$ toward the pool mean by a James--Stein factor,
+on the reasoning that the kernel is fine and the statistic it reads is coarse. \textbf{That
+repair addresses a problem this pool does not have.} Shrinkage buys accuracy when $\hat p$ is
+noisy; here the split-half reliability of a $k=8$ measurement is $0.871$ and the
+selecting-to-fresh shift is $-0.0123$, so there is almost no noise for it to remove, and
+shrinking toward a pool mean of $0.8622$ would drag every candidate \emph{away} from the target
+rather than toward it. We stated in advance that if shrinkage did not help, the shrinkage
+thread should be dropped for tasks. It does not, and we drop it.
+
+\paragraph{What this measures, and what it cannot show.}
+\label{sec:gatescope}
+Ornith's task reward is a product of three factors, $R_{\mathrm{task}}=V\cdot D\cdot N$: a
+validity gate, the difficulty kernel, and novelty against a buffer of tasks the system has
+already produced. \textbf{On a fixed curated pool two of those three are inert by
+construction.} Every OlympiadBench problem is valid, so $V\equiv1$; there is no generation
+buffer, so $N$ is the constant the implementation returns against an empty archive. What we
+exercised is $D$ alone, and we applied it to a difficulty distribution the method never
+chooses.
+
+\textbf{Ornith does not select from a pool. It proposes tasks ``that go beyond what the model
+has already solved''.} A generator is not bound by the benchmark's difficulty distribution: it
+can aim at the mixed region directly, and the novelty term exists precisely to push it
+somewhere the buffer is not. So the scarcity in Table~\ref{tab:scarcity} is \textbf{a property
+of pool-based selection, not a refutation of Ornith-1.5}. Read the other way round it is the
+strongest argument in this paper \emph{for} their design: if only $$3.7\%$$ of a curated
+frontier-mathematics half sits where the kernel has weight, and $0.7130$ of it the model
+already solves every time, then a loop that selects from such a pool is starved, and
+generating tasks is the sensible response rather than an ornament. Our reimplementation
+supports generation; this measurement simply does not use it.
+
+\paragraph{Which parts of this are theirs and which are ours.} $p^\star=0.2$ is the only
+hyperparameter Ornith-1.5 publishes. Everything else in Table~\ref{tab:theirsours} is a choice
+of ours standing in for one of theirs, and a reader is entitled to see the list rather than
+infer it. Two entries do real work in the numbers above: $\sigma$ sets how wide the ``gate's
+support'' column is, and the rollout count $k$ sets how finely $\hat p$ is resolved at all.
+
+\begin{table}[t]
+\centering\small
+\caption{Published against substituted. Ambiguity ids are those of
+\texttt{ornith\_repro/AMBIGUITIES.md}. Nothing in the right column is a criticism of their
+method; it is a statement of what a reader of their method page can and cannot pin down.}
+\label{tab:theirsours}
+\begin{tabular}{lll}
+\toprule
+quantity & published? & ours \\
+\midrule
+target success rate $p^\star$      & \textbf{yes}, $0.2$ & $0.2$ \\
+kernel width $\sigma$              & no (A2)  & $0.15$ \\
+rollouts per task $k$              & no (A1)  & $8$, and $16$ here to give two blocks \\
+GRPO group size $G$                & no (A3)  & $8$ \\
+similarity behind $N(q)$           & no (A6)  & Jaccard over tokens \\
+$C$, $F$, $H$ of $R_{\mathrm{harness}}$ & named only & frozen judges, never trained (A11) \\
+scaffolds/rollouts per task        & figure only (A16, A17) & nested, $3\times8$ \\
+stage update order                 & no (A10) & solver $\to$ harness $\to$ proposer \\
+base model                         & Qwen3.5, Gemma 4 & \texttt{Qwen3.8-27B} (A14) \\
+benchmark                          & agentic, repository-scale & OlympiadBench \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{The reasoning budget cuts the same way, and also in their favour.} These figures come
+from \texttt{reasoning\_effort=low}, chosen because the default does not terminate. That budget
+also lowers accuracy --- and lower accuracy means \emph{more} mixed problems, not fewer. So the
+mixed fraction reported below is the optimistic end: at the default thinking budget the model
+is stronger, more problems become always-solved, and informative groups would be rarer still.
+Every scarcity number here is a lower bound on the difficulty of pool-based selection.
+
+\paragraph{The scarcity, quantified, and it is not a property of the rollout budget.} A group
+contributes gradient only when its members disagree. Table~\ref{tab:scarcity} gives the exact
+hypergeometric probability of that, per group size, computed from each problem's own sixteen
+resolved outcomes rather than from a fitted difficulty model.
+
+\begin{table}[t]
+\centering\small
+\caption{Informative groups are rare, and group size is a bounded lever. Exact probabilities
+from the measured outcomes of the 230 problems that still hold all sixteen samples once
+truncated generations are dropped as unknown: for a problem with $c$ of $n$ resolved samples
+correct, a group of $G$ drawn without replacement is unanimous with probability
+$[\binom{c}{G}+\binom{n-c}{G}]/\binom{n}{G}$. ``Informative'' is one minus that, which by the
+energy identity is also the advantage energy delivered per rollout.}
+\label{tab:scarcity}
+\begin{tabular}{cccc}
+\toprule
+group size $G$ & informative & dead & in the gate's support $[0.10,0.35]$ \\
+\midrule
+$2$ & $0.0689$ & $0.9311$ & $0.0000$ \\
+$4$ & $0.1284$ & $0.8716$ & $0.0193$ \\
+$8$ & $0.1928$ & $0.8072$ & $0.0226$ \\
+$16$ & $0.2565$ & $0.7435$ & $0.0217$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{An always-solved problem cannot produce a disagreeing group at any $G$}, so the
+ceiling on informative groups is the fraction of the pool that is genuinely mixed --- here
+$0.2565$, against $0.7130$ the model solves every time out of sixteen. Raising $G$ from
+$2$ to $16$, an eightfold increase in cost per task, moves the informative fraction only from
+$0.0689$ to $0.2565$, and leaves the share of groups landing in the gate's support at $0.0217$.
+Group size is a real lever on wasted rollouts and a strictly bounded one: it cannot manufacture
+a task the model sometimes solves.
+
+\paragraph{Three measurements, one shape.} This is the third independent count in this paper of
+training signal that does no work, and they do not overlap in method.
+Sec.~\ref{sec:credit} shows the router's credit signal is uninformative \emph{by construction},
+the per-arm counts cancelling so that every arm converges to the same vector.
+Sec.~\ref{sec:truncation} finds $21.1\%$ of A0's negative-advantage gradient mass pushing
+\emph{away} from rollouts that were on their way to a correct answer. And here, at the
+operating point a self-improvement loop would actually run at, $0.8095$ of groups carry exactly
+zero advantage. A companion reachability analysis adds a fourth from the weight side: the
+displacements actually applied are first-order capability-null, while a data-derived direction
+of identical norm separates at a factor of $442$. \textbf{If informative groups are this rare,
+the binding constraint on this literature is manufacturing them, not choosing among them} ---
+which would explain why a learned router and a clustering method both sit on the same flat
+trunk. We do not extend that list to Ornith's gate: we never ran it as specified, and the one
+factor of it we did run was applied to a pool its authors would not have selected from. We state that as the reading these four measurements invite,
+not as a result they establish: none of them was designed to test it, and the experiment that
+would is a different one from any run here.
+
+\paragraph{What we did and did not commit GPU-days to.} We did not start T, C1 and C2 at the
+default operating point. A run there would have returned a difference smaller than the
+instrument, and the pre-registration's stop rule --- ``if T versus C1 does not separate beyond
+the noise band, the gate works and does not matter'' --- would have fired for want of an
+instrument rather than for want of an effect. That is the false negative this programme has
+already documented, in which ``the method does not work'' and ``there was no room left''
+produce the same table; firing a pre-registered stop rule on it would have converted a
+measurement failure into a published finding. What we did run is the two-block difficulty
+measurement the pre-registration's matching rule~2 requires and which did not previously exist
+for any real model: every problem in the committed search half sampled sixteen times at the
+terminating budget, split into an independent selecting block and fresh block of $k=8$, so
+that the control can be matched to fresh-block difficulty rather than to the inflated
+selecting-block value.
