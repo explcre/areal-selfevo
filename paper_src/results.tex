@@ -5099,3 +5099,118 @@ a working demonstration of the layer, not a measurement of the sources, and it i
 such. The calibration that matters --- $17$ false refutations in $38$ decided curated
 cases --- is the number this section stands on, and it says the next thing to build is a
 format-invariant key check, not more tasks.
+
+\subsection{Corrections to Sec.~\ref{sec:tasksource}: both of its numbers were instruments,
+and both are withdrawn}
+\label{sec:tasksourcecorr}
+
+Sec.~\ref{sec:tasksource} reported two findings and flagged one of them as uninterpretable.
+On re-measurement \emph{both} turn out to be properties of the measuring apparatus rather than
+of the task sources, and both are withdrawn here. The methodological point that section made
+--- that a format-sensitive comparison confounds a source comparison --- survives, and is
+strengthened by what follows.
+
+\paragraph{Correction 1: the $0.447$ false-refutation rate was the comparator, not the
+verifier.} That calibration compared the verifier's computed answer with the asserted key
+using \texttt{answers\_match}, the string normalisation the live grader uses, rather than
+\texttt{symbolic.symbolic\_compare}, which strips \LaTeX{}, splits answers as unordered sets,
+uses exact rationals and \emph{refuses} inexact decimals. Re-running the identical $60$ curated
+problems and the identical $300$ solutions through both comparators, so that only the
+comparator differs (Table~\ref{tab:comparator}):
+
+\begin{table}[t]
+\centering\small
+\caption{The same 60 curated problems and the same solutions under two comparators, run
+\texttt{out/tasksource/recalibration.json}. Every one of the sixteen string-refutations
+dissolves: three are symbolically equal, thirteen are unparseable and become UNVERIFIABLE,
+none survives. The exact comparator never contradicts a string verification.}
+\label{tab:comparator}
+\begin{tabular}{lccc}
+\toprule
+comparator & decided & refuted & false-refutation rate (Wilson 95\%) \\
+\midrule
+\texttt{answers\_match} (string) & $37$ & $16$ & $0.432$ \ $[0.287, 0.591]$ \\
+\texttt{symbolic\_compare} (exact) & $22$ & $\mathbf{0}$ & $\mathbf{0.000}$ \ $[0.000, 0.149]$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{So the instrument is not eighteen times off; the earlier run used the weaker
+comparator.} The paired breakdown is unambiguous: $19$ verified under both, $0$ refuted under
+both, $3$ string-refuted but symbolically \emph{equal}, $13$ string-refuted but symbolically
+\emph{indeterminate}, and $0$ string-verified but symbolically different. The last count
+matters as much as the first: the exact comparator introduces no refutations of its own.
+
+Two caveats that must travel with the $0.000$. It rests on $22$ decided cases, so its upper
+bound is $0.149$ --- consistent with the published $2.55\%$ but not on its own establishing it.
+And soundness is bought with coverage: decided cases fall from $37$ of $60$ to $22$ of $60$,
+because declining to parse is how the comparator avoids refuting a key it cannot read. That is
+the right trade for a key check and the wrong one for a training signal, which is why the loop
+grades with \texttt{answers\_match} and the verifier should not.
+
+\textbf{And this makes Sec.~\ref{sec:tasksource}'s methodological warning sharper rather than
+weaker.} A generated key is written in the solver's own answer format; a retrieved key is
+written in its corpus's. Under the string comparator that asymmetry produced a $0.432$
+refutation rate on keys that are not wrong, and it would have fallen hardest on the retrieved
+source --- so the source comparison would have appeared to refute the prediction by exactly the
+mechanism that guarantees a wrong answer. The fix is not more tasks; it is that any comparison
+of key correctness \emph{across} sources must use a format-invariant decision. With
+\texttt{symbolic\_compare} in place, that comparison can now be run.
+
+\paragraph{Correction 2: the contamination ordering does not survive a negative control, and
+is withdrawn.} Sec.~\ref{sec:tasksource} reported that $7$ of $20$ self-generated candidates
+overlapped the held-out half against $3$ of $20$ retrieved, and called it the strongest result
+in the section. Widened to $40$ model-written and $200$ retrieved candidates the ordering
+persists but shrinks --- rejection at the $0.45$ cut of $0.200$ (generated), $0.200$
+(distilled) and $0.075$ (retrieved). The top-scoring ``overlaps'', however, are plainly
+unrelated problems: a derivative of $-3/(4x^2-2x+1)$ scored $0.625$ against an arctangent
+identity.
+
+So the measure was given the control it should have had first: $400$ curated problems from
+\emph{other} corpora scored against the same held-out half, where a high score is a false
+positive by construction (Table~\ref{tab:simcontrol}).
+
+\begin{table}[t]
+\centering\small
+\caption{False-positive rate of the contamination cut on unrelated curated problems, by
+statement length, run \texttt{out/tasksource/similarity\_control.json}. The measure is
+$\max$(token Jaccard, character $5$-gram cosine); short statements have few content words, so
+both components inflate.}
+\label{tab:simcontrol}
+\begin{tabular}{lrccc}
+\toprule
+statement length (chars) & $n$ & mean similarity & false positive @$0.45$ & @$0.55$ \\
+\midrule
+$0$--$60$      & $113$ & $0.313$ & $0.142$ & $0.044$ \\
+$60$--$100$    & $124$ & $0.340$ & $0.129$ & $0.065$ \\
+$100$--$160$   & $89$  & $0.259$ & $0.067$ & $0.011$ \\
+$160$--$260$   & $53$  & $0.215$ & $0.000$ & $0.000$ \\
+$>260$         & $21$  & $0.163$ & $0.000$ & $0.000$ \\
+\midrule
+all            & $400$ & $0.275$ & $\mathbf{0.095}$ & $0.035$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{The $0.45$ cut has a $9.5\%$ false-positive rate overall and $14.2\%$ on statements
+under sixty characters, falling to zero above $160$.} Model-written statements are short and
+formulaic; retrieved ones are longer and more varied. The observed rejection rates --- $0.200$
+for model-written against a floor of $0.13$--$0.14$ in their length band, and $0.075$ for
+retrieved against a floor of $0.095$ --- are therefore consistent with the measure's own
+length-dependent false-positive rate and establish nothing about memorisation. \textbf{The
+claim that self-generation is a larger contamination risk than retrieval is withdrawn.}
+
+What survives is the filter's designed purpose. It was built so that a false reject costs one
+candidate while a false accept costs the held-out set, and at $9.5\%$ false positives it is
+doing exactly that job. Its rejection rate is an upper bound and must never be quoted as a
+contamination estimate. Testing the question properly needs a measure whose false-positive rate
+does not depend on statement length --- exact long-span $n$-gram overlap, the standard
+decontamination method, rather than a similarity score.
+
+\paragraph{Two instruments, two withdrawals, one pattern.} Both corrections have the same
+shape: a number was produced by an apparatus that had never been calibrated against a case
+whose answer was known in advance. The comparator was never run on keys known to be right; the
+similarity measure was never run on problems known to be unrelated. Each control cost minutes
+--- the similarity control needed no GPU at all --- and each overturned the finding it tested.
+The audit discipline that caught five deliberately planted defects in the layer's code did not
+extend to the measurements the layer produced, and that is the gap worth naming.
