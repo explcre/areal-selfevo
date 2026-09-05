@@ -4358,3 +4358,278 @@ $\hat p \approx 1$. That is the same shape as this paper's other three counts of
 signal that does no work, arriving one level up --- and it is an argument for seeding the loop
 from measured difficulty, which is exactly what the mixed subset of Sec.~\ref{sec:gatearms}
 provides and what the arms there used.
+
+\subsection{OpenRSI's fix lands, and it is the correct fix: the evaluation contract
+verified end to end}
+\label{sec:openrsifix}
+
+Sections~\ref{sec:openrsirung0} and~\ref{sec:openrsirung0b} left the only genuinely
+reproducible external system in this paper blocked at its reward stage, on a version skew
+between two of its authors' own repositories. We reported it as FrontisAI/OpenRSI issue~12.
+It was closed on 2026-09-04 with ``we have pushed a new PR for this problem, please try
+it.'' This section reports what the fix does, and --- because a fix to \emph{this}
+particular bug is exactly the kind that can succeed by returning a plausible wrong number
+--- what we did to check it on observable state rather than on a status code.
+
+\paragraph{What they changed.}
+The fix is commit \texttt{ce3ba53} (``Fix current NatureBench evaluation contract''), merged
+as \texttt{215bad9} from branch \texttt{fix/naturebench-eval-contract}; OpenRSI HEAD moves
+from \texttt{1f477c4} to \texttt{215bad9}. It touches five files and adds $585$ lines. It
+closes both halves of the skew we reported, and it closes the third hazard --- the one we
+declined to patch ourselves --- in the way we guessed but did not dare assume:
+
+\begin{itemize}
+\item \textbf{The control-token gate.} \texttt{base\_task} now attaches
+  \texttt{X-NatureBench-Control-Token} to exactly the four control endpoints
+  (\texttt{register}, \texttt{start\_timer}, \texttt{resume\_timer}, \texttt{pause\_timer}),
+  reading the token from an \texttt{eval\_control\_token\_file} config key or the
+  \texttt{NATUREBENCH\_EVAL\_CONTROL\_TOKEN\_FILE} environment variable. The launcher starts
+  the evaluator with \texttt{-{}-control-token-file} pointed at a private file under the
+  experiment output, so the token is never exposed to model-generated candidate code. This is
+  the same change as our withdrawn local patch, done more carefully.
+\item \textbf{The \texttt{/evaluate} contract.} The client now generates its own opaque
+  \texttt{eval\_token}, persists it under the eval-service output directory, and sends it at
+  both \texttt{register} and \texttt{evaluate}. It explicitly rejects a token that collides
+  with the control token, which is the check the service also performs.
+\item \textbf{The directory-binding hazard.} This is the part that matters. Under the token
+  contract each attempt's workspace becomes \texttt{<attempt>/workspace} and its output
+  \texttt{<attempt>/workspace/output}; \texttt{\_post\_evaluate} re-registers before every
+  evaluation with \texttt{out\_dir} set to \texttt{<attempt>}, so the service's fixed
+  \texttt{<out\_dir>/workspace/output} resolves to the directory that attempt actually wrote.
+  \texttt{force} is sent only on the first registration, so the re-registration path takes
+  NatureBench's ``re-register without force'' branch, which updates \texttt{out\_dir} and
+  leaves the live timer untouched.
+\end{itemize}
+
+Their own suite goes from $66$ passed to $70$ passed and $1$ skipped, the four new tests
+being assertions on the register/evaluate call sequence and on the per-attempt output paths.
+
+\paragraph{Why a green suite was not enough, and what we ran instead.}
+The failure mode we flagged in issue~12 is that a minimal fix ``would evaluate a directory
+the candidate never wrote to --- and would \emph{succeed}, returning a score for the wrong
+path rather than an error.'' A test that only checks for HTTP $200$ cannot see that, and
+their four new tests assert against a mocked \texttt{\_post\_json}, so they constrain the
+client's call sequence but never exercise a real evaluator. We therefore drove
+\emph{their} client against a \emph{real} NatureBench eval service at current HEAD
+(\texttt{2bd59cf}) on the task package \texttt{s42256-023-00611-x}, with two hand-written
+candidates chosen so that a wrong-directory bug would be visible: attempt~$1$ predicts a
+constant, attempt~$2$ fits a logistic regression. If the service scored a fixed path, the two
+attempts would return the \emph{same} number. No upstream file was modified; the task class
+was imported from the upstream tree.
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+stage & observable & result \\
+\midrule
+control endpoint & \texttt{POST /register} & \texttt{200} (was \texttt{404}) \\
+timer & \texttt{POST /start\_timer} & \texttt{200}, fired \emph{once} \\
+reward & \texttt{POST /evaluate} & \texttt{200} (was \texttt{400}) \\
+re-binding & service-logged \texttt{out\_dir} & \texttt{\dots\_validation\_1}, then \texttt{\dots\_validation\_2} \\
+\textbf{scored the right dir} & \texttt{aggregate\_improvement} & $-0.835758$ vs $-0.588490$ \\
+artifacts & \texttt{submissions.jsonl} & one per attempt root, \texttt{attempt}$=1$, $2$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The two attempts received different scores, ordered as the written predictions imply, with
+per-instance $F_1$ values recorded for all four instances. That is the assertion the
+silent-wrong-number hazard would have failed. \textbf{The contract is repaired, and repaired
+correctly.} OpenRSI's documented NatureBench quickstart evaluates a task again.
+
+\paragraph{One gap in the fix, reported here for completeness.}
+Only the quickstart launcher \texttt{run\_naturebench\_local.py} wires the token; no
+configuration under \texttt{tts\_search/configs} sets \texttt{eval\_control\_token\_file}, so
+the \emph{formal} Lite-v2 path (\texttt{run\_naturebench.sh}) still sends the pre-hardening
+contract unless the operator exports
+\texttt{NATUREBENCH\_EVAL\_CONTROL\_TOKEN\_FILE} by hand. Because \texttt{base\_task} reads
+that variable, the formal path works with no patch --- but it is undocumented, and an
+operator following \texttt{benchmarks/naturebench\_lite\_v2/RUNNING.md} verbatim would hit
+the same $404$ we reported. This is worth sending upstream and costs them one line of
+documentation.
+
+\subsection{What OpenRSI's cheap benchmark can and cannot settle, priced from their own
+configuration files}
+\label{sec:openrsicost}
+
+Before spending on a reproduction we priced it from their configs rather than their prose,
+and two things need correcting in how the target has been described --- including by us.
+
+\paragraph{The cheap benchmark has its own published delta; it is not the headline one.}
+The $39.39\% \to 60.61\%$ Medal Average figure is \textbf{MLE-Bench Lite}. NatureBench Lite
+carries two \emph{separate} published claims, and the one that matches the base-versus-evolved
+shape is \textbf{Match-SOTA $50\% \to 70\%$} with the framework fixed and the model swapped.
+Their README also reports $20\% \to 50\%$ with the model fixed and the harness swapped ---
+which is the scaffold-versus-no-scaffold contrast, and is the only one of the three that could
+be measured on a model whose evolved counterpart does not exist.
+
+\paragraph{The costs, confirmed.}
+\texttt{naturebench\_scm\_lite\_v2.yaml} sets \texttt{time\_budget: 14400} and
+\texttt{model\_plus\_sandbox\_time\_budget: 14400} over a pinned ten-task manifest at one
+sample per task: \textbf{$40$ model-plus-sandbox hours per cell}, $80$ for a base/evolved
+pair. \texttt{openmle\_evo.yaml} sets \texttt{time\_budget: 43200} ($12$\,h) but
+\texttt{model\_plus\_sandbox\_time\_budget: 64800} ($18$\,h); at $22$ tasks $\times$ $3$ runs
+that is $792$ agent-hours or $1{,}188$ model-plus-sandbox hours per cell, so the familiar
+``$\sim$1{,}584 sandbox-hours for the pair'' is right on the agent-budget basis and an
+underestimate on the one the harness actually enforces. The $20\times$ ratio between the two
+routes holds.
+
+\paragraph{The finding that changes what the cheap route is worth.}
+NatureBench Lite-v2 is \emph{ten tasks at one sample each}. Its published delta is therefore
+$5/10 \to 7/10$: a two-task difference. Fisher's exact test gives $p = 0.65$. Worse, at
+$n=10$ against a $5/10$ baseline, \textbf{no outcome short of $10/10$ reaches $p<0.05$}
+($8/10$ gives $p=0.35$, $9/10$ gives $p=0.14$, $10/10$ gives $p=0.033$). The published
+NatureBench Lite delta is thus not merely uncertain --- at its own sample size it is
+\emph{unfalsifiable}. Recovering it would not confirm it and failing to recover it would not
+refute it.
+
+The headline is different in kind. $39.39\%$, $60.61\%$ and $71.21\%$ of $66$ are exactly
+$26$, $40$ and $47$, confirming $22$ tasks $\times$ $3$ runs as the denominator; $26/66 \to
+40/66$ gives $p = 0.023$. That is a real separation, though $66$ trials are $3$ seeds over
+$22$ tasks and clustering by task pulls the effective $n$ back toward $22$.
+
+\textbf{So the two routes trade off exactly against the thing we care about.} The affordable
+benchmark cannot resolve its own claim; the benchmark that can resolve its claim is the
+$1{,}188$-hour one. This does not make the cheap route worthless --- it is a genuine
+end-to-end exercise of published code on published data, and a \emph{failure} there would
+still be decisive, since code that cannot run at all is a different finding from code whose
+effect is small. But it does mean the cheap route must be reported as a
+\emph{correctness} check on the released system, never as confirmation of their effect.
+
+\subsection{The vendored framework is Meta's aira-dojo, and what that is worth}
+\label{sec:airadojo}
+
+The \texttt{aira-evo} tree inside OpenRSI is Meta's \texttt{aira-dojo}
+(arXiv:2507.02554, ``AI Research Agents for Machine Learning: Search, Exploration, and
+Generalization in MLE-bench''), CC BY-NC 4.0. Pulling OpenRSI therefore delivers part of a
+second published system whether or not one intends it. Three facts bound how much that is
+worth.
+
+\begin{itemize}
+\item \textbf{It is a fork, not a copy.} Against upstream HEAD \texttt{c795d86}
+  (2025-09-26, $15$ commits), the vendored tree differs in $29$ files and adds a further
+  $38$ paths, including the entire NatureBench adapter and the experience-memory operators
+  (\texttt{draft\_experience}, \texttt{improve\_experience}, \texttt{crossover\_experience},
+  \texttt{rich\_memory\_summary}) that carry OpenMLE-Evo's contribution. OpenRSI's numbers
+  are results \emph{of their fork}, and a comparison against ``aira-dojo'' would have to say
+  which one.
+\item \textbf{The tests are theirs, not Meta's.} Upstream \texttt{aira-dojo} ships
+  \emph{no} test suite --- zero \texttt{test\_*.py} files. The $53$ tests we previously
+  credited to ``the vendored aira-evo'' are six files FrontisAI added. This is a point in
+  FrontisAI's favour and a correction to our earlier note.
+\item \textbf{Upstream implements exactly one task: \texttt{mlebench}.} That makes MLE-Bench
+  the one surface where OpenRSI and Meta's agent line both have numbers --- but running it
+  requires a Kaggle API token to fetch competition data, and this machine has none. The
+  MLE-Bench route is therefore blocked on a credential, not on compute.
+\end{itemize}
+
+\paragraph{The newer Meta work is on a different surface, and is not released.}
+``AI Research Preference Models'' (arXiv:2608.13940, v2) builds preference models from frozen
+pretrained LLMs in two variants --- one reasoning over candidate plans, code and previously
+executed solutions, one additionally running small-scale pilot experiments --- and lifts the
+average normalised score from $0.684$ to $0.711$ and $0.729$. Two things matter for how we
+position against it. First, it is evaluated on \textbf{AIRS-Bench} ($20$ tasks from SOTA
+papers), \emph{not} MLE-bench, so it does not in fact widen the shared surface; the MLE-bench
+overlap is with the older Toledo et al. paper. Second, there is \textbf{no code release} for
+it: the \texttt{aira-dojo} repository's last push predates the paper by four months and its
+tree contains no file matching \texttt{rpm}, \texttt{preference}, \texttt{pilot} or
+\texttt{airs}. It is prior art we must credit, but it is not a system we can run.
+
+We must credit it regardless. Their inference-only variant is the frozen-LLM router over
+retrieved prior executions that this project had written down, and their agentic variant
+spends a small pilot before committing expensive compute, which is the same logic as our
+verifier checking a key before spending $48$ rollouts. What remains distinct is granularity:
+they choose among candidate research plans, we act on training data and parameter updates.
+It is worth recording that their own uncertainty is thin --- the reported separation is a
+probability of improvement of $0.5923$ and $0.5913$ with $95\%$ CI lower bounds of $0.5066$
+and $0.5018$, and the agentic variant with the \emph{higher} mean has the \emph{lower}
+probability of improvement. No numeric confidence interval is printed for $0.684$, $0.711$
+or $0.729$ anywhere in the text.
+
+\subsection{Rung 0 passes: every stage of OpenRSI's quickstart fires, and the reward is a
+real number}
+\label{sec:openrsirung0c}
+
+With the contract repaired we re-ran the stop-rule gate from Sec.~\ref{sec:openrsirung0}:
+one task, one candidate, one reward, artifacts written and read back. This is the pass the
+brief requires before any scaled run, and it is the third attempt at it. Machine: one
+\texttt{8$\times$B200} node; GPUs $0$--$1$ served the evolved model, $2$--$3$ the base, via
+SGLang $0.5.19$ on \texttt{torch 2.13.0+cu130}; all eight cards were verified usable by
+allocation and a bf16 matmul rather than by \texttt{device\_count}, which has lied to us
+before. Command: their \texttt{scripts/run\_naturebench\_local.py --smoke} on
+\texttt{s42256-023-00611-x}, upstream unmodified at \texttt{215bad9}.
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+stage & Sec.~\ref{sec:openrsirung0b} & now \\
+\midrule
+task construction & OK & OK \\
+eval service + control token & --- & OK, token auto-created \texttt{0600} \\
+prompt / scaffold & OK & OK \\
+generation & OK & OK, real \texttt{run.py} (LightGBM) \\
+candidate execution & --- & OK, ran $52.3$\,s, exit $1$ \\
+\textbf{evaluation / reward} & \textbf{404 on /register} & \textbf{200; \texttt{aggregate\_improvement}$=-1.0$} \\
+artifacts & --- & journal, summary.csv, submissions.jsonl \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The candidate itself failed, and it failed for a reason worth recording because it is
+\emph{not} ours: the generated solution trained LightGBM on $23$ features and predicted on
+$22$, so \texttt{LGBM\_GetLastError} reported a shape mismatch, no \texttt{predictions.csv}
+was written, and all four instances scored the $-1.0$ floor. LightGBM was installed and
+executed; this is a modelling error by the agent under a two-step smoke budget, not a
+missing dependency. \texttt{summary.csv} again shows \texttt{grade\_avg@k}$=1.0$ beside
+\texttt{success\_rate}$=0.0$ and \texttt{unknown}$=1$, which is their conservative fallback
+for a null submit score and not a phantom perfect score.
+
+\textbf{What rung 0 establishes.} The released system runs end to end on published data at
+current HEADs, and the reward stage --- the one that was blocked --- now returns a number
+that is bound to the directory the attempt wrote. What it does not establish is anything
+about their published effect: one task, one candidate and two steps is a wiring test, not a
+measurement.
+
+\paragraph{Both cells pass rung 0, and the smoke result runs the wrong way.}
+We ran the same gate on both cells of their published comparison: the evolved model
+\texttt{Frontis-MA1-35B} and its base \texttt{Qwen/Qwen3.6-35B-A3B}, served side by side on
+the same node from separate GPU pairs and verified to be distinct weights (identical prompts
+at temperature $0$ produce different completions). Both complete the contract; both write a
+reward. The rewards are:
+
+\begin{center}
+\begin{tabular}{lrrr}
+\toprule
+cell & \texttt{aggregate\_improvement} & \texttt{success\_rate} & instances scored \\
+\midrule
+evolved, \texttt{Frontis-MA1-35B} & $-1.000$ & $0.0$ & $0/4$ (crashed) \\
+base, \texttt{Qwen3.6-35B-A3B} & $+0.0026$ & $1.0$ & $4/4$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{This is not evidence against their claim and we will not report it as any.} It is one
+task, one candidate, two steps and a thirty-minute budget --- a hundredth of the search their
+protocol grants --- and the evolved model's loss is a single feature-alignment bug that more
+search would very likely have debugged away, since debugging is precisely what the loop does.
+We record it for two reasons. First, it is the honest content of the artifact. Second, it is a
+concrete instance of the arithmetic in Sec.~\ref{sec:openrsicost}: at one sample per task, a
+single unlucky crash moves a ten-task Match-SOTA score by a full ten points, which is half
+their published effect. The published delta is $5/10 \to 7/10$; a protocol in which one
+feature-count bug costs a whole point cannot separate that from noise.
+
+\paragraph{The scaled run, and the deviation it carries.}
+With rung 0 passed on both cells we launched the ten-task Lite-v2 comparison, both cells
+concurrently on the same node. Their search protocol is reproduced exactly ---
+\texttt{step\_limit}$=160$, $80$ generations $\times$ $2$ individuals, $14{,}400$\,s budget,
+one sample per task --- because \texttt{naturebench\_local\_quick} already carries the same
+search parameters as \texttt{naturebench\_scm\_lite\_v2}; only concurrency and the sandbox
+differ. One deviation must be declared: execution is a \emph{local process}, not their
+\texttt{scm\_docker} sandbox on \texttt{cnsbench-base:v3}. That is forced, not chosen. Their
+released \texttt{Dockerfile.base} pins CUDA $11.8$ and \texttt{torch 2.6.0+cu118}, which
+cannot target \texttt{sm\_100}, so on a B200 their own container cannot use the GPUs at all.
+Their documentation is explicit that the local path is ``dependency isolation rather than a
+security sandbox'' and unsuitable for formal submission, so the result must be read as a
+correctness check on the released system rather than as a benchmark submission. We installed
+every package their prompt advertises to the candidate ($16/16$ verified importable) so that
+candidate failures are attributable to the agent and not to our environment.
