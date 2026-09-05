@@ -6741,3 +6741,249 @@ first two, one of them within an hour of diagnosing the other. \textbf{Any futur
 zero-acceptance run must therefore check the server before it examines the proposer}, and the
 log line has to be split so that the three causes are distinguishable at the point they occur
 rather than reconstructed afterwards from process state that may no longer exist.
+
+\subsection{Anchoring the proposer on exemplars of known difficulty: the mechanism measured
+before the outcome}
+\label{sec:anchoring}
+
+\paragraph{The setting.} Sec.~\ref{sec:taskstore} established the constraint this experiment
+attacks: across $52$ accepted tasks from three sources only three carried gradient, all three
+from retrieval, and \textbf{both model-written sources produced zero gradient-bearing tasks
+between them}. The diagnosis was that a model asked to write a problem writes one it can
+already solve. Sec.~\ref{sec:strictinformative} sharpened how little room there is above that
+floor. An exemplar at a \emph{known} difficulty is the one lever these systems have not tried:
+Ornith's proposer is already conditioned on exemplars, but on exemplars chosen for being solved
+or unsolved, never on exemplars chosen to place the new task at a target.
+
+\textbf{The outcome question is expensive and the mechanism question is cheap, so the mechanism
+question is asked first.} If the anchor's difficulty does not transmit to the generated task's
+difficulty at all, then no anchor-selection policy can work and the outcome experiment is
+answered without being run. \texttt{PREREG\_anchor\_difficulty.md} fixed that ordering, the
+primary statistic and the decision thresholds before any number existed.
+
+\paragraph{Configuration.}
+
+\begin{center}\small
+\begin{tabular}{ll}
+\toprule
+served model & \texttt{qwen38-27b} (Qwen/Qwen3.8-27B), \texttt{--tp 1 --dp 8}, context $65536$ \\
+sampling & temperature $1.0$, \texttt{top\_p} $0.95$, \texttt{reasoning\_effort=low} throughout \\
+generation cap & $4096$ (proposal), $2048$ (scaffold), $\mathbf{16384}$ (solver rollout) \\
+              & \multicolumn{1}{r}{\emph{raised from $8192$ by amendment A3; see below}} \\
+difficulty & $k=8$ rollouts bare $+$ $8$ under one scaffold, per task \\
+anchor pool & $191$ training problems with $\ge 8$ resolved rollouts, $\hat p$ from
+              \texttt{blocks\_low}$+$\texttt{blocks\_low\_more} \\
+grid & \texttt{n\_anchors} $\in \{0,1,4\}$ $\times$ selection $\in$
+       \{random, hardest, at-target\} $\times$ $3$ sources \\
+     & $=21$ cells, $12$ tasks per cell per seed, $504$ tasks total \\
+seeds & \textbf{two}: $20260905$ and $20260906$, each a full independent replicate \\
+      & per-task seed \texttt{md5(cell|slot|seed)}, stable across processes \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{The split, and the guard that enforces it.} Anchors are drawn \textbf{only} from the
+training remainder of the search half. \texttt{build\_pools()} asserts that the anchor pool is
+disjoint from both the probe and the report half and raises rather than warns; an anchor drawn
+from the measured or the held-out set would make every difficulty claim circular. Probe is
+$118$ problems and report $337$, and the anchor pool of $191$ intersects neither.
+
+\paragraph{Method.} For each task slot the anchors are selected, the task is produced, the
+duplicate readings are taken, and only then is difficulty measured; nothing downstream feeds
+back into selection. The two axes are crossed rather than bundled because they are different
+hypotheses: \texttt{random} supplies the spread in anchor difficulty that powers a correlation,
+while \texttt{hardest} and \texttt{at\_target} concentrate it and therefore test a shift in the
+mean. The $n_{\text{anchors}}=0$ cell of each source differs from that source's anchored cells
+by the presence of the anchor block and by nothing else \emph{in the prompt}; the sampling seed
+also differs, since it is derived from the cell identity, which makes the draws independent
+rather than paired. Source-versus-source comparisons are likewise not anchor-matched. Files:
+\texttt{reimpl/anchor\_ablation.py}, \texttt{reimpl/anchor\_dupe.py},
+\texttt{reimpl/analyse\_anchor.py}.
+
+\textbf{Retrieval is the positive control, not a competing source.} Its ``generation'' is a
+nearest-neighbour lookup in the same pool the anchor came from, so it is the most
+anchor-faithful supply that can exist, and its correlation is the ceiling any conditioned
+generator could reach. The pre-registration fixed in advance that if retrieval does not
+correlate, the instrument is broken and no arm may be read. The pooled model-written figure
+therefore excludes it; pooling the control into the treatment would import the control's
+correlation into the number the decision rule reads.
+
+\paragraph{The three hazards, guarded rather than noted.}
+\begin{enumerate}
+\item \textbf{Anchors invite paraphrase, and the duplicate check is narrower than we first
+claimed.} Duplicate detection runs on a \emph{number-masked} form and on character $5$-gram
+cosine as well as on the shipped word overlap, every reading is quoted against a false-positive
+floor measured per length band on unrelated pairs, and every candidate is checked against
+\textbf{its own anchors} as well as against the pool. We had written that the shipped
+\texttt{jaccard\_similarity} is blind to a renumbered restatement; \textbf{an audit of our own
+module withdrew that}. On renumber-only pairs the shipped check reads $0.724$ against an
+unrelated-pair $95$th percentile of $0.156$ and rejects five of five at the project's $0.60$
+threshold, where the masked reading reads $0.986$ --- better by degree, not by kind. The gap
+that remains is one step further out: on pairs that renumber \emph{and} reword \emph{and}
+rename variables, the three readings are $0.124$, $0.195$ and $0.324$ against floors of
+$0.157$, $0.178$ and $0.228$, so \textbf{none of them catches those, ours included}. Every
+null duplicate reading in this section therefore means ``no renumbered restatement was
+found'', never ``no paraphrase was found''.
+\item \textbf{Leakage}, guarded as above.
+\item \textbf{Scaffolding polarises difficulty to the extremes}
+(Sec.~\ref{sec:postscaffold}), so difficulty is measured twice per task and the bare and
+scaffolded numbers are never pooled. The gap between them is reported per cell, because that is
+where the mechanism dies if it dies: an anchor that drags the bare number and loses it after
+scaffolding has moved a statistic nobody trains on.
+\end{enumerate}
+
+\paragraph{A defect in our own apparatus, found before the run finished.} The first launch
+derived each task's seed from Python's \texttt{hash()} of a tuple containing strings. String
+hashing is \textbf{salted per process}, so the experiment could not have been reproduced even
+with identical arguments --- every anchor draw, and therefore every generated task, would
+differ on a rerun. Three runs of the same expression returned $430{,}099{,}815$,
+$684{,}065{,}568$ and $1{,}747{,}739{,}814$. The seed is now \texttt{md5} of the same fields,
+verified stable across processes, and the salted-seed records were moved aside rather than
+reused. This is the same class as the defects in Secs.~\ref{sec:granularity}
+and~\ref{sec:coverage}: an apparatus that produces a number which looks like a measurement and
+does not have the property the write-up would have claimed for it.
+
+\begin{table}[t]
+\centering\small
+\caption{All twenty-one cells, pooled over both seeds. $d_{\text{anch}}$ is the realised mean
+measured difficulty of the anchors shown, and confirms the selection rules do what they say
+after the amendment: random $\approx 0.82$--$0.91$, at-target $\approx 0.21$--$0.24$ against
+$p^\star = 0.2$, hardest $\approx 0.01$. ``gap'' is scaffolded minus bare. \textbf{Read the
+$d_{\text{anch}}$ column against the bare column}: within retrieval the hardest anchors produce
+the \emph{easiest} tasks at one anchor and among the hardest at four, which is the
+non-monotonicity that invalidates the positive control.}
+\label{tab:anchorgrid}
+\begin{tabular}{llrrrrrr}
+\toprule
+source & selection & $n_a$ & $n$ & $d_{\text{anch}}$ & bare $\hat p$ & scaf. $\hat p$ & strict \\
+\midrule
+retrieval & ---        & $0$ & $24$ & ---     & $0.833$ & $0.841$ & $1/21$ \\
+retrieval & random     & $1$ & $24$ & $0.819$ & $0.935$ & $0.972$ & $1/21$ \\
+retrieval & at-target  & $1$ & $24$ & $0.217$ & $0.603$ & $0.700$ & $0/23$ \\
+retrieval & hardest    & $1$ & $24$ & $0.013$ & $1.000$ & $0.889$ & $0/18$ \\
+retrieval & random     & $4$ & $23$ & $0.815$ & $0.918$ & $0.962$ & $4/23$ \\
+retrieval & at-target  & $4$ & $24$ & $0.217$ & $0.867$ & $1.000$ & $0/15$ \\
+retrieval & hardest    & $4$ & $24$ & $0.009$ & $0.646$ & $0.708$ & $\mathbf{5/19}$ \\
+\midrule
+self-gen  & ---        & $0$ & $23$ & ---     & $0.944$ & $0.951$ & $0/23$ \\
+self-gen  & random     & $1$ & $23$ & $0.894$ & $0.977$ & $1.000$ & $1/20$ \\
+self-gen  & at-target  & $1$ & $18$ & $0.237$ & $1.000$ & $1.000$ & $0/15$ \\
+self-gen  & hardest    & $1$ & $18$ & $0.009$ & $0.875$ & $0.882$ & $0/17$ \\
+self-gen  & random     & $4$ & $19$ & $0.844$ & $0.891$ & $0.914$ & $2/16$ \\
+self-gen  & at-target  & $4$ & $18$ & $0.213$ & $0.944$ & $0.889$ & $0/18$ \\
+self-gen  & hardest    & $4$ & $13$ & $0.010$ & $1.000$ & $0.990$ & $0/13$ \\
+\midrule
+teacher   & ---        & $0$ & $20$ & ---     & $0.934$ & $0.947$ & $0/19$ \\
+teacher   & random     & $1$ & $22$ & $0.637$ & $0.977$ & $0.987$ & $1/20$ \\
+teacher   & at-target  & $1$ & $24$ & $0.224$ & $0.932$ & $0.953$ & $0/24$ \\
+teacher   & hardest    & $1$ & $21$ & $0.007$ & $0.945$ & $0.923$ & $2/21$ \\
+teacher   & random     & $4$ & $19$ & $0.911$ & $0.934$ & $0.941$ & $0/17$ \\
+teacher   & at-target  & $4$ & $21$ & $0.221$ & $0.952$ & $0.946$ & $0/21$ \\
+teacher   & hardest    & $4$ & $21$ & $0.011$ & $0.919$ & $0.906$ & $1/20$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Result 1: the pre-registered positive control failed, and the pre-registration says
+that blocks the primary.} Retrieval, the most anchor-faithful supply that can exist, gives
+$\rho = 0.096$ on $42$ distinct tasks, $95\%$ CI $[-0.280, 0.404]$, $p = 0.564$. Across the two
+seeds it is $\mathbf{0.186 \pm 0.233}$ --- \textbf{a standard deviation larger than the mean}.
+\path{PREREG_anchor_difficulty.md} fixed in advance that if retrieval does not correlate the
+instrument is broken and no arm may be interpreted, so \textbf{the correlation arm is reported
+as uninterpretable rather than as a null}, and the mechanism verdict is not taken from it.
+
+\textbf{The two seeds are the whole reason we know that.} A pilot at one seed gave
+$\rho = 0.326$ with a bootstrap interval of $[-0.019, 0.604]$, which reads as a marginal
+positive. The replicate gives $+0.021$ and $+0.351$: the pilot was one draw from a distribution
+whose run-to-run spread swamps its mean. \textbf{A bootstrap interval on a single run describes
+sampling within that run and would have implied a precision that does not exist} --- which is
+exactly the distinction this section exists to demonstrate.
+
+\paragraph{Why the control failed, which is a finding rather than a defect.} It is tempting to
+read a failed positive control as ``the instrument cannot see anything''. That is not what
+happened. The instrument distinguishes cells perfectly well: within retrieval, anchoring on
+at-target exemplars yields tasks at $\hat p = 0.603$ while anchoring on the hardest yields
+$\hat p = 1.000$ and random yields $0.935$ (Table~\ref{tab:anchorgrid}). What it does not do is
+order those cells by anchor difficulty --- the relation is \emph{non-monotone}, and the hardest
+anchors produced the \emph{easiest} retrieved tasks.
+
+So the control's premise was false, not the instrument. It assumed that textually similar
+problems have similar difficulty, and \textbf{in this corpus textual similarity and difficulty
+are close to independent}. A null there is therefore uninformative about the instrument's
+sensitivity rather than proof of its absence, and we say so instead of claiming the stronger
+result the pre-registration's letter would allow.
+
+\paragraph{Result 2: the outcome question does not need the control, and it is decisive.}
+Whether anchoring moves model-written supply into the informative band is a \emph{direct}
+measurement. It does not require difficulty to be transmissible, or measurable, or correlated
+with anything. It is reported in Table~\ref{tab:anchorout} and it is negative.
+
+\begin{table}[t]
+\centering\small
+\caption{Outcome by source, mean $\pm$ sd over \textbf{two independent seeds} ($504$ tasks,
+$447$ with a measured $\hat p$). Each seed redraws anchors and regenerates every task, so the
+spread is run-to-run variation and not resampling within one run. ``Below ceiling'' is
+$\hat p < 1$; ``strict'' requires $\ge 2$ successes and $\ge 2$ failures with $\ge 6$ of $8$
+rollouts gradeable.}
+\label{tab:anchorout}
+\begin{tabular}{lccccc}
+\toprule
+source & $n$ & $\rho$ (mean $\pm$ sd) & below ceiling & permissive & \textbf{strict} \\
+\midrule
+retrieval  & $140$ & $0.186 \pm 0.233$ & $0.239 \pm 0.105$ & $0.129$ & $\mathbf{0.079 \pm 0.015}$ \\
+self-gen   & $122$ & $-0.082 \pm 0.078$ & $0.105 \pm 0.023$ & $0.066$ & $\mathbf{0.024 \pm 0.009}$ \\
+teacher    & $142$ & $0.056 \pm 0.022$ & $0.140 \pm 0.037$ & $0.106$ & $\mathbf{0.028 \pm 0.001}$ \\
+\midrule
+model-written pooled & $222$ & $-0.002 \pm 0.070$ & --- & --- & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{No anchor configuration moved a model-written source off the ceiling.} Self-generation
+lands below $\hat p = 1$ on $10.5\%$ of tasks and the teacher on $14.0\%$, against retrieval's
+$23.9\%$. The strict informative fraction is $\mathbf{0.024}$ and $\mathbf{0.028}$ for the two
+model-written sources, against $0.079$ for retrieval; the pooled figure over all $404$ measured
+tasks is $18/404 = \mathbf{0.045}$ strict against $41/404 = 0.101$ permissive. \textbf{Anchoring
+at a known difficulty --- with the number of anchors and the selection rule varied
+independently across twenty-one cells --- did not move the constraint.} The verdict of
+Sec.~\ref{sec:taskstore} stands, and the one untried lever in these systems is now tried.
+
+\paragraph{The scaffold gap, which was where we expected the mechanism to die.} It did not die
+there, because there was nothing to kill: the bare-to-scaffolded gap is within $\pm 0.13$ in
+every one of the twenty-one cells and within $\pm 0.03$ in every model-written cell
+(Table~\ref{tab:anchorgrid}). Scaffolding neither rescues nor destroys an anchoring effect
+here, for the straightforward reason that there is no anchoring effect for it to act on.
+
+\paragraph{Hazard 1 did not fire, and the stronger check is what establishes that.} Anchors
+were expected to invite paraphrase. \textbf{They did not, for the model-written sources}: of
+$109$ self-generated and $128$ teacher tasks checked against their own anchors, the
+number-masked and $n$-gram readings flag $0$ and $1$ respectively at the $0.60$ threshold, and
+the shipped word-overlap check flags $0$ and $1$. Both checks agree, so the negative is not an
+artefact of a weak instrument.
+
+The two readings disagree sharply exactly where they should: on \emph{retrieval}, where the
+candidate is a nearest neighbour of the anchor by construction, the shipped check flags $1$ of
+$143$ and the masked/$n$-gram reading flags $\mathbf{27}$. \textbf{That $27{:}1$ ratio is the
+measured value of the stronger check} --- and it is measured on the arm where near-duplication
+is designed in, not on the arms where it would have been a finding.
+
+\paragraph{Caveats.}
+\begin{itemize}
+\item \textbf{The primary statistic is uninterpretable by its own pre-registered rule.} The
+outcome result above does not depend on it, but the mechanism question --- does anchor
+difficulty transmit at all --- is \emph{not} answered by this run. A control with a true premise
+would be needed, and we do not currently have one.
+\item \textbf{Two seeds is the minimum that shows variance and is not enough to estimate it.}
+An sd computed from two runs is itself extremely noisy; $0.186 \pm 0.233$ should be read as
+``these two runs disagree'', not as a calibrated interval.
+\item \textbf{Per-cell tests are exploratory}, as the amendment fixed in advance: eighteen arms
+against three shared baselines with no multiplicity control, and at $n \approx 20$ per cell a
+two-proportion test needs roughly a $35$-point shift to reach $p<0.05$. The one cell that looks
+interesting --- retrieval with four hardest anchors, $5/19$ strict --- is exactly the kind of
+result that multiplicity produces, and it is reported as description, not as a finding.
+\item \textbf{The teacher is the same checkpoint as the solver}, in a teacher role at the same
+effort, because the machine's other cards were committed. It is a prompt-framing arm and is
+\emph{not} evidence about distillation from a stronger model.
+\item $13$ of $447$ tasks ($2.9\%$) had their asserted answer contradicted by a strong solver
+consensus; excluding them does not change any figure above.
+\end{itemize}
