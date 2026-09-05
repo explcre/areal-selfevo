@@ -5382,3 +5382,71 @@ produce $52$ tasks and $259{,}671$ to score them, four fifths of the bill spent 
 tasks rather than on making them. \textbf{No money was spent}; every arm, teacher included, ran
 on the local checkpoint, so the dollar axis is unmeasured here rather than zero, and the routing
 plan declines to rank on it.
+
+\subsection{OpenRSI phase 1, executed on verified data: the pipeline runs, and the published
+model-swap delta does not reappear}
+\label{sec:openrsiphase1}
+
+The ten-task Lite-v2 comparison completed on byte-exact task packages
+(Sec.~\ref{sec:openrsidata}), both cells, one sample per task, seed $42$. Scores are computed
+by NatureBench's own \texttt{compute\_scores.calculate\_metrics}: Match-SOTA is the fraction
+of tasks with $g \ge 0$, Surpass-SOTA the fraction with $g > 0.1$, both over the ten-task
+count.
+
+\begin{center}
+\begin{tabular}{lrrrr}
+\toprule
+cell & Match-SOTA & Surpass-SOTA & search nodes & wall clock \\
+\midrule
+evolved, \texttt{Frontis-MA1-35B}   & $60\%$ ($6/10$) & $40\%$ ($4/10$) & $563$ & $4$\,h\,$23$\,m \\
+base, \texttt{Qwen3.6-35B-A3B}      & $70\%$ ($7/10$) & $20\%$ ($2/10$) & $574$ & $4$\,h\,$18$\,m \\
+\midrule
+\emph{their published pair}         & $70\%$ vs $50\%$ & --- & --- & --- \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{What this says, stated at the altitude the sample size allows.}
+The pipeline executes: twenty task-cells ran to their four-hour budget, $1{,}137$ search nodes
+were created and evaluated, every task returned a directory-correct score, and both cells
+produced artifacts that read back. That is the claim this run was for, and it is a real change
+from Sec.~\ref{sec:openrsirung0b}, where the same released quickstart could not evaluate a
+single task.
+
+On the published effect, the run recovers nothing. Their reported pair is base $50\%$ to
+evolved $70\%$; we measure base $70\%$ and evolved $60\%$, so the Match-SOTA difference has
+the \emph{opposite sign} to the claim. Surpass-SOTA moves the other way, $40\%$ against
+$20\%$, in the claimed direction. \textbf{None of these differences is distinguishable from
+none.} Fisher's exact test gives $p = 1.00$ for $6/10$ against $7/10$ and $p = 0.63$ for
+$4/10$ against $2/10$; our base is not distinguishable from their base either ($7/10$ against
+$5/10$, $p = 0.65$). This is exactly the regime Sec.~\ref{sec:openrsicost} predicted in
+advance, and it is why we neither claim a failure to reproduce nor treat the sign reversal as
+a finding. A single task moves Match-SOTA by ten points, and the difference we observe is one
+task.
+
+\paragraph{Three checks that the comparison is not confounded.}
+\emph{Throughput matched.} An early reading suggested the evolved cell was searching far
+faster, which under a wall-clock budget would confound quality with speed. It was a startup
+transient: the completed run gives $563$ nodes against $574$, a $2\%$ difference, so both
+cells received effectively the same amount of search.
+
+\emph{The task both cells fail is genuinely hard.} \texttt{s43588-025-00842-5} scored the
+$-1.0$ floor in both cells. With the data now complete, its failures are agent coding errors
+--- \texttt{KeyError: 'SMILES'}, \texttt{np.mode}, \texttt{os.dirname}, InChIKey strings cast
+to float --- and not missing files. It is a task neither model can do, which is a legitimate
+benchmark outcome and costs both cells equally.
+
+\emph{The one asymmetry runs against the base cell, not for it.} The base cell lost
+\texttt{s42256-023-00627-3} after two attempts when the harness assembled a prompt of
+$\mathbf{555{,}006}$ \textbf{tokens} and the server refused it; the evolved cell hit this zero
+times. That is an OpenMLE-Evo robustness issue rather than a limit of our serving
+configuration --- no context window would accommodate it, including the model's own $262{,}144$
+--- and it is worth reporting upstream: their prompt assembly has no cap, so one pathological
+debug cycle can terminate a task. Because it truncated the \emph{base} cell's search on a task
+the base cell nonetheless matched, the base $70\%$ should be read as a floor.
+
+\paragraph{What we are running to bound the noise.}
+A single seed cannot say whether a one-task difference is signal or scatter, so a second
+independent replicate at seed $43$ is running for both cells. Its purpose is not to improve the
+estimate of their effect --- at $n=10$ nothing can --- but to measure the run-to-run spread
+against which the one-task gap should be read. We report the pair, not the better of the two.
