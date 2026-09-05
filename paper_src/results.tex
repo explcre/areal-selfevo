@@ -5629,3 +5629,20 @@ sequence that long cannot be backpropagated whole at this vocabulary size. Train
 the loss accumulated over sub-sequences, which nothing in the reproduction does today.
 \textbf{So the honest statement about the three-stage loop is that it runs, that all three
 stages train, and that the proposer stage trains only when its proposal happens to be short.}
+
+\paragraph{And the rebuilt check had the same disease one level up.} Made per stage, it was
+still evaluated on the \emph{last} iteration only. The validation run's final iteration scored
+one task and formed no group, so every per-stage assertion was skipped and the check returned
+without testing anything --- a vacuous pass, from a check written specifically to stop vacuous
+passes. Its \texttt{return 1} also sat outside the \texttt{if probs} test, so it could never
+report success either. The check is now asserted over the whole run --- at least one task group
+must have formed, and each stage must be shown to have trained in at least one iteration that
+formed one --- and it was lifted out of \texttt{main} so it can be tested. Against records
+mutated from a real run it passes the repaired run, passes a sound run whose last iteration
+happens to be empty, and fails all three of: a harness stage starved every iteration, a harness
+step that moved no parameter, and a run in which no group ever formed
+(\texttt{code/test\_smoke\_verdict.py}). \textbf{That is the eighth guard in this project to
+pass the condition it was written to refuse, and the fifth found by whoever wrote it.} The
+repaired \texttt{pre} run trains the harness stage in three consecutive grouped iterations ---
+rows $6, 6, 9$, gradient norms $0.077, 0.052, 0.035$, parameters moving every time --- against
+$0$, $0.0$ and no movement in every iteration of the run behind Sec.~\ref{sec:postscaffold}.
