@@ -4723,3 +4723,152 @@ absent}, because absence raises an error and partial presence produces a number.
 reproduction that downloads its own evaluation data should verify it against the publisher's
 manifest by size or checksum before the first GPU-second is spent, and should treat an
 exit code of zero from a downloader as carrying no information about completeness.
+
+\subsection{Seeding the loop from measured difficulty: the cold start was not the problem}
+\label{sec:seededloop}
+
+Sec.~\ref{sec:ornithloop} located the loop's failure at its first turn --- a prompted proposer
+emits problems the base already solves, so the difficulty gate has nothing in its support ---
+and scoped that as a statement about the cold start rather than about the method. The obvious
+repair is to supply the first turns from measurement instead of from a prompt, and this section
+runs it. \texttt{PREREG\_seeded\_loop.md} fixes the claim, the primary quantity, the
+degeneration conditions and, explicitly, the reading of the outcome in which seeding changes
+nothing; it was written before either arm started.
+
+\textbf{Two arms, both run fresh at matched settings}, concurrently so that a truncated run
+leaves them with the same number of iterations. \textbf{COLD} takes every task from the
+proposer, as published. \textbf{SEED} draws iterations 0--3 from the \emph{mixed subset} --- the
+benchmark problems this base sometimes solves and sometimes does not, established from its own
+rollouts --- and hands over to the proposer at iteration 4. Same three rewards, same nested
+structure, same group sizes, same caps. The control is re-run rather than compared against
+Sec.~\ref{sec:ornithloop}'s numbers, whose group size and iteration count would otherwise be
+confounded with the seed.
+
+\paragraph{The answer is that seeding does not rescue the loop.}
+\textbf{SEED formed a task group in $0$ of $6$ iterations --- including $0$ of its $4$ seeded
+ones --- against COLD's $1$ of $4$} (Table~\ref{tab:seedarms}). Both numbers are near zero and
+$n$ is small, so the honest statement is not that seeding hurt but that it did not help: the
+pre-registered outcome in which seeding changes nothing is the one that occurred.
+
+\begin{table}[t]
+\centering\small
+\caption{COLD against SEED, run concurrently at matched settings (3 tasks per iteration,
+3 scaffolds, $G=4$ rollouts, caps 16384, $\eta=10^{-4}$), runs \texttt{runs/COLD} and
+\texttt{runs/SEED}. A task group needs two survivors, so an iteration with one scored task
+still trains nothing.}
+\label{tab:seedarms}
+\begin{tabular}{llcccc}
+\toprule
+arm & iteration & task source & accepted & scored & formed a group \\
+\midrule
+COLD & $0$ & proposer & $3$ & $0$ & no \\
+COLD & $1$ & proposer & $2$ & $0$ & no \\
+COLD & $2$ & proposer & $3$ & $2$ & \textbf{yes} \\
+COLD & $3$ & proposer & $2$ & $0$ & no \\
+\addlinespace
+SEED & $0$ & seed     & $3$ & $1$ & no \\
+SEED & $1$ & seed     & $3$ & $0$ & no \\
+SEED & $2$ & seed     & $3$ & $1$ & no \\
+SEED & $3$ & seed     & $3$ & $1$ & no \\
+SEED & $4$ & proposer & $3$ & $0$ & no \\
+SEED & $5$ & proposer & $3$ & $0$ & no \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Seeding did move the per-task number, just not far enough.} Three seeded tasks survived
+scoring across four seeded iterations against COLD's two across four, but never two in the same
+iteration, and a task group needs two. The refusals say why: across SEED's $15$ refused tasks
+($45$ scaffold groups) $27$ groups were unanimously correct and $18$ unanimously wrong, with
+\emph{none} mixed. In SEED's first seeded iteration the two refused tasks carried the k-vectors
+$[0,0,4]$ and $[4,4,4]$ at $G=4$ --- tasks drawn from the mixed subset \emph{because} the base
+does not always solve them, solved under the loop every time or not at all.
+
+\textbf{Nor did seeding change the proposer when it took over.} On proposer-driven iterations
+SEED's proposer never terminated on $18$ of $24$ attempts ($0.750$) at a validity yield of
+$0.250$, against COLD's $47$ of $60$ ($0.783$) at $0.167$ --- indistinguishable at this $n$, and
+neither near usable. Four seeded iterations of solver and harness updates, carried to the
+proposer through the shared adapter, did not visibly change what it writes.
+
+\paragraph{Why: the scaffold stage destroys the difficulty the seed was chosen for.}
+The loop never solves a task bare. The harness writes a scaffold and the solver is conditioned
+on it, so a seed's measured $\hat p$ is a property of a different prompt from the one the
+rollouts see. Measured directly on the base model, on eight mixed-subset tasks, three generated
+scaffolds each, four rollouts per scaffold (Table~\ref{tab:scafdrift}):
+
+\begin{table}[t]
+\centering\small
+\caption{A generated scaffold does not preserve the difficulty a seed was selected for.
+Base model, eight tasks drawn from the mixed subset, three scaffolds each, four rollouts per
+scaffold, run \texttt{out/SCAFFOLD\_DRIFT.txt}. ``pool $\hat p$'' is the difficulty measured by
+this paper from bare prompting over sixteen samples; ``scaffolded'' is the rate under the
+loop's own harness stage.}
+\label{tab:scafdrift}
+\begin{tabular}{rcc l}
+\toprule
+task & pool $\hat p$ & scaffolded & $k$ per scaffold (of $4$) \\
+\midrule
+$26$  & $0.812$ & $0.583$ & $[4,1,2]$ \\
+$374$ & $0.938$ & $1.000$ & $[4,4,4]$ \\
+$184$ & $0.812$ & $1.000$ & $[4,4,4]$ \\
+$529$ & $0.938$ & $1.000$ & $[4,4,4]$ \\
+$315$ & $0.875$ & $1.000$ & $[4,4,4]$ \\
+$209$ & $0.562$ & $1.000$ & $[4,4,4]$ \\
+$487$ & $0.938$ & $1.000$ & $[4,4,4]$ \\
+$132$ & $0.312$ & $0.500$ & $[0,4,2]$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Mean absolute drift from the measured value is $0.169$ and the signed mean is $\mathbf{+0.112}$:
+scaffolds make tasks \emph{easier}. Six of the eight went to $\hat p = 1.000$ exactly.
+$21$ of $24$ scaffold groups were unanimous, and \textbf{six of the eight tasks would be refused
+by the package's own guard G4} --- the same refusal, at the same rate, that the proposed tasks
+earn. A seed selected for difficulty arrives at the solver as a task that is no longer
+difficult.
+
+\paragraph{And the seed pool was never at the target difficulty to begin with.} ``Mixed'' means
+not unanimous over sixteen samples, which on a strong base mostly means solved thirteen or
+fourteen times out of sixteen. The mixed subset's own $\hat p$ has mean $0.671$ and
+\textbf{median $0.812$}; $57.6\%$ of it sits above $0.75$ and only $\mathbf{13.6\%}$ lies in
+the gate's effective support $[0.10,0.35]$. So the two effects compound: a seed pool whose
+median task is already solved four times in five, pushed a further $+0.112$ by the scaffold.
+The mixed subset is the right pool for \emph{extracting gradient} --- that is what
+Sec.~\ref{sec:gatearms} used it for, and there it moved held-out accuracy by up to fourteen
+points --- but it is not a supply of tasks at $p^\star = 0.2$, and this experiment is what
+distinguishes those two uses.
+
+\paragraph{What this settles, and it is the stronger negative.}
+The pre-registration named this outcome in advance: if the seeded arm's behaviour matches the
+cold-started one, then the cold start was not the problem and the fault lies in the proposer
+stage or the design, not in how the loop is started. That is what happened, and the drift
+measurement says which: \textbf{it is not the proposer either.} Even when the task is supplied
+from measurement, the loop's own harness stage moves it off the difficulty its own task reward
+demands, and the rollout-level guard then refuses it. The difficulty gate is being asked to
+select on a statistic that a later stage of the same loop overwrites.
+
+\textbf{One structural observation, which is the sharpest thing in this section.} The refused
+seed with $k=[0,0,4]$ is not an uninformative task. Two of its scaffolds never solved it and
+one always did: at the \emph{scaffold} comparison level --- the level the nested structure
+exists to create, and the one $R_{\mathrm{harness}}$ is defined on --- that task carries a
+large, clean signal. It is discarded because guard G4 is applied to the \emph{rollout} groups
+alone. The nesting creates a second comparison level and the batch guard then refuses batches
+without consulting it, so the loop throws away exactly the tasks whose signal lives at the
+level the nesting was introduced for. That is a defect of the guard's placement, ours to fix
+rather than Ornith's, and we record it as a correction to Sec.~\ref{sec:ornithloop}'s reading
+of the same refusals: some of those twenty refusals will have been scaffold-informative too.
+
+\paragraph{The cost, which replicates.} The one iteration that trained generated $703{,}186$
+tokens for two tasks that reached scoring, i.e.\ $\mathbf{352}$\textbf{k per scored task},
+against the $407$k measured in Sec.~\ref{sec:ornithloop} on a different configuration. COLD
+spent $938{,}924$ tokens on the proposer alone across four iterations. Whatever else is true of
+this loop, a task that survives to be scored costs on the order of $4\times10^{5}$ generated
+tokens, and three quarters of the proposer's spend buys generations that never terminate.
+
+\paragraph{Scope.} Eight tasks in the drift measurement and four to six iterations per arm;
+the drift direction is large and consistent but its magnitude is not tightly estimated. The
+seeded arm gives the proposer no gradient of its own during seeding --- it did not write those
+tasks --- so it benefits only through the shared adapter, which is stated in the
+pre-registration as the mechanism under test and leaves a behaviour-cloning variant untested.
+And the whole section speaks to \texttt{Qwen3.8-27B} at \texttt{reasoning\_effort=low} on
+OlympiadBench-derived tasks; a weaker base would put more of any pool inside the gate's support.
