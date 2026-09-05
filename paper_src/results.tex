@@ -5646,3 +5646,93 @@ pass the condition it was written to refuse, and the fifth found by whoever wrot
 repaired \texttt{pre} run trains the harness stage in three consecutive grouped iterations ---
 rows $6, 6, 9$, gradient norms $0.077, 0.052, 0.035$, parameters moving every time --- against
 $0$, $0.0$ and no movement in every iteration of the run behind Sec.~\ref{sec:postscaffold}.
+
+\subsection{Phase 2, declared before its numbers exist: what a null there could and could not
+mean}
+\label{sec:openrsiphase2pre}
+
+The harness comparison of Sec.~\ref{sec:openrsicost} --- OpenMLE-Evo's
+\texttt{airaevo\_naturebench} against the original AIRA-Evo TTS baseline
+\texttt{airaevo\_naturebench\_original\_tts}, differing only in the \texttt{experience} block
+and \texttt{fresh\_draft\_prob}, with the model held fixed at \texttt{Qwen3.8-27B} --- is
+running as this is written. We state its principal limitation now, while the numbers do not
+yet exist, because stating it afterwards would be worthless.
+
+\paragraph{The limitation.}
+Under their wall-clock budget this pair completes roughly \textbf{ten to fifteen search nodes
+per task}, against the $160$ their \texttt{step\_limit} permits and the $\approx\!56$ per task
+that phase~1 achieved. The treatment arm's entire mechanism is experience memory and
+parent selection operating over a search population: it retrieves up to three related cards,
+three ancestors and three siblings, and ranks parents within an island sized at $160$. At a
+dozen nodes per task that population barely exists, and the machinery under test has almost
+nothing to rank or retrieve from.
+
+\textbf{Therefore a null result in phase 2 cannot be read as evidence against the mechanism.}
+It would be substantially explained by the mechanism having nothing to operate on, and that
+explanation is available independently of whether the mechanism works at the depth its authors
+measured it at. We pre-register that reading here. What phase 2 can still support is the
+weaker and honest claim that the two harnesses were exercised end to end on identical models,
+budgets and data, and what their scores were at this depth. The comparison remains internally
+fair --- same model, same budget, same task packages, same containment, differing only in the
+config block under test.
+
+We considered and rejected buying depth. The available levers are raising
+\texttt{individuals\_per\_generation} or switching to the asynchronous steady-state profile,
+and both alter the search protocol that phase 2 exists to measure.
+
+\subsection{A wall-clock evaluation budget silently advantages terse models over reasoning
+models}
+\label{sec:openrsiwallclock}
+
+This is a property of OpenRSI's evaluation design rather than of any model, it is measured
+rather than argued, and it affects anyone who runs their benchmark.
+
+Their protocol fixes \texttt{model\_plus\_sandbox\_time\_budget} at $14{,}400$ seconds per
+task. It does not fix the number of search steps, so the amount of search a model receives is
+whatever its own verbosity permits inside four hours. Measured on the same node, same harness,
+same ten tasks:
+
+\begin{center}
+\begin{tabular}{lrr}
+\toprule
+model & architecture & search nodes per wall-clock hour \\
+\midrule
+\texttt{Frontis-MA1-35B}   & MoE, $8$ of $256$ experts active & $128$ \\
+\texttt{Qwen3.6-35B-A3B}   & MoE, $8$ of $256$ experts active & $133$ \\
+\texttt{Qwen3.8-27B}       & dense, $64$ layers               & $\mathbf{26}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The dense model receives roughly \textbf{a fifth} of the search. The cause is not serving
+speed: its server sustained \emph{higher} aggregate token throughput than either mixture-model
+server ($694$--$704$ tokens/s at batch $12$--$13$, against $323$--$479$ at batch $2$--$5$).
+The difference is tokens emitted per search node --- a dense reasoning model writes far longer
+completions per candidate, and the wall-clock budget converts that verbosity directly into
+fewer search steps.
+
+Two consequences. First, a like-for-like comparison of two models under this protocol is
+partly a comparison of their output lengths, and the quieter model is advantaged in a way that
+has nothing to do with the quality of its candidates. Second, and more practically for
+reproduction, our phase-2 depth limitation
+(Sec.~\ref{sec:openrsiphase2pre}) is a direct consequence: it is not a configuration mistake
+but the protocol's own arithmetic applied to a verbose model. Anyone reporting a harness or
+model comparison on NatureBench under a wall-clock budget should publish search-node counts
+beside the scores, which is why we do.
+
+\paragraph{A correction to a framing we were carrying.}
+We had been considering proposing that OpenRSI's task supply be sourced from retrieval rather
+than generation, on the strength of our own measurement that model-written tasks carry no
+gradient. An audit of their code retires that proposal: \textbf{OpenRSI does not generate
+tasks anywhere, at any stage}. Their training supply is already a fixed on-disk manifest of
+quality-gated Kaggle-derived tasks walked uniformly at random, and the only generation in
+their loop is of candidate \emph{programs} for a task read off disk. The improvement we were
+going to propose is already their design, and we record it as a corrected framing rather than
+a contribution. Two facts from that audit do bear on our own work and are taken up elsewhere:
+that substituting their RL task supply is a single path change with no call sites touched,
+because every consumer reads task identity from sample metadata and none constructs it, so the
+real cost of any substitution is \emph{evaluator} construction rather than plumbing; and that
+their RL loop runs a group-relative objective at sixteen samples per group over a uniformly
+sampled fixed task set with no dynamic-sampling filter, leaving the upstream framework's
+\texttt{check\_reward\_nonzero\_std} at \texttt{None} in all four launchers, so unanimous
+groups are retained and contribute exactly zero gradient.
