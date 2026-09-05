@@ -5821,3 +5821,601 @@ refusal rate, the other reports nothing at all, and the second is the more dange
 presentation because the wasted fraction of every batch does not appear in any number the
 system prints. Our own polarisation result says the fraction is not small and not stable
 either: it depends on the scaffold, which the loop is simultaneously training.
+
+\subsection{What fraction of a competition benchmark a program can check, and what a
+self-generated corpus turns out to be a sample of}
+\label{sec:verifiablesubset}
+
+\paragraph{The setting.} Every verification result in this project is bounded by a question we
+had not measured: how much of the benchmark is checkable by machine at all. The answer decides
+a build. If proof-or-construction problems are a large share, a proof assistant is the only way
+to reach them and Lean has to be built; if they are a small share, the effort belongs in a
+symbolic backend that serves the majority. The recommendation to build the symbolic backend
+and leave Lean unbuilt was made on this measurement, so it is recorded with it.
+
+\paragraph{The configuration.} Served model \texttt{qwen38-27b}, \textbf{$3$ samples per
+problem, and a class is assigned only on unanimity} --- any disagreement, and any truncation,
+falls to \texttt{unclassifiable} rather than to a majority vote. The taxonomy and the
+class-to-backend map are \texttt{reimpl/ornith\_repro/classify.py}; the run is
+\texttt{reimpl/classify\_benchmark.py}. ``Executable reach'' is not a judgement, it is exactly
+the set of classes for which \texttt{backend\_for(cls)} is not \texttt{None}
+(\texttt{bounded\_search}, \texttt{combinatorial}, \texttt{symbolic}, \texttt{geometry});
+``CAS'' is exactly the \texttt{symbolic\_cas} backend (\texttt{symbolic}, \texttt{geometry}).
+
+\begin{table}[t]
+\centering\small
+\caption{Class histogram of the benchmark against the proposer's own corpus,
+\texttt{out/classify\_olympiadbench.jsonl} and \texttt{out/classify\_generated.jsonl}. The two
+denominators differ and are given: $675$ is the benchmark, $693$ is the generated corpus, and
+percentages are of each file's own total. \texttt{unclassifiable} is a refusal, not a class:
+of the benchmark's $121$, $100$ were sample disagreements and $21$ truncations.}
+\label{tab:classmap}
+\begin{tabular}{lrrrr}
+\toprule
+& \multicolumn{2}{c}{benchmark ($n{=}675$)} & \multicolumn{2}{c}{generated ($n{=}693$)} \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}
+class & count & share & count & share \\
+\midrule
+\texttt{symbolic}              & $203$ & $30.1\%$ & $92$  & $13.3\%$ \\
+\texttt{bounded\_search}       & $147$ & $21.8\%$ & $\mathbf{289}$ & $\mathbf{41.7\%}$ \\
+\texttt{unclassifiable}        & $121$ & $17.9\%$ & $64$  & $9.2\%$ \\
+\texttt{geometry}              & $92$  & $13.6\%$ & $79$  & $11.4\%$ \\
+\texttt{combinatorial}         & $90$  & $13.3\%$ & $169$ & $24.4\%$ \\
+\texttt{proof\_or\_construction} & $22$ & $\mathbf{3.3\%}$ & $\mathbf{0}$ & $\mathbf{0.0\%}$ \\
+\midrule
+executable reach               & $532$ & $\mathbf{78.8\%}$ & $629$ & $90.8\%$ \\
+CAS (\texttt{symbolic\_cas})   & $295$ & $\mathbf{43.7\%}$ & $171$ & $24.7\%$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{The result, and the build decision it carries.} $532$ of $675$ benchmark problems
+($78.8\%$) are in executable reach and $295$ ($43.7\%$) are claimed by a computer algebra
+system, against $22$ problems ($3.3\%$) that are proof-or-construction
+(Table~\ref{tab:classmap}). \textbf{A proof assistant is the only route to $3.3\%$ of this
+benchmark, and a symbolic backend is a route to $43.7\%$ of it.} That ratio, better than
+thirteen to one, is why Lean is unbuilt and why the symbolic backend was written instead. The
+figure is an upper bound on what any executable checker can decide here and a matching lower
+bound on how little a proof assistant would add, and both are what a build decision needs.
+
+\paragraph{The finding that was not the reason for the run: a self-generated corpus is not a
+sample of the domain it imitates.} Run against the proposer's own $693$ tasks the same
+classifier returns \textbf{zero proof-or-construction problems} --- not few, none --- against
+the benchmark's $3.3\%$, and $41.7\%$ bounded search against the benchmark's $21.8\%$, a factor
+of $\mathbf{1.91\times}$. The proposer was never asked for a distribution and never told to
+avoid proofs as such; it was asked for ``exactly ONE correct final answer, a specific closed
+form''. \textbf{So the answer format, and not the difficulty target, is what selected the
+mathematics.} A requirement written to make grading possible silently deleted an entire class
+of problem and nearly doubled another, and it did so without appearing anywhere in the loop's
+reward, its difficulty gate or its novelty term. Any self-improvement loop that grades on a
+final answer inherits this, and inherits it invisibly: the corpus it trains on drifts toward
+what its grader can read, which is a different object from the domain it believes it is
+sampling.
+
+\paragraph{Caveats.}
+\begin{itemize}
+\item The classifier is the same model that wrote the generated corpus, so a shared blind spot
+between writer and classifier would be invisible here. The unanimity-over-three rule bounds
+per-sample noise, not a systematic bias shared by both roles.
+\item $17.9\%$ of the benchmark is \texttt{unclassifiable} and is excluded from both derived
+rows. If those $121$ problems were disproportionately proofs, $3.3\%$ is an underestimate;
+the run does not settle that, and the honest reading of the build decision is that
+proof-or-construction is between $3.3\%$ and $21.2\%$ of the benchmark, still far below the
+CAS share.
+\item The denominators differ ($675$ against $693$) and no attempt is made to match them; the
+comparison is between two corpora, not two arms of one experiment.
+\end{itemize}
+
+\subsection{How wrong are self-written answer keys: three numbers, two instrument failures,
+and one case that needed no external check}
+\label{sec:keyquality}
+
+\paragraph{The setting.} A self-improvement loop with no external answer key trains on keys the
+model wrote itself. Sec.~\ref{sec:taskstore} caught a single mis-keyed task and preserved its
+witness; this asks the rate, and asks it against the only comparator that makes the number
+mean anything --- \emph{the same verifier run against professionally curated keys}. Without
+that arm a generated-key error rate is uninterpretable, because it confounds how often the
+generator is wrong with how often the verifier is.
+
+\textbf{The arc is reported rather than the endpoint, because the corrections are the useful
+part.} The number went $72.5\%$, then $12.9\%$, then $8.60\%$, and each move was an instrument
+failure rather than new evidence about the generator.
+
+\paragraph{The configuration.} Served model \texttt{qwen38-27b}, context $65536$,
+\texttt{reasoning\_effort=low}, run by \texttt{reimpl/verify\_generated.py} over the cascade in
+\texttt{reimpl/ornith\_repro/verify.py}. Verdicts are three-valued
+(\texttt{verified} / \texttt{refuted} / \texttt{unverifiable}) on top of the three-valued
+comparator \texttt{symbolic\_compare}, and \textbf{difference must be proved} --- by disjoint
+Arb enclosures or an exact structural mismatch --- while equality may rest on evidence. A
+refutation additionally requires a substantiated witness. \texttt{ERROR} rows are excluded from
+``decided'' but retained in the coverage denominator.
+
+\begin{table}[t]
+\centering\small
+\caption{Every run of the key check, in order. ``Decided'' is verified $+$ refuted; coverage is
+decided over the file's own row count; the error rate is refuted over decided. The two rows in
+bold are the like-for-like pair. Counts are given beside every rate because $16$ of $244$ and
+$6.56\%$ read very differently.}
+\label{tab:keyquality}
+\begin{tabular}{llrrrrrr}
+\toprule
+pool & file & rows & ver. & ref. & decided & coverage & error \\
+\midrule
+generated & \texttt{verify\_generated.jsonl}      & $634$ & $11$  & $29$ & $40$  & $6.3\%$  & $72.50\%$ \\
+generated & \texttt{verify\_generated\_v2.jsonl}  & $693$ & $230$ & $34$ & $264$ & $38.1\%$ & $12.88\%$ \\
+generated & \texttt{verify\_generated\_sym.jsonl} & $693$ & $228$ & $16$ & $244$ & $35.2\%$ & $6.56\%$ \\
+\textbf{generated} & \texttt{verify\_generated\_cov.jsonl} & $693$ & $287$ & $27$ & $314$ & $\mathbf{45.3\%}$ & $\mathbf{8.60\%}$ \\
+\midrule
+published & \texttt{verify\_olympiad.jsonl}        & $675$ & $172$ & $49$ & $221$ & $32.7\%$ & $22.17\%$ \\
+published & \texttt{verify\_olympiad\_sym.jsonl}   & $240$ & $40$  & $3$  & $43$  & $17.9\%$ & $6.98\%$ \\
+published & \texttt{verify\_olympiad\_sym2.jsonl}  & $675$ & $229$ & $6$  & $235$ & $34.8\%$ & $2.55\%$ \\
+\textbf{published} & \texttt{verify\_olympiad\_cov.jsonl} & $675$ & $268$ & $8$ & $276$ & $\mathbf{40.9\%}$ & $\mathbf{2.90\%}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{The three numbers, and what each correction taught.}
+
+\emph{$72.5\%$ --- a truncation bug that deleted verifications and spared refutations.} The
+first run decided only $40$ of $634$ rows and called $29$ of them wrong. The generation cap
+truncated the verifier's own program-writing, and truncation is not symmetric across verdicts:
+a run that gets far enough to \emph{refute} has already produced its witness, while a run that
+would have \emph{verified} is cut off before it can and is recorded as unverifiable. The bug
+therefore removed the denominator's successes and kept its failures, which is the worst
+possible shape for a rate. \textbf{A coverage of $6.3\%$ was the visible symptom and it was
+sitting in the table beside the number the whole time.}
+
+\emph{$12.9\%$ --- a real number that could not be interpreted, because the comparator was
+broken.} With the truncation fixed, coverage rose to $38.1\%$ and the generated-key error rate
+fell to $12.88\%$. It was uninterpretable: the same instrument scored \emph{published} keys at
+$22.17\%$, and a comparator that refutes better than a fifth of professionally curated answers
+is measuring its own formatting intolerance. $12.9\%$ sat \emph{below} that floor. The lesson
+is the one this project keeps relearning --- \textbf{a treatment number is not a result until
+the control number is credible} --- and the fix was the exact three-valued comparator, which
+must \emph{prove} difference rather than fail to prove equality.
+
+\emph{$6.56\%$ against $2.55\%$, then $8.60\%$ against $2.90\%$.} With the exact comparator the
+published-key floor drops to $2.55\%$ ($6$ of $235$) and the generated rate to $6.56\%$ ($16$ of
+$244$). After the coverage work of Sec.~\ref{sec:coverage} the like-for-like pair is
+$\mathbf{8.60\%}$ ($27$ of $314$, coverage $45.3\%$) against $\mathbf{2.90\%}$ ($8$ of $276$,
+coverage $40.9\%$). \textbf{Self-written keys are wrong about three times as often as published
+ones}, and the residual $2.90\%$ is the instrument's own floor rather than a property of the
+generator.
+
+\paragraph{Reading all sixteen refutations individually established it is the generator, not
+the instrument.} \textbf{This was done on \texttt{verify\_generated\_sym.jsonl}, the $6.56\%$
+run, which is the file that contains exactly sixteen refutations}; the $8.60\%$ run contains
+twenty-seven and was not read exhaustively. We record that distinction because attaching
+``we read all sixteen'' to the $8.60\%$ figure would overstate what was audited.
+
+The decisive case needs no external check at all. The proposer wrote the same problem
+\textbf{three times} and asserted \textbf{three different answers}:
+
+\begin{center}\small
+\begin{tabular}{llr}
+\toprule
+source file & statement & asserted \\
+\midrule
+\texttt{gen\_tasks\_main.jsonl} & ``\ldots ordered pairs $(a,b)$ of positive integers with $a \le b \le 100$ & $182$ \\
+                                & \quad such that $a+b$ divides $a^2+b^2$'' & \\
+\texttt{gen\_tasks\_main.jsonl} & ``\ldots with $1 \le a \le b \le 100$ such that $a+b$ divides $a^2+b^2$'' & $100$ \\
+\texttt{gen\_novel.jsonl}       & ``\ldots with $1 \le a \le b \le 100$ such that $a^2+b^2$ is divisible by $a+b$'' & $86$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The three statements are mathematically identical --- ``positive integers'' already forces
+$a \ge 1$ --- and \textbf{the verifier returned $186$ for all three, in every run}. We
+confirmed independently by exhaustive enumeration that $186$ is correct. \textbf{Two of these
+came out of the same file asserting $182$ and $100$ for the same question}, so no external
+authority is required to know the generator is wrong: \emph{it contradicts itself}, and a
+consistent verifier agrees with neither. That is the cleanest available separation of ``the
+generator writes wrong keys'' from ``the checker misreads right ones'', and it is why the
+witness field is mandatory in the task store.
+
+\paragraph{Caveats.}
+\begin{itemize}
+\item \textbf{Both rates are conditional on being decided}, at $45.3\%$ and $40.9\%$ coverage.
+The undecided majority is not known to be correct. If keys the verifier cannot read are
+disproportionately wrong, both rates are underestimates, and there is no reason to assume the
+unreadable half resembles the readable one.
+\item The two pools have different coverage ($45.3\%$ against $40.9\%$), so the $3\times$ ratio
+compares two conditional rates over differently selected subsets, not two matched samples.
+\item Sixteen and six refutations respectively: the Wilson interval on $6/235$ reaches past
+$5\%$, so the \emph{ordering} is solid but the multiplier is not resolved to better than about
+a factor of two.
+\item The exhaustive-enumeration confirmation of $186$ was run by us, outside the loop's own
+verifier, and is the one place in this section where an external check was used.
+\end{itemize}
+
+\subsection{Tripling the program budget: coverage rises on both pools, and two claims we had
+been carrying do not survive their own artifacts}
+\label{sec:coverage}
+
+\paragraph{The setting.} The key check in Sec.~\ref{sec:keyquality} abstains on most of what it
+sees, and an abstention is not a neutral outcome: it removes a task from every rate computed
+downstream. The question is whether abstentions are a \emph{decision} the verifier is making or
+a \emph{budget} it is running out of. If the latter, more tokens buy coverage at no cost to
+soundness, because the model's opportunity to emit a program changes while the rule that judges
+the program does not. This is the fifth instance in this project of a budget sized for the
+visible output while the model reasons first, and it belongs with the other four.
+
+\paragraph{The configuration.} \texttt{qwen38-27b}, context $65536$, effort \texttt{low}. The
+post-fix runs use \texttt{max\_new\_tokens}$=12288$ in both \texttt{solve\_structured} and
+\texttt{check\_witness}. Failure buckets are assigned by \texttt{classify\_reason()} in
+\texttt{reimpl/verify\_generated.py} over the free-text \texttt{detail} field.
+
+\begin{table}[t]
+\centering\small
+\caption{Coverage and the abstention buckets, before and after. ``Before'' is
+\texttt{\_sym}/\texttt{\_sym2}, ``after'' is \texttt{\_cov}. Coverage denominators are the
+files' own row counts ($693$ generated, $675$ published). Buckets are counted over abstentions
+only, so the columns sum to the abstention totals ($446 \to 376$ and $439 \to 398$).}
+\label{tab:coverage}
+\begin{tabular}{lrrcrr}
+\toprule
+& \multicolumn{2}{c}{generated keys} & & \multicolumn{2}{c}{published keys} \\
+\cmidrule(lr){2-3}\cmidrule(lr){5-6}
+& before & after & & before & after \\
+\midrule
+decided                        & $244$ & $314$ & & $235$ & $276$ \\
+\textbf{coverage}              & $\mathbf{35.2\%}$ & $\mathbf{45.3\%}$ & & $\mathbf{34.8\%}$ & $\mathbf{40.9\%}$ \\
+error rate among decided       & $6.56\%$ & $8.60\%$ & & $2.55\%$ & $2.90\%$ \\
+\midrule
+\texttt{no\_program\_produced}  & $140$ & $\mathbf{49}$  & & $\mathbf{272}$ & $\mathbf{156}$ \\
+\texttt{bound\_falsified}       & $\mathbf{181}$ & $\mathbf{205}$ & & $43$  & $54$ \\
+\texttt{bound\_rerun\_failed}   & $59$  & $47$  & & $32$  & $30$ \\
+\texttt{other}                  & $30$  & $37$  & & $46$  & $83$ \\
+\texttt{witness\_rejected}      & $22$  & $16$  & & $15$  & $27$ \\
+\texttt{round\_trip\_mismatch}  & $5$   & $11$  & & $12$  & $9$ \\
+\texttt{no\_witness}            & $5$   & $6$   & & $4$   & $6$ \\
+\texttt{programs\_disagree}     & $4$   & $5$   & & $12$  & $21$ \\
+\texttt{bound\_unjustified}     & ---   & ---   & & $3$   & $12$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{The result: coverage rises on both pools.} $34.8\% \to 40.9\%$ on published keys and
+$35.2\% \to 45.3\%$ on generated ones (Table~\ref{tab:coverage}). On published keys the largest
+bucket, \texttt{no\_program\_produced}, falls $272 \to 156$, a \textbf{$42.6\%$ cut}, and that
+is the sense in which the budget was the binding constraint: those are cases where the model
+never emitted a checkable program, not cases where it emitted one and the program lost.
+
+\paragraph{Two claims we had been carrying, corrected against the artifacts.} Both were stated
+in a form that the files do not support, and both fail in the same way --- a statement true of
+one pool asserted of both.
+
+\emph{``The largest failure bucket was cut by $43\%$'' is true of the published pool only.} On
+the \emph{generated} pool the largest bucket before the fix was not
+\texttt{no\_program\_produced} ($140$) but \texttt{bound\_falsified} ($181$), and it
+\textbf{rose} to $205$, up $13.3\%$. The $65\%$ drop on the generated pool is in
+\texttt{no\_program\_produced} ($140 \to 49$), which was the second bucket, not the first. The
+defensible statement is the pool-specific one.
+
+\emph{``The dominant bucket moved from no-program-produced to cannot-justify-its-bound'' is
+false on both pools.} On published keys \texttt{no\_program\_produced} is dominant before
+($272$, $62.0\%$ of abstentions) \emph{and after} ($156$, $39.2\%$); even pooling all three
+bound-family buckets gives $96$, still well below $156$. On generated keys
+\texttt{bound\_falsified} was \emph{already} dominant before the fix, so nothing moved --- it
+merely widened. \textbf{What the artifacts do support}, and what we should have said, is a
+shift in the ratio: on the generated pool bound-failures to no-program-failures goes from
+$1.29\times$ to $4.18\times$, and the bound family rises from $53.8\%$ to $67.0\%$ of
+abstentions; on the published pool \texttt{no\_program\_produced} falls from $62.0\%$ to
+$39.2\%$ of abstentions while remaining the largest. The direction of the original claim is
+right and its statement was wrong, and the class a symbolic solver dissolves is indeed the
+growing one on the pool that matters --- but it did not become dominant, it already was.
+
+\paragraph{``Without weakening soundness'' is not established, and one piece of evidence points
+the other way.} The argument was that only the model's chance to emit a program changed, not
+the decision rule. We can no longer assert that from these artifacts:
+\begin{itemize}
+\item \texttt{reimpl/} is not under version control, and \texttt{verify\_sound.py} --- the file
+holding the decision rule --- has an mtime of 2026-09-05 03:02, \textbf{between} the before-runs
+(ending 23:03 on 09-04) and the after-runs (04:07 and 05:30 on 09-05). \textbf{So ``the
+decision rule did not change'' cannot be checked}, and we record that as a hole in our own
+apparatus rather than as a premise.
+\item Supporting but not conclusive: the decision-rule message vocabulary is byte-identical
+across all four runs, the comparator states are the same three, and \texttt{bound\_scale}$=10$
+in every run. \texttt{verify.py} and \texttt{symbolic.py} both predate all four runs.
+\item \textbf{The refutation rate among decided rose in both pools}, $6.56\% \to 8.60\%$ and
+$2.55\% \to 2.90\%$. Coverage that arrives with a higher refutation rate is consistent with
+newly-decided cases being genuinely harder, and it is also consistent with a looser rule; these
+files do not separate the two. If the published-key rate is being used as the instrument's
+error floor, that floor moved from $2.55\%$ to $2.90\%$ and every generated-key rate must be
+read against the floor from its own run.
+\end{itemize}
+
+\paragraph{Caveats.} The ``tripling'' is consistent with the current code
+($12288 = 3 \times 4096$) but the pre-fix constant is not recorded anywhere we could find, so
+the factor is inferred, not measured. Wall-clock rose $20\%$ on the generated pool and $77\%$
+on the published one, which is the cost side of the trade and is not proportional to the
+coverage gained. And the lesson generalises past this run: the version-control hole is why the
+task store's records carry their backend and comparator \emph{in the row}, so that a later
+reader never has to date a claim by a file mtime.
+
+\subsection{The informative fraction, and the difference between ``not unanimous'' and
+``carries gradient''}
+\label{sec:strictinformative}
+
+\paragraph{The setting.} The headline number for the generated arm has been that generated
+tasks reach the informative region $37.9\%$ of the time against the fixed pool's $25.7\%$. It
+is a real measurement and it has been quoted in a stronger sense than it supports, because
+\emph{informative} was operationalised permissively. This section reports the figure, the
+strict reading beside it, and the reconciliation, since the two differ by construction rather
+than by noise.
+
+\paragraph{The two definitions.} \texttt{scarcity.py} implements
+$1 - P(\text{unanimous})$: \textbf{any} group that is not unanimous counts. That is the weakest
+possible statement of ``carries gradient''. A group at one success in sixteen is not unanimous,
+but under a binary reward every group-relative estimator reduces to
+$\alpha(k)\,(r - \bar r)$, so its advantage vector has fifteen entries of one sign and one of
+the other and the update is carried by a single rollout that vanishes on resampling. The
+strict reading, fixed in \texttt{PREREG\_anchor\_difficulty.md} before it was computed,
+requires \textbf{at least two successes and at least two failures} in the drawn group: the
+advantage vector then has at least two entries of each sign and the group survives the loss of
+any one sample. Both are computed exactly by the same hypergeometric argument over the same
+problems with the same truncation handling, in \texttt{strict\_informative.py}, so the only
+thing that differs between the columns is the definition:
+\[
+P_{\text{perm}} = 1 - \frac{\binom{c}{G} + \binom{n-c}{G}}{\binom{n}{G}},
+\qquad
+P_{\text{strict}} = \sum_{k=2}^{G-2}\frac{\binom{c}{k}\binom{n-c}{G-k}}{\binom{n}{G}} .
+\]
+
+\begin{table}[t]
+\centering\small
+\caption{Informative fraction under both readings, $G=16$, problems with $\ge 16$ resolved
+rollouts, \texttt{out/strict\_informative.json}. Denominators are problems, and they differ
+between pools for the reason given in the caveats. ``bigcap'' re-runs the same pools at a
+larger generation cap.}
+\label{tab:strictinformative}
+\begin{tabular}{lrrrrr}
+\toprule
+pool & $n$ prob. & permissive & strict & strict/perm. & always solved \\
+\midrule
+generated (\texttt{blocks\_generated})        & $622$ & $\mathbf{0.379}$ & $\mathbf{0.203}$ & $0.534$ & $347$ \\
+fixed pool (\texttt{blocks\_low})             & $230$ & $\mathbf{0.257}$ & $\mathbf{0.165}$ & $0.644$ & $164$ \\
+\midrule
+generated, bigcap                             & $270$ & $0.415$ & $0.244$ & $0.589$ & $138$ \\
+fixed pool, bigcap                            & $240$ & $0.283$ & $0.167$ & $0.588$ & $163$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{The result: the strict reading roughly halves the number, and most of the advantage
+with it.} The generated pool falls from $0.379$ to $\mathbf{0.203}$ and the fixed pool from
+$0.257$ to $\mathbf{0.165}$ (Table~\ref{tab:strictinformative}). \textbf{The gap survives but
+shrinks from $12.3$ points to $3.7$}, and the multiplier from $1.48\times$ to $1.23\times$. So
+the honest form of the headline is: generation supplies more non-unanimous groups than the
+fixed pool, and about half of that surplus is groups so lopsided that a group-relative
+objective can do almost nothing with them. \textbf{The permissive number is the one that was
+quoted}, and it should not be quoted again without the strict one beside it.
+
+\paragraph{Reconciliation with the $52$-task measurement.} Sec.~\ref{sec:taskstore} reported
+three of $52$ accepted tasks in the mixed band, all three from retrieval. Those were measured
+at $k=5$, and the three are $3/5$, $2/5$ and $3/5$ --- so \textbf{under the strict definition
+all three still qualify, and strict equals permissive at $3/52 = 0.058$ there}. The two
+measurements are therefore not in tension: the strict-versus-permissive gap is a property of
+large $k$, where a $1/16$ group can be counted as informative, and it closes at $k=5$ where
+$1/5$ is the only lopsided non-unanimous state available. The $52$-task figure remains the
+harsher number by a wide margin, because it measures \emph{accepted, model-written} tasks
+rather than a pool of benchmark problems.
+
+\paragraph{Caveats, and two are large.}
+\begin{itemize}
+\item \textbf{Unequal exclusion, and it cuts the wrong way.} Truncated rollouts are dropped
+rather than scored wrong, and problems below $16$ resolved samples are skipped. The fixed pool
+loses $108$ of $338$ problems that way ($32\%$; $21.0\%$ of its rollouts truncated), the
+generated pool only $71$ of $693$ ($10\%$; $2.1\%$ truncated). Truncation correlates with
+difficulty, so the problems dropped from the fixed pool are disproportionately its hard ones,
+which biases the fixed pool's informative fraction \emph{downward} and inflates the gap. The
+denominators are $622$ against $230$ and are not matched.
+\item \textbf{Neither number is a cap-independent property of a pool.} At the larger cap the
+same fixed problems give $0.283$ permissive and the generated pool $0.415$. The gap survives
+the cap change; the individual values do not, and $25.7\%$ should always be quoted with its
+cap.
+\item The two pools were run at matched caps for the headline comparison ($n{=}16$,
+\texttt{max\_tokens} $16384$, effort \texttt{low}), which is what makes that one comparison
+fair even though the denominators are not matched.
+\item The strict threshold of two is a choice, pre-registered but not derived. It is the
+smallest value that makes the criterion robust to the loss of any single rollout; a larger
+threshold would lower both columns further and is not reported.
+\end{itemize}
+
+\subsection{Grouping granularity: a pre-registered sweep with an interior optimum, and the
+point where significance and usefulness part company}
+\label{sec:granularity}
+
+\paragraph{The setting.} Sec.~\ref{sec:taskstore} left weakness-targeted generation without a
+grouping to target. A curriculum that aims at weakness needs groups whose weakness actually
+differs, and this project has twice retired a component --- the learned router, and the MEDS
+clustering --- for failing exactly that test: a learned structure that made real distinctions
+made them no better than a size-matched random structure of the same shape.
+\texttt{PREREG\_grouping\_gate.md} was written before any statistic below existed and fixed the
+statistic, the null, the arms and the decision rule. It named four outcomes in advance, and the
+one that occurred --- fine passes, coarse does not --- was assigned the action ``proceed to
+weakness-ranked generation on fine labels''.
+
+The registered claim is narrow and worth restating, because the machinery is shared with a
+closed result: this asks whether a grouping identifies \emph{differential weakness}, where MEDS
+was retired for failing to show that behavioural clusters have less \emph{gradient conflict}
+than a random partition. Same test, different question, and this section is not a
+rehabilitation of that one.
+
+\paragraph{The configuration.}
+
+\begin{center}\small
+\begin{tabular}{ll}
+\toprule
+served model & \texttt{qwen38-27b} (Qwen/Qwen3.8-27B), \texttt{--tp 1 --dp 8}, context $65536$ \\
+probe & $105$ problems, from the $118$-problem probe of the search half \\
+inclusion rule & $\ge 8$ \emph{resolved} rollouts; truncated generations dropped, not scored wrong \\
+outcome source & \texttt{out/blocks\_low.jsonl} ($n{=}16$, \texttt{max\_tokens} $16384$) \\
+              & $+$ \texttt{out/blocks\_low\_more.jsonl} ($n{=}16$, \texttt{max\_tokens} $24576$) \\
+reasoning effort & \texttt{low}, identical for every rollout in both blocks \\
+labels & \texttt{out/fine\_labels.jsonl}: $3$ samples/problem, \textbf{unanimity required} \\
+permutation draws & $2000$ per arm, seed $20260905$, each arm against its own size-matched null \\
+probe split & \texttt{probe\_frac}$=0.35$, seed $20260904$, stratified by subfield \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{The method.} The statistic is the weighted between-group variance of per-group
+accuracy, $V = \sum_g (n_g/N)\,(\mathrm{acc}_g - \mathrm{acc}_{\mathrm{pool}})^2$, computed in
+\texttt{spread\_gate.weighted\_between\_variance}. The null permutes the \emph{assignment} of
+problems to groups while holding every problem's measured $\hat p$ fixed, which is what makes
+it a fair reference: small groups inflate observed variance through sampling noise, and a
+size-matched permutation carries exactly the same inflation, so the comparison is against noise
+of the right shape rather than against zero. Effect size is $V_{\mathrm{obs}}$ over the null
+median; $p$ is the one-sided fraction of draws at or above $V_{\mathrm{obs}}$.
+
+Granularity is swept by varying the pooling threshold --- groups smaller than \texttt{min\_size}
+are merged into a single \texttt{other} before anything is computed --- and by crossing the
+topic label with the answer type. \textbf{Granularity is never varied using accuracy.} Groups
+are built from the topic label, the answer type and the pooling threshold and from nothing
+else; partitioning on the very quantity whose spread is being tested would manufacture the
+result. The sweep is \texttt{reimpl/granularity\_sweep.py}, the gate itself
+\texttt{reimpl/spread\_gate.py}, and the curve is \texttt{out/granularity\_sweep.json}.
+
+\begin{figure}[t]
+\centering
+\begin{minipage}{0.60\textwidth}
+\centering
+\begin{tikzpicture}[x=0.36cm, y=2.05cm]
+  % Region indistinguishable from a size-matched random partition.
+  \fill[black!10]
+    (3,0) -- (3,3.0) -- (4,3.0) -- (10,1.97) -- (17,1.69) -- (19,1.67) -- (27,1.53)
+    -- (27,0) -- cycle;
+  \draw[black!45, thick]
+    (4,3.0) -- (10,1.97) -- (17,1.69) -- (19,1.67) -- (27,1.53);
+  % Axes.
+  \draw[->] (2,0) -- (29.5,0) node[below left=1pt and -2pt] {\scriptsize number of groups};
+  \draw[->] (2,0) -- (2,3.25);
+  \draw[dashed, black!55] (2,1) -- (29,1);
+  \node[left] at (2,1) {\scriptsize $1$};
+  \node[left] at (2,2) {\scriptsize $2$};
+  \node[left] at (2,3) {\scriptsize $3$};
+  \node[left] at (2,0) {\scriptsize $0$};
+  \foreach \x in {3,4,10,17,19,27} {
+    \draw (\x,0) -- (\x,-0.04);
+    \node[below] at (\x,-0.04) {\scriptsize \x};
+  }
+  \node[rotate=90, anchor=south] at (0.4,1.6) {\scriptsize spread ratio $V_{\mathrm{obs}}/\mathrm{med}(V_{\mathrm{null}})$};
+  % Fine-topic arm.
+  \draw[thick] (3,0.15) -- (10,2.70) -- (17,1.87) -- (19,1.65);
+  \foreach \p in {(3,0.15),(10,2.70),(17,1.87),(19,1.65)}
+    \fill \p circle (2.6pt);
+  % Coarse subfield.
+  \fill[black!70] (4,2.13) ++(-2.4pt,-2.4pt) rectangle ++(4.8pt,4.8pt);
+  % Topic x answer-type.
+  \foreach \p in {(17,1.29),(27,1.81)}
+    \fill[black!70] \p ++(-3pt,-2pt) -- ++(6pt,0pt) -- ++(-3pt,5pt) -- cycle;
+  % Marks.
+  \draw[<-] (10,2.78) -- ++(0,0.28) node[above, align=center] {\scriptsize \textbf{peak}\\[-2pt]\scriptsize $7.5$/group};
+  \node[right, align=left] at (27.4,1.81) {\scriptsize $3$/group};
+  \node[align=center] at (21.5,0.45) {\scriptsize indistinguishable from\\[-2pt]\scriptsize a random partition\\[-2pt]\scriptsize (null $95$th pct)};
+  \node[right] at (4.4,2.13) {\scriptsize coarse};
+\end{tikzpicture}
+\end{minipage}\hfill
+\begin{minipage}{0.38\textwidth}
+\centering\scriptsize
+\begin{tabular}{lrrrr}
+\toprule
+scheme & grps & /grp & ratio & $p$ \\
+\midrule
+fine topic          & $3$  & $19.0$ & $0.15$ & $0.900$ \\
+coarse subfield     & $4$  & $22.5$ & $2.13$ & $0.148$ \\
+\textbf{fine topic} & $\mathbf{10}$ & $\mathbf{7.5}$ & $\mathbf{2.70}$ & $\mathbf{0.009}$ \\
+fine topic          & $17$ & $5.0$  & $1.87$ & $0.024$ \\
+topic $\times$ type & $17$ & $5.0$  & $1.29$ & $0.219$ \\
+fine topic          & $19$ & $4.0$  & $1.65$ & $0.053$ \\
+topic $\times$ type & $27$ & $3.0$  & $1.81$ & $\mathbf{0.006}$ \\
+\midrule
+\multicolumn{5}{l}{\emph{excluded, degenerate:}} \\
+fine topic          & $1$  & $105$  & $\infty$ & $1.000$ \\
+\bottomrule
+\end{tabular}
+\end{minipage}
+\caption{Spread ratio against grouping granularity, $105$ probe problems, $2000$ permutation
+draws per arm, seed $20260905$. The shaded region is each granularity's own null $95$th
+percentile expressed as a ratio, so a point inside it is indistinguishable from a size-matched
+random partition; at three groups that band runs off the top of the axis at $4.25$. The band
+\emph{narrows} as groups get finer --- $3.00$ at four groups, $1.97$ at ten, $1.53$ at
+twenty-seven --- which is the whole of the effect described below. Circles are the fine-topic
+arm at five pooling thresholds, the square is the four coarse subfields, triangles cross the
+topic label with the answer type. The dashed line at $1$ is ``no structure''.}
+\label{fig:granularity}
+\end{figure}
+
+\paragraph{The result.} The curve has an interior maximum
+(Fig.~\ref{fig:granularity}). \textbf{The four coarse subfields fail}: ratio $2.13$ at
+$p=0.148$, and their failure was predicted in writing before the run. \textbf{Ten fine topic
+labels pass and are the peak}: ratio $2.70$ at $p=0.009$, a median of $7.5$ problems per group.
+Beyond the peak the effect size falls monotonically --- $1.87$ at seventeen groups, $1.65$ at
+nineteen --- and below the peak it collapses, with three groups landing at $0.15$, which is
+\emph{less} spread than a random partition of the same shape. Two points do not make a curve
+and this is why the sweep was run: the two arms the pre-registration named would have shown a
+rise from $2.13$ to $2.70$ and said nothing about where it stops.
+
+\paragraph{The finding: significance and usefulness diverge, and the null band is the
+mechanism.} At twenty-seven groups $p=0.006$ \emph{beats} the peak's $p=0.009$ while the effect
+size has fallen from $2.70$ to $1.81$ and each group holds three problems. Both are valid
+tests --- the null is size-matched by construction, so the $p$-value is honest at every
+granularity --- but they are not equally useful, and \textbf{a reader who ranks these
+partitions by $p$ picks the one a curriculum cannot act on}. ``Generate more problems like
+these three problems'' is not a category; it is three problems.
+
+The reason is visible in Fig.~\ref{fig:granularity} and is worth stating as the general lesson.
+The null's $95$th percentile, in ratio units, is $3.00$ at four groups, $1.97$ at ten and
+$1.53$ at twenty-seven: \textbf{the bar a partition must clear falls as the partition gets
+finer}, because more groups means more of them and their mean spread is estimated more
+tightly. So the twenty-seven-group arm is significant not because its structure is stronger but
+because its null is narrower. \textbf{The $p$-value answers ``is this more than noise'', and
+the effect size answers ``is there enough of it to aim at''; only the second is what a
+curriculum needs, and the two are ordered differently here.} This is why the sweep reports the
+median problems-per-group beside every point, and why we report both columns rather than the
+one that sorts most favourably.
+
+\paragraph{A defect in our own apparatus, recorded with its mechanism.} The first pass of this
+sweep reported \textbf{a single group of $105$ problems as the optimum}. The arithmetic is
+correct and the conclusion is nonsense: pooling at \texttt{min\_size}$=20$ leaves one surviving
+group, one group has zero between-group variance \emph{by definition}, its permutation null is
+also identically zero, and $0/0$ was taken through the ratio as $\infty$. A maximum over
+effect size then selected it. The failure mode is the one this project keeps finding --- a
+number that is an artefact of the instrument being read as a measurement --- and it is
+dangerous here specifically because $\infty$ sorts first and $p=1.000$, the strongest possible
+disconfirmation, sits in the adjacent column being ignored. \texttt{granularity\_sweep.py} now
+excludes partitions with fewer than two surviving groups or a non-finite ratio before any
+maximum is taken, and reports a second maximum restricted to partitions of at least five
+problems per group. Both maxima land on the same row, ten fine topics at $2.70$, which is the
+only reason the headline is unchanged.
+
+\paragraph{Caveats.}
+\begin{itemize}
+\item \textbf{The clustering arm never ran.} Arm 3 of the pre-registration --- embedding
+clusters at $k$ matched to the label count --- was not executed. \textbf{No claim is made that
+labels beat clusters}, and the pre-registration's tie-break rule in favour of labels was never
+invoked because there is nothing to break a tie against.
+\item \textbf{The probe is $105$ problems.} Every group at the peak holds a median of $7.5$ of
+them. The ordering of the interior points is not resolved by this probe.
+\item \textbf{Ten versus seventeen is not itself tested.} The sweep establishes that the curve
+has an interior maximum and that it is at ten among the granularities tried; it does not
+establish that ten differs significantly from seventeen. Each arm is tested against its own
+null, not against the other arms, and no multiplicity correction is applied across the eight
+arms because the pre-registered decision concerned the fine-versus-coarse contrast only.
+\item \textbf{Two of the points come from a different labelling scheme.} The seventeen-group
+comparison is instructive precisely because both schemes reach seventeen groups and disagree:
+fine topic gives $1.87$ at $p=0.024$, topic $\times$ answer type gives $1.29$ at $p=0.219$.
+Granularity is therefore \emph{not} a sufficient description of a partition, and the curve
+should not be read as a function of the group count alone.
+\end{itemize}
+
+\paragraph{What this implies for an evolving taxonomy, which is the reason the sweep was run.}
+The curve says structure becomes usable somewhere around five to eight problems per group and
+is gone by three. A taxonomy that splits a mastered topic in two, at this probe size, turns a
+$7.5$-problem group into two groups of about $3.8$ --- \textbf{below the point where the curve
+says the structure stops being actionable}, and into the regime where the test still passes.
+So an evolving taxonomy is not blocked by needing better splitting logic; it is blocked by
+probe size, and the honest next step is a larger probe rather than a cleverer split. That
+conclusion is a consequence of the shape of Fig.~\ref{fig:granularity}, which is why the figure
+is here and why it could not have been replaced by its table.
