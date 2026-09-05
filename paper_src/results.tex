@@ -5736,3 +5736,88 @@ their RL loop runs a group-relative objective at sixteen samples per group over 
 sampled fixed task set with no dynamic-sampling filter, leaving the upstream framework's
 \texttt{check\_reward\_nonzero\_std} at \texttt{None} in all four launchers, so unanimous
 groups are retained and contribute exactly zero gradient.
+
+\subsection{The proposer stage was silently selecting on length, and the fix is arithmetic}
+\label{sec:chunkedloss}
+
+Sec.~\ref{sec:threestage} ended on an out-of-memory failure: a single proposal of ${\sim}41{,}000$
+tokens needs $38.2$ GiB for one backward pass, so the run died at iteration $9$. That is worth
+more than an engineering note, because of \emph{how} it fails. A row that does not fit is not
+an error the loop reports; it is a row that is absent from the batch. The proposer's median
+generation is $30{,}903$ tokens and its distribution is wide, so \textbf{the proposer stage was
+training on its short proposals and dropping its long ones} --- a selection on exactly the
+variable the stage is supposed to be learning to control.
+
+\paragraph{Why it is the method's constraint and not this machine's.} The peak is set by the
+log-softmax: a $[\text{tokens} \times 248320]$ tensor in float32, which is $0.99$ MiB per token
+before anything else. At the observed median proposal that is $29$ GiB for one row, on any
+device, at any batch size, because a sequence cannot be split across a forward pass. Their
+published description of the loop specifies the three stages, the rewards and the nested
+sampling, and says nothing about this; \textbf{anyone reproducing the loop at a realistic
+proposal length will hit it}, and will hit it as a silent length filter rather than as a crash
+if their harness happens to catch the allocation.
+
+\paragraph{The fix.} The loss is a sum over positions of $-w_t \log p(x_t)$, so it decomposes
+exactly over any partition of the positions; what does not decompose is the transformer
+forward, since every position's activations depend on the whole prefix. So the trunk runs once,
+its hidden states are detached into a leaf, each chunk of positions materialises its own logits
+and backpropagates into that leaf, and a single backward then carries the accumulated
+hidden-state gradient through the trunk. Positions whose weight is zero --- the prompt and the
+padding --- are skipped rather than multiplied by zero, which is most of the saving on a
+short-prompt, long-generation row. The chunk is $2048$ positions.
+
+\paragraph{Verified three ways, because any one of them passes a no-op.} Equal gradients alone
+are what an unapplied optimisation produces; a lower peak alone is what a wrong gradient
+produces; and both on a short row say nothing about the case that motivated the change
+(Table~\ref{tab:chunked}).
+
+\begin{table}[t]
+\centering\small
+\caption{Chunked loss accumulation, \texttt{out/chunked\_loss\_test.json}. The gradient
+difference is judged against the same-path run-to-run floor rather than a tolerance chosen to
+pass: in bf16 with gradient checkpointing, two runs of the identical code already differ, and
+chunking must not add to that. It does not --- it is \emph{below} the floor.}
+\label{tab:chunked}
+\begin{tabular}{lrr}
+\toprule
+& chunked & unchunked \\
+\midrule
+gradient norm, same batch & $0.472435$ & $0.472478$ \\
+same batch, unchunked run again & --- & $0.471950$ \\
+\midrule
+max relative gradient difference, chunked vs unchunked & \multicolumn{2}{c}{$5.91\times10^{-3}$} \\
+max relative gradient difference, unchunked vs itself & \multicolumn{2}{c}{$7.27\times10^{-3}$} \\
+ratio to the same-path noise floor & \multicolumn{2}{c}{$\mathbf{0.81}$} \\
+\midrule
+peak memory, $20{,}000$-token row & $\mathbf{73.8}$ GiB & $128.2$ GiB \\
+peak memory, $41{,}000$-token row & $\mathbf{97.9}$ GiB & \textbf{did not fit} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{So the proposer stage can now train on a proposal of any length the server will
+generate}, and the length selection is gone. The run in
+Sec.~\ref{sec:threestage} that reached iteration $9$ reached it because its one trainable
+proposal happened to be short enough; that is no longer a condition.
+
+\paragraph{This is the same failure as the OpenRSI audit's, seen from the other side.} That
+audit (Sec.~\ref{sec:openrsiwallclock}) records that their RL loop runs a group-relative
+objective at sixteen samples per group over a uniformly sampled fixed task set with the
+upstream framework's \texttt{check\_reward\_nonzero\_std} left at \texttt{None} in all four
+launchers, so unanimous groups are retained and contribute exactly zero gradient. It is taken
+up here because it is the same phenomenon we measured, with the sign of the design decision
+reversed.
+
+Of our $22$ refused tasks, $12$ were solved by every rollout under every scaffold and $9$ by
+none, and those tasks came from the mixed subset --- chosen precisely for $0 < p < 1$ on the
+bare model. The two systems differ only in what they do about it. Ornith's guard G4
+\emph{refuses} such a task and pays in yield, which is why fewer than half our iterations form
+a task group and why the refusal rate is the first number we report. A released, reproducible
+system instead \emph{keeps} it, multiplies it by an advantage of exactly zero, and pays in
+tokens. \textbf{Neither removes the underlying problem, which is that a group is generated
+before anything can tell you it will be unanimous} --- the cost is incurred at generation and
+only discovered at scoring. What differs is visibility: one design surfaces the cost as a
+refusal rate, the other reports nothing at all, and the second is the more dangerous
+presentation because the wasted fraction of every batch does not appear in any number the
+system prints. Our own polarisation result says the fraction is not small and not stable
+either: it depends on the scaffold, which the loop is simultaneously training.
