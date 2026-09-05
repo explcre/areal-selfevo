@@ -5833,14 +5833,16 @@ to reach them and Lean has to be built; if they are a small share, the effort be
 symbolic backend that serves the majority. The recommendation to build the symbolic backend
 and leave Lean unbuilt was made on this measurement, so it is recorded with it.
 
+\begin{sloppypar}
 \paragraph{The configuration.} Served model \texttt{qwen38-27b}, \textbf{$3$ samples per
 problem, and a class is assigned only on unanimity} --- any disagreement, and any truncation,
 falls to \texttt{unclassifiable} rather than to a majority vote. The taxonomy and the
-class-to-backend map are \texttt{reimpl/ornith\_repro/classify.py}; the run is
-\texttt{reimpl/classify\_benchmark.py}. ``Executable reach'' is not a judgement, it is exactly
+class-to-backend map are \path{reimpl/ornith_repro/classify.py}; the run is
+\path{reimpl/classify_benchmark.py}. ``Executable reach'' is not a judgement, it is exactly
 the set of classes for which \texttt{backend\_for(cls)} is not \texttt{None}
 (\texttt{bounded\_search}, \texttt{combinatorial}, \texttt{symbolic}, \texttt{geometry});
 ``CAS'' is exactly the \texttt{symbolic\_cas} backend (\texttt{symbolic}, \texttt{geometry}).
+\end{sloppypar}
 
 \begin{table}[t]
 \centering\small
@@ -5922,8 +5924,8 @@ part.} The number went $72.5\%$, then $12.9\%$, then $8.60\%$, and each move was
 failure rather than new evidence about the generator.
 
 \paragraph{The configuration.} Served model \texttt{qwen38-27b}, context $65536$,
-\texttt{reasoning\_effort=low}, run by \texttt{reimpl/verify\_generated.py} over the cascade in
-\texttt{reimpl/ornith\_repro/verify.py}. Verdicts are three-valued
+\texttt{reasoning\_effort=low}, run by \path{reimpl/verify_generated.py} over the cascade in
+\path{reimpl/ornith_repro/verify.py}. Verdicts are three-valued
 (\texttt{verified} / \texttt{refuted} / \texttt{unverifiable}) on top of the three-valued
 comparator \texttt{symbolic\_compare}, and \textbf{difference must be proved} --- by disjoint
 Arb enclosures or an exact structural mismatch --- while equality may rest on evidence. A
@@ -6040,10 +6042,12 @@ soundness, because the model's opportunity to emit a program changes while the r
 the program does not. This is the fifth instance in this project of a budget sized for the
 visible output while the model reasons first, and it belongs with the other four.
 
+\begin{sloppypar}
 \paragraph{The configuration.} \texttt{qwen38-27b}, context $65536$, effort \texttt{low}. The
 post-fix runs use \texttt{max\_new\_tokens}$=12288$ in both \texttt{solve\_structured} and
 \texttt{check\_witness}. Failure buckets are assigned by \texttt{classify\_reason()} in
-\texttt{reimpl/verify\_generated.py} over the free-text \texttt{detail} field.
+\path{reimpl/verify_generated.py} over the free-text \texttt{detail} field.
+\end{sloppypar}
 
 \begin{table}[t]
 \centering\small
@@ -6150,11 +6154,11 @@ possible statement of ``carries gradient''. A group at one success in sixteen is
 but under a binary reward every group-relative estimator reduces to
 $\alpha(k)\,(r - \bar r)$, so its advantage vector has fifteen entries of one sign and one of
 the other and the update is carried by a single rollout that vanishes on resampling. The
-strict reading, fixed in \texttt{PREREG\_anchor\_difficulty.md} before it was computed,
+strict reading, fixed in \path{PREREG_anchor_difficulty.md} before it was computed,
 requires \textbf{at least two successes and at least two failures} in the drawn group: the
 advantage vector then has at least two entries of each sign and the group survives the loss of
 any one sample. Both are computed exactly by the same hypergeometric argument over the same
-problems with the same truncation handling, in \texttt{strict\_informative.py}, so the only
+problems with the same truncation handling, in \path{strict_informative.py}, so the only
 thing that differs between the columns is the definition:
 \[
 P_{\text{perm}} = 1 - \frac{\binom{c}{G} + \binom{n-c}{G}}{\binom{n}{G}},
@@ -6231,7 +6235,7 @@ grouping to target. A curriculum that aims at weakness needs groups whose weakne
 differs, and this project has twice retired a component --- the learned router, and the MEDS
 clustering --- for failing exactly that test: a learned structure that made real distinctions
 made them no better than a size-matched random structure of the same shape.
-\texttt{PREREG\_grouping\_gate.md} was written before any statistic below existed and fixed the
+\path{PREREG_grouping_gate.md} was written before any statistic below existed and fixed the
 statistic, the null, the arms and the decision rule. It named four outcomes in advance, and the
 one that occurred --- fine passes, coarse does not --- was assigned the action ``proceed to
 weakness-ranked generation on fine labels''.
@@ -6274,8 +6278,8 @@ are merged into a single \texttt{other} before anything is computed --- and by c
 topic label with the answer type. \textbf{Granularity is never varied using accuracy.} Groups
 are built from the topic label, the answer type and the pooling threshold and from nothing
 else; partitioning on the very quantity whose spread is being tested would manufacture the
-result. The sweep is \texttt{reimpl/granularity\_sweep.py}, the gate itself
-\texttt{reimpl/spread\_gate.py}, and the curve is \texttt{out/granularity\_sweep.json}.
+result. The sweep is \path{reimpl/granularity_sweep.py}, the gate itself
+\path{reimpl/spread_gate.py}, and the curve is \path{out/granularity_sweep.json}.
 
 \begin{figure}[t]
 \centering
