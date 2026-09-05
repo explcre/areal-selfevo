@@ -6212,7 +6212,9 @@ P_{\text{strict}} = \sum_{k=2}^{G-2}\frac{\binom{c}{k}\binom{n-c}{G-k}}{\binom{n
 \caption{Informative fraction under both readings, $G=16$, problems with $\ge 16$ resolved
 rollouts, \texttt{out/strict\_informative.json}. Denominators are problems, and they differ
 between pools for the reason given in the caveats. ``bigcap'' re-runs the same pools at a
-larger generation cap.}
+larger generation cap. The generated bigcap row is the \emph{completed} run ($11{,}088$
+rollouts over $693$ problems); it was first computed from that run while it was still in
+flight, which gave $0.415$ on $270$ problems, and that partial value is superseded here.}
 \label{tab:strictinformative}
 \begin{tabular}{lrrrrr}
 \toprule
@@ -6221,7 +6223,7 @@ pool & $n$ prob. & permissive & strict & strict/perm. & always solved \\
 generated (\texttt{blocks\_generated})        & $622$ & $\mathbf{0.379}$ & $\mathbf{0.203}$ & $0.534$ & $347$ \\
 fixed pool (\texttt{blocks\_low})             & $230$ & $\mathbf{0.257}$ & $\mathbf{0.165}$ & $0.644$ & $164$ \\
 \midrule
-generated, bigcap                             & $270$ & $0.415$ & $0.244$ & $0.589$ & $138$ \\
+generated, bigcap                             & $677$ & $0.383$ & $0.235$ & $0.614$ & $369$ \\
 fixed pool, bigcap                            & $240$ & $0.283$ & $0.167$ & $0.588$ & $163$ \\
 \bottomrule
 \end{tabular}
@@ -6256,7 +6258,7 @@ difficulty, so the problems dropped from the fixed pool are disproportionately i
 which biases the fixed pool's informative fraction \emph{downward} and inflates the gap. The
 denominators are $622$ against $230$ and are not matched.
 \item \textbf{Neither number is a cap-independent property of a pool.} At the larger cap the
-same fixed problems give $0.283$ permissive and the generated pool $0.415$. The gap survives
+same fixed problems give $0.283$ permissive and the generated pool $0.383$. The gap survives
 the cap change; the individual values do not, and $25.7\%$ should always be quoted with its
 cap.
 \item The two pools were run at matched caps for the headline comparison ($n{=}16$,
