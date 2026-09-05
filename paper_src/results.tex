@@ -5874,6 +5874,38 @@ to reach them and Lean has to be built; if they are a small share, the effort be
 symbolic backend that serves the majority. The recommendation to build the symbolic backend
 and leave Lean unbuilt was made on this measurement, so it is recorded with it.
 
+\paragraph{What the $675$ is, and what it is not.} Stated before any number that rests on it,
+because a reader will otherwise assume we used OlympiadBench whole. \textbf{We did not build
+this file.} It is inherited verbatim from the pinned Absolute-Zero-Reasoner clone (MIT), whose
+acquisition path is a sparse \texttt{git clone} of one data directory; \textbf{no filtering or
+subsetting script exists in either of our trees}, and none of our code creates it --- our
+scripts only \emph{split} the $675$.
+
+Its properties are therefore \emph{measured from its contents} rather than read off a manifest.
+All $675$ rows carry a non-empty \texttt{final\_answer} and an \texttt{answer\_type}, so the
+set is open-ended rather than theorem-proving; the schema contains \textbf{no image or figure
+key at all}, so it is text-only; \texttt{subfield} takes exactly four values (Algebra $264$,
+Combinatorics $154$, Geometry $129$, Number Theory $128$), all mathematics, so physics is
+absent; and no question contains a CJK codepoint, so it is English. There is no
+\texttt{choices} field, so it is not multiple choice. \textbf{The mapping of those four
+measured properties onto the release's own split name --- open-ended, text-only, maths, English
+--- is an inference from that naming convention and was not checkable offline}, and we label it
+as inference rather than as provenance.
+
+So the benchmark reported throughout this paper \textbf{excludes} OlympiadBench's multimodal
+problems, its Chinese-language problems, its physics problems and its theorem-proving problems.
+The $\texttt{id}$ field spans $1606$--$3102$ in $211$ disjoint runs, which is the signature of a
+subset carved from a larger globally-numbered pool, and corroborates that reading.
+
+\textbf{We decline to widen it to physics}, although that is the obvious way to add text
+problems. Our loader maps \texttt{final\_answer[0]} to the graded answer and \textbf{discards
+the \texttt{unit} and \texttt{error} fields entirely}. Our maths subset survives that because
+only $8$ of $675$ rows carry a unit and $1$ carries a tolerance; physics rows carry both
+pervasively, so admitting them would silently mark unit-bearing and tolerance-bearing answers
+\emph{wrong}. A contract violation that grades correct answers as incorrect is worse than a
+smaller benchmark, and widening would require unit normalisation and tolerance comparison
+first.
+
 \begin{sloppypar}
 \paragraph{The configuration.} Served model \texttt{qwen38-27b}, \textbf{$3$ samples per
 problem, and a class is assigned only on unanimity} --- any disagreement, and any truncation,
@@ -6582,3 +6614,130 @@ pooled zero --- is a statement about the \emph{count} metric, and we have been c
 so there rather than letting it stand as a claim that the evolved model does nothing. On the
 magnitude metrics it consistently does something, in both seeds, and that something is not
 statistically resolvable at ten tasks.
+
+\subsection{A harness comparison in which the proposer never ran: seed-pool exhaustion, and
+the guard that would have caught it in seconds}
+\label{sec:seedpool}
+
+\paragraph{The setting.} Two arms were run to compare harness training on against off ---
+\texttt{HON} trains \texttt{proposer,harness,solver} and \texttt{HOFF} trains
+\texttt{proposer,solver}, identical in every other argument. Both completed $45$ iterations.
+Only $9$ and $8$ of those iterations respectively formed a task group, and from iteration $14$
+to $44$ inclusive every iteration in both arms logged \texttt{only 0 task(s) accepted, no task
+group; skipping}. The stage-evidence file for \texttt{HON} lists \texttt{harness} and
+\texttt{solver} as having taken a step, \texttt{HOFF} lists \texttt{solver} alone:
+\textbf{the proposer never took a step in either arm.}
+
+\paragraph{The hypothesis we tested first, and why it was wrong.} Novelty declines
+monotonically across the usable iterations, $0.985$ at iteration $0$ to about $0.82$ by
+iteration $13$, immediately before acceptance goes to zero and stays there. Ornith's task
+reward is multiplicative, $R_{\text{task}} = V \cdot D \cdot N$, so a falling $N$ acts as a
+\emph{gate} rather than as a term: as the buffer fills every new task resembles something
+already in it, the product falls under any acceptance threshold, and the proposer starves
+permanently. Collapse at the same iteration in both arms, independent of the harness setting,
+is exactly what that predicts. It is a good hypothesis and it is not what happened.
+
+\paragraph{The mechanism, established from the code and confirmed three ways.} Reading the
+acceptance path settles it before any statistic is computed. \texttt{propose\_round} rejects a
+proposal on exactly three conditions --- a request error, \texttt{hit\_cap} (a truncated
+generation), and a \texttt{parse\_proposal} failure. \textbf{$V$, $D$ and $N$ do not enter any
+acceptance decision anywhere in this implementation.} There is no product threshold and no
+adaptive one; acceptance is validity-only. That refutes the novelty hypothesis and the
+difficulty-gate alternative in the same stroke.
+
+What actually happened is simpler and is visible in three independent places
+(Table~\ref{tab:seedpool}). Stage 1 branches on \texttt{seeded = it < a.seed\_iters}, and the
+proposer loop is guarded by \texttt{while (not seeded) and \ldots}. Both arms ran with
+\texttt{seed\_iters}$=45$ and \texttt{max\_iters}$=45$, so \texttt{seeded} was true on every
+iteration and \textbf{the proposer branch was dead code for the entire run}. Tasks came from a
+fixed pool of $59$, drawn $4$ per iteration, and \texttt{seed\_tasks} returns an empty list once
+fewer than \texttt{tasks\_per\_iter} remain. $\lfloor 59/4 \rfloor = 14$, so the pool supplies
+iterations $0$ through $13$ and nothing thereafter --- which is the observed collapse, to the
+iteration, in both arms.
+
+\begin{table}[t]
+\centering\small
+\caption{Three independent confirmations, from \texttt{runs/HON/meta.json},
+\texttt{runs/HOFF/meta.json} and the two \texttt{iters.jsonl} files. The novelty figures come
+from the stdout logs; note that \texttt{iters.jsonl} carries \emph{no} novelty field at all, so
+$N$ was never available to any decision.}
+\label{tab:seedpool}
+\begin{tabular}{lcc}
+\toprule
+& \texttt{HON} & \texttt{HOFF} \\
+\midrule
+\texttt{seed\_iters} / \texttt{max\_iters} & $45$ / $45$ & $45$ / $45$ \\
+\texttt{task\_source} over all logged iterations & \texttt{\{seed\}} & \texttt{\{seed\}} \\
+\texttt{proposer\_calls}, every iteration & $0$ & $0$ \\
+\texttt{proposer\_reasons}, every iteration & \texttt{\{\}} & \texttt{\{\}} \\
+iterations logging a novelty value in \texttt{iters.jsonl} & $0$ & $0$ \\
+\midrule
+seed pool size & \multicolumn{2}{c}{$59$ tasks} \\
+tasks required ($45 \times 4$) & \multicolumn{2}{c}{$\mathbf{180}$} \\
+iterations the pool can supply & \multicolumn{2}{c}{$\lfloor 59/4 \rfloor = \mathbf{14}$} \\
+\midrule
+iterations accepting $4$ tasks & $0$--$13$ & $0$--$13$ \\
+iterations accepting $0$ tasks & $31$ & $31$ \\
+task groups actually formed & $9$ & $8$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Why the symptom was misleading, and what that costs.} An exhausted pool returns
+\texttt{[]}, which reaches the caller as \texttt{len(accepted) < 2} and prints \texttt{only 0
+task(s) accepted} --- \textbf{the identical message a genuine proposer failure produces}. So
+$31$ iterations reported an empty proposer that had never been called once. This is the
+silent-zero class this project has documented repeatedly, in its most expensive form: the
+failure is not merely invisible, it actively impersonates a different failure, and the
+plausible story it tells --- a proposer starving as its buffer fills --- is the one we
+initially believed.
+
+\paragraph{What the earlier comparison does and does not establish.} \textbf{It is
+underpowered, not confounded.} The frozen proposer is symmetric across arms, and every other
+argument was identical, so nothing about the harness contrast is biased by it. But $9$ and $8$
+task groups from $45$ iterations each is far too little to separate the arms, and $31$ of $45$
+iterations in each arm bought nothing at all.
+
+\textbf{And we can say nothing about Ornith's multiplicative gate from this run.} Acceptance
+in our implementation is validity-only; the product never entered the decision, and $N$ was
+never even recorded per iteration. Whether their formula starves a proposer as the buffer fills
+is a real question --- an unbounded buffer with whole-history novelty makes $N$ monotonically
+non-increasing by construction, since a maximum over a growing set cannot fall --- and it
+deserves a deliberate experiment in which acceptance is actually placed on $R_{\text{task}}$.
+It is not this one.
+
+\paragraph{The fix, in three parts, and the one that generalises.}
+\begin{enumerate}
+\item \textbf{A preflight assertion that fails on CPU in seconds}, before a single weight is
+loaded: refuse to start unless the pool can supply \texttt{seed\_iters} $\times$
+\texttt{tasks\_per\_iter}. On the exact configuration that ran it prints \emph{``seed pool holds
+$59$ tasks but \texttt{-{}-seed-iters} $45$ $\times$ \texttt{-{}-tasks-per-iter} $4$ needs
+$180$. Refusing to start.''} \textbf{This is the part worth keeping.} Two machine-hours bought
+the discovery that a supply was too small, and the check that would have said so costs
+microseconds. It is demonstrated firing on the bad configuration and passing on the fixed one,
+rather than asserted to work.
+\item \textbf{Exhaustion raises rather than returning empty}, and records its own refusal
+reason, so a supply failure can never again be read as a proposer failure.
+\item \textbf{A small warmup} (\texttt{seed\_iters}$=4$) so the proposer actually trains, which
+the run's own stage banner says was the intent.
+\end{enumerate}
+
+\paragraph{Two further defects found while relaunching, both ours and both worth recording.}
+Neither damaged anything, and both are the same shape as the finding above --- a failure that
+presents as a different failure. First, the training processes were launched without
+\texttt{CUDA\_VISIBLE\_DEVICES}, so despite the \emph{servers} being pinned correctly both
+trainers defaulted to device $0$ and died out of memory on a card belonging to another job.
+Second, the relaunched server crashed with \texttt{FileNotFoundError: 'ninja'} when sglang
+JIT-compiled a FlashInfer kernel on its first LoRA request, because the launch environment
+lacked the virtualenv's \texttt{bin} on \texttt{PATH}. \textbf{That crash presented downstream
+as ``0 tasks accepted''} --- the very symptom we had just spent a section diagnosing. The
+runner now pins the trainer explicitly and issues a warm-up LoRA request before either arm
+starts, so a JIT failure surfaces as a server fault rather than as an empty proposer.
+
+\textbf{The general lesson is that ``zero tasks accepted'' does not identify its own cause.}
+Three unrelated faults produce that identical line: an exhausted supply, a dead inference
+server, and a proposer that genuinely fails to write anything parseable. We have now seen the
+first two, one of them within an hour of diagnosing the other. \textbf{Any future
+zero-acceptance run must therefore check the server before it examines the proposer}, and the
+log line has to be split so that the three causes are distinguishable at the point they occur
+rather than reconstructed afterwards from process state that may no longer exist.
