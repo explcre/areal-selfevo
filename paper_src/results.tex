@@ -4662,3 +4662,64 @@ grants. Capping the five thread-pool variables (verified in a live candidate's
 \texttt{/proc/\textless pid\textgreater/environ}, not assumed) brought the same workload to
 $1{,}706$ threads and a load average of $31$. Anyone reproducing a per-task-container
 benchmark on a single fat node should set these before the first run.
+
+\subsection{A silently truncated download produced a valid-looking benchmark score, and the
+check that caught it was not the check we had written}
+\label{sec:openrsidata}
+
+We discarded the first ten-task run and restarted it. The reason is worth a subsection,
+because the failure produced no error at any stage, the run completed tasks normally, and the
+resulting numbers were plausible.
+
+\paragraph{What the metric actually is.}
+First a correction that matters for reading any of these numbers. NatureBench's
+\texttt{\_compute\_improvements} defines the per-instance score as
+$g = \mathrm{direction} \times (\mathrm{agent} - \mathrm{sota}) / |\mathrm{sota}|$, aggregated
+as a mean over primary instances with a fixed $-1.0$ penalty for an instance that produced no
+finite score. So $g$ is measured \emph{relative to the paper's SOTA}, not on a
+baseline-to-SOTA scale: $g = 0$ means the agent matched SOTA and $g < 0$ means it fell short.
+Their scorer defines \textbf{Match-SOTA as the fraction of tasks with $g \ge 0$} and
+\textbf{Surpass-SOTA as the fraction with $g > 0.1$}, each over the track's official task
+count, so an unscored task counts against the denominator. We score with their
+\texttt{compute\_scores.calculate\_metrics} rather than reimplementing it, supplying case
+metadata restricted to the ten Lite-v2 tasks because their command line validates only the
+official $90$- and $25$-task tracks.
+
+\paragraph{The failure.}
+Two of the ten task packages were incomplete on disk, and nothing said so.
+\texttt{s43588-025-00842-5} was missing nine files including \texttt{train\_data.csv},
+\texttt{x\_test.csv} and \texttt{zeolite\_priors\_0.pkl}; every one of its eleven attempts in
+both cells died on \texttt{FileNotFoundError} and scored the $-1.0$ floor.
+\texttt{s41467-025-65557-7} was worse and quieter: all $399$ files were present, but $188$ of
+them were \emph{truncated}, at roughly $29$\,kB against an upstream $400$\,kB. Candidates
+therefore ran to completion on about seven per cent of the data, wrote a well-formed
+\texttt{predictions.csv}, and were scored against the paper's SOTA as though the run were
+real. \textbf{That task carried the evolved cell's best score of $g = 0.2145$ and its only
+clear Surpass-SOTA.} The interim standing --- evolved Match-SOTA $50\%$ and Surpass-SOTA
+$20\%$ against base $40\%$ and $0\%$ --- was thus contaminated in the one cell and the one
+direction that would have flattered the published claim.
+
+\paragraph{The check we had written could not have caught it.}
+Our download verification asserted that each package had a \texttt{metadata.json}, an
+\texttt{evaluation/evaluator.py}, a \texttt{ground\_truth/} directory and a
+\texttt{problem/data} directory. All four were true of both broken packages. The verification
+tested \emph{existence}, and the failure was \emph{completeness}; a guard of that shape passes
+exactly the case it is meant to refuse. What found it was comparing every local file against
+the upstream tree by name \emph{and by size}, which reported $188$ mismatches on one task and
+nine missing files on the other. That audit is now a hard preflight in the run script: it runs
+before the model is contacted and aborts the run on any discrepancy, and we tested that it
+fires by truncating a known-good file to $1$\,kB and confirming the launcher refused to start.
+
+\paragraph{Why it happened, and the general lesson.}
+The downloads reported success. \texttt{hf download} with an \texttt{-{}-include} pattern exits
+zero whether it fetched everything, something or nothing, and with
+\texttt{HF\_HUB\_ENABLE\_HF\_TRANSFER} set we also had a transfer path that left short files
+without raising. Refetching without \texttt{hf\_transfer} and with fewer workers produced
+byte-exact copies, and all ten packages now match upstream exactly.
+
+The lesson generalises past this benchmark and is the same one this paper keeps rediscovering
+in other forms. \textbf{A dataset that is partially present is more dangerous than one that is
+absent}, because absence raises an error and partial presence produces a number. Any
+reproduction that downloads its own evaluation data should verify it against the publisher's
+manifest by size or checksum before the first GPU-second is spent, and should treat an
+exit code of zero from a downloader as carrying no information about completeness.
