@@ -4872,3 +4872,114 @@ tasks --- so it benefits only through the shared adapter, which is stated in the
 pre-registration as the mechanism under test and leaves a behaviour-cloning variant untested.
 And the whole section speaks to \texttt{Qwen3.8-27B} at \texttt{reasoning\_effort=low} on
 OlympiadBench-derived tasks; a weaker base would put more of any pool inside the gate's support.
+
+\subsection{Measuring difficulty after the scaffold: the fix our own criticism implies, tested}
+\label{sec:postscaffold}
+
+Sec.~\ref{sec:seededloop} left a criticism with no remedy attached: the difficulty gate selects
+on a success rate measured by prompting the model with the task alone, while the loop's solver
+sees a scaffolded prompt, so the gate selects on a number describing a prompt nobody runs. The
+implied repair is a change in \emph{where} the statistic is computed, not in the reward, the
+kernel or the target. \texttt{PREREG\_postscaffold.md} fixes the primary quantity, the cost
+accounting and the outcome in which the fix changes nothing; it was written before either arm
+started.
+
+\textbf{Two arms, run fresh and concurrently at matched settings}, $8$ iterations each, six
+candidate tasks per iteration, three selected, three scaffolds per task, $G=4$.
+\textbf{PRE} selects the top three candidates by $D(\hat p)$ with $\hat p$ measured bare, as
+published. \textbf{POST} scaffolds \emph{every} candidate, rolls an independent probe block,
+and selects by $D(\hat p)$ with $\hat p$ measured under those scaffolds; the block the loop
+then scores is fresh, so a task is never scored on the draw that selected it. Neither arm uses
+the proposer --- both draw from the mixed subset --- which isolates where difficulty is
+measured from whether a prompted proposer can hit a target at all.
+
+\paragraph{The primary outcome: it changes nothing.}
+\textbf{PRE formed a task group in $4$ of $8$ iterations; POST in $4$ of $8$}
+(Table~\ref{tab:postpre}). The informative rollout-group fraction within those iterations was
+$0.486$ for PRE and $0.611$ for POST, on four iterations each. This is the outcome the
+pre-registration named in advance, and it is reported as a result rather than as an
+inconclusive run.
+
+\begin{table}[t]
+\centering\small
+\caption{PRE against POST, runs \texttt{runs/PRE} and \texttt{runs/POST}, eight iterations
+each. Tokens are generated tokens, split by what generated them. POST's probe is the block it
+must pay for in order to measure difficulty under the scaffold; it cannot be reused as the
+scored block without scoring the selection on its own draw.}
+\label{tab:postpre}
+\begin{tabular}{lccccc}
+\toprule
+arm & task groups formed & informative rollout groups & tokens & per scored task & probe share \\
+\midrule
+PRE  & $4/8$ & $0.486$ & $1{,}521{,}051$ & $\mathbf{109}$k & --- \\
+POST & $4/8$ & $0.611$ & $4{,}074{,}971$ & $\mathbf{370}$k & $56\%$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{The cost, which is half the result.} POST costs $\mathbf{2.68\times}$ PRE per
+iteration and $\mathbf{370}$k generated tokens per task that reaches scoring against PRE's
+$\mathbf{109}$k --- and $56\%$ of POST's entire spend is the probe block, which the loop
+consumes for nothing but the estimate. At equal tokens PRE would run $2.7\times$ as many
+iterations. \textbf{So the fix costs roughly $3.4\times$ per scored task and buys no additional
+task groups.} It is worth noting what the $109$k figure means on its own: the
+$\sim\!350$k-per-scored-task figure that replicated twice in
+Secs.~\ref{sec:ornithloop}--\ref{sec:seededloop} was dominated by the \emph{proposer}, and
+removing that stage alone drops it by a factor of three. POST lands back at $370$k for an
+entirely different reason.
+
+\paragraph{Why it changes nothing, and it corrects our own earlier claim.}
+POST's selection works on the statistic it measures: it picked tasks whose \emph{scaffolded}
+$\hat p$ averaged $0.301$, close to the published $p^\star=0.2$, where PRE's picks averaged
+$0.510$ on the bare statistic. But on the fresh scored block the realised rates were
+$0.696$ for POST and $0.736$ for PRE --- indistinguishable, and both far above the target.
+\textbf{A four-sample scaffolded estimate does not predict the next four samples on the same
+task-scaffold pair.}
+
+The reason is that the scaffold does not shift difficulty, it \emph{re-randomises} it, and this
+corrects the reading in Sec.~\ref{sec:seededloop}. Over $48$ candidates measured here the
+signed drift from bare to scaffolded $\hat p$ is $\mathbf{-0.099}$ with mean absolute drift
+$\mathbf{0.362}$; the two smaller measurements that preceded it gave $+0.112$ and $+0.039$.
+\textbf{The signed drift is not stable across measurements and is not distinguishable from zero;
+the absolute drift is large and consistent.} Our earlier statement that ``scaffolds make tasks
+easier'' does not survive its own replication and is withdrawn. What survives, and is stronger,
+is that a scaffold changes a task's difficulty by roughly $0.2$--$0.36$ in an unpredictable
+direction. Selecting on the extreme of an estimate that noisy is selecting on noise, and the
+regression from $0.301$ to $0.696$ is exactly the winner's curse this paper has documented at
+two other levels.
+
+\paragraph{The guard, decided deliberately.} Guard G4 is applied to the rollout groups only,
+which discards tasks whose scaffolds disagree --- signal at the level the nesting exists to
+create. \textbf{We left it as the package has it}, so the primary numbers describe their design,
+and recorded every refusal's k-vector so the alternative could be priced. It is cheap: of PRE's
+ten refused tasks one carried scaffold-level signal and of POST's thirteen none did, so a
+scaffold-aware guard would have added one task group to PRE ($5/8$) and none to POST ($4/8$).
+On this configuration the guard's placement is not what is limiting the loop, which is worth
+knowing before anyone spends effort changing it.
+
+\paragraph{A defect in our own harness, found in the logs and matched across arms.}
+Every iteration reports \texttt{harness rows=0, grad\_norm=0}: the update loop iterates over
+\texttt{("solver", "harness")} but only ever populates rows for the solver, so \textbf{the
+harness stage never took a gradient step in either arm}. Both arms carry the defect identically,
+so the PRE-versus-POST comparison stands, but this run trained the solver alone and is not a
+test of the full loop. The smoke check missed it because it asserted that \emph{some} stage
+stepped with a non-zero gradient norm rather than that \emph{each} did --- the third instance in
+this programme of a guard that passes exactly the condition it was written to refuse, and this
+one is ours.
+
+\paragraph{What this settles.} Both pre-registered outcomes were on the table and the null one
+occurred: moving the difficulty estimate onto the prompt the solver actually receives does not
+make the loop form more task groups, at $3.4\times$ the price per scored task. \textbf{The
+problem is therefore deeper than where difficulty is measured.} It is not that the gate reads
+the wrong prompt; it is that on this base a task's difficulty under a scaffold is not a stable
+quantity to read at all --- it varies by $0.36$ across scaffolds and is not reproduced by a
+fresh sample of the same pair. A selection rule needs a statistic that predicts the block it is
+selecting for, and at these group sizes no cheap estimate does. That is a constraint on the
+whole family of difficulty-targeted self-improvement loops, not on Ornith's kernel.
+
+\textbf{Scope.} Eight iterations per arm and four groups formed per arm, so the equality of the
+two rates is $4/8$ against $4/8$ and not a tight bound; a probe larger than four rollouts would
+estimate difficulty better and cost more still, and that trade was not swept. Truncation was
+re-measured on this configuration rather than inherited and is not a confound: $0.073$ for
+PRE's scored blocks, $0.087$ for POST's and $0.049$ for its probe, against the $0.317$ that
+made the default operating point unusable.
