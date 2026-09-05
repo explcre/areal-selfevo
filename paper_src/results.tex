@@ -5676,6 +5676,18 @@ budgets and data, and what their scores were at this depth. The comparison remai
 fair --- same model, same budget, same task packages, same containment, differing only in the
 config block under test.
 
+\paragraph{Update, still before the numbers: it is worse than shallow.}
+Mid-run measurement sharpens this. The treatment arm has produced $29$ nodes of which $8$ are
+non-buggy; the control arm $64$ nodes of which $4$ are non-buggy. So the experience memory is
+not merely retrieving from a small population, it is retrieving from a population of roughly
+\emph{eight successful nodes spread across ten tasks}. The node-count gap between the arms is
+also not what it appears: the control is not out-searching the treatment, it is failing faster
+($94\%$ buggy at $0.3$\,s mean execution against $72\%$ at $1.2$\,s), so its extra nodes are
+cheap dead ends rather than extra search. Node count is therefore not a budget measure here
+and we do not use it as one. The one signal visible so far runs in the mechanism's favour ---
+the treatment's candidates run about four times as often --- but on eight successful nodes
+that is an observation, not a result.
+
 We considered and rejected buying depth. The available levers are raising
 \texttt{individuals\_per\_generation} or switching to the asynchronous steady-state profile,
 and both alter the search protocol that phase 2 exists to measure.
@@ -5704,19 +5716,48 @@ model & architecture & search nodes per wall-clock hour \\
 \end{tabular}
 \end{center}
 
-The dense model receives roughly \textbf{a fifth} of the search. The cause is not serving
-speed: its server sustained \emph{higher} aggregate token throughput than either mixture-model
-server ($694$--$704$ tokens/s at batch $12$--$13$, against $323$--$479$ at batch $2$--$5$).
-The difference is tokens emitted per search node --- a dense reasoning model writes far longer
-completions per candidate, and the wall-clock budget converts that verbosity directly into
-fewer search steps.
+The dense model receives roughly \textbf{a fifth} of the search. It is not serving speed: its
+server sustained \emph{higher} aggregate token throughput than either mixture-model server
+($694$--$704$ tokens/s at batch $12$--$13$, against $323$--$479$ at batch $2$--$5$).
 
-Two consequences. First, a like-for-like comparison of two models under this protocol is
-partly a comparison of their output lengths, and the quieter model is advantaged in a way that
-has nothing to do with the quality of its candidates. Second, and more practically for
-reproduction, our phase-2 depth limitation
-(Sec.~\ref{sec:openrsiphase2pre}) is a direct consequence: it is not a configuration mistake
-but the protocol's own arithmetic applied to a verbose model. Anyone reporting a harness or
+\paragraph{Correction: we cannot attribute this gap to verbosity, and an earlier draft of this
+section did.}
+We first wrote that the difference is tokens emitted per search node, a verbose model spending
+its budget on output. Checking that claim rather than restating it shows it is not
+established, because the two families are not in the same regime. A search node costs
+generation \emph{plus} candidate execution, and those differ by two orders of magnitude here:
+
+\begin{center}
+\begin{tabular}{lrrr}
+\toprule
+cell & buggy nodes & non-buggy nodes & mean execution / node \\
+\midrule
+\texttt{evolved} (MoE)    & $36\%$ & $359$ & $132.8$\,s \\
+\texttt{base} (MoE)       & $33\%$ & $385$ & $89.4$\,s \\
+\texttt{h\_treat} (dense) & $72\%$ & $8$   & $1.2$\,s \\
+\texttt{h\_ctrl} (dense)  & $94\%$ & $4$   & $0.3$\,s \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The phase-1 cells were \textbf{execution-bound}: their candidates actually trained models, at
+one to two minutes apiece, and node throughput was limited by sandbox slots. The phase-2 cells
+are \textbf{generation-bound}: their candidates fail in under a second because most of them do
+not run at all. Comparing nodes per hour across those two regimes does not isolate output
+length, and the dominant measured difference between the families is not verbosity but
+\emph{candidate validity} --- $33$--$36\%$ buggy against $72$--$94\%$.
+
+What survives is the weaker, still useful statement: \textbf{under a wall-clock budget the
+amount of search a model receives is an outcome, not a constant}, and it varied fivefold
+across the models we ran. Which model property drives it --- output length, candidate
+validity, or the execution cost of the code produced --- is not identified by this
+measurement, and separating them would need a controlled run we have not done. Anyone
+reporting a harness or model comparison on NatureBench under a wall-clock budget should
+publish search-node counts, buggy fractions and execution times beside the scores, because the
+scores alone do not reveal which regime the run was in. That is why we do.
+
+The practical consequence for us is unchanged: our phase-2 depth limitation
+(Sec.~\ref{sec:openrsiphase2pre}) is not a configuration mistake. Anyone reporting a harness or
 model comparison on NatureBench under a wall-clock budget should publish search-node counts
 beside the scores, which is why we do.
 
