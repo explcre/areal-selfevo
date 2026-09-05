@@ -4983,3 +4983,119 @@ estimate difficulty better and cost more still, and that trade was not swept. Tr
 re-measured on this configuration rather than inherited and is not a confound: $0.073$ for
 PRE's scored blocks, $0.087$ for POST's and $0.049$ for its probe, against the $0.317$ that
 made the default operating point unusable.
+
+\subsection{A task-source layer, and why its headline number could not be measured with a
+string-matching verifier}
+\label{sec:tasksource}
+
+Three sources --- self-generated, retrieved, and teacher-distilled --- behind one interface,
+so that everything downstream is identical and a difference between sources is a difference in
+what survives the same path: contamination check, then \emph{one} shared novelty buffer, then
+the verifier. The layer exists to test a sharp prediction. Self-generated keys are refuted
+$6.56\%$ of the time among decided cases against $2.55\%$ for professionally curated ones, and
+retrieved problems carry keys written by someone other than the model being trained, so they
+should not show that failure at all.
+
+\paragraph{What was built, and what an audit was allowed to attack.}
+$694$ lines across six modules, with eleven tests. Passing tests are not evidence, so each of
+the four properties an auditor would go for was \emph{broken on purpose} in a copy and the
+suite required to notice; all five mutants were caught
+(\texttt{code/mutate\_tasksource.py}):
+
+\begin{itemize}
+\item the shared novelty buffer replaced by one buffer per source --- caught: a retrieved
+  near-duplicate of a generated task must lose to it, and the rejection must name the source
+  that already held it;
+\item the contamination check degraded to exact matching --- caught: a reworded held-out
+  problem must still be rejected, which is why similarity is the \emph{maximum} of token
+  Jaccard and character $5$-gram cosine rather than either alone;
+\item provenance dropped on the way to the artifact --- caught: source, origin and licence
+  must survive every transformation, and a record refuses to exist without them;
+\item a source returning zero tasks recorded as a success --- caught, in both shapes (an
+  explicit failure and an empty success), because a silent zero is the failure mode this
+  programme has hit five times;
+\item a refuted key accepted anyway --- caught: it must enter neither the buffer nor the
+  artifacts.
+\end{itemize}
+
+\begin{table}[t]
+\centering\small
+\caption{Twenty candidates per source through the identical path, run
+\texttt{out/tasksource/table.json}, $162$\,s. ``contam'' is rejection for overlap with the
+held-out report half at a deliberately conservative threshold; ``dupe'' is rejection by the
+shared novelty buffer. \textbf{The refuted column is not interpretable at this configuration}
+and the next paragraph is why.}
+\label{tab:tasksource}
+\begin{tabular}{lrrrrrrr}
+\toprule
+source & candidates & contam & dupe & novelty rej. & decided & refuted & accepted \\
+\midrule
+generated & $20$ & $7$ & $3$ & $0.150$ & $10$ & $2$ & $8$ \\
+retrieved & $20$ & $3$ & $0$ & $0.000$ & $5$  & $2$ & $15$ \\
+distilled & $20$ & $2$ & $9$ & $0.450$ & $9$  & $2$ & $7$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{The prediction could not be tested, and finding that out is the result.}
+Retrieved tasks came back with the \emph{highest} refuted-key rate of the three, $2$ of $5$
+decided. Curated keys from MATH, AIME and AMC are not wrong two times in five, so that number
+measures the verifier. Retrieval costs no generation, so the curated corpora were used as a
+calibration set --- their keys are right by assumption, so every refutation on them is a false
+one. On $60$ curated problems the verifier decided $38$ and \textbf{refuted $17$: a false
+refutation rate of $\mathbf{0.447}$, Wilson $95\%$ $[0.301, 0.603]$}, against the $2.55\%$
+published for the same class of problem. The instrument is off by a factor of about eighteen
+and cannot resolve a $6.56\%$-versus-$2.55\%$ difference.
+
+Reading the refutations individually --- the same method that established the generated-key
+figure was real --- \textbf{eight of eight were formatting, not arithmetic}: key
+\texttt{29.0} against computed \texttt{29}; \texttt{101.68} against \texttt{\textbackslash\$101.68};
+\texttt{\$C=12/5\$} against \texttt{\textbackslash frac\{12\}\{5\}};
+\texttt{\$-\textbackslash ln|\textbackslash cos x|+C\$} against
+\texttt{\textbackslash ln|\textbackslash sec x|+C}; \texttt{\$\textbackslash log(e\^{}\{\textbackslash ln(100)\})=2\$},
+where the corpus stores the whole equation and the model answers \texttt{2}. Not one was a
+wrong key. Fourteen of the seventeen came from \texttt{college\_math}, whose answers carry
+prefixes and \LaTeX{} wrappers.
+
+\textbf{And the confound is not neutral across sources, which is what makes it fatal rather
+than merely noisy.} A generated key is written by the same model that later solves the
+problem, so it is already in that model's answer format; a retrieved key is written in its
+corpus's format. A string-normalising comparison therefore refutes retrieved keys more often
+\emph{for reasons that have nothing to do with correctness}. Running this table as it stands
+would have appeared to refute the prediction --- retrieved worse than generated --- by exactly
+the mechanism that guarantees the wrong answer. Source comparison of key correctness needs a
+format-invariant decision (symbolic equivalence, or the execution backend the package's
+cascade puts first), not the single consensus backend used here.
+
+\paragraph{What the run does establish.}
+\textbf{Self-generated tasks are a contamination risk, and a larger one than retrieval.}
+Seven of twenty generated candidates were rejected for overlapping the held-out report half,
+against three of twenty retrieved and two of twenty distilled. At a threshold chosen so that a
+false reject costs one candidate while a false accept costs the evaluation, that is an upper
+bound rather than a count of memorised problems --- but the ordering is the opposite of the
+expectation that retrieval is where contamination comes from. A model asked to invent problems
+reproduces its own evaluation set.
+
+\textbf{The shared buffer does real work, and it is asymmetric.} The distilled source lost
+nine of twenty candidates as near-duplicates and the retrieved source lost none. With three
+buffers under one name both would have been admitted; the collisions are recorded with the
+source that already held the near-duplicate, so a cross-source duplicate is visible rather
+than merely subtracted.
+
+\paragraph{Cost, and the teacher backend.} The teacher is provider-agnostic and was tested
+against the local \texttt{Qwen3.8-27B}; \textbf{no paid API call was made}, and the hosted
+backend refuses to make one unless an explicit environment authorisation is set, while
+remaining priceable without contacting anyone. From this run's measured counts --- $721$
+output tokens per call and $11.4$ calls per accepted task, that ratio being the parse and
+novelty yield rather than an assumption --- a hosted teacher at illustrative \$3/\$15 per
+million tokens would cost \textbf{\$13 for 100 accepted tasks and \$130 for 1000}. That is the
+estimate to take to the PI; nothing has been spent. The collusion risk is recorded in
+provenance rather than assumed away: the teacher here is the \emph{same model} as the solver,
+which is the hazard already logged for the judges, and a different-family teacher is exactly
+what the paid option would buy.
+
+\textbf{Scope.} Twenty candidates per source and five to ten decided cases each: the table is
+a working demonstration of the layer, not a measurement of the sources, and it is reported as
+such. The calibration that matters --- $17$ false refutations in $38$ decided curated
+cases --- is the number this section stands on, and it says the next thing to build is a
+format-invariant key check, not more tasks.
