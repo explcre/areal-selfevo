@@ -6468,3 +6468,60 @@ So an evolving taxonomy is not blocked by needing better splitting logic; it is 
 probe size, and the honest next step is a larger probe rather than a cleverer split. That
 conclusion is a consequence of the shape of Fig.~\ref{fig:granularity}, which is why the figure
 is here and why it could not have been replaced by its table.
+
+\subsection{A second seed measures the noise floor, and it is the size of the effect}
+\label{sec:openrsiseed43}
+
+Sec.~\ref{sec:openrsiphase1} reported one seed and declined to interpret a one-task
+difference. A second independent replicate at seed $43$, identical in every other respect,
+now says how much of that was scatter. This is the measurement the replicate existed for.
+
+\begin{center}
+\begin{tabular}{lrrr}
+\toprule
+Match-SOTA & seed $42$ & seed $43$ & pooled \\
+\midrule
+evolved, \texttt{Frontis-MA1-35B} & $60\%$ & $60\%$ & $12/20 = 60\%$ \\
+base, \texttt{Qwen3.6-35B-A3B}    & $70\%$ & $50\%$ & $12/20 = 60\%$ \\
+\midrule
+delta                             & $-10$\,pt & $+10$\,pt & $\mathbf{0}$\,\textbf{pt} \\
+\emph{their published delta}       & \multicolumn{3}{c}{$+20$\,pt ($50\% \to 70\%$)} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{The finding.}
+\textbf{The base cell moved $20$ points between two seeds --- $70\%$ to $50\%$ --- which is
+exactly the size of the effect OpenRSI reports.} The evolved cell was stable at $60\%$ across
+both. So the run-to-run noise floor on a single cell of this benchmark is as large as the
+published difference between two cells, and the sign of our measured delta flips between
+seeds ($-10$\,pt, then $+10$\,pt) purely from reseeding.
+
+This converts the argument of Sec.~\ref{sec:openrsicost} from a power calculation into a
+measurement. There we showed \emph{a priori} that at $n=10$ nothing short of $10/10$ separates
+from a $5/10$ baseline. Here we observe directly that the instrument's own scatter spans the
+claimed effect. Pooled over both seeds the Match-SOTA model-swap delta is \emph{exactly zero},
+$12/20$ against $12/20$, where the published claim is $+20$ points.
+
+\paragraph{The one signal that replicates, reported in OpenRSI's favour.}
+Surpass-SOTA --- their stricter metric, $g > 0.1$ --- moves in the claimed direction in
+\emph{both} seeds and by the same margin each time: $40\%$ against $20\%$ at seed $42$, and
+$20\%$ against $0\%$ at seed $43$, pooling to $6/20$ against $2/20$. That is $+20$ points twice
+from independent draws, and it is the only quantity in this reproduction that behaves the way
+their claim predicts. We report it because it is real and because it would be easy to omit
+having led with a null. It is not significant ($p = 0.235$) and the counts are tiny, and
+because both seeds run the same ten tasks the twenty trials are clustered rather than
+independent, so the effective sample is nearer ten. But the direction is consistent, and a
+reader deciding whether their evolved model does anything should weigh a replicated
+directional signal on the strict metric against a pooled zero on the permissive one.
+
+\paragraph{What we therefore claim, and what we do not.}
+We do not claim to have refuted OpenRSI's model-swap result. Two seeds on ten tasks cannot,
+and our own numbers reproduce neither their base ($50\%$; we see $70\%$ and $50\%$) nor their
+evolved figure ($70\%$; we see $60\%$ twice). We claim something narrower and, we think, more
+useful: \textbf{that this benchmark at its published protocol --- ten tasks, one sample each
+--- has a per-cell noise floor of about twenty points, and therefore cannot support a
+twenty-point claim from single runs.} That is a statement about the measuring instrument, it is
+measured rather than argued, and it applies to anyone using NatureBench Lite at this size,
+ourselves included. The remedy is not a better model but more samples per task, and their
+harness already exposes \texttt{n\_samples\_per\_task} to provide them.
