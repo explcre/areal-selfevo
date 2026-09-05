@@ -5450,3 +5450,182 @@ A single seed cannot say whether a one-task difference is signal or scatter, so 
 independent replicate at seed $43$ is running for both cells. Its purpose is not to improve the
 estimate of their effect --- at $n=10$ nothing can --- but to measure the run-to-run spread
 against which the one-task gap should be read. We report the pair, not the better of the two.
+
+\subsection{The three-stage loop, actually run: a repaired harness stage, and two caps that
+were reading the budget rather than the method}
+\label{sec:threestage}
+
+Sec.~\ref{sec:postscaffold} compared difficulty measured before and after the scaffold stage.
+That comparison stands --- both arms carried the defect identically --- but the run behind it
+trained one stage of three. This section repairs the defect, rebuilds the check that hid it,
+re-measures every cap, and runs the loop.
+
+\paragraph{The defect.} The update loop iterated over both stages and built rows only for the
+solver:
+
+\begin{quote}\small\ttfamily
+for stage in ("solver", "harness"):\\
+\hspace*{1em}rows = []\\
+\hspace*{1em}if stage == "solver":\\
+\hspace*{2em}\ldots\ append one row per non-degenerate rollout\ldots
+\end{quote}
+
+so the harness optimiser was handed an empty list every iteration, took the
+\texttt{grad\_norm 0.0} branch, and logged cleanly. The scaffold generations it needed were
+already being fetched and were discarded at the call site with \texttt{\_}. The repair builds
+harness rows from the scaffold advantages the nested scorer already returns, indexed by the
+same list that subsets the scaffolds, so a scaffold's advantage cannot be attributed to
+another's tokens.
+
+\paragraph{The check that hid it, rebuilt.} The old check asked whether \emph{any} stage had
+stepped. It is now per stage and on three observables: rows populated, gradient norm non-zero,
+and the adapter fingerprint --- summed $|\text{LoRA-B}|$ over the whole adapter, exactly zero
+at initialisation --- actually moved. A step function returning normally is not evidence;
+parameters moving is. The check is itself tested against a stage deliberately handed no data,
+which it must fail, because a guard never shown to fire is the failure mode this project has
+now logged seven times (Table~\ref{tab:stagesmoke}).
+
+\begin{table}[t]
+\centering\small
+\caption{Each stage exercised separately on real generations in that stage's own prompt shape,
+run \texttt{out/smoke\_stages.json}. Advantages are assigned rather than earned: this tests
+whether data of each shape reaches the optimiser, which is a different question from whether
+the loop produces such data, and conflating the two is how the defect survived.}
+\label{tab:stagesmoke}
+\begin{tabular}{lrrrc}
+\toprule
+stage & rows & grad norm & fingerprint $\Delta$ & verdict \\
+\midrule
+proposer & $2$ & $0.0188$ & $8964.7$ & PASS \\
+harness  & $2$ & $0.0205$ & $3978.6$ & PASS \\
+solver   & $2$ & $0.0061$ & $3271.0$ & PASS \\
+\midrule
+starved control (must fail) & $0$ & $0.0000$ & $0.0$ & \textbf{FAIL, as required} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[t]
+\centering\small
+\caption{Every cap re-measured on this configuration at a ceiling chosen not to bind, run
+\texttt{out/budget\_3stage.json} and \texttt{out/budget\_proposer\_40k.json}. Two of the three
+caps in use were wrong, in opposite directions.}
+\label{tab:budget3}
+\begin{tabular}{lrrrrrc}
+\toprule
+stage & ceiling & p50 & p90 & max & at ceiling & usable yield \\
+\midrule
+proposer & $16384$ & $16384$ & $16384$ & $16384$ & $0.938$ & $0.063$ parsed \\
+proposer & $\mathbf{40960}$ & $30903$ & $37666$ & $40960$ & $0.083$ & $\mathbf{0.917}$ parsed \\
+harness  & $16384$ & $2164$ & $5837$ & $9625$ & $0.000$ & --- \\
+solver   & $8192$ & $4390$ & $8192$ & $8192$ & $0.125$ & $0.906$ answered \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Re-measuring the budget overturned the configuration for the fifth time, twice in
+one pass.} Both errors were caps inherited rather than measured, and they pushed in opposite
+directions (Table~\ref{tab:budget3}).
+
+\emph{The proposer does terminate.} At the inherited $16384$ cap it ran to the ceiling in $15$
+of $16$ attempts and $1$ proposal in $16$ parsed, which this project had recorded as ``the
+proposer never terminates 75\% of the time''. At $40960$ it terminates in $11$ of $12$ and
+$\mathbf{11}$ parse --- a yield of $0.917$ against $0.063$, from nothing but the cap. The
+median proposal costs $30{,}903$ tokens. \textbf{The proposer's non-termination was an artefact
+of a budget roughly half of what it needs}, and the earlier finding is withdrawn.
+
+\emph{The rollout cap was below the median rollout.} The loop had been running at $4096$ while
+the median scored rollout is $4390$ tokens, so more than half of every group was truncated and
+the degeneracy statistics were partly reading the cap. At the measured p90 of $8192$, $90.6\%$
+of rollouts answer.
+
+\emph{And the harness was paying the proposer's bill.} The scaffold stage shared
+\texttt{gen\_cap}: it was allocated $16384$ tokens for a stage whose longest generation in $16$
+was $9625$ and whose p90 is $5837$. It now has its own cap at $6144$.
+
+\begin{table}[t]
+\centering\small
+\caption{The three-stage run, \texttt{runs/THREE/iters.jsonl}. A stage counts as having trained
+only if it received rows, produced a non-zero gradient norm, AND moved the adapter
+fingerprint; $\Delta$ is that movement. Iterations 0--6 draw tasks from the mixed subset, so
+the proposer correctly receives nothing and is marked n/a; 7--8 run the proposer live.
+Blank rows are iterations where fewer than two tasks survived scoring, so no group formed.}
+\label{tab:threestage}
+\begin{tabular}{llrrrrrrrrr}
+\toprule
+& & & \multicolumn{2}{c}{proposer} & \multicolumn{2}{c}{harness} & \multicolumn{2}{c}{solver}
+& \multicolumn{2}{c}{informative} \\
+\cmidrule(lr){4-5}\cmidrule(lr){6-7}\cmidrule(lr){8-9}\cmidrule(lr){10-11}
+it & source & scored & rows & grad & rows & grad & rows & grad & roll. & scaf. \\
+\midrule
+0 & seed     & $1$ & \multicolumn{8}{c}{\emph{no task group}} \\
+1 & seed     & $2$ & n/a & n/a & $6$ & $0.053$ & $24$ & $0.020$ & $0.667$ & $1.000$ \\
+2 & seed     & $2$ & n/a & n/a & $6$ & $0.045$ & $30$ & $0.015$ & $0.833$ & $1.000$ \\
+3 & seed     & $1$ & \multicolumn{8}{c}{\emph{no task group}} \\
+4 & seed     & $1$ & \multicolumn{8}{c}{\emph{no task group}} \\
+5 & seed     & $1$ & \multicolumn{8}{c}{\emph{no task group}} \\
+6 & seed     & $2$ & n/a & n/a & $6$ & $0.069$ & $12$ & $0.042$ & $0.333$ & $1.000$ \\
+7 & proposer & $1$ & \multicolumn{8}{c}{\emph{no task group}} \\
+8 & proposer & $3$ & $\mathbf{3}$ & $\mathbf{0.054}$ & $9$ & $0.059$ & $30$ & $0.018$ &
+$0.556$ & $1.000$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{The loop ran, and at iteration 8 all three stages took a gradient step in the same
+iteration.} That had not happened before: iteration 8 trained the proposer ($3$ rows,
+$\Delta 1570$), the harness ($9$ rows, $\Delta 1712$) and the solver ($30$ rows, $\Delta 1997$),
+with both nested comparison levels formed and the across-task group informative
+(Table~\ref{tab:threestage}). \textbf{The repair is also confirmed in the file the defect lived
+in}: a \texttt{pre}-mode iteration of \texttt{postscaffold\_train.py} now reports harness rows
+$6$, gradient norm $0.077$, fingerprint $\Delta 2086$, where every iteration of the run behind
+Sec.~\ref{sec:postscaffold} reported $0$, $0.0$ and no movement.
+
+\paragraph{Does the loop sustain informative groups?} Four of nine iterations formed a task
+group at all, and \emph{every} one that did was informative at all three levels: the across-task
+group was non-degenerate every time, the scaffold group was informative in $1.000$ of cases in
+all four, and the rollout groups in $0.333$--$0.833$. So the failure is not that groups go flat
+as the loop runs; it is that a group forms less than half the time. Of $22$ refused tasks the
+k-vectors are almost always extreme: $12$ were solved by every rollout under every
+scaffold, $9$ by none, and exactly $1$ was anything in between. \textbf{The scaffold stage polarises difficulty.} These tasks were
+drawn from the mixed subset --- selected precisely for $0 < p < 1$ measured on the bare model
+--- and conditioning the solver on a harness scaffold moves most of them to one extreme or the
+other. That is the post-scaffold drift of Sec.~\ref{sec:postscaffold} seen from the other side,
+and it is the reason the loop's yield is what it is.
+
+\paragraph{Does harness training change anything? We cannot say, and four updates is why.} The
+harness stage now trains, and its gradient norm is consistently \emph{larger} than the solver's
+--- mean $0.056$ against $0.023$ over the same four iterations, a factor of $2.4$. That is a
+fact about the signal, not about the outcome. Four updates cannot support a claim that the
+stage changed the loop's behaviour, and the mean $\hat{p}$ over those four iterations
+($0.833$, $0.870$, $0.500$, $0.368$, falling toward the $p^\star = 0.2$ the reward targets) is
+exactly the kind of four-point trend this project has already been wrong about twice. Powering
+it properly is arithmetic: at the observed $0.44$ groups per iteration, twenty harness updates
+per arm needs about $45$ iterations, and a harness-on/harness-off comparison at matched budget
+is therefore roughly $18$M tokens and ten hours on this box. That is the experiment this run
+does not perform, and it is pre-registered here rather than approximated.
+
+\paragraph{Guard G4 keeps its rollout-group scope, and now for a measured reason.} G4 refuses a
+task whose every rollout group is unanimous, which also removes it from the harness and
+proposer stages before scaffold advantages are computed. Widening it was priced at one extra
+task group in eight. On every refusal the scaffold rewards were recomputed with the package's
+own judges and reward function, changing nothing about the run: \textbf{of $22$ refused tasks,
+$0$ had an informative scaffold group.} Their scaffold rewards were not merely equal but exactly
+$[0,0,0]$ in all $22$ cases --- because reward fidelity is computed against the task's own rollouts, so when
+every rollout agrees, every scaffold scores the same. The guard discards nothing that the
+harness stage could have used, and the decision is to keep it exactly as the package has it.
+
+\paragraph{Cost, and the one thing that does not fit.} The run scored $14$ tasks for
+$1{,}788{,}713$ tokens: \textbf{$127{,}765$ tokens per scored task}, $106{,}387$ in the seeded
+iterations and $181{,}208$ with the proposer live. The proposer is now $16.9\%$ of the bill
+rather than the dominant term it was when it was being retried into a truncating cap. Rollouts
+are $75\%$.
+
+The run ended at iteration $9$ on a fatal out-of-memory: a single proposer row of ${\sim}41{,}000$
+tokens needs $38.2$ GiB for its float32 logits in one backward, and the device has $178$ GiB
+with the model and optimiser already resident. This is a real constraint on the method rather
+than an accident of this box: the proposer stage's median generation is $30{,}903$ tokens, and a
+sequence that long cannot be backpropagated whole at this vocabulary size. Training it needs
+the loss accumulated over sub-sequences, which nothing in the reproduction does today.
+\textbf{So the honest statement about the three-stage loop is that it runs, that all three
+stages train, and that the proposer stage trains only when its proposal happens to be short.}
