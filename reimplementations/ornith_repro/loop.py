@@ -33,7 +33,7 @@ from pathlib import Path
 
 from .buffer import TaskBuffer
 from .grpo import grpo_advantages
-from .guards import assert_batch_not_all_degenerate, assert_task_not_in_buffer
+from .guards import assert_batch_not_all_degenerate, assert_task_not_in_buffer, GuardViolation
 from .judges import Judges
 from .rewards import (
     P_STAR_PUBLISHED,
@@ -111,6 +111,67 @@ class IterationResult:
     stages_fired: list[str] = field(default_factory=list)
 
 
+def extract_boxed(text: str) -> str | None:
+    """Return the content of the LAST \\boxed{...}, matching braces rather than regex.
+
+    A regex like ``\\boxed\\{([^}]*)\\}`` stops at the first inner brace, so it silently
+    truncates any answer containing one (a fraction, a set, a nested expression) and marks
+    a correct rollout wrong. This scans and balances instead.
+
+    Args:
+        text: The rollout text.
+
+    Returns:
+        The final boxed expression, or None when there is none.
+    """
+    key = "\\boxed{"
+    start = text.rfind(key)
+    if start < 0:
+        return None
+    i = start + len(key)
+    depth = 1
+    out = []
+    while i < len(text) and depth:
+        c = text[i]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if not depth:
+                break
+        out.append(c)
+        i += 1
+    return "".join(out).strip() if depth == 0 else None
+
+
+def answers_match(got: str | None, want: str | None) -> bool:
+    """Compare a boxed answer with a reference under light normalisation.
+
+    Deliberately conservative: it strips whitespace, LaTeX spacing and a few wrappers, and
+    otherwise demands equality. A lenient comparator would inflate the success rate, and
+    the success rate IS the difficulty signal the whole loop is built on.
+
+    Args:
+        got: The extracted answer, or None.
+        want: The reference answer, or None.
+
+    Returns:
+        True when the two agree after normalisation.
+    """
+    if got is None or want is None:
+        return False
+
+    def norm(x: str) -> str:
+        x = x.strip().replace("\\left", "").replace("\\right", "")
+        x = x.replace("\\!", "").replace("\\,", "").replace("\\;", "").replace(" ", "")
+        x = x.replace("$", "").replace("\\$", "")
+        if x.startswith("{") and x.endswith("}"):
+            x = x[1:-1]
+        return x.rstrip(".").lower()
+
+    return norm(got) == norm(want)
+
+
 def grade(scaffold: Scaffold, task: Task, text: str, truncated: bool) -> Rollout:
     """Grade one rollout with the scaffold, which IS the rollout reward function.
 
@@ -135,7 +196,32 @@ def grade(scaffold: Scaffold, task: Task, text: str, truncated: bool) -> Rollout
             reward=0.0,
             abort_reason="truncated_or_no_stop",
         )
-    ok = "SOLVED" in text if scaffold.grader_kind == "exact" else text.strip() != ""
+    if scaffold.grader_kind == "boxed_exact":
+        # The live grader: the scaffold checks the rollout's boxed answer against the
+        # task's reference. Agreement with a GENERATED task's answer is agreement with the
+        # proposer, not correctness; `Task.answer` records that distinction.
+        if task.answer is None:
+            # Without a reference EVERY rollout compares false, so a perfectly solved task
+            # scores p_hat = 0 and earns D = 0.411 -- close to the p*=0.2 peak. That is the
+            # mis-keying confound arriving through a missing key rather than a wrong one, and
+            # it is silent. Refuse instead (guard G8).
+            raise GuardViolation(
+                f"scaffold {scaffold.scaffold_id} grades boxed_exact but task "
+                f"{task.task_id} carries no answer; every rollout would compare false and "
+                f"the task would score p_hat=0 and look ideally difficult (guard G8)."
+            )
+        ok = answers_match(extract_boxed(text), task.answer)
+    elif scaffold.grader_kind == "exact":
+        ok = "SOLVED" in text
+    elif scaffold.grader_kind == "nonempty":
+        ok = text.strip() != ""
+    else:
+        # An unknown grader used to fall through to "any non-empty text is correct", so a
+        # single typo in `grader_kind` scored every rollout SUCCESS at p_hat = 1.0.
+        raise GuardViolation(
+            f"unknown grader_kind {scaffold.grader_kind!r}; refusing rather than defaulting "
+            f"to 'any non-empty output is correct' (guard G9)."
+        )
     return Rollout(
         rollout_id=rid,
         text=text,

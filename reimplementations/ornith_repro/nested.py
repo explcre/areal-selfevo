@@ -37,7 +37,8 @@ from dataclasses import dataclass, field
 
 from .buffer import TaskBuffer
 from .grpo import grpo_advantages
-from .guards import GuardViolation, assert_task_not_in_buffer
+from .guards import (GuardViolation, assert_batch_not_all_degenerate,
+                     assert_task_not_in_buffer)
 from .judges import Judges
 from .loop import OrnithConfig, grade
 from .rewards import (
@@ -198,6 +199,12 @@ def run_iteration_nested(
                           provenance=digest(task.task_id, sc.scaffold_id, C, F, H, R))
         )
     stages.append("harness")
+
+    # G4, which had no caller anywhere in the package: refuse a batch in which every group
+    # carries zero reward-directed gradient. Applied to the ROLLOUT groups, because a task
+    # whose every scaffold produced a unanimous block contributes nothing and would
+    # otherwise be indistinguishable, after the fact, from one that trained.
+    assert_batch_not_all_degenerate(rollout_advs)
 
     scaffold_adv = (
         grpo_advantages(disc, epsilon=cfg.epsilon) if ncfg.sampling == "nested" else None

@@ -90,9 +90,20 @@ class Judges:
         # 1.0 at a 50/50 split, 0.0 when unanimous.
         return 1.0 - abs(2.0 * frac - 1.0)
 
+    #: Graders that check the rollout against a specific required answer. Anything outside
+    #: this set is assumed gameable until shown otherwise, so adding a grader kind is a
+    #: deliberate act rather than something a new caller gets for free.
+    HARDENED_GRADERS = ("exact", "boxed_exact")
+
     def hack_resistance(self, scaffold: Scaffold) -> float:
         """H(h): does the scaffold avoid trivially gameable grading?
 
         Penalises graders that accept any non-empty output. Our rubric; Ornith gives none.
+
+        `boxed_exact` is hardened: it extracts the rollout's boxed answer and requires it to
+        match a specific reference, which is strictly harder to game than the marker check
+        `exact` performs. It was omitted when the live grader was added, which scored the
+        strictest grader in the package as the most gameable one and multiplied every live
+        scaffold's R_harness by 0.3.
         """
-        return 1.0 if scaffold.grader_kind == "exact" else 0.3
+        return 1.0 if scaffold.grader_kind in self.HARDENED_GRADERS else 0.3

@@ -5058,3 +5058,86 @@ module, and its step-200 point at 21:25 UTC still ran the old probe.
 *Appended by the second liveness agent. `EXPERIMENTS.md` left UNCOMMITTED deliberately: it
 carries 600+ uncommitted lines from other agents and committing it would take their work with
 mine.*
+
+## Grouping granularity, four unrecorded results, and the anchoring ablation (H200, 2026-09-05)
+
+Written up in `paper_src/results.tex` (commits `d44a6312`, `5887c8bf`, `3e641486`). This is the
+short index; the paper carries the full record.
+
+### Granularity sweep (`sec:granularity`)
+
+Pre-registered gate (`PREREG_grouping_gate.md`) swept across granularities, 105 probe problems,
+2000 draws/arm, seed 20260905. Reproduced exactly from `reimpl/granularity_sweep.py`:
+
+| groups | probs/grp | ratio | p | scheme |
+|---|---|---|---|---|
+| 3 | 19.0 | 0.15 | 0.900 | fine topic |
+| 4 | 22.5 | 2.13 | 0.148 | coarse subfield (FAILS, predicted in writing) |
+| **10** | **7.5** | **2.70** | **0.009** | fine topic (PEAK) |
+| 17 | 5.0 | 1.87 | 0.024 | fine topic |
+| 17 | 5.0 | 1.29 | 0.219 | topic x answer-type |
+| 19 | 4.0 | 1.65 | 0.053 | fine topic |
+| 27 | 3.0 | 1.81 | 0.006 | topic x answer-type |
+
+**FINDING: significance and usefulness diverge, and the null band is the mechanism.** The null's
+95th percentile in ratio units is 3.00 at 4 groups, 1.97 at 10, 1.53 at 27. The bar a partition
+must clear FALLS as it gets finer, so 27 groups reach p=0.006 with a *smaller* effect than the
+peak. Ranking partitions by p selects the one a curriculum cannot act on.
+
+**DEFECT (ours):** the first pass named "one group of 105" as the optimum -- one group has zero
+between-group variance by definition, its null is identically zero, and 0/0 went through as
+inf, which sorts first while p=1.000 sat ignored in the next column. Degenerate partitions are
+now excluded before any maximum is taken.
+
+**Caveats:** the clustering arm never ran (no claim that labels beat clusters); probe is 105
+problems; 10 vs 17 is not itself tested; granularity alone does not determine a partition (two
+schemes both reach 17 groups and give 1.87 vs 1.29).
+
+### Four results recorded against their artifacts, with six corrections
+
+- **Verifiable-subset map** (`sec:verifiablesubset`): 532/675 = 78.8% executable reach,
+  295/675 = 43.7% CAS, 22/675 = 3.3% proof-or-construction -- the ratio behind leaving Lean
+  unbuilt. Generated corpus (693 rows, NOT 675) emits **zero** proofs and 41.7% bounded search
+  against 21.8%, a factor of **1.91x** (not 2.0). The answer format, not difficulty, selects the
+  mathematics.
+- **Key quality** (`sec:keyquality`): arc 72.5% (truncation bug deleting verifications, sparing
+  refutations) -> 12.9% (uninterpretable, below a broken comparator's 22.2% floor) -> **8.60%
+  (27/314) vs 2.90% (8/276)**. CORRECTION: the sixteen refutations read individually belong to
+  `verify_generated_sym.jsonl` (the 6.56% run), NOT the 8.60% run, which has 27.
+  Decisive case CONFIRMED and stronger: the same problem generated **three** times asserting
+  182 / 100 / 86, verifier returned 186 every time, and 186 is provably correct.
+- **Coverage** (`sec:coverage`): 34.8->40.9% published, 35.2->45.3% generated, all four
+  reproduce. CORRECTIONS: "largest bucket cut 43%" holds only on published keys (on generated
+  the largest bucket ROSE 13.3%); "dominant bucket moved to bound-justification" is FALSE on
+  both pools; "without weakening soundness" is WITHDRAWN -- `verify_sound.py` was modified
+  between the runs (no version control) and the refutation rate rose in both pools.
+- **Informative fraction** (`sec:strictinformative`): permissive 0.379 generated / 0.257 fixed
+  reproduce (236/622, 59/230). **STRICT (>=2 successes AND >=2 failures): 0.203 / 0.165.** The
+  strict reading halves the generated figure and cuts the gap from 12.3 points to 3.7.
+  Caveat: unequal truncation exclusion (fixed pool loses 32% of problems, generated 10%) biases
+  the fixed pool DOWN and inflates the gap. On the 52-task store, strict == permissive == 3/52
+  because at k=5 the three mixed tasks are 3/5, 2/5, 3/5.
+
+### Anchoring ablation (`PREREG_anchor_difficulty.md`, in flight)
+
+Mechanism before outcome: Spearman rho between anchor difficulty and generated-task difficulty.
+Grid n_anchors {0,1,4} x selection {random, hardest, at_target} x source {self_gen, retrieval,
+teacher}. Retrieval is the PRE-DECLARED POSITIVE CONTROL.
+
+**Early: the positive control works.** Retrieval rho = 0.571, 95% CI [0.282, 0.778], perm
+p = 0.001 on 29 tasks. Textually similar problems in this corpus have correlated difficulty, so
+the instrument can see transmission when it exists.
+
+**DEFECT (ours), found mid-run:** the per-task seed came from Python's `hash()` of a tuple
+containing strings, which is **salted per process** -- three runs of the same expression gave
+430099815 / 684065568 / 1747739814. The experiment could not have been reproduced with
+identical arguments. Now `md5` of the same fields; salted-seed records moved aside, not deleted.
+
+**Guarded hazard, CORRECTED after audit.** I first claimed the shipped `jaccard_similarity` is
+blind to a renumbered restatement, on the strength of one constructed pair reading 0.441.
+**Withdrawn.** On renumber-only pairs (wording preserved) raw Jaccard reads 0.724 against an
+unrelated-pair p95 of 0.156 and rejects 5/5 at the shipped 0.60 threshold; masked Jaccard reads
+0.986. The masked reading is better by degree, not by kind. The real gap is one step out: on
+renumber+reword+rename pairs, raw 0.124 / masked 0.195 / ngram 0.324 against floors of
+0.157 / 0.178 / 0.228 -- **nothing catches those, `anchor_dupe` included**. A null duplicate
+reading therefore means "no renumbered restatement", never "no paraphrase".

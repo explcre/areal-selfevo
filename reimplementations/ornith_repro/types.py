@@ -62,6 +62,11 @@ class Task:
         length_bin: Observable covariate, as above.
         source: "generated" for the treatment, "pool" for the random control. Recorded so
             that no analysis can silently mix the arms.
+        answer: Reference answer, when the task carries one. A generated task's answer is
+            asserted by the PROPOSER and is not ground truth: this project has measured
+            58.8% of self-generated golds disagreeing with confident solver consensus, so
+            an analysis must treat agreement with this field as agreement with the
+            generator rather than as correctness. `None` for tasks with no answer key.
     """
 
     task_id: str
@@ -69,6 +74,7 @@ class Task:
     family: str = "unknown"
     length_bin: str = "unknown"
     source: str = "generated"
+    answer: str | None = None
 
     def covariates(self) -> dict[str, str]:
         """Return the observable covariates used for proportion matching."""

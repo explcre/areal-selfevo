@@ -98,6 +98,11 @@ class OpenAICompatClient:
         served_context_len: Context length the backend reports, used for the token-budget
             guard. Must come from the backend, not from our config.
         api_key: Bearer token; "EMPTY" for unauthenticated local services.
+        reasoning_effort: Passed through `chat_template_kwargs`. NOT cosmetic: at this
+            model's default (`xhigh`) 62.5% of rollouts on frontier mathematics hit a
+            57344-token cap and the MEDIAN rollout is the cap, which makes the success rate
+            the whole loop is built on a measurement of the token budget rather than of task
+            difficulty. `low` terminates. `None` leaves the server default alone.
 
     Raises:
         GuardViolation: if `model_id` is not among `served_models`.
@@ -110,8 +115,14 @@ class OpenAICompatClient:
         served_models: Sequence[str],
         served_context_len: int,
         api_key: str = "EMPTY",
+        reasoning_effort: str | None = None,
     ) -> None:
         assert_model_served(model_id, served_models)
+        if reasoning_effort is not None and reasoning_effort not in ("low", "medium", "xhigh"):
+            raise ValueError(
+                f"reasoning_effort must be low|medium|xhigh or None, got {reasoning_effort!r}"
+            )
+        self.reasoning_effort = reasoning_effort
         self.base_url = base_url.rstrip("/")
         self.model_id = model_id
         self.served_models = list(served_models)
@@ -142,6 +153,8 @@ class OpenAICompatClient:
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": max_new_tokens,
                 "seed": seed,
+                **({"chat_template_kwargs": {"reasoning_effort": self.reasoning_effort}}
+                   if self.reasoning_effort else {}),
             },
             timeout=600.0,
         )
