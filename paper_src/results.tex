@@ -6525,3 +6525,60 @@ twenty-point claim from single runs.} That is a statement about the measuring in
 measured rather than argued, and it applies to anyone using NatureBench Lite at this size,
 ourselves included. The remedy is not a better model but more samples per task, and their
 harness already exposes \texttt{n\_samples\_per\_task} to provide them.
+
+\subsection{Which metric you choose decides the answer, and Match-SOTA is the worst of the
+four}
+\label{sec:openrsimetric}
+
+Sec.~\ref{sec:openrsiseed43} reported a pooled zero on Match-SOTA and a replicated $+20$ points
+on Surpass-SOTA. Asking why one metric moves and the other does not turns out to be the most
+useful thing in this reproduction, and it is a criticism of the headline metric rather than of
+either model.
+
+\paragraph{Where the instability lives.}
+Comparing the two seeds task by task, \textbf{four of ten tasks flip their Match-SOTA
+classification between seeds, in both cells}. The flips are not spread over the range; they
+are concentrated at the threshold. \texttt{s41467-025-63412-3} moves from $g = -0.004$ to
+$g = +0.007$, and that $0.011$ change in a continuous score flips a full ten points of
+Match-SOTA. \texttt{s42256-023-00627-3} moves from $-0.015$ to $+0.059$, likewise across zero.
+Match-SOTA thresholds $g$ at exactly $0$, and $g = 0$ is where the mass of this task
+distribution sits --- six of ten tasks land within $\pm 0.09$ of it. \textbf{The metric
+discretises the score precisely where the data is densest, so it converts small continuous
+noise into maximal binary noise.}
+
+\paragraph{Four metrics, one disagreeing.}
+\begin{center}
+\begin{tabular}{lrrl}
+\toprule
+metric (evolved $-$ base) & seed $42$ & seed $43$ & consistent? \\
+\midrule
+Match-SOTA ($g \ge 0$, a count)      & $-10$\,pt & $+10$\,pt & \textbf{no, flips} \\
+Surpass-SOTA ($g > 0.1$, a count)    & $+20$\,pt & $+20$\,pt & yes \\
+mean $g$ (continuous)                & $+0.0328$ & $+0.0576$ & yes \\
+median $g$ (continuous)              & $+0.0064$ & $+0.0147$ & yes \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Three of the four favour the evolved model in both seeds. The one that does not is the one
+OpenRSI leads with, and it is the one whose threshold sits in the densest part of the
+distribution.
+
+\paragraph{But the advantage is in margins, not in wins, and it is not significant.}
+It would be easy to stop there and report a vindication. A paired test, with the task as the
+pairing unit, does not support one. Evolved beats base on $6$ of $9$ scored tasks at seed $42$
+and $5$ of $9$ at seed $43$; pooled, $11$ of $18$ task-seeds, sign-test $p = 0.48$. So the
+evolved model does \emph{not} win on more tasks. It wins by \emph{larger margins} on the tasks
+where it wins, which is exactly why the magnitude-sensitive metrics (mean $g$, and
+Surpass-SOTA, which requires clearing $0.1$) favour it while the count at zero does not.
+
+\paragraph{What we take from this.}
+Two things, and neither is a verdict on OpenRSI's model. First, \textbf{a reader of this
+benchmark should not use Match-SOTA alone}: it is the least stable of the four summaries
+available from the same data, for a structural reason that will recur on any task set whose
+scores cluster near the SOTA reference. Reporting mean $g$ beside it costs nothing, since the
+evaluator already returns it. Second, our own headline in Sec.~\ref{sec:openrsiseed43} --- a
+pooled zero --- is a statement about the \emph{count} metric, and we have been careful to say
+so there rather than letting it stand as a claim that the evolved model does nothing. On the
+magnitude metrics it consistently does something, in both seeds, and that something is not
+statistically resolvable at ten tasks.
