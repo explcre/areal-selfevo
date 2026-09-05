@@ -5214,3 +5214,171 @@ similarity measure was never run on problems known to be unrelated. Each control
 --- the similarity control needed no GPU at all --- and each overturned the finding it tested.
 The audit discipline that caught five deliberately planted defects in the layer's code did not
 extend to the measurements the layer produced, and that is the gap worth naming.
+
+\subsection{A permanent task store, the source comparison run properly, and the finding that
+none of the three sources supplies gradient}
+\label{sec:taskstore}
+
+With the comparator fixed (Sec.~\ref{sec:tasksourcecorr}) the source comparison can finally be
+run, and its output is worth keeping rather than printing. This section reports both: the store
+the layer now writes to, and the comparison read back out of it.
+
+\paragraph{The store.} One record per task, append-only JSONL, on
+\path{/extra/zhanglab1/pengchx3/selfevo/taskstore} and mirrored to
+\path{gs://selfevo/taskstore}; $52$ records, $87{,}668$ bytes, identical by MD5 in all three
+places. The schema version appears both in the filename and in every row, and the reader is
+shipped beside the data so the store can be read without the training box. The record
+\emph{refuses to be constructed} without: a content hash as well as an id; per-source
+provenance (teacher model and version for distilled, corpus, row and licence for retrieved,
+prompt version and exemplars for generated); a verdict with its backend, its comparator, and
+--- for a refutation --- the witness that refuted it; a success rate together with the prompt
+it was measured under; three separate deduplication readings, each with its threshold and the
+false-positive floor for that statement's length band; and cost split into what it took to
+produce the task and what it took to score it. Sixteen tests cover these refusals and eleven
+deliberately planted defects are all caught, including the one that matters most: a record
+written under an older schema is refused loudly rather than reread with today's meanings.
+
+\paragraph{The store's own discipline caught two more instruments, and one of them changed an
+answer.} Both have the shape named at the end of Sec.~\ref{sec:tasksourcecorr}.
+
+\emph{Schema v1: a boolean named for the floor and computed from the threshold.} The dedup
+reading carried one flag, \texttt{above\_floor}, whose value was in fact
+$\text{score} \ge \text{threshold}$. The two answer different questions --- whether an overlap
+triggers the reference set's action, and whether it is distinguishable from the chance overlap
+between unrelated problems of that length --- so an overlap that was real but not actionable
+was recorded as if it were nothing. v2 records both.
+
+\emph{Schema v2: a per-record cost field holding a batch mean.} \texttt{cost.score\_tokens} was
+the mean over every task scored in the run, written into each row as though it were that row's
+own cost. It read as a measurement and was not one, and the cost ranking built on it compared
+three identical numbers, $4218$, and returned list order. v3 attributes verification cost to
+the task's own samples. \textbf{The fix inverted the result}: verification costs $1685$ tokens
+per accepted task for generated, $4265$ for distilled and $7563$ for retrieved, so retrieval is
+simultaneously the only source that is free to produce and, by a factor of $4.5$, the dearest
+to trust. Under the collapsed column that inversion was invisible.
+
+Neither old file was deleted. Both were retired beside the store, and the current reader was
+run against both to show it refuses them by version rather than reinterpreting them --- the
+guard demonstrated firing, not asserted.
+
+\begin{table}[t]
+\centering\small
+\caption{The three sources, read back out of the store
+(\texttt{taskstore/tasks.v3.jsonl}, $52$ records). Keys are decided by \texttt{SolverConsensus}
+at $k{=}5$ against \texttt{symbolic\_compare}; the solver never sees the key it is checking.
+Coverage travels with every rate: a source whose keys are mostly unparseable is not a source
+whose keys are mostly right. $\hat{p}$ is the success rate over the same five samples, measured
+under the bare solution prompt and recorded with it.}
+\label{tab:storesources}
+\begin{tabular}{lrrrrcrrrc}
+\toprule
+& & \multicolumn{3}{c}{verdict} & & \multicolumn{2}{c}{tokens / accepted} & & \\
+\cmidrule(lr){3-5}\cmidrule(lr){7-8}
+source & $n$ & ver. & ref. & unver. & coverage & produce & verify & refuted rate (Wilson) & mean $\hat{p}$ \\
+\midrule
+generated & $16$ & $14$ & $1$ & $1$  & $0.938$ & $1859$ & $\mathbf{1685}$ & $0.067$ \ $[0.012, 0.298]$ & $0.938$ \\
+retrieved & $24$ & $9$  & $0$ & $15$ & $\mathbf{0.375}$ & $\mathbf{0}$ & $7563$ & $0.000$ \ $[0.000, 0.299]$ & $0.817$ \\
+distilled & $12$ & $10$ & $0$ & $2$  & $0.833$ & $2580$ & $4265$ & $0.000$ \ $[0.000, 0.278]$ & $1.000$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{The comparison (Table~\ref{tab:storesources}), with the coverage caveat carried.}
+The refuted rates are $0.067$, $0.000$ and $0.000$, and their Wilson intervals all reach past
+$0.27$: on nine to fifteen decided cases per source \emph{no ordering of key reliability is
+established}, and the routing plan says so rather than presenting the sort order as a result.
+What the table does separate cleanly is coverage. The verifier decides $15$ of $16$ generated
+keys and $10$ of $12$ distilled ones, but only $9$ of $24$ retrieved --- because retrieved keys
+are written in their corpus's format and the exact comparator declines to parse what it cannot
+read. That is the soundness-for-coverage trade of Sec.~\ref{sec:tasksourcecorr} landing
+unevenly across sources, and it is a property of the checker, not of the keys.
+
+The single refutation is a real one and its witness makes it checkable, which is the entire
+reason the field is mandatory. The generator wrote \emph{``the determinant of the 2$\times$2
+matrix with first row $[2,3]$ and second row $[5,7]$''} and asserted $-11$; the witness is
+$-1$, and $2{\cdot}7 - 3{\cdot}5 = -1$. \textbf{A model writing its own tasks writes some of
+its own keys wrong, and the layer catches it and preserves the evidence.}
+
+\begin{table}[t]
+\centering\small
+\caption{Difficulty of the accepted tasks, over the same five samples used for verification.
+The mixed band $0 < \hat{p} < 1$ is where a group-relative objective has any gradient at all;
+outside it every rollout in the group agrees and the advantage is exactly zero.}
+\label{tab:storediff}
+\begin{tabular}{lrrrrc}
+\toprule
+source & $n$ & $\hat{p}=0$ & $0<\hat{p}<1$ & $\hat{p}=1$ & gradient-bearing share \\
+\midrule
+generated & $16$ & $1$ & $0$ & $15$ & $0.000$ \\
+retrieved & $24$ & $3$ & $3$ & $18$ & $0.125$ \\
+distilled & $12$ & $0$ & $0$ & $12$ & $0.000$ \\
+\midrule
+all       & $52$ & $4$ & $\mathbf{3}$ & $45$ & $\mathbf{0.058}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{The result that matters is not in the key column.} Three of $52$ accepted tasks fall
+in the mixed band, and all three came from retrieval (Table~\ref{tab:storediff}). \textbf{Both
+model-written sources produced zero gradient-bearing tasks between them}: every one of the
+twelve distilled tasks was solved five times out of five, as were fifteen of sixteen generated
+ones. This is the unanimous-group problem arriving one stage earlier than we have been looking
+for it. We have been treating task supply and difficulty targeting as separable --- build the
+sources, then aim them --- and at this model's competence they are not separable, because a
+model asked to write a problem writes one it can already solve. A source layer that triples
+throughput and leaves $94\%$ of its output outside the informative band has not moved the
+constraint.
+
+Two caveats bound this. First, $\hat{p}$ is measured on five samples, so $\hat{p}=1$ is not
+$p=1$: a task with a true $p$ of $0.85$ reads $5/5$ $44\%$ of the time. The mixed count is
+therefore a \emph{lower} bound, and the honest statement is that the mixed share is under
+$12\%$ even for the best source, not that it is exactly $0.058$. Second, difficulty here is
+measured under the bare prompt and recorded with it, for the reason established in
+Sec.~\ref{sec:postscaffold}: the same task measured after the harness stage is a different
+number, so the two must never be pooled.
+
+\paragraph{Three reference sets, three rates, and one of them is not a rejection.} Candidates
+are checked against the held-out half (contamination), the running novelty buffer (repetition)
+and the training pool (redundancy). Over $45$ candidates per source, rejections were $7/14/0$
+(generated), $3/5/0$ (retrieved) and $8/20/0$ (distilled) for contamination, repetition and
+redundancy respectively. Two of these three readings must be quoted against their floors, and
+only one may be quoted at all:
+
+\begin{itemize}
+\item \textbf{Contamination, at $0.45$, rejects.} The costs are asymmetric --- a false reject
+loses one candidate, a false accept loses the held-out set --- so rejecting on suspicion is
+correct even at a $9.5\%$ false-positive rate. But the floors ($0.092$ and $0.081$ in the two
+shortest bands, $0$ above $160$ characters) are why the contamination \emph{ordering} was
+withdrawn in Sec.~\ref{sec:tasksourcecorr}, and the same caution applies to the numbers above.
+\item \textbf{Repetition, at $0.60$ against the buffer, rejects --- and its counts are an upper
+bound.} The buffer's false-positive floor is $0.292$ for statements under $60$ characters and
+$0.140$ for $60$--$100$. Model-written statements fall \emph{entirely} in those two bands
+(median length $69$ and $85$ characters, against $104$ for retrieved), so the higher repetition
+rejection rates for generated ($0.31$) and distilled ($0.44$) sit exactly where the measure is
+least trustworthy. \textbf{We do not report that model-written sources repeat themselves more
+than retrieval}; that would be the withdrawn contamination claim wearing a different hat.
+\item \textbf{Redundancy, at $0.60$ against the training pool, only flags.} Here the floor is
+$0.000$ in every length band --- unrelated curated problems never reach $0.60$ against the pool
+--- so this reading is clean, and it is null: $0$ of $52$ stored tasks were flagged. The
+decision not to reject on it is deliberate and survives the clean floor. Redundancy is
+symmetric in cost, and a redundant task is not an invalid task: it is one the pool already
+covers, which is a scheduling fact rather than a validity fact. It is recorded per task so a
+scheduler can act on it, and it never silently removes a candidate.
+\end{itemize}
+
+\paragraph{Routing, not a winner.} The plan the layer emits ranks the sources per need and
+refuses to rank on a field nobody measured, marking a tie as a tie. Retrieval is the only
+source free to produce, the only one whose writer does not collude with the solver, and the
+only one that produced a gradient-bearing task --- and it is the dearest to verify, cannot be
+aimed at a difficulty, is licence-constrained, and is a fixed pool. Generation is unbounded,
+aimable, and the cheapest to verify, and it is the only source observed to write a wrong key.
+Distillation as run here is \emph{not} evidence about distillation: the teacher was the same
+checkpoint as the solver, which is why it produced the twelve tasks the solver solved twelve
+times out of twelve, and why its provenance records the collusion explicitly. A different-family
+teacher is the experiment this row does not perform.
+
+\textbf{Cost.} The store was produced for $320{,}375$ tokens on the B200 --- $60{,}704$ to
+produce $52$ tasks and $259{,}671$ to score them, four fifths of the bill spent on trusting the
+tasks rather than on making them. \textbf{No money was spent}; every arm, teacher included, ran
+on the local checkpoint, so the dollar axis is unmeasured here rather than zero, and the routing
+plan declines to rank on it.
