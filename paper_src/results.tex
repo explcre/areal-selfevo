@@ -4510,6 +4510,16 @@ comparison we run on a current base. The same power arithmetic applies to it: $2
 gives $p = 0.35$, so it too is a statement about whether the mechanism runs and moves scores
 in the expected direction, not a significance test.
 
+It is, however, the \emph{better-powered} of their two NatureBench claims, and that is a
+second reason to prefer it beyond mere measurability. Because its baseline is $2/10$ rather
+than $5/10$, the separation needed for significance is reachable in principle: $8/10$ gives
+$p=0.023$ and $7/10$ gives $p=0.070$, where the model-swap comparison against a $5/10$
+baseline requires a perfect $10/10$. So a harness-swap run that landed well above its
+published $5/10$ could actually say something, whereas no attainable model-swap result on
+this benchmark could. We do not expect that outcome and do not design around it; we record
+it so that the run is interpreted against a threshold fixed in advance rather than one
+chosen after the scores are in.
+
 \subsection{Correction: the vendored framework is Meta's aira-dojo, but it does not give us a
 shared measurement surface with Meta}
 \label{sec:airadojo}
